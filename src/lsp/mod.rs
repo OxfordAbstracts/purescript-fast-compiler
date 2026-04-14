@@ -112,6 +112,7 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 document_formatting_provider: Some(OneOf::Left(self.formatter_command.is_some())),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -235,6 +236,18 @@ impl LanguageServer for Backend {
         let result = self.handle_completion(params).await;
         self.info(format!(
             "[lsp] << textDocument/completion: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
+        result
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        self.info("[lsp] >> textDocument/codeAction").await;
+        let t = std::time::Instant::now();
+        let result = self.handle_code_action(params).await;
+        self.info(format!(
+            "[lsp] << textDocument/codeAction: {:.2?}",
             t.elapsed()
         ))
         .await;

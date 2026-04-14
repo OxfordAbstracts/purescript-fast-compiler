@@ -212,6 +212,26 @@ impl TestServer {
         .await;
         self.read_response(id).await
     }
+
+    async fn code_action(
+        &mut self,
+        id: u64,
+        uri: &str,
+        range: Value,
+        diagnostics: Value,
+    ) -> Value {
+        self.send_request(
+            id,
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": range,
+                "context": { "diagnostics": diagnostics },
+            }),
+        )
+        .await;
+        self.read_response(id).await
+    }
 }
 
 #[tokio::test]
@@ -1519,3 +1539,157 @@ async fn test_lsp_formatting_without_command_returns_null() {
 // Qualified goto_definition is tested by:
 // - test_lsp_goto_definition_fixture (line 27: Lib.times2 in Simple.purs)
 // - test_lsp_goto_def_import_module_name (clicking on module name in import)
+
+fn apply_text_edits(source: &str, edits: &Vec<Value>) -> String {
+    let mut pairs: Vec<(usize, usize, String)> = edits
+        .iter()
+        .map(|e| {
+            let range = e.get("range").unwrap();
+            let start = offset_from_range(source, range, "start");
+            let end = offset_from_range(source, range, "end");
+            let new_text = e.get("newText").unwrap().as_str().unwrap().to_string();
+            (start, end, new_text)
+        })
+        .collect();
+    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = source.to_string();
+    for (start, end, new_text) in pairs {
+        out.replace_range(start..end, &new_text);
+    }
+    out
+}
+
+fn offset_from_range(source: &str, range: &Value, key: &str) -> usize {
+    let pos = range.get(key).unwrap();
+    let line = pos.get("line").unwrap().as_u64().unwrap() as usize;
+    let character = pos.get("character").unwrap().as_u64().unwrap() as usize;
+    let mut offset = 0;
+    for (i, l) in source.split('\n').enumerate() {
+        if i == line {
+            offset += character.min(l.len());
+            return offset;
+        }
+        offset += l.len() + 1;
+    }
+    source.len()
+}
+
+fn first_action_edits(resp: &Value, uri: &str) -> Option<Vec<Value>> {
+    let actions = resp.get("result")?.as_array()?;
+    let first = actions.first()?;
+    let edit = first.get("edit")?;
+    let changes = edit.get("changes")?;
+    let file_edits = changes.get(uri)?.as_array()?;
+    Some(file_edits.clone())
+}
+
+#[tokio::test]
+async fn test_lsp_code_action_prefix_unused_let_binding() {
+    let mut server = TestServer::start().await;
+    let uri = "file:///test/UnusedLet.purs";
+    let src = "module UnusedLet where\n\nf = let x = 1 in 2\n";
+    server.open_file(uri, src).await;
+
+    // Range covering `x` on line 2 (0-indexed), columns 8..9
+    let range = json!({
+        "start": { "line": 2, "character": 8 },
+        "end": { "line": 2, "character": 9 },
+    });
+    let diag = json!({
+        "range": range,
+        "severity": 2,
+        "code": "TypeWarning.UnusedName",
+        "source": "pfc",
+        "message": "Unused name: x",
+    });
+    let resp = server.code_action(20, uri, range.clone(), json!([diag])).await;
+
+    let edits = first_action_edits(&resp, uri).expect("expected edits");
+    let fixed = apply_text_edits(src, &edits);
+    assert!(fixed.contains("let _x = 1"), "fixed source should prefix with underscore, got: {fixed}");
+}
+
+#[tokio::test]
+async fn test_lsp_code_action_prefix_unused_lambda_param() {
+    let mut server = TestServer::start().await;
+    let uri = "file:///test/UnusedLambda.purs";
+    let src = "module UnusedLambda where\n\nf = \\x -> 1\n";
+    server.open_file(uri, src).await;
+
+    // `x` is at line 2 col 5
+    let range = json!({
+        "start": { "line": 2, "character": 5 },
+        "end": { "line": 2, "character": 6 },
+    });
+    let diag = json!({
+        "range": range,
+        "severity": 2,
+        "code": "TypeWarning.UnusedName",
+        "source": "pfc",
+        "message": "Unused name: x",
+    });
+    let resp = server.code_action(21, uri, range, json!([diag])).await;
+
+    let edits = first_action_edits(&resp, uri).expect("expected edits");
+    let fixed = apply_text_edits(src, &edits);
+    assert!(fixed.contains("\\_x ->"), "expected lambda param prefixed with underscore, got: {fixed}");
+}
+
+#[tokio::test]
+async fn test_lsp_code_action_remove_unused_import_middle() {
+    let mut server = TestServer::start().await;
+    let uri = "file:///test/UnusedImport.purs";
+    // Source with `bar` unused among three imports
+    let src = "module UnusedImport where\nimport Dep (foo, bar, baz)\nx = foo\ny = baz\n";
+    server.open_file(uri, src).await;
+
+    // `bar` at line 1, characters 17..20
+    let range = json!({
+        "start": { "line": 1, "character": 17 },
+        "end": { "line": 1, "character": 20 },
+    });
+    let diag = json!({
+        "range": range,
+        "severity": 2,
+        "code": "TypeWarning.UnusedImport",
+        "source": "pfc",
+        "message": "Unused import: bar",
+    });
+    let resp = server.code_action(22, uri, range, json!([diag])).await;
+
+    let edits = first_action_edits(&resp, uri).expect("expected edits");
+    let fixed = apply_text_edits(src, &edits);
+    assert!(
+        fixed.contains("import Dep (foo, baz)"),
+        "bar should be removed keeping foo and baz, got: {fixed}"
+    );
+}
+
+#[tokio::test]
+async fn test_lsp_code_action_remove_sole_import() {
+    let mut server = TestServer::start().await;
+    let uri = "file:///test/UnusedSoleImport.purs";
+    let src = "module UnusedSoleImport where\nimport Dep (foo)\nx = 1\n";
+    server.open_file(uri, src).await;
+
+    // `foo` at line 1, characters 12..15
+    let range = json!({
+        "start": { "line": 1, "character": 12 },
+        "end": { "line": 1, "character": 15 },
+    });
+    let diag = json!({
+        "range": range,
+        "severity": 2,
+        "code": "TypeWarning.UnusedImport",
+        "source": "pfc",
+        "message": "Unused import: foo",
+    });
+    let resp = server.code_action(23, uri, range, json!([diag])).await;
+
+    let edits = first_action_edits(&resp, uri).expect("expected edits");
+    let fixed = apply_text_edits(src, &edits);
+    assert!(
+        !fixed.contains("import Dep"),
+        "entire import line should be removed, got: {fixed}"
+    );
+}
