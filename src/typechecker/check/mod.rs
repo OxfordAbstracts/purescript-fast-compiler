@@ -6346,9 +6346,40 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 for &ri in rhs_indices {
                     if ri >= args.len() { continue; }
                     let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
+                    // Skip if the fundep-determined type still has type vars.
+                    // But if the arg has concrete OUTER STRUCTURE (not a bare unif/var)
+                    // AND the inst_ty's type vars also appear in the original args
+                    // (from the user's forall context), proceed — the unification
+                    // catches rigid type var mismatches (e.g., Record vs forall-bound
+                    // `state`, or Int vs `state`).
                     if contains_type_var(&inst_ty) {
-                        all_rhs_determined = false;
-                        continue;
+                        let arg_has_concrete_structure = !matches!(&args[ri],
+                            Type::Var(_) | Type::Unif(_));
+                        // Check that the type var in inst_ty also appears in the
+                        // original constraint args (meaning it's from the user's
+                        // forall, not an unsubstituted instance pattern var).
+                        let inst_var_in_args = if let Type::Var(v) = &inst_ty {
+                            args.iter().any(|a| contains_type_var_named(a, *v))
+                        } else {
+                            false
+                        };
+                        fn contains_type_var_named(t: &Type, name: TypeVarName) -> bool {
+                            match t {
+                                Type::Var(v) => *v == name,
+                                Type::App(f, a) => contains_type_var_named(f, name) || contains_type_var_named(a, name),
+                                Type::Fun(a, b) => contains_type_var_named(a, name) || contains_type_var_named(b, name),
+                                Type::Record(fields, tail) => {
+                                    fields.iter().any(|(_, ft)| contains_type_var_named(ft, name))
+                                        || tail.as_ref().map_or(false, |t| contains_type_var_named(t, name))
+                                }
+                                Type::Forall(_, body) => contains_type_var_named(body, name),
+                                _ => false,
+                            }
+                        }
+                        if !(arg_has_concrete_structure && inst_var_in_args) {
+                            all_rhs_determined = false;
+                            continue;
+                        }
                     }
                     if inst_ty == args[ri] {
                         all_rhs_determined = false;
