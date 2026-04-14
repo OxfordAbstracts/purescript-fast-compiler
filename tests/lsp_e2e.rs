@@ -759,6 +759,91 @@ async fn test_lsp_hover_returns_null_on_whitespace() {
 }
 
 #[tokio::test]
+async fn test_lsp_hover_type_shows_definition() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/TypeDef.purs";
+    let src = "module TypeDef where\n\ndata Color = Red | Green | Blue\n\nc :: Color\nc = Red\n";
+    server.open_file(uri, src).await;
+
+    // Hover on `Color` at the declaration site (line 2, col 5)
+    let resp = server.hover(11, uri, 2, 5).await;
+    let result = resp.get("result").expect("should have result");
+    assert!(!result.is_null(), "hover result should not be null, got: {result}");
+    let value = result
+        .get("contents")
+        .unwrap()
+        .get("value")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        value.contains("data Color = Red | Green | Blue"),
+        "hover should include the type definition, got: {value}"
+    );
+}
+
+#[tokio::test]
+async fn test_lsp_hover_value_shows_definition() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/ValDef.purs";
+    let src = "module ValDef where\n\nfoo :: Int\nfoo = 42\n";
+    server.open_file(uri, src).await;
+
+    // Hover on `foo` at the definition line (line 3, col 0)
+    let resp = server.hover(13, uri, 3, 0).await;
+    let result = resp.get("result").expect("should have result");
+    let value = result
+        .get("contents")
+        .unwrap()
+        .get("value")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        value.contains("foo = 42"),
+        "hover should include the value body, got: {value}"
+    );
+    assert!(
+        value.contains("foo :: Int"),
+        "hover should include the type signature above the body, got: {value}"
+    );
+}
+
+#[tokio::test]
+async fn test_lsp_hover_type_definition_truncated() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/BigType.purs";
+    // Build a type with many constructors so the source exceeds 1000 chars.
+    let mut ctors = Vec::new();
+    for i in 0..200 {
+        ctors.push(format!("Ctor{i:03}"));
+    }
+    let src = format!(
+        "module BigType where\n\ndata Big = {}\n\nx :: Big\nx = Ctor000\n",
+        ctors.join(" | ")
+    );
+    server.open_file(uri, &src).await;
+
+    // Hover on `Big` at the declaration site
+    let resp = server.hover(12, uri, 2, 5).await;
+    let result = resp.get("result").expect("should have result");
+    let value = result
+        .get("contents")
+        .unwrap()
+        .get("value")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        value.contains('…'),
+        "hover should truncate long definitions with ellipsis, got: {value}"
+    );
+}
+
+#[tokio::test]
 async fn test_lsp_hover_with_doc_comment() {
     let mut server = TestServer::start().await;
 

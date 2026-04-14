@@ -152,8 +152,19 @@ impl Backend {
             Vec::new()
         };
 
+        // For types/classes, include the source definition (first 1000 chars).
+        let definition_text = self
+            .get_type_definition_text(&module, &source, &target)
+            .await;
+
         // Build markdown content
         let mut markdown = format!("```purescript\n{name_str} :: {type_str}\n```");
+
+        if let Some(def) = &definition_text {
+            markdown.push_str("\n\n---\n\n```purescript\n");
+            markdown.push_str(def);
+            markdown.push_str("\n```");
+        }
 
         if !doc_comments.is_empty() {
             markdown.push_str("\n\n---\n\n");
@@ -389,6 +400,59 @@ impl Backend {
         None
     }
 
+    async fn get_type_definition_text(
+        &self,
+        module: &cst::Module,
+        source: &str,
+        target: &HoverTarget,
+    ) -> Option<String> {
+        match target {
+            HoverTarget::TypeDeclaration(sym) => {
+                find_decl_source_text(&module.decls, *sym, source, DeclTextKind::Type)
+            }
+            HoverTarget::ValueDeclaration(sym) => {
+                find_decl_source_text(&module.decls, *sym, source, DeclTextKind::Value)
+            }
+            HoverTarget::Reference(resolved) => {
+                let kind = match resolved.namespace {
+                    Namespace::Type | Namespace::Class => DeclTextKind::Type,
+                    Namespace::Value => DeclTextKind::Value,
+                    _ => return None,
+                };
+                let full_name = interner::resolve(resolved.src_symbol).unwrap_or_default();
+                let name_str = full_name.rsplit('.').next().unwrap_or(&full_name);
+                let name_sym = interner::intern(name_str);
+                match &resolved.definition {
+                    DefinitionSite::Local(_) => {
+                        find_decl_source_text(&module.decls, name_sym, source, kind)
+                    }
+                    DefinitionSite::LocalVar(_) => None,
+                    DefinitionSite::Imported(module_sym) => {
+                        let module_name = interner::resolve(*module_sym).unwrap_or_default();
+                        self.get_imported_decl_source(&module_name, name_sym, kind)
+                            .await
+                    }
+                    DefinitionSite::Prim => None,
+                }
+            }
+        }
+    }
+
+    async fn get_imported_decl_source(
+        &self,
+        module_name: &str,
+        symbol: interner::Symbol,
+        kind: DeclTextKind,
+    ) -> Option<String> {
+        let target_uri = {
+            let mf = self.module_file_map.read().await;
+            mf.get(module_name).cloned()
+        }?;
+        let target_source = self.get_source_for_uri(&target_uri).await?;
+        let target_module = crate::parser::parse(&target_source).ok()?;
+        find_decl_source_text(&target_module.decls, symbol, &target_source, kind)
+    }
+
     async fn get_imported_type(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {
         let module_name = interner::resolve(module_sym).unwrap_or_default();
         let module_parts: Vec<interner::Symbol> = module_name
@@ -439,6 +503,71 @@ impl Backend {
         let target_module = crate::parser::parse(&target_source).ok()?;
         find_cst_kind(&target_module.decls, name_str, &target_source)
     }
+}
+
+#[derive(Clone, Copy)]
+enum DeclTextKind {
+    Type,
+    Value,
+}
+
+/// Extract the source text of a matching declaration, truncated to 1000 characters
+/// (with an ellipsis when truncated). `kind` controls which declaration flavors to
+/// consider: `Type` covers data/newtype/type-alias/class/foreign-data; `Value` covers
+/// value bindings and foreign imports (prefixed with their type signature if present).
+fn find_decl_source_text(
+    decls: &[Decl],
+    symbol: interner::Symbol,
+    source: &str,
+    kind: DeclTextKind,
+) -> Option<String> {
+    let mut sig_text: Option<&str> = None;
+    for decl in decls {
+        let (match_kind, decl_sym, span) = match decl {
+            Decl::Data { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
+            Decl::TypeAlias { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
+            Decl::Newtype { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
+            Decl::Class { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
+            Decl::ForeignData { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
+            Decl::TypeSignature { name, span, .. } => {
+                if matches!(kind, DeclTextKind::Value) && name.value.symbol() == symbol {
+                    sig_text = source.get(span.start..span.end);
+                }
+                continue;
+            }
+            Decl::Value { name, span, .. } => (DeclTextKind::Value, name.value.symbol(), *span),
+            Decl::Foreign { name, span, .. } => (DeclTextKind::Value, name.value.symbol(), *span),
+            _ => continue,
+        };
+        if decl_sym != symbol {
+            continue;
+        }
+        let matches_kind = matches!(
+            (kind, match_kind),
+            (DeclTextKind::Type, DeclTextKind::Type) | (DeclTextKind::Value, DeclTextKind::Value)
+        );
+        if !matches_kind {
+            continue;
+        }
+        let body = source.get(span.start..span.end)?;
+        let combined = match (kind, sig_text) {
+            (DeclTextKind::Value, Some(sig)) => format!("{sig}\n{body}"),
+            _ => body.to_string(),
+        };
+        return Some(truncate_to_chars(&combined, 1000));
+    }
+    None
+}
+
+fn truncate_to_chars(s: &str, max_chars: usize) -> String {
+    let mut char_count = 0;
+    for (i, _) in s.char_indices() {
+        if char_count == max_chars {
+            return format!("{}…", &s[..i]);
+        }
+        char_count += 1;
+    }
+    s.to_string()
 }
 
 /// Check if the offset falls on a declaration name (the definition site itself).
