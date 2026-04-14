@@ -893,17 +893,33 @@ fn collect_unif_vars(ty: &Type, ids: &mut Vec<u32>) {
     }
 }
 
-/// Format a type with normalized unification variable names.
+/// Maximum recursion depth when pretty-printing types. Beyond this depth,
+/// the nested structure is replaced with `...`.
+const PRETTY_TYPE_MAX_DEPTH: u32 = 3;
+
+/// Maximum number of labels shown in a record before eliding the rest with `...`.
+const PRETTY_TYPE_MAX_RECORD_LABELS: usize = 12;
+
+/// Format a type with normalized unification variable names, depth-limited,
+/// and indented for nested records.
 fn pretty_type(ty: &Type, var_map: &HashMap<u32, usize>) -> String {
-    if var_map.is_empty() {
-        return format!("{ty}");
-    }
     let mut out = String::new();
-    fmt_type(&mut out, ty, var_map, false);
+    fmt_type(&mut out, ty, var_map, false, 0, 0);
     out
 }
 
-fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: bool) {
+fn fmt_type(
+    out: &mut String,
+    ty: &Type,
+    var_map: &HashMap<u32, usize>,
+    nested: bool,
+    depth: u32,
+    indent: usize,
+) {
+    if depth >= PRETTY_TYPE_MAX_DEPTH {
+        out.push_str("...");
+        return;
+    }
     match ty {
         Type::Unif(id) => {
             if let Some(&idx) = var_map.get(&id.0) {
@@ -921,18 +937,20 @@ fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: 
         Type::App(func, arg) => {
             if nested { out.push('('); }
             match func.as_ref() {
-                Type::App(..) | Type::Con(..) | Type::Var(..) | Type::Unif(..) => fmt_type(out, func, var_map, false),
-                _ => fmt_type(out, func, var_map, true),
+                Type::App(..) | Type::Con(..) | Type::Var(..) | Type::Unif(..) => {
+                    fmt_type(out, func, var_map, false, depth + 1, indent);
+                }
+                _ => fmt_type(out, func, var_map, true, depth + 1, indent),
             }
             out.push(' ');
-            fmt_type(out, arg, var_map, true);
+            fmt_type(out, arg, var_map, true, depth + 1, indent);
             if nested { out.push(')'); }
         }
         Type::Fun(from, to) => {
             if nested { out.push('('); }
-            fmt_type(out, from, var_map, true);
+            fmt_type(out, from, var_map, true, depth + 1, indent);
             out.push_str(" -> ");
-            fmt_type(out, to, var_map, false);
+            fmt_type(out, to, var_map, false, depth + 1, indent);
             if nested { out.push(')'); }
         }
         Type::Forall(vars, body) => {
@@ -946,7 +964,7 @@ fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: 
                 }
             }
             out.push_str(". ");
-            fmt_type(out, body, var_map, false);
+            fmt_type(out, body, var_map, false, depth + 1, indent);
             if nested { out.push(')'); }
         }
         Type::TypeString(sym) => {
@@ -956,19 +974,66 @@ fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: 
             let _ = write!(out, "{n}");
         }
         Type::Record(fields, tail) => {
-            out.push_str("{ ");
-            for (i, (label, field_ty)) in fields.iter().enumerate() {
-                if i > 0 { out.push_str(", "); }
-                let _ = write!(out, "{label} :: ");
-                fmt_type(out, field_ty, var_map, false);
-            }
-            if let Some(tail) = tail {
-                if !fields.is_empty() { out.push_str(" | "); }
-                fmt_type(out, tail, var_map, false);
-            }
-            out.push_str(" }");
+            fmt_record(out, fields, tail, var_map, depth, indent);
         }
     }
+}
+
+fn fmt_record(
+    out: &mut String,
+    fields: &[(LabelName, Type)],
+    tail: &Option<Box<Type>>,
+    var_map: &HashMap<u32, usize>,
+    depth: u32,
+    indent: usize,
+) {
+    let total = fields.len();
+    // Compact single-line form for empty or single-field records.
+    if total <= 1 {
+        out.push_str("{ ");
+        for (i, (label, field_ty)) in fields.iter().enumerate() {
+            if i > 0 { out.push_str(", "); }
+            let _ = write!(out, "{label} :: ");
+            fmt_type(out, field_ty, var_map, false, depth + 1, indent);
+        }
+        if let Some(tail) = tail {
+            if !fields.is_empty() { out.push_str(" | "); }
+            fmt_type(out, tail, var_map, false, depth + 1, indent);
+        }
+        out.push_str(" }");
+        return;
+    }
+
+    // Multi-line form: each label on its own line, indented.
+    let inner_indent = indent + 2;
+    let inner_pad: String = " ".repeat(inner_indent);
+    let outer_pad: String = " ".repeat(indent);
+    out.push('{');
+    out.push('\n');
+    let shown = total.min(PRETTY_TYPE_MAX_RECORD_LABELS);
+    for (i, (label, field_ty)) in fields.iter().take(shown).enumerate() {
+        out.push_str(&inner_pad);
+        if i == 0 {
+            out.push_str("  ");
+        } else {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{label} :: ");
+        fmt_type(out, field_ty, var_map, false, depth + 1, inner_indent);
+        out.push('\n');
+    }
+    if total > PRETTY_TYPE_MAX_RECORD_LABELS {
+        out.push_str(&inner_pad);
+        out.push_str(", ...\n");
+    }
+    if let Some(tail) = tail {
+        out.push_str(&inner_pad);
+        out.push_str("| ");
+        fmt_type(out, tail, var_map, false, depth + 1, inner_indent);
+        out.push('\n');
+    }
+    out.push_str(&outer_pad);
+    out.push('}');
 }
 
 /// Replace `?N` patterns in a pre-formatted string with normalized `tN` names.
@@ -1003,4 +1068,132 @@ fn replace_unif_vars_in_string(s: &str, var_map: &HashMap<u32, usize>) -> String
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::names::{LabelName, TypeName};
+
+    fn intern(s: &str) -> Symbol {
+        interner::intern(s)
+    }
+
+    fn con(name: &str) -> Type {
+        Type::Con(Qualified::unqualified(TypeName::new(intern(name))))
+    }
+
+    fn record(fields: Vec<(&str, Type)>) -> Type {
+        Type::Record(
+            fields
+                .into_iter()
+                .map(|(l, t)| (LabelName::new(intern(l)), t))
+                .collect(),
+            None,
+        )
+    }
+
+    fn open_record(fields: Vec<(&str, Type)>, tail: Type) -> Type {
+        Type::Record(
+            fields
+                .into_iter()
+                .map(|(l, t)| (LabelName::new(intern(l)), t))
+                .collect(),
+            Some(Box::new(tail)),
+        )
+    }
+
+    #[test]
+    fn prints_simple_con() {
+        let ty = con("Int");
+        assert_eq!(pretty_type(&ty, &HashMap::new()), "Int");
+    }
+
+    #[test]
+    fn prints_empty_record() {
+        let ty = record(vec![]);
+        assert_eq!(pretty_type(&ty, &HashMap::new()), "{  }");
+    }
+
+    #[test]
+    fn prints_single_field_record_inline() {
+        let ty = record(vec![("x", con("Int"))]);
+        assert_eq!(pretty_type(&ty, &HashMap::new()), "{ x :: Int }");
+    }
+
+    #[test]
+    fn prints_multi_field_record_multiline() {
+        let ty = record(vec![
+            ("x", con("Int")),
+            ("y", con("String")),
+            ("z", con("Boolean")),
+        ]);
+        let expected = "{\n    x :: Int\n  , y :: String\n  , z :: Boolean\n}";
+        assert_eq!(pretty_type(&ty, &HashMap::new()), expected);
+    }
+
+    #[test]
+    fn nested_records_are_indented() {
+        let inner = record(vec![
+            ("a", con("Int")),
+            ("b", con("String")),
+        ]);
+        let outer = record(vec![
+            ("outer1", inner),
+            ("outer2", con("Boolean")),
+        ]);
+        let expected = "{\n    outer1 :: {\n      a :: Int\n    , b :: String\n  }\n  , outer2 :: Boolean\n}";
+        assert_eq!(pretty_type(&outer, &HashMap::new()), expected);
+    }
+
+    #[test]
+    fn depth_limit_replaces_deep_structure_with_ellipsis() {
+        // 4 levels: Record > Record > Record > Record.
+        // With max depth 3, the 4th level should render as "...".
+        let lvl3 = record(vec![("d", con("Int"))]);
+        let lvl2 = record(vec![("c", lvl3)]);
+        let lvl1 = record(vec![("b", lvl2)]);
+        let lvl0 = record(vec![("a", lvl1)]);
+        let out = pretty_type(&lvl0, &HashMap::new());
+        assert!(out.contains("..."), "expected ellipsis, got: {out}");
+    }
+
+    #[test]
+    fn record_label_limit_replaces_tail_with_ellipsis() {
+        let fields: Vec<(&str, Type)> = (0..15)
+            .map(|i| {
+                let name: &str = Box::leak(format!("f{i}").into_boxed_str());
+                (name, con("Int"))
+            })
+            .collect();
+        let ty = record(fields);
+        let out = pretty_type(&ty, &HashMap::new());
+        // First 12 fields should appear, then `, ...`
+        assert!(out.contains("f0 :: Int"), "should show first field");
+        assert!(out.contains("f11 :: Int"), "should show 12th field");
+        assert!(!out.contains("f12 :: Int"), "should not show 13th field");
+        assert!(out.contains(", ..."), "should show ellipsis for remaining fields");
+    }
+
+    #[test]
+    fn open_record_shows_row_tail() {
+        let tail = Type::Var(TypeVarName::new(intern("r")));
+        let ty = open_record(vec![("x", con("Int")), ("y", con("String"))], tail);
+        let out = pretty_type(&ty, &HashMap::new());
+        assert!(out.contains("| r"), "should show row tail: {out}");
+    }
+
+    #[test]
+    fn function_types_use_arrows() {
+        let ty = Type::Fun(Box::new(con("Int")), Box::new(con("String")));
+        assert_eq!(pretty_type(&ty, &HashMap::new()), "Int -> String");
+    }
+
+    #[test]
+    fn unif_vars_use_mapped_names() {
+        let mut var_map = HashMap::new();
+        var_map.insert(5, 0);
+        let ty = Type::Unif(crate::typechecker::types::TyVarId(5));
+        assert_eq!(pretty_type(&ty, &var_map), "t0");
+    }
 }
