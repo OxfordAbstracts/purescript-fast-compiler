@@ -312,6 +312,20 @@ pub struct InferCtx {
     /// These should only be pushed to codegen_deferred_constraints (not deferred_constraints)
     /// to avoid spurious type errors when the let-bound var is used in a non-constrained context.
     pub newtype_only_codegen_constraints: std::collections::HashSet<Qualified<ValueName>>,
+    /// Declarations of values that should be warned about if never referenced.
+    /// Populated when explicit imports are added, when let bindings are declared,
+    /// and when lambda/binder parameters are introduced. Checked at module finalization.
+    pub declared_for_unused_check: Vec<(crate::span::Span, ValueName, UnusedDeclKind)>,
+    /// Names actually referenced during inference (via `infer_var`).
+    /// A declaration is considered "unused" if its ValueName is not in this set.
+    pub used_name_refs: std::collections::HashSet<ValueName>,
+}
+
+/// Which kind of declaration a name came from. Used to pick the right warning variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnusedDeclKind {
+    Import,
+    Binding,
 }
 
 impl InferCtx {
@@ -385,6 +399,8 @@ impl InferCtx {
             newtype_field_constraints: HashMap::new(),
             pattern_binding_constraints: HashMap::new(),
             newtype_only_codegen_constraints: std::collections::HashSet::new(),
+            declared_for_unused_check: Vec::new(),
+            used_name_refs: std::collections::HashSet::new(),
         }
     }
 
@@ -681,6 +697,13 @@ impl InferCtx {
         }
 
         let lookup_result = env.lookup(ValueName::new(resolved_name));
+        // Track that this name was referenced for unused-variable/import warnings.
+        // We also record the unqualified symbol so a `H.foo` reference counts as
+        // using the import of `foo` (which may have been registered unqualified).
+        self.used_name_refs.insert(ValueName::new(resolved_name));
+        if module.is_some() {
+            self.used_name_refs.insert(ValueName::new(name_sym));
+        }
         match lookup_result {
             Some(scheme) => {
                 let (ty, scheme_subst) = self.instantiate_with_subst(scheme);
@@ -2007,6 +2030,13 @@ impl InferCtx {
             match binding {
                 LetBinding::Value { span, binder, expr } => match binder {
                     Binder::Var { name, .. } => {
+                        // Record this let-binding for unused-variable warnings.
+                        // Dedup by (span, name) happens at emit time.
+                        self.declared_for_unused_check.push((
+                            name.span,
+                            ValueName::new(name.value),
+                            UnusedDeclKind::Binding,
+                        ));
                         // Skip bindings already processed in Phase 2.5
                         if eagerly_processed.contains(&name.value) {
                             continue;
@@ -3505,6 +3535,14 @@ impl InferCtx {
                 if self.collect_span_types {
                     self.span_types.insert(name.span, expected.clone());
                 }
+                // Record the binding for unused-variable warnings.
+                // Covers lambda params, case patterns, let-binding Var binders,
+                // constructor-pattern sub-binders, etc.
+                self.declared_for_unused_check.push((
+                    name.span,
+                    ValueName::new(name.value),
+                    UnusedDeclKind::Binding,
+                ));
                 Ok(())
             }
             Binder::Wildcard { .. } => Ok(()),

@@ -62,6 +62,9 @@ pub struct ModuleResult {
     pub path: PathBuf,
     pub module_name: String,
     pub type_errors: Vec<TypeError>,
+    /// Non-fatal warnings (e.g. unused imports, unused variables).
+    /// Emitted alongside type_errors but do not prevent building.
+    pub type_warnings: Vec<crate::typechecker::error::TypeWarning>,
     pub cached: bool,
 }
 
@@ -658,6 +661,7 @@ fn build_from_sources_impl(
                     path: pm.path.clone(),
                     module_name: pm.module_name.clone(),
                     type_errors: vec![],
+                    type_warnings: vec![],
                     cached: true,
                 });
             }
@@ -748,6 +752,7 @@ fn build_from_sources_impl(
                                 path: pm.path.clone(),
                                 module_name: pm.module_name.clone(),
                                 type_errors: vec![],
+                                type_warnings: vec![],
                                 cached: true,
                             });
                             continue;
@@ -984,6 +989,7 @@ fn build_from_sources_impl(
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
                             type_errors: result.errors,
+                            type_warnings: result.warnings,
                             cached: false,
                         });
                     }

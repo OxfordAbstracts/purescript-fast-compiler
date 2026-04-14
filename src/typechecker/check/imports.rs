@@ -947,6 +947,18 @@ pub(crate) fn import_item(
                 });
                 return;
             }
+            // Record the explicit value import for unused-import warnings.
+            // Operators and class methods are skipped — tracking them requires
+            // separate usage tracking for operator syntax and instance resolution.
+            if !exports.value_operator_targets.contains_key(&name_qop)
+                && !exports.class_methods.contains_key(&name_qv)
+            {
+                ctx.declared_for_unused_check.push((
+                    name_spanned.span,
+                    ValueName::new(maybe_qualify_symbol(name_sym, qualifier)),
+                    crate::typechecker::infer::UnusedDeclKind::Import,
+                ));
+            }
             // Import class method info first if applicable
             if let Some(info) = exports.class_methods.get(&name_qv) {
                 ctx.class_methods.insert(name_qv, info.clone());

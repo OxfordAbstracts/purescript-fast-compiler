@@ -70,6 +70,7 @@ fn check_module_with_options(module: &crate::cst::Module, registry: &ModuleRegis
         return CheckResult {
             types: HashMap::new(),
             errors: convert_errors,
+            warnings: Vec::new(),
             exports: ModuleExports::default(),
             span_types: HashMap::new(),
             record_update_fields: HashMap::new(),

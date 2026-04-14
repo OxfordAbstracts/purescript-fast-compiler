@@ -116,6 +116,9 @@ fn qualify_type_head(ty: &Type, origins: &HashMap<Symbol, names::ModuleQualifier
 pub struct CheckResult {
     pub types: HashMap<ValueName, Type>,
     pub errors: Vec<TypeError>,
+    /// Non-fatal warnings (e.g. unused imports, unused variables).
+    /// Reported in build output and LSP diagnostics but do not block compilation.
+    pub warnings: Vec<crate::typechecker::error::TypeWarning>,
     pub exports: ModuleExports,
     /// Span→Type map for local variable bindings, for hover support.
     pub span_types: HashMap<crate::span::Span, Type>,
@@ -276,6 +279,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut signatures: HashMap<ValueName, (crate::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<ValueName, Type> = HashMap::new();
     let mut errors: Vec<TypeError> = Vec::new();
+    let mut warnings: Vec<crate::typechecker::error::TypeWarning> = Vec::new();
     // Classes that appear in explicit type signature constraints (not inferred).
     // Used to distinguish legitimate "given" constraints from inferred body constraints
     // for chain ambiguity checking in Pass 3.
@@ -9386,9 +9390,42 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     let record_update_fields = std::mem::take(&mut ctx.record_update_fields);
 
+    // Emit unused-import and unused-variable warnings. A declaration is "unused"
+    // if its ValueName never appears in `used_name_refs`. Names beginning with `_`
+    // are exempted by convention (user-signaled intentional).
+    {
+        use crate::typechecker::error::TypeWarning;
+        use crate::typechecker::infer::UnusedDeclKind;
+        // Dedupe by (span, name) to avoid duplicate warnings when a binding is
+        // visited multiple times (e.g., multi-equation functions).
+        let mut seen: std::collections::HashSet<(crate::span::Span, ValueName)> =
+            std::collections::HashSet::new();
+        for (span, name, kind) in ctx.declared_for_unused_check.drain(..) {
+            if !seen.insert((span, name)) {
+                continue;
+            }
+            let name_str = crate::interner::resolve(name.symbol()).unwrap_or_default();
+            if name_str.starts_with('_') || name_str.is_empty() {
+                continue;
+            }
+            if ctx.used_name_refs.contains(&name) {
+                continue;
+            }
+            // Also check the unqualified form: a name imported as `H.foo` may be
+            // stored with a qualified symbol but referenced as `foo` in tests.
+            // The insertion path in `infer_var` already records both forms.
+            let warning = match kind {
+                UnusedDeclKind::Import => TypeWarning::UnusedImport { span, name },
+                UnusedDeclKind::Binding => TypeWarning::UnusedName { span, name },
+            };
+            warnings.push(warning);
+        }
+    }
+
     CheckResult {
         types: result_types,
         errors,
+        warnings,
         exports: module_exports,
         span_types,
         record_update_fields,

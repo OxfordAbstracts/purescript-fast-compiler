@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
@@ -6,6 +8,12 @@ use crate::interner;
 use crate::names;
 use crate::lsp::utils::find_definition::position_to_offset;
 use crate::lsp::utils::resolve::{self, DefinitionSite, Namespace};
+use crate::typechecker::error::pretty_type;
+use crate::typechecker::types::Type;
+
+fn fmt_ty(ty: &Type) -> String {
+    pretty_type(ty, &HashMap::new())
+}
 
 use super::super::Backend;
 
@@ -180,7 +188,7 @@ impl Backend {
         for (span, ty) in &check_result.span_types {
             if offset >= span.start && offset < span.end {
                 let label = &source[span.start..span.end];
-                let type_str = format!("{ty}");
+                let type_str = fmt_ty(ty);
                 let markdown = format!("```purescript\n{label} :: {type_str}\n```");
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
@@ -197,14 +205,14 @@ impl Backend {
     async fn get_local_var_type(&self, module: &cst::Module, span: crate::span::Span) -> Option<String> {
         let registry = self.registry.read().await;
         let check_result = crate::typechecker::check_module_for_ide(module, &registry);
-        check_result.span_types.get(&span).map(|ty| format!("{ty}"))
+        check_result.span_types.get(&span).map(fmt_ty)
     }
 
     async fn get_local_type(&self, module: &cst::Module, symbol: interner::Symbol, source: &str) -> Option<String> {
         let registry = self.registry.read().await;
         let check_result = crate::typechecker::check_module_with_registry(module, &registry);
         if let Some(ty) = check_result.types.get(&crate::names::ValueName::new(symbol)) {
-            return Some(format!("{ty}"));
+            return Some(fmt_ty(ty));
         }
         // Fall back to CST type signatures for declarations not in CheckResult.types
         // (foreign imports, class methods, etc.)
@@ -299,7 +307,7 @@ impl Backend {
         mod_exports
             .values
             .get(&qv)
-            .map(|scheme| format!("{}", scheme.ty))
+            .map(|scheme| fmt_ty(&scheme.ty))
     }
 
     async fn get_imported_doc_comments(&self, module_name: &str, symbol: interner::Symbol) -> Vec<String> {
@@ -394,7 +402,7 @@ impl Backend {
         mod_exports
             .values
             .get(&qv)
-            .map(|scheme| format!("{}", scheme.ty))
+            .map(|scheme| fmt_ty(&scheme.ty))
     }
 
     async fn get_imported_kind(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {

@@ -488,6 +488,39 @@ pub enum TypeError {
     VisibleQuantificationCheckFailureInType { span: Span },
 }
 
+/// Type checking warnings. Unlike TypeError, warnings do not prevent building.
+/// They are surfaced in build output and LSP diagnostics so the user can fix them
+/// without blocking compilation.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum TypeWarning {
+    /// An imported name is never referenced in the module.
+    /// Names starting with `_` are excluded.
+    #[error("Unused import: {name}")]
+    UnusedImport { span: Span, name: ValueName },
+
+    /// A let-binding or lambda parameter is never referenced.
+    /// Names starting with `_` are excluded.
+    #[error("Unused name: {name}")]
+    UnusedName { span: Span, name: ValueName },
+}
+
+impl TypeWarning {
+    pub fn span(&self) -> Span {
+        match self {
+            TypeWarning::UnusedImport { span, .. } => *span,
+            TypeWarning::UnusedName { span, .. } => *span,
+        }
+    }
+
+    /// Short code for classification (similar to TypeError::code).
+    pub fn code(&self) -> String {
+        match self {
+            TypeWarning::UnusedImport { .. } => "UnusedImport".into(),
+            TypeWarning::UnusedName { .. } => "UnusedName".into(),
+        }
+    }
+}
+
 impl TypeError {
     pub fn span(&self) -> Span {
         match self {
@@ -901,8 +934,9 @@ const PRETTY_TYPE_MAX_DEPTH: u32 = 3;
 const PRETTY_TYPE_MAX_RECORD_LABELS: usize = 12;
 
 /// Format a type with normalized unification variable names, depth-limited,
-/// and indented for nested records.
-fn pretty_type(ty: &Type, var_map: &HashMap<u32, usize>) -> String {
+/// and indented for nested records. Pass an empty `var_map` for contexts where
+/// unification variable names don't need remapping (e.g., hover).
+pub fn pretty_type(ty: &Type, var_map: &HashMap<u32, usize>) -> String {
     let mut out = String::new();
     fmt_type(&mut out, ty, var_map, false, 0, 0);
     out

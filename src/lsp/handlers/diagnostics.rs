@@ -117,8 +117,9 @@ impl Backend {
         cache.update(module_name.clone(), source_hash, check_result.exports.clone(), import_names, import_items, !check_result.errors.is_empty());
         drop(cache);
 
-        // Publish diagnostics for the changed module
-        let diagnostics = type_errors_to_diagnostics(&check_result.errors, &source);
+        // Publish diagnostics for the changed module: errors and warnings together.
+        let mut diagnostics = type_errors_to_diagnostics(&check_result.errors, &source);
+        diagnostics.extend(type_warnings_to_diagnostics(&check_result.warnings, &source));
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
@@ -222,6 +223,39 @@ pub(crate) fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::Ty
                 code: Some(NumberOrString::String(format!("TypeError.{}", err.code()))),
                 source: Some("pfc".to_string()),
                 message: format!("{}\n", err.format_pretty()),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn type_warnings_to_diagnostics(
+    warnings: &[crate::typechecker::error::TypeWarning],
+    source: &str,
+) -> Vec<Diagnostic> {
+    warnings
+        .iter()
+        .map(|w| {
+            let span = w.span();
+            let range = match span.to_pos(source) {
+                Some((start, end)) => Range {
+                    start: Position {
+                        line: start.line.saturating_sub(1) as u32,
+                        character: start.column.saturating_sub(1) as u32,
+                    },
+                    end: Position {
+                        line: end.line.saturating_sub(1) as u32,
+                        character: end.column.saturating_sub(1) as u32,
+                    },
+                },
+                None => Range::default(),
+            };
+            Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(NumberOrString::String(format!("TypeWarning.{}", w.code()))),
+                source: Some("pfc".to_string()),
+                message: format!("{w}\n"),
                 ..Default::default()
             }
         })
