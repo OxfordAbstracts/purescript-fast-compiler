@@ -92,7 +92,14 @@ impl Backend {
 
                 let type_str = match &resolved_name.definition {
                     DefinitionSite::Local(_) => {
-                        self.get_local_type(&module, resolved_name.src_symbol, &source).await
+                        let ty = self.get_local_type(&module, resolved_name.src_symbol, &source).await;
+                        if ty.is_none() && matches!(resolved_name.namespace, Namespace::Type | Namespace::Class) {
+                            let sym = interner::intern(&name_str);
+                            self.get_local_kind(&module, sym).await
+                                .or_else(|| Some("Type".to_string()))
+                        } else {
+                            ty
+                        }
                     }
                     DefinitionSite::LocalVar(local_span) => {
                         self.get_local_var_type(&module, *local_span).await
@@ -224,6 +231,16 @@ impl Backend {
         let check_result = crate::typechecker::check_module_with_registry(module, &registry);
         if let Some(ty) = check_result.types.get(&crate::names::ValueName::new(symbol)) {
             return Some(fmt_ty(ty));
+        }
+        // Data constructors are stored in exports.values (keyed by unqualified ValueName),
+        // not in `types` (which is limited to Value/Foreign decls).
+        let name_str = interner::resolve(symbol).unwrap_or_default();
+        if let Some(scheme) = check_result
+            .exports
+            .values
+            .get(&names::unqualified_value(&name_str))
+        {
+            return Some(fmt_ty(&scheme.ty));
         }
         // Fall back to CST type signatures for declarations not in CheckResult.types
         // (foreign imports, class methods, etc.)
@@ -524,6 +541,13 @@ fn find_decl_source_text(
     let mut sig_text: Option<&str> = None;
     for decl in decls {
         let (match_kind, decl_sym, span) = match decl {
+            // Skip standalone kind signatures (`data Foo :: Kind`, `type Foo :: Kind`, etc.) —
+            // they share a name with the real declaration but don't contain its definition.
+            Decl::Data { kind_sig, .. } if !matches!(kind_sig, cst::KindSigSource::None) => {
+                continue;
+            }
+            Decl::Class { is_kind_sig: true, .. } => continue,
+            Decl::Data { is_role_decl: true, .. } => continue,
             Decl::Data { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
             Decl::TypeAlias { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
             Decl::Newtype { name, span, .. } => (DeclTextKind::Type, name.value.symbol(), *span),
@@ -555,6 +579,33 @@ fn find_decl_source_text(
             _ => body.to_string(),
         };
         return Some(truncate_to_chars(&combined, 1000));
+    }
+    // Value-namespace fallback: the symbol may be a data/newtype constructor. Return the
+    // parent declaration so hover shows the type the constructor belongs to.
+    if matches!(kind, DeclTextKind::Value) {
+        for decl in decls {
+            match decl {
+                Decl::Data {
+                    span,
+                    constructors,
+                    kind_sig,
+                    is_role_decl,
+                    ..
+                } if matches!(kind_sig, cst::KindSigSource::None) && !is_role_decl => {
+                    if constructors.iter().any(|c| c.name.value.symbol() == symbol) {
+                        let text = source.get(span.start..span.end)?;
+                        return Some(truncate_to_chars(text, 1000));
+                    }
+                }
+                Decl::Newtype {
+                    span, constructor, ..
+                } if constructor.value.symbol() == symbol => {
+                    let text = source.get(span.start..span.end)?;
+                    return Some(truncate_to_chars(text, 1000));
+                }
+                _ => {}
+            }
+        }
     }
     None
 }

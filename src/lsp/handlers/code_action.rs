@@ -27,7 +27,6 @@ impl Backend {
         let module = crate::parser::parse(&source).ok();
 
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
-        let mut unused_import_diags: Vec<&Diagnostic> = Vec::new();
         for diag in &params.context.diagnostics {
             let Some(code_str) = diag_code(diag) else { continue };
             match code_str.as_str() {
@@ -39,7 +38,6 @@ impl Backend {
                     }
                 }
                 "TypeWarning.UnusedImport" => {
-                    unused_import_diags.push(diag);
                     if let Some(module) = &module {
                         if let Some(action) =
                             remove_import_action(&uri, &source, module, diag)
@@ -52,10 +50,14 @@ impl Backend {
             }
         }
 
-        if unused_import_diags.len() >= 2 {
-            if let Some(module) = &module {
+        // Fix-all: collect every unused-import warning in the module via the typechecker,
+        // not just the ones the client included in `context.diagnostics` (clients often
+        // only send diagnostics within the requested range).
+        if let Some(module) = &module {
+            let unused_spans = self.collect_unused_import_spans(module).await;
+            if !unused_spans.is_empty() {
                 if let Some(action) =
-                    remove_all_imports_action(&uri, &source, module, &unused_import_diags)
+                    remove_all_imports_action(&uri, &source, module, &unused_spans)
                 {
                     actions.push(CodeActionOrCommand::CodeAction(action));
                 }
@@ -67,6 +69,19 @@ impl Backend {
         } else {
             Ok(Some(actions))
         }
+    }
+
+    async fn collect_unused_import_spans(&self, module: &Module) -> Vec<Span> {
+        let registry = self.registry.read().await;
+        let result = crate::typechecker::check_module_with_registry(module, &registry);
+        result
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                crate::typechecker::error::TypeWarning::UnusedImport { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -144,15 +159,8 @@ fn remove_all_imports_action(
     uri: &Url,
     source: &str,
     module: &Module,
-    diagnostics: &[&Diagnostic],
+    targets: &[Span],
 ) -> Option<CodeAction> {
-    let targets: Vec<Span> = diagnostics
-        .iter()
-        .filter_map(|d| {
-            range_to_offsets(source, d.range).map(|(start, end)| Span { start, end })
-        })
-        .collect();
-
     let mut edits: Vec<TextEdit> = Vec::new();
 
     for decl in &module.imports {
@@ -215,15 +223,13 @@ fn remove_all_imports_action(
         return None;
     }
 
-    let diag_clones: Vec<Diagnostic> = diagnostics.iter().map(|d| (*d).clone()).collect();
     let workspace_edit = WorkspaceEdit {
         changes: Some(single_change(uri, edits)),
         ..Default::default()
     };
     Some(CodeAction {
-        title: format!("Remove all unused imports ({})", diagnostics.len()),
+        title: format!("Remove all unused imports ({})", targets.len()),
         kind: Some(CodeActionKind::QUICKFIX),
-        diagnostics: Some(diag_clones),
         edit: Some(workspace_edit),
         ..Default::default()
     })

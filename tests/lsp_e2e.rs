@@ -784,6 +784,60 @@ async fn test_lsp_hover_type_shows_definition() {
 }
 
 #[tokio::test]
+async fn test_lsp_hover_local_type_reference_shows_definition() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/LocalRef.purs";
+    // Reference to a locally-defined type inside a type signature.
+    let src = "module LocalRef where\n\ndata Color = Red | Green\n\nc :: Color\nc = Red\n";
+    server.open_file(uri, src).await;
+
+    // Hover on the `Color` reference in `c :: Color` (line 4, col 5)
+    let resp = server.hover(15, uri, 4, 5).await;
+    let result = resp.get("result").expect("should have result");
+    assert!(
+        !result.is_null(),
+        "hover on a local type reference should not be null, got: {result}"
+    );
+    let value = result
+        .get("contents")
+        .unwrap()
+        .get("value")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        value.contains("data Color = Red | Green"),
+        "hover should include the type definition, got: {value}"
+    );
+}
+
+#[tokio::test]
+async fn test_lsp_hover_type_with_kind_signature_shows_definition() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/KindSig.purs";
+    // Standalone kind signature precedes the actual data declaration.
+    let src = "module KindSig where\n\ndata Proxy :: Type -> Type\ndata Proxy a = Proxy\n\np :: Proxy Int\np = Proxy\n";
+    server.open_file(uri, src).await;
+
+    // Hover on the definition `Proxy` (line 3, col 5)
+    let resp = server.hover(14, uri, 3, 5).await;
+    let result = resp.get("result").expect("should have result");
+    let value = result
+        .get("contents")
+        .unwrap()
+        .get("value")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        value.contains("data Proxy a = Proxy"),
+        "hover should show the data definition body, got: {value}"
+    );
+}
+
+#[tokio::test]
 async fn test_lsp_hover_value_shows_definition() {
     let mut server = TestServer::start().await;
 
@@ -1774,59 +1828,57 @@ fn action_edits(action: &Value, uri: &str) -> Option<Vec<Value>> {
 
 #[tokio::test]
 async fn test_lsp_code_action_remove_all_unused_imports_mixed() {
-    let mut server = TestServer::start().await;
-    let uri = "file:///test/FixAllImports.purs";
-    // Two import lines: Dep1 has foo (kept) + bar (unused) + baz (unused)
-    //                    Dep2 has qux (unused)
+    // Set up a tempdir with two real dependency modules so the typechecker actually
+    // emits UnusedImport warnings (the fix-all action re-typechecks to find every
+    // unused import, independent of what the client put in context.diagnostics).
+    let tmp_dir = std::env::temp_dir().join("pfc-lsp-fix-all-imports");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let dep1_path = tmp_dir.join("Dep1.purs");
+    let dep2_path = tmp_dir.join("Dep2.purs");
+    let main_path = tmp_dir.join("FixAllImports.purs");
+    std::fs::write(
+        &dep1_path,
+        "module Dep1 where\nfoo :: Int\nfoo = 1\nbar :: Int\nbar = 2\nbaz :: Int\nbaz = 3\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &dep2_path,
+        "module Dep2 where\nqux :: Int\nqux = 4\n",
+    )
+    .unwrap();
     let src = "module FixAllImports where\n\
                import Dep1 (foo, bar, baz)\n\
                import Dep2 (qux)\n\
                x = foo\n";
-    server.open_file(uri, src).await;
+    std::fs::write(&main_path, src).unwrap();
 
-    let range_bar = json!({
-        "start": { "line": 1, "character": 18 },
-        "end": { "line": 1, "character": 21 },
-    });
-    let range_baz = json!({
-        "start": { "line": 1, "character": 23 },
-        "end": { "line": 1, "character": 26 },
-    });
-    let range_qux = json!({
-        "start": { "line": 2, "character": 13 },
-        "end": { "line": 2, "character": 16 },
-    });
-    let diags = json!([
-        {
-            "range": range_bar,
-            "severity": 2,
-            "code": "TypeWarning.UnusedImport",
-            "source": "pfc",
-            "message": "Unused import: bar",
-        },
-        {
-            "range": range_baz,
-            "severity": 2,
-            "code": "TypeWarning.UnusedImport",
-            "source": "pfc",
-            "message": "Unused import: baz",
-        },
-        {
-            "range": range_qux,
-            "severity": 2,
-            "code": "TypeWarning.UnusedImport",
-            "source": "pfc",
-            "message": "Unused import: qux",
-        },
-    ]);
+    let sources_cmd = format!("echo '{}/*.purs'", tmp_dir.display());
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    let uri = Url::from_file_path(&main_path).unwrap().to_string();
+    server.open_file(&uri, src).await;
+
+    // Wait for server to become ready.
+    for _ in 0..50 {
+        let resp = server.hover(99, &uri, 3, 0).await;
+        if !resp.get("result").unwrap().is_null() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Pass an empty diagnostics list — the client may only have diagnostics for the
+    // clicked position. The fix-all action must still find every unused import.
     let whole = json!({
         "start": { "line": 0, "character": 0 },
         "end": { "line": 3, "character": 0 },
     });
-    let resp = server.code_action(25, uri, whole, diags).await;
+    let resp = server.code_action(25, &uri, whole, json!([])).await;
     let action = find_action_by_title(&resp, "Remove all unused imports")
         .expect("expected fix-all action");
-    let edits = action_edits(action, uri).expect("expected edits on fix-all action");
+    let edits = action_edits(action, &uri).expect("expected edits on fix-all action");
     let fixed = apply_text_edits(src, &edits);
     assert!(
         fixed.contains("import Dep1 (foo)"),
@@ -1836,6 +1888,8 @@ async fn test_lsp_code_action_remove_all_unused_imports_mixed() {
         !fixed.contains("Dep2"),
         "Dep2 import line should be removed entirely, got: {fixed}"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 #[tokio::test]

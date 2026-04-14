@@ -928,7 +928,7 @@ fn collect_unif_vars(ty: &Type, ids: &mut Vec<u32>) {
 
 /// Maximum recursion depth when pretty-printing types. Beyond this depth,
 /// the nested structure is replaced with `...`.
-const PRETTY_TYPE_MAX_DEPTH: u32 = 3;
+const PRETTY_TYPE_MAX_DEPTH: u32 = 8;
 
 /// Maximum number of labels shown in a record before eliding the rest with `...`.
 const PRETTY_TYPE_MAX_RECORD_LABELS: usize = 12;

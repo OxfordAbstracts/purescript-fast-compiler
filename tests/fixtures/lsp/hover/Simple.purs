@@ -1,6 +1,6 @@
 module Simple where
 
-import Simple.Lib (class Cl, member, times2, addOne, Effect, class MyFunctor, myMap)
+import Simple.Lib (class Cl, member, times2, addOne, Effect, class MyFunctor, myMap, LibT(..))
 import Simple.Lib as Lib
 
 -- | The answer to everything
@@ -67,6 +67,9 @@ qualAddOne = Lib.addOne 10
 qualMember :: forall a. Lib.Cl a => a -> a
 qualMember a = Lib.member a
 
+useLibA :: LibT
+useLibA = LibA
+
 -- Format: line:col (name) => hover: <expected_type_substring>
 -- Use "null" for expected null result
 -- Use "doc: <text>" to also check doc-comment content
@@ -121,6 +124,13 @@ qualMember a = Lib.member a
 -- 64:13 (Lib.times2) => hover: times2
 -- 65:13 (Lib.addOne) => hover: addOne | doc: Adds one to a number
 -- 67:15 (Lib.member) => hover: member
+--
+-- Local constructors — parent data declaration is shown
+-- 15:8 (MkBox-use) => hover: data Box a = MkBox a
+-- 18:2 (Red-use) => hover: data Color = Red | Green | Blue
+--
+-- Imported constructors — parent data declaration from source module is shown
+-- 70:10 (LibA-use) => hover: data LibT
 --
 -- Empty line
 -- 1:0 (ws) => hover: null
