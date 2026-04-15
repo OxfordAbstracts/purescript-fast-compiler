@@ -6,3 +6,6 @@
 
 pub mod parse_decl;
 pub mod names;
+pub mod signatures;
+pub mod ctor_details;
+pub mod kinds;

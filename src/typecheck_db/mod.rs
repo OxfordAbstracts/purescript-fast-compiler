@@ -8,8 +8,10 @@
 pub mod key;
 pub mod store;
 pub mod driver;
+pub mod types;
 pub mod passes;
 
 pub use driver::{CacheOutcome, TypecheckDb};
 pub use key::{InputHash, InputHasher, OutputHash, PassKey};
 pub use store::{PassRow, Store, StoreError};
+pub use types::{Constraint, QName, Scheme, Type, TypeOpMap};
