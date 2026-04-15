@@ -15,6 +15,21 @@ fn fmt_ty(ty: &Type) -> String {
     pretty_type(ty, &HashMap::new())
 }
 
+/// Format a `name :: type` line, wrapping long types onto a new indented line
+/// so the type stays readable in hover popovers.
+fn format_sig(name: &str, ty: &str) -> String {
+    if ty.chars().count() > 32 {
+        let indented = ty
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{name} ::\n{indented}")
+    } else {
+        format!("{name} :: {ty}")
+    }
+}
+
 use super::super::Backend;
 
 /// Info about what the cursor is on: either a resolved reference or a declaration name.
@@ -165,7 +180,8 @@ impl Backend {
             .await;
 
         // Build markdown content
-        let mut markdown = format!("```purescript\n{name_str} :: {type_str}\n```");
+        let sig = format_sig(&name_str, &type_str);
+        let mut markdown = format!("```purescript\n{sig}\n```");
 
         if let Some(def) = &definition_text {
             markdown.push_str("\n\n---\n\n```purescript\n");
@@ -207,7 +223,8 @@ impl Backend {
             if offset >= span.start && offset < span.end {
                 let label = &source[span.start..span.end];
                 let type_str = fmt_ty(ty);
-                let markdown = format!("```purescript\n{label} :: {type_str}\n```");
+                let sig = format_sig(label, &type_str);
+                let markdown = format!("```purescript\n{sig}\n```");
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -303,7 +320,8 @@ impl Backend {
                     };
                     // Look up doc-comments from the source module
                     let doc_comments = self.get_imported_doc_comments(&module_name, symbol).await;
-                    let mut markdown = format!("```purescript\n{name_str} :: {type_str}\n```");
+                    let sig = format_sig(&name_str, &type_str);
+                    let mut markdown = format!("```purescript\n{sig}\n```");
                     if !doc_comments.is_empty() {
                         markdown.push_str("\n\n---\n\n");
                         for doc in &doc_comments {

@@ -936,10 +936,76 @@ const PRETTY_TYPE_MAX_RECORD_LABELS: usize = 12;
 /// Format a type with normalized unification variable names, depth-limited,
 /// and indented for nested records. Pass an empty `var_map` for contexts where
 /// unification variable names don't need remapping (e.g., hover).
+///
+/// Output style follows purs-tidy: multi-field records open with `{ ` and
+/// the first field on the same line; subsequent fields are comma-prefixed at
+/// the `{` column; the closing `}` sits on its own line at the same column.
+/// A field whose value is itself multi-line breaks after `::` and indents the
+/// value by four spaces. Type applications whose arguments include multi-line
+/// values render the head on one line and each argument on a new line indented
+/// by two spaces.
 pub fn pretty_type(ty: &Type, var_map: &HashMap<u32, usize>) -> String {
     let mut out = String::new();
     fmt_type(&mut out, ty, var_map, false, 0, 0);
     out
+}
+
+/// True when rendering `ty` will emit a newline. Used to decide whether a
+/// parent construct (record field, type application) should itself break.
+fn is_multiline(ty: &Type) -> bool {
+    match ty {
+        Type::Record(fields, tail) => {
+            let total = fields.len() + tail.is_some() as usize;
+            if total >= 2 {
+                return true;
+            }
+            fields.iter().any(|(_, t)| is_multiline(t))
+                || tail.as_deref().map_or(false, is_multiline)
+        }
+        Type::App(..) => {
+            let (_, args) = unfold_app(ty);
+            args.iter().any(|a| is_multiline(a))
+        }
+        Type::Fun(from, to) => is_multiline(from) || is_multiline(to),
+        Type::Forall(_, body) => is_multiline(body),
+        _ => false,
+    }
+}
+
+/// Unfold a left-associated App spine: `App(App(F, a), b)` → (F, [a, b]).
+fn unfold_app(ty: &Type) -> (&Type, Vec<&Type>) {
+    let mut head = ty;
+    let mut args: Vec<&Type> = Vec::new();
+    while let Type::App(f, a) = head {
+        args.push(a.as_ref());
+        head = f.as_ref();
+    }
+    args.reverse();
+    (head, args)
+}
+
+/// Unfold a right-associated Fun chain: `Fun(a, Fun(b, c))` → [a, b, c].
+fn unfold_fun(ty: &Type) -> Vec<&Type> {
+    let mut parts: Vec<&Type> = Vec::new();
+    let mut cur = ty;
+    while let Type::Fun(from, to) = cur {
+        parts.push(from.as_ref());
+        cur = to.as_ref();
+    }
+    parts.push(cur);
+    parts
+}
+
+/// Does `ty` need parentheses when it appears on the left of `->`?
+/// Arrows and foralls bind tighter on the right, so they need parens on the left.
+fn needs_parens_as_fun_arg(ty: &Type) -> bool {
+    matches!(ty, Type::Fun(..) | Type::Forall(..))
+}
+
+fn pad(out: &mut String, n: usize) {
+    for _ in 0..n {
+        out.push(' ');
+    }
 }
 
 fn fmt_type(
@@ -948,7 +1014,7 @@ fn fmt_type(
     var_map: &HashMap<u32, usize>,
     nested: bool,
     depth: u32,
-    indent: usize,
+    col: usize,
 ) {
     if depth >= PRETTY_TYPE_MAX_DEPTH {
         out.push_str("...");
@@ -968,27 +1034,73 @@ fn fmt_type(
         Type::Con(sym) => {
             let _ = write!(out, "{sym}");
         }
-        Type::App(func, arg) => {
-            if nested { out.push('('); }
-            match func.as_ref() {
-                Type::App(..) | Type::Con(..) | Type::Var(..) | Type::Unif(..) => {
-                    fmt_type(out, func, var_map, false, depth + 1, indent);
-                }
-                _ => fmt_type(out, func, var_map, true, depth + 1, indent),
+        Type::App(..) => {
+            let (head, args) = unfold_app(ty);
+            let any_multi = args.iter().any(|a| is_multiline(a));
+            if nested {
+                out.push('(');
             }
-            out.push(' ');
-            fmt_type(out, arg, var_map, true, depth + 1, indent);
-            if nested { out.push(')'); }
+            let head_col = col + if nested { 1 } else { 0 };
+            fmt_type(out, head, var_map, false, depth + 1, head_col);
+            if any_multi {
+                // Head on this line; each argument on its own line, indented by
+                // two spaces from the head's column.
+                let arg_col = head_col + 2;
+                for a in &args {
+                    out.push('\n');
+                    pad(out, arg_col);
+                    fmt_type(out, a, var_map, true, depth + 1, arg_col);
+                }
+            } else {
+                for a in &args {
+                    out.push(' ');
+                    fmt_type(out, a, var_map, true, depth + 1, head_col);
+                }
+            }
+            if nested {
+                out.push(')');
+            }
         }
-        Type::Fun(from, to) => {
-            if nested { out.push('('); }
-            fmt_type(out, from, var_map, true, depth + 1, indent);
-            out.push_str(" -> ");
-            fmt_type(out, to, var_map, false, depth + 1, indent);
-            if nested { out.push(')'); }
+        Type::Fun(..) => {
+            let parts = unfold_fun(ty);
+            let any_multi = parts.iter().any(|p| is_multiline(p));
+            if nested {
+                out.push('(');
+            }
+            let inner_col = col + if nested { 1 } else { 0 };
+            if any_multi {
+                // Break the chain: each segment on its own line at `inner_col`,
+                // with ` ->` trailing every segment except the last.
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                        pad(out, inner_col);
+                    }
+                    let is_last = i + 1 == parts.len();
+                    let part_nested = !is_last && needs_parens_as_fun_arg(p);
+                    fmt_type(out, p, var_map, part_nested, depth + 1, inner_col);
+                    if !is_last {
+                        out.push_str(" ->");
+                    }
+                }
+            } else {
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" -> ");
+                    }
+                    let is_last = i + 1 == parts.len();
+                    let part_nested = !is_last && needs_parens_as_fun_arg(p);
+                    fmt_type(out, p, var_map, part_nested, depth + 1, inner_col);
+                }
+            }
+            if nested {
+                out.push(')');
+            }
         }
         Type::Forall(vars, body) => {
-            if nested { out.push('('); }
+            if nested {
+                out.push('(');
+            }
             out.push_str("forall");
             for (v, visible) in vars {
                 if *visible {
@@ -998,8 +1110,10 @@ fn fmt_type(
                 }
             }
             out.push_str(". ");
-            fmt_type(out, body, var_map, false, depth + 1, indent);
-            if nested { out.push(')'); }
+            fmt_type(out, body, var_map, false, depth + 1, col);
+            if nested {
+                out.push(')');
+            }
         }
         Type::TypeString(sym) => {
             let _ = write!(out, "\"{}\"", interner::resolve(*sym).unwrap_or_default());
@@ -1008,7 +1122,7 @@ fn fmt_type(
             let _ = write!(out, "{n}");
         }
         Type::Record(fields, tail) => {
-            fmt_record(out, fields, tail, var_map, depth, indent);
+            fmt_record(out, fields, tail, var_map, depth, col);
         }
     }
 }
@@ -1019,54 +1133,83 @@ fn fmt_record(
     tail: &Option<Box<Type>>,
     var_map: &HashMap<u32, usize>,
     depth: u32,
-    indent: usize,
+    col: usize,
 ) {
     let total = fields.len();
-    // Compact single-line form for empty or single-field records.
-    if total <= 1 {
+    let has_tail = tail.is_some();
+    let total_items = total + has_tail as usize;
+
+    // Render inline when the record is small and every field is itself inline.
+    let record_is_multi = total_items >= 2
+        || fields.iter().any(|(_, t)| is_multiline(t))
+        || tail.as_deref().map_or(false, is_multiline);
+
+    if total_items == 0 {
+        out.push_str("{}");
+        return;
+    }
+    if !record_is_multi {
         out.push_str("{ ");
         for (i, (label, field_ty)) in fields.iter().enumerate() {
-            if i > 0 { out.push_str(", "); }
+            if i > 0 {
+                out.push_str(", ");
+            }
             let _ = write!(out, "{label} :: ");
-            fmt_type(out, field_ty, var_map, false, depth + 1, indent);
+            fmt_type(out, field_ty, var_map, false, depth + 1, col);
         }
         if let Some(tail) = tail {
-            if !fields.is_empty() { out.push_str(" | "); }
-            fmt_type(out, tail, var_map, false, depth + 1, indent);
+            if !fields.is_empty() {
+                out.push_str(" | ");
+            }
+            fmt_type(out, tail, var_map, false, depth + 1, col);
         }
         out.push_str(" }");
         return;
     }
 
-    // Multi-line form: each label on its own line, indented.
-    let inner_indent = indent + 2;
-    let inner_pad: String = " ".repeat(inner_indent);
-    let outer_pad: String = " ".repeat(indent);
-    out.push('{');
-    out.push('\n');
+    // Multi-line record. `{` sits at `col`; fields are prefixed with `, ` at
+    // that column so labels land at col + 2. Closing `}` is at `col`.
+    //
+    //   { first :: T1
+    //   , second :: T2
+    //   }
+    let field_col = col + 2;
     let shown = total.min(PRETTY_TYPE_MAX_RECORD_LABELS);
     for (i, (label, field_ty)) in fields.iter().take(shown).enumerate() {
-        out.push_str(&inner_pad);
         if i == 0 {
-            out.push_str("  ");
+            out.push_str("{ ");
         } else {
+            out.push('\n');
+            pad(out, col);
             out.push_str(", ");
         }
-        let _ = write!(out, "{label} :: ");
-        fmt_type(out, field_ty, var_map, false, depth + 1, inner_indent);
-        out.push('\n');
+        if is_multiline(field_ty) {
+            // Break after `::` and indent the value by +2 from the label column
+            // (i.e. col + 4 from the record's `{`).
+            let _ = write!(out, "{label} ::");
+            out.push('\n');
+            pad(out, field_col + 2);
+            fmt_type(out, field_ty, var_map, false, depth + 1, field_col + 2);
+        } else {
+            let _ = write!(out, "{label} :: ");
+            fmt_type(out, field_ty, var_map, false, depth + 1, field_col);
+        }
     }
     if total > PRETTY_TYPE_MAX_RECORD_LABELS {
-        out.push_str(&inner_pad);
-        out.push_str(", ...\n");
+        out.push('\n');
+        pad(out, col);
+        out.push_str(", ...");
     }
     if let Some(tail) = tail {
-        out.push_str(&inner_pad);
-        out.push_str("| ");
-        fmt_type(out, tail, var_map, false, depth + 1, inner_indent);
-        out.push('\n');
+        if !fields.is_empty() {
+            out.push('\n');
+            pad(out, col);
+            out.push_str("| ");
+        }
+        fmt_type(out, tail, var_map, false, depth + 1, field_col);
     }
-    out.push_str(&outer_pad);
+    out.push('\n');
+    pad(out, col);
     out.push('}');
 }
 
@@ -1146,7 +1289,7 @@ mod tests {
     #[test]
     fn prints_empty_record() {
         let ty = record(vec![]);
-        assert_eq!(pretty_type(&ty, &HashMap::new()), "{  }");
+        assert_eq!(pretty_type(&ty, &HashMap::new()), "{}");
     }
 
     #[test]
@@ -1162,33 +1305,82 @@ mod tests {
             ("y", con("String")),
             ("z", con("Boolean")),
         ]);
-        let expected = "{\n    x :: Int\n  , y :: String\n  , z :: Boolean\n}";
+        let expected = "{ x :: Int\n, y :: String\n, z :: Boolean\n}";
         assert_eq!(pretty_type(&ty, &HashMap::new()), expected);
     }
 
     #[test]
-    fn nested_records_are_indented() {
-        let inner = record(vec![
-            ("a", con("Int")),
-            ("b", con("String")),
-        ]);
-        let outer = record(vec![
-            ("outer1", inner),
-            ("outer2", con("Boolean")),
-        ]);
-        let expected = "{\n    outer1 :: {\n      a :: Int\n    , b :: String\n  }\n  , outer2 :: Boolean\n}";
+    fn nested_records_break_at_colons() {
+        let inner = record(vec![("a", con("Int")), ("b", con("String"))]);
+        let outer = record(vec![("outer1", inner), ("outer2", con("Boolean"))]);
+        let expected = "\
+{ outer1 ::
+    { a :: Int
+    , b :: String
+    }
+, outer2 :: Boolean
+}";
         assert_eq!(pretty_type(&outer, &HashMap::new()), expected);
     }
 
     #[test]
+    fn type_app_breaks_when_arg_is_multiline() {
+        // RemoteData { err :: E, warn :: W } { result :: R, warn :: W }
+        let left = record(vec![("err", con("E")), ("warn", con("W"))]);
+        let right = record(vec![("result", con("R")), ("warn", con("W"))]);
+        let ty = Type::App(
+            Box::new(Type::App(Box::new(con("RemoteData")), Box::new(left))),
+            Box::new(right),
+        );
+        let expected = "\
+RemoteData
+  { err :: E
+  , warn :: W
+  }
+  { result :: R
+  , warn :: W
+  }";
+        assert_eq!(pretty_type(&ty, &HashMap::new()), expected);
+    }
+
+    #[test]
+    fn function_chain_breaks_when_any_segment_is_multiline() {
+        // Int -> { a :: Int, b :: String } -> String
+        let rec = record(vec![("a", con("Int")), ("b", con("String"))]);
+        let ty = Type::Fun(
+            Box::new(con("Int")),
+            Box::new(Type::Fun(Box::new(rec), Box::new(con("String")))),
+        );
+        let expected = "\
+Int ->
+{ a :: Int
+, b :: String
+} ->
+String";
+        assert_eq!(pretty_type(&ty, &HashMap::new()), expected);
+    }
+
+    #[test]
+    fn function_chain_stays_inline_when_all_inline() {
+        let ty = Type::Fun(
+            Box::new(con("Int")),
+            Box::new(Type::Fun(Box::new(con("String")), Box::new(con("Int")))),
+        );
+        assert_eq!(
+            pretty_type(&ty, &HashMap::new()),
+            "Int -> String -> Int"
+        );
+    }
+
+    #[test]
     fn depth_limit_replaces_deep_structure_with_ellipsis() {
-        // 4 levels: Record > Record > Record > Record.
-        // With max depth 3, the 4th level should render as "...".
-        let lvl3 = record(vec![("d", con("Int"))]);
-        let lvl2 = record(vec![("c", lvl3)]);
-        let lvl1 = record(vec![("b", lvl2)]);
-        let lvl0 = record(vec![("a", lvl1)]);
-        let out = pretty_type(&lvl0, &HashMap::new());
+        // Wrap records more than PRETTY_TYPE_MAX_DEPTH deep; the innermost
+        // structure should render as "...".
+        let mut ty = con("Int");
+        for _ in 0..(PRETTY_TYPE_MAX_DEPTH as usize + 2) {
+            ty = record(vec![("f", ty)]);
+        }
+        let out = pretty_type(&ty, &HashMap::new());
         assert!(out.contains("..."), "expected ellipsis, got: {out}");
     }
 
@@ -1221,6 +1413,113 @@ mod tests {
     fn function_types_use_arrows() {
         let ty = Type::Fun(Box::new(con("Int")), Box::new(con("String")));
         assert_eq!(pretty_type(&ty, &HashMap::new()), "Int -> String");
+    }
+
+    #[test]
+    fn mirrors_purs_tidy_style_for_deeply_nested_types() {
+        // Reproduces the hover example the user provided. The layout should
+        // match purs-tidy: multi-field records open with `{ `, subsequent
+        // fields comma-prefixed at the `{` column; multi-line field values
+        // break after `::` and indent by +4; type applications with multi-line
+        // arguments break the args onto new lines at head + 2; function
+        // chains break across segments with trailing arrows at column 0.
+        let inner_ab = record(vec![("a", con("Int")), ("b", con("String"))]);
+        let form_ctx = Type::App(
+            Box::new(Type::App(
+                Box::new(Type::App(
+                    Box::new(Type::App(
+                        Box::new(con("F.FormContext")),
+                        Box::new(Type::App(Box::new(con("Form")), Box::new(con("F.FieldState")))),
+                    )),
+                    Box::new(Type::App(
+                        Box::new(con("Form")),
+                        Box::new(Type::App(Box::new(con("F.FieldAction")), Box::new(con("Action")))),
+                    )),
+                )),
+                Box::new(inner_ab.clone()),
+            )),
+            Box::new(con("Action")),
+        );
+        let rd_right = Type::Record(
+            vec![
+                (LabelName::new(intern("result")), con("AutoAssignResponse")),
+                (
+                    LabelName::new(intern("warningsx")),
+                    Type::App(Box::new(con("Array")), Box::new(con("SolverWarning"))),
+                ),
+                (LabelName::new(intern("form")), form_ctx),
+                (
+                    LabelName::new(intern("function")),
+                    Type::Fun(
+                        Box::new(con("Int")),
+                        Box::new(Type::Fun(Box::new(inner_ab), Box::new(con("String")))),
+                    ),
+                ),
+            ],
+            None,
+        );
+        let rd_left = record(vec![
+            ("error", con("SolverError")),
+            (
+                "warnings",
+                Type::App(Box::new(con("Array")), Box::new(con("SolverWarning"))),
+            ),
+        ]);
+        let remote_data = Type::App(
+            Box::new(Type::App(Box::new(con("RemoteData")), Box::new(rd_left))),
+            Box::new(rd_right),
+        );
+        let state = Type::Record(
+            vec![
+                (LabelName::new(intern("context")), con("FormContext")),
+                (LabelName::new(intern("debounceId")), con("Int")),
+                (
+                    LabelName::new(intern("submissionsHaveCategories")),
+                    con("Boolean"),
+                ),
+                (
+                    LabelName::new(intern("reviewersHaveCategories")),
+                    con("Boolean"),
+                ),
+                (LabelName::new(intern("resultFromSolverId")), con("Int")),
+                (
+                    LabelName::new(intern("resultFromSolver")),
+                    remote_data,
+                ),
+            ],
+            None,
+        );
+        let out = pretty_type(&state, &HashMap::new());
+        let expected = "\
+{ context :: FormContext
+, debounceId :: Int
+, submissionsHaveCategories :: Boolean
+, reviewersHaveCategories :: Boolean
+, resultFromSolverId :: Int
+, resultFromSolver ::
+    RemoteData
+      { error :: SolverError
+      , warnings :: Array SolverWarning
+      }
+      { result :: AutoAssignResponse
+      , warningsx :: Array SolverWarning
+      , form ::
+          F.FormContext
+            (Form F.FieldState)
+            (Form (F.FieldAction Action))
+            { a :: Int
+            , b :: String
+            }
+            Action
+      , function ::
+          Int ->
+          { a :: Int
+          , b :: String
+          } ->
+          String
+      }
+}";
+        assert_eq!(out, expected, "\nactual:\n{out}\n\nexpected:\n{expected}");
     }
 
     #[test]
