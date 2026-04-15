@@ -5,3 +5,4 @@
 //! hash. See the design doc for the full pipeline.
 
 pub mod parse_decl;
+pub mod names;
