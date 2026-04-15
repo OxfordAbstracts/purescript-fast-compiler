@@ -18,7 +18,7 @@ fn fmt_ty(ty: &Type) -> String {
 /// Format a `name :: type` line, wrapping long types onto a new indented line
 /// so the type stays readable in hover popovers.
 fn format_sig(name: &str, ty: &str) -> String {
-    if ty.chars().count() > 32 {
+    if ty.chars().count() > 32 || ty.contains('(') || ty.contains('{') {
         let indented = ty
             .lines()
             .map(|line| format!("  {line}"))
