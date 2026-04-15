@@ -46,8 +46,74 @@ impl fmt::Display for QName {
     }
 }
 
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Var(n) => write!(f, "{}", n),
+            Type::Con(q) => write!(f, "{}", q),
+            Type::App(g, a) => write!(f, "({} {})", g, a),
+            Type::Fun(a, b) => write!(f, "({} -> {})", a, b),
+            Type::Forall(vars, body) => {
+                write!(f, "forall")?;
+                for (n, _, _) in vars {
+                    write!(f, " {}", n)?;
+                }
+                write!(f, ". {}", body)
+            }
+            Type::Constrained(cs, body) => {
+                for (i, c) in cs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", c.class)?;
+                    for a in &c.args {
+                        write!(f, " {}", a)?;
+                    }
+                }
+                write!(f, " => {}", body)
+            }
+            Type::Record(fields, tail) => {
+                write!(f, "{{ ")?;
+                for (i, (l, t)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{} :: {}", l, t)?;
+                }
+                if let Some(t) = tail {
+                    write!(f, " | {}", t)?;
+                }
+                write!(f, " }}")
+            }
+            Type::Row(fields, tail) => {
+                write!(f, "(")?;
+                for (i, (l, t)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{} :: {}", l, t)?;
+                }
+                if let Some(t) = tail {
+                    write!(f, " | {}", t)?;
+                }
+                write!(f, ")")
+            }
+            Type::Hole(n) => write!(f, "?{}", n),
+            Type::Wildcard => write!(f, "_"),
+            Type::TypeString(s) => write!(f, "\"{}\"", s),
+            Type::TypeInt(n) => write!(f, "{}", n),
+            Type::Kinded(t, k) => write!(f, "({} :: {})", t, k),
+            Type::Unif(id) => write!(f, "?u{}", id),
+        }
+    }
+}
+
 /// A type — used for both value-level types and kinds. PureScript treats
 /// kinds as types; this wire type mirrors that.
+///
+/// The `Unif` variant is only meaningful *during* inference. Any `Type`
+/// stored in a cache blob must be fully zonked — no remaining unification
+/// variables.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Type {
     Var(String),
@@ -66,6 +132,9 @@ pub enum Type {
     TypeString(String),
     TypeInt(i64),
     Kinded(Box<Type>, Box<Type>),
+    /// A mutable unification variable; resolved during inference.
+    /// Must not appear in any serialized output.
+    Unif(u32),
 }
 
 impl Type {

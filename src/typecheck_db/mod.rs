@@ -9,6 +9,9 @@ pub mod key;
 pub mod store;
 pub mod driver;
 pub mod types;
+pub mod unify;
+pub mod env;
+pub mod generalize;
 pub mod passes;
 
 pub use driver::{CacheOutcome, TypecheckDb};

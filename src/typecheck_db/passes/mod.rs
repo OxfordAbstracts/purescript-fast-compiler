@@ -9,3 +9,4 @@ pub mod names;
 pub mod signatures;
 pub mod ctor_details;
 pub mod kinds;
+pub mod infer_value;

@@ -1,0 +1,96 @@
+//! Inference environment: top-level schemes + local monomorphic bindings.
+//!
+//! `Env` is effectively a frozen snapshot used to infer one SCC of value
+//! declarations. Its contents come from the SCC's dependency schemes
+//! (cached outputs of `infer_value_scc` on earlier groups) and its own
+//! decl-level locals introduced by lambdas / let / where bindings.
+
+use std::collections::HashMap;
+
+use crate::typecheck_db::types::{QName, Scheme, Type};
+use crate::typecheck_db::unify::UnifyState;
+
+#[derive(Debug, Clone, Default)]
+pub struct Env {
+    /// Qualified top-level schemes (values, constructors, class methods).
+    pub top_level: HashMap<QName, Scheme>,
+    /// Unqualified local bindings introduced by lambdas, case binders, etc.
+    /// Monomorphic — we don't generalize let-bindings until the appropriate
+    /// sub-milestone (M4b).
+    pub locals: Vec<HashMap<String, Type>>,
+}
+
+impl Env {
+    pub fn new() -> Self {
+        Self { top_level: HashMap::new(), locals: vec![HashMap::new()] }
+    }
+
+    pub fn bind_scheme(&mut self, name: QName, scheme: Scheme) {
+        self.top_level.insert(name, scheme);
+    }
+
+    pub fn push_scope(&mut self) {
+        self.locals.push(HashMap::new());
+    }
+
+    pub fn pop_scope(&mut self) {
+        self.locals.pop();
+        if self.locals.is_empty() {
+            self.locals.push(HashMap::new());
+        }
+    }
+
+    pub fn bind_local(&mut self, name: impl Into<String>, ty: Type) {
+        if let Some(top) = self.locals.last_mut() {
+            top.insert(name.into(), ty);
+        }
+    }
+
+    /// Look up an unqualified name: local scope first, then top-level with
+    /// the unqualified key.
+    pub fn lookup_unqualified(&self, name: &str) -> Lookup<'_> {
+        for scope in self.locals.iter().rev() {
+            if let Some(ty) = scope.get(name) {
+                return Lookup::Local(ty);
+            }
+        }
+        if let Some(s) = self
+            .top_level
+            .get(&QName { module: None, name: name.to_string() })
+        {
+            return Lookup::Scheme(s);
+        }
+        Lookup::Missing
+    }
+
+    /// Look up a qualified name against the top-level scheme map.
+    pub fn lookup_qualified(&self, q: &QName) -> Option<&Scheme> {
+        self.top_level.get(q)
+    }
+
+    /// Every unification variable free in any local or top-level type.
+    /// Used by `generalize` to avoid quantifying vars that appear in the
+    /// surrounding env.
+    pub fn free_unif_vars(&self, state: &UnifyState) -> std::collections::HashSet<u32> {
+        let mut out = std::collections::HashSet::new();
+        for scope in &self.locals {
+            for ty in scope.values() {
+                out.extend(state.free_unif_vars(ty));
+            }
+        }
+        // Top-level schemes have already been generalized — their quantified
+        // vars are `Type::Var`, and any residual Unif there would be a bug.
+        // Still, conservatively fold them in.
+        for scheme in self.top_level.values() {
+            out.extend(state.free_unif_vars(&scheme.ty));
+        }
+        out
+    }
+}
+
+#[derive(Debug)]
+pub enum Lookup<'a> {
+    Scheme(&'a Scheme),
+    Local(&'a Type),
+    Missing,
+}
