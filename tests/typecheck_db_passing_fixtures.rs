@@ -46,6 +46,14 @@ fn collect_purs_files(root: &Path) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip Spago's per-package dependency caches — they
+        // duplicate the sources already present under each
+        // package's own `src/`, and wading in pulls in hundreds
+        // of identical module names.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == ".spago" || name == "output" || name == ".psc-package" {
+            continue;
+        }
         if path.is_dir() {
             out.extend(collect_purs_files(&path));
         } else if path.extension().and_then(|s| s.to_str()) == Some("purs") {

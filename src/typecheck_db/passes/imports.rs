@@ -167,19 +167,17 @@ fn import_all_except(
         let key = QName { module: qualifier.clone(), name: name.clone() };
         env.bind_scheme(key, scheme.clone());
     }
-    // Data constructors: imported as values (the ctor can be used
-    // as a function) plus recorded for exhaustiveness.
+    // Data constructors: synthesize each one's value scheme
+    // (`forall a b. f1 -> f2 -> … -> T a b …`) and bind it.
+    // Without this, cross-module pattern matches and uses like
+    // `Just 1` fail with `UnboundConstructor`.
     for (ctor_name, info) in &target.ctors {
         if hidden.ctors.contains(ctor_name.as_str()) {
             continue;
         }
+        let scheme = synth_ctor_scheme(info);
         let key = QName { module: qualifier.clone(), name: ctor_name.clone() };
-        // Build a synthetic Scheme for the ctor if we can — for now
-        // we skip this and let Phase C/onwards surface the ctor
-        // via `ctors` lookup. Env bindings come when we have the
-        // original scheme; Prim ctors are type-level only so this
-        // is correct.
-        let _ = (key, info);
+        env.bind_scheme(key, scheme);
     }
     // Instances + class info: always propagated.
     merge_instances_and_classes(target, ix);
@@ -251,10 +249,13 @@ fn apply_explicit(
                         });
                         continue;
                     }
-                    // Ctors as env bindings: see import_all_except
-                    // for the shared pathway (no scheme yet at
-                    // this layer).
-                    let _ = (ctor, qualifier.clone(), target);
+                    if let Some(info) = target.ctors.get(&ctor) {
+                        let key = QName {
+                            module: qualifier.clone(),
+                            name: ctor.clone(),
+                        };
+                        env.bind_scheme(key, synth_ctor_scheme(info));
+                    }
                 }
             }
         }
@@ -303,6 +304,24 @@ fn merge_instances_and_classes(target: &ModuleExports, ix: &mut InstanceIndex) {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// Synthesize the value-level `Scheme` for a constructor:
+/// `forall <type_vars>. f1 -> f2 -> … -> Parent <type_vars>`.
+fn synth_ctor_scheme(
+    info: &crate::typecheck_db::passes::exhaustiveness::CtorInfo,
+) -> crate::typecheck_db::types::Scheme {
+    use crate::typecheck_db::types::{Scheme, Type};
+    let head = Type::Con(QName::unqualified(&info.parent_type));
+    let mut result = head;
+    for v in &info.type_vars {
+        result = Type::app(result, Type::Var(v.clone()));
+    }
+    let mut ty = result;
+    for field in info.fields.iter().rev() {
+        ty = Type::fun(field.clone(), ty);
+    }
+    Scheme { vars: info.type_vars.clone(), ty }
+}
 
 fn module_name_string(m: &cst::ModuleName) -> String {
     m.parts

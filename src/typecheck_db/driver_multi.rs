@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::cst;
-use crate::typecheck_db::desugar::{desugar, DesugarContext};
+use crate::typecheck_db::desugar::{desugar_module, DesugarContext};
 use crate::typecheck_db::env::Env;
 use crate::typecheck_db::module_registry::{distill_exports, ModuleExports, ModuleRegistry};
 use crate::typecheck_db::passes::constraints::{ConstraintError, PendingConstraint, ResolvedDict};
@@ -116,16 +116,14 @@ fn check_one_module(
     let (mut env, mut instance_index, import_errors) =
         build_env_from_imports(module, registry);
 
-    // 2) Desugar every decl with whatever fixity the module
-    // already declares. Cross-module operator rebracketing will
-    // need fixity_table injection from imports; that lands when
-    // a fixture demands it.
+    // 2) Desugar the module as a whole. `desugar_module` runs
+    // the multi-equation merger *before* per-decl transforms so
+    // that multi-clause function definitions (`f Nothing = …`
+    // + `f (Just x) = …`) collapse into a single `case`-bodied
+    // decl, which is what the inference + exhaustiveness passes
+    // expect.
     let ctx = DesugarContext::default();
-    let desugared: Vec<cst::Decl> = module
-        .decls
-        .iter()
-        .map(|d| desugar(d, &ctx))
-        .collect();
+    let desugared: Vec<cst::Decl> = desugar_module(module.decls.clone(), &ctx);
 
     // 3) Build data_constructors + ctor_details from local decls
     // plus imported entries. Exhaustiveness consults the merged

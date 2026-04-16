@@ -163,10 +163,55 @@ pub fn distill_exports(
     // Full pool of exportable items, sourced from the CST + the
     // checker's per-decl outputs. We'll prune this down by the
     // export clause.
-    let scheme_by_name: HashMap<String, Scheme> = schemes
-        .iter()
-        .map(|s| (s.name.clone(), s.scheme.clone()))
-        .collect();
+    //
+    // Start with every inferred value scheme, then layer on the
+    // CST-declared types of foreign imports and any top-level
+    // type signatures (the checker doesn't run inference on
+    // signatures-without-bodies, so their schemes only live in
+    // the CST). Signature entries lose to inferred schemes when
+    // both exist, since a `foo :: T` + `foo = body` pair should
+    // export the inferred type, not the raw annotation.
+    let mut scheme_by_name: HashMap<String, Scheme> = HashMap::new();
+    for d in &module.decls {
+        match d {
+            Decl::Foreign { name, ty, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let declared = crate::typecheck_db::types::convert_type_expr(
+                    ty,
+                    &crate::typecheck_db::types::TypeOpMap::default(),
+                );
+                let (vars, body) = match declared {
+                    Type::Forall(qs, body) => {
+                        let ns: Vec<String> =
+                            qs.into_iter().map(|(n, _, _)| n).collect();
+                        (ns, *body)
+                    }
+                    other => (Vec::new(), other),
+                };
+                scheme_by_name.insert(n, Scheme { vars, ty: body });
+            }
+            Decl::TypeSignature { name, ty, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let declared = crate::typecheck_db::types::convert_type_expr(
+                    ty,
+                    &crate::typecheck_db::types::TypeOpMap::default(),
+                );
+                let (vars, body) = match declared {
+                    Type::Forall(qs, body) => {
+                        let ns: Vec<String> =
+                            qs.into_iter().map(|(n, _, _)| n).collect();
+                        (ns, *body)
+                    }
+                    other => (Vec::new(), other),
+                };
+                scheme_by_name.entry(n).or_insert(Scheme { vars, ty: body });
+            }
+            _ => {}
+        }
+    }
+    for s in schemes {
+        scheme_by_name.insert(s.name.clone(), s.scheme.clone());
+    }
 
     // Walk decls once to extract everything the checker doesn't
     // already hand us (data/newtype ctor membership, type aliases,

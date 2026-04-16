@@ -252,10 +252,22 @@ pub fn infer_value_scc_with_all(
     // "current decl" marker on state lets `infer_case` stamp each
     // pending exhaustiveness record with its owning decl.
     for (decl, name) in &decl_refs {
-        if let Decl::Value { binders, guarded, where_clause: _, .. } = decl {
+        if let Decl::Value { binders, guarded, where_clause, .. } = decl {
             let expected = slot_of.get(name).cloned().unwrap();
             state.set_current_decl(Some(name.clone()));
-            let lam_ty = infer_equation(&mut state, env, type_ops, binders, guarded)?;
+            // Wrap the body with any where-clause bindings so
+            // declarations like `foo = bar where bar = 1` see `bar`
+            // during inference. `wrap_guarded_with_where` turns the
+            // where-clause into a synthetic `let` around the body.
+            let guarded_with_where =
+                wrap_guarded_with_where(guarded.clone(), where_clause.clone());
+            let lam_ty = infer_equation(
+                &mut state,
+                env,
+                type_ops,
+                binders,
+                &guarded_with_where,
+            )?;
             state.unify(&expected, &lam_ty)?;
         }
     }
@@ -890,8 +902,19 @@ fn infer_let(
     // body benefits from let-polymorphism. We remove the slot from `locals`
     // *before* generalizing so its own unif var isn't considered free in the
     // surrounding env.
+    //
+    // Duplicate names in `value_bindings` (multi-equation let, e.g.
+    // `let f Nothing = 0; f (Just x) = x in …`) map to a single slot —
+    // the second `bind_local` in Pass 2 overwrote the first and only one
+    // entry remains to remove. We dedupe by name here so the second
+    // pass-4 iteration doesn't trip on an already-empty slot.
     let mut finished: Vec<(String, Scheme)> = Vec::new();
+    let mut generalized: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for vb in &value_bindings {
+        if !generalized.insert(vb.name.clone()) {
+            continue;
+        }
         let slot_ty = env
             .locals
             .last_mut()
@@ -1057,6 +1080,43 @@ fn infer_equation(
         out = Type::fun(pt, out);
     }
     Ok(out)
+}
+
+/// Lower a value decl's `where` clause into a synthetic `let`
+/// wrapping each guard's body. Mirrors multi_eq's helper so a
+/// `foo … | g = e where h = …` program behaves the same through
+/// both paths (merged via multi_eq or direct).
+fn wrap_guarded_with_where(
+    g: cst::GuardedExpr,
+    where_clause: Vec<LetBinding>,
+) -> cst::GuardedExpr {
+    if where_clause.is_empty() {
+        return g;
+    }
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            let span = e.span();
+            cst::GuardedExpr::Unconditional(Box::new(Expr::Let {
+                span,
+                bindings: where_clause,
+                body: e,
+            }))
+        }
+        cst::GuardedExpr::Guarded(guards) => cst::GuardedExpr::Guarded(
+            guards
+                .into_iter()
+                .map(|grd| cst::Guard {
+                    span: grd.span,
+                    patterns: grd.patterns,
+                    expr: Box::new(Expr::Let {
+                        span: grd.expr.span(),
+                        bindings: where_clause.clone(),
+                        body: grd.expr,
+                    }),
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn type_of_literal(lit: &Literal) -> Type {
