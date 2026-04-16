@@ -16,10 +16,16 @@
 //! After desugar, the resulting [`Decl`] is guaranteed to not contain any of
 //! these forms, and downstream passes can rely on that invariant.
 //!
-//! **Current state (MDa)**: the pipeline is a no-op. Sub-milestones MDb..MDe
-//! fill it in.
+//! **Current state (MDb)**: signed literals, operator sections, and
+//! record-literal wildcards are lowered. Do/ado, multi-equation, and
+//! operator rebracketing remain for MDc..MDe.
 
 use crate::cst::Decl;
+
+pub mod walk;
+pub mod signed;
+pub mod sections;
+pub mod records;
 
 /// Module-scoped inputs that can steer the desugar pipeline.
 ///
@@ -39,8 +45,15 @@ pub struct DesugarContext {
 /// must always produce the same output (bit-for-bit), because downstream
 /// cache keys depend on the output's content hash.
 pub fn desugar(decl: &Decl, _ctx: &DesugarContext) -> Decl {
-    // MDa: identity. Each of MDb..MDe will plug its transform in here.
-    decl.clone()
+    let d = decl.clone();
+    // Order matters: handle sections first so that wildcards inside
+    // operator / backtick / app positions become lambdas before
+    // `records` looks for record-literal wildcards (it should only see
+    // wildcards that were still sitting in a `Record { .. }` value slot).
+    let d = sections::desugar_decl(d);
+    let d = records::desugar_decl(d);
+    let d = signed::desugar_decl(d);
+    d
 }
 
 #[cfg(test)]
