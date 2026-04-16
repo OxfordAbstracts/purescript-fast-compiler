@@ -16,9 +16,9 @@
 //! After desugar, the resulting [`Decl`] is guaranteed to not contain any of
 //! these forms, and downstream passes can rely on that invariant.
 //!
-//! **Current state (MDc)**: signed literals, operator sections,
-//! record-literal wildcards, and do/ado are all lowered. Multi-equation
-//! merging and operator rebracketing remain for MDd..MDe.
+//! **Current state (MDd)**: signed literals, operator sections,
+//! record-literal wildcards, do/ado, and multi-equation merging are all
+//! lowered. Operator rebracketing remains for MDe.
 
 use crate::cst::Decl;
 
@@ -27,6 +27,7 @@ pub mod signed;
 pub mod sections;
 pub mod records;
 pub mod do_notation;
+pub mod multi_eq;
 
 /// Module-scoped inputs that can steer the desugar pipeline.
 ///
@@ -60,6 +61,20 @@ pub fn desugar(decl: &Decl, _ctx: &DesugarContext) -> Decl {
     let d = signed::desugar_decl(d);
     let d = do_notation::desugar_decl(d);
     d
+}
+
+/// Module-level entry point.
+///
+/// Runs the multi-equation merger (which changes the decl count) first,
+/// then applies the per-decl pipeline to each resulting decl. This is
+/// the right order: merging produces a single `case`-bodied decl per
+/// function name, and the inner expressions (including the synthesized
+/// case) then flow through the normal per-decl transforms.
+pub fn desugar_module(decls: Vec<Decl>, ctx: &DesugarContext) -> Vec<Decl> {
+    multi_eq::merge(decls)
+        .into_iter()
+        .map(|d| desugar(&d, ctx))
+        .collect()
 }
 
 #[cfg(test)]
