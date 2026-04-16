@@ -5,6 +5,7 @@
 //! hash. See the design doc for the full pipeline.
 
 pub mod parse_decl;
+pub mod desugar_decl;
 pub mod names;
 pub mod signatures;
 pub mod ctor_details;

@@ -42,6 +42,7 @@ pub struct InputHasher {
     pass_name: &'static str,
     pass_version: u32,
     source_hash: [u8; 32],
+    module_context: [u8; 32],
     deps: Vec<DepEntry>,
 }
 
@@ -59,12 +60,23 @@ impl InputHasher {
             pass_name,
             pass_version,
             source_hash: [0u8; 32],
+            module_context: [0u8; 32],
             deps: Vec::new(),
         }
     }
 
     pub fn with_source_hash(mut self, hash: [u8; 32]) -> Self {
         self.source_hash = hash;
+        self
+    }
+
+    /// Fold in a module-scoped context hash (e.g. fixity declarations
+    /// visible to this decl, the module's import list). Folding this in
+    /// here — instead of mixing it with the source_hash at the call site —
+    /// keeps the semantic axes separate and makes the cache diagnostics
+    /// easier to reason about.
+    pub fn with_module_context(mut self, hash: [u8; 32]) -> Self {
+        self.module_context = hash;
         self
     }
 
@@ -93,6 +105,7 @@ impl InputHasher {
         h.update(&[0u8]);
         h.update(&self.pass_version.to_le_bytes());
         h.update(&self.source_hash);
+        h.update(&self.module_context);
         h.update(&(self.deps.len() as u32).to_le_bytes());
         for d in &self.deps {
             h.update(d.dep_module.as_bytes());
@@ -143,6 +156,19 @@ mod tests {
         b.add_dep("M", "x", "q", [9u8; 32]);
 
         assert_eq!(a.finish(), b.finish());
+    }
+
+    #[test]
+    fn module_context_change_changes_hash() {
+        let a = InputHasher::new("p", 1)
+            .with_source_hash([1u8; 32])
+            .with_module_context([7u8; 32])
+            .finish();
+        let b = InputHasher::new("p", 1)
+            .with_source_hash([1u8; 32])
+            .with_module_context([8u8; 32])
+            .finish();
+        assert_ne!(a, b);
     }
 
     #[test]
