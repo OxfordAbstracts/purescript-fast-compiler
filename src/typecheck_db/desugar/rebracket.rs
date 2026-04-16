@@ -253,7 +253,7 @@ fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: S
                     // Backtick-style `a `f` b`: the parser stored `f`
                     // as an OpName, but it's really the function value
                     // to call. Lower to `App(App(Var(f), a), b)`.
-                    let vn = value_name(&resolve_or_empty(sym));
+                    let vn = value_name(&resolve_sym(sym));
                     let qualified = match n.value.module {
                         Some(m) => Qualified::qualified(m, vn),
                         None => Qualified::unqualified(vn),
@@ -286,7 +286,7 @@ fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: S
 }
 
 fn is_identifier_op(sym: Ident) -> bool {
-    let s = resolve_or_empty(sym);
+    let s = resolve_sym(sym);
     s.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
 }
 
@@ -295,15 +295,15 @@ fn lookup_op(op: &Spanned<Qualified<crate::names::OpName>>, fixity: &FixityTable
 }
 
 fn target_var(info: FixityInfo, span: Span) -> Qualified<ValueName> {
-    let vn: ValueName = value_name(&resolve_or_empty(info.target_name));
+    let vn: ValueName = value_name(&resolve_sym(info.target_name));
     match info.target_module {
         Some(m) => Qualified::qualified(crate::names::ModuleQualifier::new(m), vn),
         None => Qualified::unqualified(vn),
     }
 }
 
-fn resolve_or_empty(s: Ident) -> String {
-    crate::interner::resolve(s).unwrap_or_default()
+fn resolve_sym(s: Ident) -> String {
+    crate::typecheck_db::util::resolve_symbol(s)
 }
 
 fn span_of(e: &Expr) -> Span {

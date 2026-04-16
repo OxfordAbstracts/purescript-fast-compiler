@@ -285,7 +285,7 @@ pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
 // ============================================================================
 
 fn resolve(sym: crate::interner::Symbol) -> String {
-    interner::resolve(sym).unwrap_or_default()
+    crate::typecheck_db::util::resolve_symbol(sym)
 }
 
 /// Deterministic hash of a [`TypeOpMap`], used by passes that fold this map

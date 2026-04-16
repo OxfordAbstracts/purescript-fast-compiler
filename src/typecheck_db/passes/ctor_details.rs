@@ -39,12 +39,12 @@ pub fn compute(decl: &Decl, type_ops: &TypeOpMap) -> CtorDetailsOutput {
             }
             let vars = type_vars
                 .iter()
-                .map(|v| crate::interner::resolve(v.value.symbol()).unwrap_or_default())
+                .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
                 .collect();
             let ctors = constructors
                 .iter()
                 .map(|c| {
-                    let name = crate::interner::resolve(c.name.value.symbol()).unwrap_or_default();
+                    let name = crate::typecheck_db::util::resolve_symbol(c.name.value.symbol());
                     let fields: Vec<Type> =
                         c.fields.iter().map(|f| convert_type_expr(f, type_ops)).collect();
                     (name, fields)
@@ -55,10 +55,10 @@ pub fn compute(decl: &Decl, type_ops: &TypeOpMap) -> CtorDetailsOutput {
         Decl::Newtype { type_vars, constructor, ty, .. } => {
             let vars = type_vars
                 .iter()
-                .map(|v| crate::interner::resolve(v.value.symbol()).unwrap_or_default())
+                .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
                 .collect();
             let ctor_name =
-                crate::interner::resolve(constructor.value.symbol()).unwrap_or_default();
+                crate::typecheck_db::util::resolve_symbol(constructor.value.symbol());
             let field = convert_type_expr(ty, type_ops);
             CtorDetailsOutput::Data(CtorDetails {
                 type_vars: vars,

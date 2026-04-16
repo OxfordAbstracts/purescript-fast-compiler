@@ -8,6 +8,7 @@
 pub mod key;
 pub mod store;
 pub mod driver;
+pub mod util;
 pub mod types;
 pub mod unify;
 pub mod env;

@@ -947,7 +947,7 @@ impl Collector {
 // ============================================================================
 
 fn sym_to_string(sym: Symbol) -> String {
-    interner::resolve(sym).unwrap_or_default()
+    crate::typecheck_db::util::resolve_symbol(sym)
 }
 
 fn qi_module(qi: &QualifiedIdent) -> Option<String> {
@@ -978,7 +978,7 @@ pub fn decl_key_for(decl: &Decl) -> String {
 pub fn module_name_string(m: &ModuleName) -> String {
     m.parts
         .iter()
-        .map(|p| interner::resolve(*p).unwrap_or_default())
+        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
         .collect::<Vec<_>>()
         .join(".")
 }

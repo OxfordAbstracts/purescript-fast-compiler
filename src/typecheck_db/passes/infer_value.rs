@@ -135,7 +135,7 @@ pub fn infer_value_scc(
 
     for decl in decls {
         if let Decl::Value { name, .. } = decl {
-            let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+            let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             let v = state.fresh();
             env.bind_local(n.clone(), v.clone());
             slot_of.insert(n.clone(), v);
@@ -189,8 +189,8 @@ fn infer_var(
 ) -> Result<Type, InferError> {
     let qi = name.to_qi();
     let name_str =
-        crate::interner::resolve(qi.name).unwrap_or_default();
-    let module_str = qi.module.and_then(crate::interner::resolve);
+        crate::typecheck_db::util::resolve_symbol(qi.name);
+    let module_str = qi.module.map(crate::typecheck_db::util::resolve_symbol);
 
     if let Some(module) = module_str {
         let q = QName { module: Some(module), name: name_str.clone() };
@@ -214,8 +214,8 @@ fn infer_constructor(
 ) -> Result<Type, InferError> {
     let qi = name.to_qi();
     let name_str =
-        crate::interner::resolve(qi.name).unwrap_or_default();
-    let module_str = qi.module.and_then(crate::interner::resolve);
+        crate::typecheck_db::util::resolve_symbol(qi.name);
+    let module_str = qi.module.map(crate::typecheck_db::util::resolve_symbol);
 
     let q = QName { module: module_str, name: name_str.clone() };
     let scheme = env
@@ -280,7 +280,7 @@ fn bind_pattern(
         Binder::Wildcard { .. } => Ok(state.fresh()),
         Binder::Var { name, .. } => {
             let v = state.fresh();
-            let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+            let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             env.bind_local(n, v.clone());
             Ok(v)
         }
@@ -297,7 +297,7 @@ fn bind_pattern(
         }
         Binder::As { name, binder, .. } => {
             let inner = bind_pattern(state, env, type_ops, binder)?;
-            let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+            let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             env.bind_local(n, inner.clone());
             Ok(inner)
         }
@@ -324,8 +324,8 @@ fn bind_constructor_pattern(
     args: &[Binder],
 ) -> Result<Type, InferError> {
     let qi = name.to_qi();
-    let name_str = crate::interner::resolve(qi.name).unwrap_or_default();
-    let module_str = qi.module.and_then(crate::interner::resolve);
+    let name_str = crate::typecheck_db::util::resolve_symbol(qi.name);
+    let module_str = qi.module.map(crate::typecheck_db::util::resolve_symbol);
     let q = QName { module: module_str, name: name_str.clone() };
     let scheme = env
         .lookup_qualified(&q)
@@ -389,7 +389,7 @@ fn infer_let(
     let mut sigs: HashMap<String, Type> = HashMap::new();
     for b in bindings {
         if let LetBinding::Signature { name, ty, .. } = b {
-            let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+            let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             sigs.insert(n, convert_type_expr(ty, type_ops));
         }
     }
@@ -400,7 +400,7 @@ fn infer_let(
     for b in bindings {
         match b {
             LetBinding::Value { binder: Binder::Var { name, .. }, expr, .. } => {
-                let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let sig = sigs.get(&n).cloned();
                 let slot = sig.clone().unwrap_or_else(|| state.fresh());
                 env.bind_local(n.clone(), slot);
