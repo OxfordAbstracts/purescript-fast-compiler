@@ -116,8 +116,8 @@ mod tests {
         let d = first_decl("module M where\nfoo = 1\n");
         let sh = [0u8; 32];
 
-        let ctx1 = DesugarContext { module_fixity_hash: [1u8; 32] };
-        let ctx2 = DesugarContext { module_fixity_hash: [2u8; 32] };
+        let ctx1 = DesugarContext { module_fixity_hash: [1u8; 32], ..Default::default() };
+        let ctx2 = DesugarContext { module_fixity_hash: [2u8; 32], ..Default::default() };
 
         let (_, _, o1) = run(&mut db, "M", "foo", sh, &ctx1, &d).unwrap();
         assert_eq!(o1, CacheOutcome::Miss);

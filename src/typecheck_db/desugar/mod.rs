@@ -16,9 +16,10 @@
 //! After desugar, the resulting [`Decl`] is guaranteed to not contain any of
 //! these forms, and downstream passes can rely on that invariant.
 //!
-//! **Current state (MDd)**: signed literals, operator sections,
-//! record-literal wildcards, do/ado, and multi-equation merging are all
-//! lowered. Operator rebracketing remains for MDe.
+//! **Current state (MDe)**: signed literals, operator sections,
+//! record-literal wildcards, do/ado, multi-equation merging, and
+//! operator rebracketing (with Op→App lowering against a fixity table)
+//! are all lowered. The MD stage is feature-complete.
 
 use crate::cst::Decl;
 
@@ -28,16 +29,26 @@ pub mod sections;
 pub mod records;
 pub mod do_notation;
 pub mod multi_eq;
+pub mod rebracket;
 
-/// Module-scoped inputs that can steer the desugar pipeline.
+pub use rebracket::{fixity_table_from_decls, FixityInfo, FixityTable};
+
+/// Module-scoped inputs that steer the desugar pipeline.
 ///
-/// `module_fixity_hash` folds in every `Decl::Fixity` (local and imported)
-/// that's visible when this decl is being desugared. MDa doesn't read it
-/// yet — the field is carried so the cache-key machinery is already in the
-/// right shape when MDe wires up the rebracketer.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// * `module_fixity_hash` — a stable digest of `fixity_table`, used by
+///   the caching layer to invalidate downstream results when the
+///   visible fixity set changes.
+/// * `fixity_table` — every value-level `Decl::Fixity` (local + imported)
+///   currently in scope, keyed by operator symbol. The rebracketer
+///   consults this to reassociate operator chains and to lower each
+///   operator to its declared target function.
+///
+/// Use [`rebracket::fixity_table_from_decls`] to build the table + hash
+/// together from a module's decls.
+#[derive(Debug, Default, Clone)]
 pub struct DesugarContext {
     pub module_fixity_hash: [u8; 32],
+    pub fixity_table: FixityTable,
 }
 
 /// Apply every sub-transform to `decl` in pipeline order and return the
@@ -46,20 +57,23 @@ pub struct DesugarContext {
 /// Determinism is a load-bearing invariant: for fixed inputs, `desugar`
 /// must always produce the same output (bit-for-bit), because downstream
 /// cache keys depend on the output's content hash.
-pub fn desugar(decl: &Decl, _ctx: &DesugarContext) -> Decl {
+pub fn desugar(decl: &Decl, ctx: &DesugarContext) -> Decl {
     let d = decl.clone();
     // Order matters:
     // 1. `sections` first — eliminate wildcards in Op/App/BacktickApp so
-    //    later passes see clean shapes.
+    //    later passes see clean shapes. Critical: runs *before*
+    //    `rebracket`, because sections depend on the original chain
+    //    shape (direct wildcard in an operand position).
     // 2. `records` — eliminate wildcards inside record literals.
     // 3. `signed` — Expr::Negate → negate application.
-    // 4. `do_notation` — do/ado statements → bind / map / apply. Runs
-    //    late enough that the inner expressions have already been
-    //    simplified by the earlier passes.
+    // 4. `do_notation` — do/ado statements → bind / map / apply.
+    // 5. `rebracket` — reassociate Op / BacktickApp chains by fixity,
+    //    and lower known operators to plain function applications.
     let d = sections::desugar_decl(d);
     let d = records::desugar_decl(d);
     let d = signed::desugar_decl(d);
     let d = do_notation::desugar_decl(d);
+    let d = rebracket::desugar_decl(d, &ctx.fixity_table);
     d
 }
 
