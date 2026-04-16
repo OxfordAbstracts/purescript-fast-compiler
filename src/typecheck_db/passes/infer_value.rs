@@ -48,6 +48,33 @@ pub enum InferError {
 pub struct InferredScheme {
     pub name: String,
     pub scheme: Scheme,
+    /// Exhaustiveness findings from case expressions and multi-equation
+    /// groups inside this decl's body. Empty when either nothing needed
+    /// checking or no registries were supplied (see
+    /// `infer_value_scc` vs `infer_value_scc_with_registries`).
+    #[serde(default)]
+    pub exhaustiveness_errors:
+        Vec<crate::typecheck_db::passes::exhaustiveness::NonExhaustive>,
+}
+
+/// Case / multi-equation pattern match recorded during inference so
+/// the exhaustiveness check can run against fully-zonked scrutinee
+/// types at the end of the SCC.
+#[derive(Debug, Clone)]
+pub struct PendingExhaust {
+    /// Name of the value decl whose body the case sits inside. The
+    /// draining caller uses this to route findings to the right
+    /// `InferredScheme`.
+    pub decl_name: Option<String>,
+    pub span: crate::span::Span,
+    pub scrutinee_tys: Vec<Type>,
+    pub alts: Vec<PendingAlt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAlt {
+    pub binders: Vec<Binder>,
+    pub guarded: cst::GuardedExpr,
 }
 
 // ============================================================================
@@ -85,7 +112,9 @@ pub fn infer_expr(
         Expr::Let { bindings, body, .. } => {
             infer_let(state, env, type_ops, bindings, body)
         }
-        Expr::Case { exprs, alts, .. } => infer_case(state, env, type_ops, exprs, alts),
+        Expr::Case { span, exprs, alts } => {
+            infer_case(state, env, type_ops, *span, exprs, alts)
+        }
         Expr::Record { fields, .. } => infer_record(state, env, type_ops, fields),
         Expr::RecordAccess { expr, field, .. } => {
             infer_record_access(state, env, type_ops, expr, field)
@@ -131,6 +160,26 @@ pub fn infer_value_scc(
     env: &mut Env,
     decls: &[&Decl],
 ) -> Result<Vec<InferredScheme>, InferError> {
+    let data = crate::typecheck_db::passes::exhaustiveness::DataConstructors::new();
+    let ctors = crate::typecheck_db::passes::exhaustiveness::CtorRegistry::new();
+    infer_value_scc_with_registries(type_ops, env, decls, &data, &ctors)
+}
+
+/// Like `infer_value_scc`, but also checks exhaustiveness of every
+/// case expression encountered while inferring the SCC's bodies.
+///
+/// `data_constructors` + `ctor_details` are the two registries the
+/// exhaustiveness pass consumes. Call sites that don't care about
+/// exhaustiveness (most of the existing test suite) use
+/// `infer_value_scc`, which passes empty registries and therefore
+/// never reports anything.
+pub fn infer_value_scc_with_registries(
+    type_ops: &TypeOpMap,
+    env: &mut Env,
+    decls: &[&Decl],
+    data_constructors: &crate::typecheck_db::passes::exhaustiveness::DataConstructors,
+    ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
+) -> Result<Vec<InferredScheme>, InferError> {
     // Pre-register each SCC member with a fresh unif var so mutual
     // references within the SCC type-check. After inference, we generalize.
     let mut state = UnifyState::new();
@@ -148,14 +197,18 @@ pub fn infer_value_scc(
         }
     }
 
-    // Infer each decl's body against its pre-registered slot.
+    // Infer each decl's body against its pre-registered slot. The
+    // "current decl" marker on state lets `infer_case` stamp each
+    // pending exhaustiveness record with its owning decl.
     for (decl, name) in &decl_refs {
         if let Decl::Value { binders, guarded, where_clause: _, .. } = decl {
             let expected = slot_of.get(name).cloned().unwrap();
+            state.set_current_decl(Some(name.clone()));
             let lam_ty = infer_equation(&mut state, env, type_ops, binders, guarded)?;
             state.unify(&expected, &lam_ty)?;
         }
     }
+    state.set_current_decl(None);
 
     // Now generalize. Temporarily clear this SCC's slots from the env so
     // they don't count as "free in env" and block quantification.
@@ -168,11 +221,67 @@ pub fn infer_value_scc(
         }
     }
 
+    // Drain pending exhaustiveness entries once, then partition by
+    // owning decl. Running the check here (after unification has
+    // settled) means scrutinee types zonk to their final form.
+    let pending = state.take_pending_exhaust();
+    let mut errors_by_decl: HashMap<String, Vec<
+        crate::typecheck_db::passes::exhaustiveness::NonExhaustive,
+    >> = HashMap::new();
+    for p in pending {
+        let owner = match &p.decl_name {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+        // For each scrutinee column: gather the column's binders from
+        // each unconditional-enough alt, zonk the scrutinee, run the
+        // check.
+        for (col, raw_scrut) in p.scrutinee_tys.iter().enumerate() {
+            let scrut = state.zonk(raw_scrut);
+            let mut column: Vec<&Binder> = Vec::new();
+            for a in &p.alts {
+                if !crate::typecheck_db::passes::exhaustiveness
+                    ::is_unconditional_for_exhaustiveness(&a.guarded)
+                {
+                    continue;
+                }
+                if let Some(b) = a.binders.get(col) {
+                    column.push(b);
+                }
+            }
+            if let Some(missing) =
+                crate::typecheck_db::passes::exhaustiveness::check_exhaustiveness(
+                    &column,
+                    &scrut,
+                    data_constructors,
+                    ctor_details,
+                )
+            {
+                // Recover the type name from the zonked scrutinee so
+                // the error message knows which ADT is short.
+                let type_name = extract_head_name(&scrut).unwrap_or_default();
+                errors_by_decl
+                    .entry(owner.clone())
+                    .or_default()
+                    .push(crate::typecheck_db::passes::exhaustiveness::NonExhaustive {
+                        span: p.span,
+                        type_name,
+                        missing,
+                    });
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for (_, name) in &decl_refs {
         let ty = slot_of.get(name).cloned().unwrap();
         let scheme = generalize(&state, env, &ty);
-        out.push(InferredScheme { name: name.clone(), scheme });
+        let exhaustiveness_errors = errors_by_decl.remove(name).unwrap_or_default();
+        out.push(InferredScheme {
+            name: name.clone(),
+            scheme,
+            exhaustiveness_errors,
+        });
     }
 
     // Restore env — callers may reuse it.
@@ -181,6 +290,20 @@ pub fn infer_value_scc(
     }
 
     Ok(out)
+}
+
+/// Walk an `App` chain down to its head `Con` and return the
+/// constructor's simple name. Used to stamp
+/// `NonExhaustive::type_name` from a zonked scrutinee type.
+fn extract_head_name(ty: &Type) -> Option<String> {
+    let mut cur = ty;
+    loop {
+        match cur {
+            Type::App(f, _) => cur = f,
+            Type::Con(q) => return Some(q.name.clone()),
+            _ => return None,
+        }
+    }
 }
 
 // ============================================================================
@@ -650,6 +773,7 @@ fn infer_case(
     state: &mut UnifyState,
     env: &mut Env,
     type_ops: &TypeOpMap,
+    span: crate::span::Span,
     scrutinees: &[Expr],
     alts: &[cst::CaseAlternative],
 ) -> Result<Type, InferError> {
@@ -676,6 +800,22 @@ fn infer_case(
         state.unify(&branch_ty, &result_ty)?;
         env.pop_scope();
     }
+
+    // Record the case for post-inference exhaustiveness analysis. The
+    // scrutinee types stored here may still be unification variables;
+    // the caller zonks before running the check.
+    state.record_pending_exhaust(PendingExhaust {
+        decl_name: None, // stamped by `record_pending_exhaust`
+        span,
+        scrutinee_tys: scrut_tys.clone(),
+        alts: alts
+            .iter()
+            .map(|a| PendingAlt {
+                binders: a.binders.clone(),
+                guarded: a.result.clone(),
+            })
+            .collect(),
+    });
 
     Ok(result_ty)
 }
@@ -747,6 +887,30 @@ fn infer_equation(
     }
     let body_ty = infer_guarded(state, env, type_ops, guarded)?;
     env.pop_scope();
+
+    // A single-equation decl with refutable top-level binders (like
+    // `f (Just y) = y`) doesn't go through `infer_case`, so we
+    // synthesize a pending exhaustiveness record here as if it were a
+    // one-alternative case. Multi-equation decls with the same name
+    // have already been collapsed into a `case` by MDd's multi_eq
+    // merger and flow through `infer_case` instead.
+    if binders
+        .iter()
+        .any(crate::typecheck_db::passes::exhaustiveness::is_refutable)
+    {
+        state.record_pending_exhaust(PendingExhaust {
+            decl_name: None, // stamped by `record_pending_exhaust`
+            span: binders
+                .first()
+                .map(|b| b.span())
+                .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+            scrutinee_tys: param_tys.clone(),
+            alts: vec![PendingAlt {
+                binders: binders.to_vec(),
+                guarded: guarded.clone(),
+            }],
+        });
+    }
 
     let mut out = body_ty;
     for pt in param_tys.into_iter().rev() {
@@ -1554,5 +1718,356 @@ foo x | x = 1
         } else {
             assert_eq!(s.zonk(&res.unwrap()), bool_ty());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M5 part 2: exhaustiveness integration into infer_value_scc
+    //
+    // These tests drive the `infer_value_scc_with_registries` entry
+    // point that accepts a `DataConstructors` + `CtorRegistry` pair and
+    // returns `InferredScheme`s with `exhaustiveness_errors` filled in.
+    // They fail until the wiring lands.
+    // ------------------------------------------------------------------
+
+    use crate::typecheck_db::passes::exhaustiveness::{
+        CtorInfo, CtorRegistry, DataConstructors,
+    };
+
+    /// Build a standard Maybe registry for integration tests.
+    fn maybe_registry() -> (DataConstructors, CtorRegistry) {
+        let mut data = DataConstructors::new();
+        let mut ctors = CtorRegistry::new();
+        data.insert("Maybe".into(), vec!["Nothing".into(), "Just".into()]);
+        ctors.insert(
+            "Nothing".into(),
+            CtorInfo {
+                parent_type: "Maybe".into(),
+                type_vars: vec!["a".into()],
+                fields: vec![],
+            },
+        );
+        ctors.insert(
+            "Just".into(),
+            CtorInfo {
+                parent_type: "Maybe".into(),
+                type_vars: vec!["a".into()],
+                fields: vec![Type::Var("a".into())],
+            },
+        );
+        (data, ctors)
+    }
+
+    /// Same for Boolean (as an ADT with True/False).
+    fn boolean_registry() -> (DataConstructors, CtorRegistry) {
+        let mut data = DataConstructors::new();
+        let mut ctors = CtorRegistry::new();
+        data.insert("Boolean".into(), vec!["True".into(), "False".into()]);
+        ctors.insert(
+            "True".into(),
+            CtorInfo { parent_type: "Boolean".into(), type_vars: vec![], fields: vec![] },
+        );
+        ctors.insert(
+            "False".into(),
+            CtorInfo { parent_type: "Boolean".into(), type_vars: vec![], fields: vec![] },
+        );
+        (data, ctors)
+    }
+
+    /// Wire the Just/Nothing constructors into `env` so bodies can
+    /// typecheck.
+    fn seed_maybe_env(env: &mut Env) {
+        let a = Type::Var("a".into());
+        let maybe_a = Type::app(Type::Con(QName::unqualified("Maybe")), a.clone());
+        env.bind_scheme(
+            QName::unqualified("Just"),
+            Scheme { vars: vec!["a".into()], ty: Type::fun(a.clone(), maybe_a.clone()) },
+        );
+        env.bind_scheme(
+            QName::unqualified("Nothing"),
+            Scheme { vars: vec!["a".into()], ty: maybe_a },
+        );
+    }
+
+    fn infer_with(
+        src: &str,
+        env: &mut Env,
+        data: &DataConstructors,
+        ctors: &CtorRegistry,
+    ) -> Vec<InferredScheme> {
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        infer_value_scc_with_registries(&ops, env, &decls, data, ctors).unwrap()
+    }
+
+    #[test]
+    fn integration_exhaustive_case_produces_no_errors() {
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Nothing -> 0
+  Just y -> y
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        assert_eq!(schemes.len(), 1);
+        assert!(
+            schemes[0].exhaustiveness_errors.is_empty(),
+            "got: {:?}",
+            schemes[0].exhaustiveness_errors,
+        );
+    }
+
+    #[test]
+    fn integration_missing_nothing_reports_error() {
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Just y -> y
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        assert_eq!(schemes[0].exhaustiveness_errors.len(), 1);
+        let err = &schemes[0].exhaustiveness_errors[0];
+        assert_eq!(err.type_name, "Maybe");
+        assert_eq!(err.missing, vec!["Nothing".to_string()]);
+    }
+
+    #[test]
+    fn integration_missing_just_reports_error() {
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Nothing -> 0
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        assert_eq!(schemes[0].exhaustiveness_errors.len(), 1);
+        assert_eq!(
+            schemes[0].exhaustiveness_errors[0].missing,
+            vec!["Just".to_string()],
+        );
+    }
+
+    #[test]
+    fn integration_nested_missing_reported_with_prefix() {
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Nothing -> 0
+  Just (Just y) -> y
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        // Inner `Just` binder covers Just; the Nothing inside Just
+        // is uncovered, so we should see "Just Nothing".
+        let errs = &schemes[0].exhaustiveness_errors;
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].missing, vec!["Just Nothing".to_string()]);
+    }
+
+    #[test]
+    fn integration_wildcard_fallback_clears_errors() {
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Just y -> y
+  _ -> 0
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        assert!(schemes[0].exhaustiveness_errors.is_empty());
+    }
+
+    #[test]
+    fn integration_multi_equation_missing_ctor_reports_error() {
+        // Post-MDd, multi-equation f is merged into a single
+        // case-bodied decl. Exhaustiveness should still catch the
+        // missing Nothing.
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        let (data, ctors) = maybe_registry();
+        // Pre-merge decls first (the desugar is currently only used by
+        // the cached pass; for this direct test we invoke the merger
+        // manually).
+        let m = parse(
+            "\
+module M where
+f (Just y) = y
+",
+        )
+        .unwrap();
+        let merged = crate::typecheck_db::desugar::multi_eq::merge(m.decls);
+        let decls: Vec<&Decl> = merged.iter().collect();
+        let ops = TypeOpMap::default();
+        let schemes =
+            infer_value_scc_with_registries(&ops, &mut env, &decls, &data, &ctors).unwrap();
+        let errs = &schemes[0].exhaustiveness_errors;
+        // Single-equation without wildcard → missing Nothing.
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].missing, vec!["Nothing".to_string()]);
+    }
+
+    #[test]
+    fn integration_guarded_without_fallback_contributes_nothing() {
+        // `Nothing | someCond` has no true/otherwise fallback, so
+        // that alt shouldn't count for coverage and Nothing must
+        // still be reported as missing.
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        env.bind_scheme(QName::unqualified("someCond"), Scheme::mono(bool_ty()));
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Nothing
+    | someCond -> 1
+  Just y -> y
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        let errs = &schemes[0].exhaustiveness_errors;
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].missing, vec!["Nothing".to_string()]);
+    }
+
+    #[test]
+    fn integration_otherwise_guard_counts_as_fallback() {
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        env.bind_scheme(QName::unqualified("someCond"), Scheme::mono(bool_ty()));
+        env.bind_scheme(QName::unqualified("otherwise"), Scheme::mono(bool_ty()));
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  Nothing
+    | someCond -> 1
+    | otherwise -> 2
+  Just y -> y
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        assert!(schemes[0].exhaustiveness_errors.is_empty(), "{:?}", schemes[0].exhaustiveness_errors);
+    }
+
+    #[test]
+    fn integration_non_adt_scrutinee_no_errors() {
+        // Case on an Int has no ADT constructor list — exhaustiveness
+        // doesn't apply here.
+        let mut env = Env::new();
+        let (data, ctors) = maybe_registry();
+        let schemes = infer_with(
+            "\
+module M where
+f x = case x of
+  0 -> \"zero\"
+  _ -> \"other\"
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        assert!(schemes[0].exhaustiveness_errors.is_empty());
+    }
+
+    #[test]
+    fn integration_multi_scrutinee_column_checked_independently() {
+        // `case m, n of Just _, True -> 1` — missing Nothing on column 0
+        // and missing False on column 1. Both must be reported.
+        let mut env = Env::new();
+        seed_maybe_env(&mut env);
+        env.bind_scheme(QName::unqualified("True"), Scheme::mono(bool_ty()));
+        env.bind_scheme(QName::unqualified("False"), Scheme::mono(bool_ty()));
+        let mut data = DataConstructors::new();
+        let mut ctors = CtorRegistry::new();
+        data.insert("Maybe".into(), vec!["Nothing".into(), "Just".into()]);
+        ctors.insert(
+            "Nothing".into(),
+            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+        );
+        ctors.insert(
+            "Just".into(),
+            CtorInfo {
+                parent_type: "Maybe".into(),
+                type_vars: vec!["a".into()],
+                fields: vec![Type::Var("a".into())],
+            },
+        );
+        let (bdata, bctors) = boolean_registry();
+        for (k, v) in bdata {
+            data.insert(k, v);
+        }
+        for (k, v) in bctors {
+            ctors.insert(k, v);
+        }
+        let schemes = infer_with(
+            "\
+module M where
+f m n = case m, n of
+  Just _, True -> 1
+",
+            &mut env,
+            &data,
+            &ctors,
+        );
+        let errs = &schemes[0].exhaustiveness_errors;
+        // Two column errors expected — order may vary.
+        assert_eq!(errs.len(), 2, "got: {errs:?}");
+        let type_names: Vec<&str> =
+            errs.iter().map(|e| e.type_name.as_str()).collect();
+        assert!(type_names.contains(&"Maybe"));
+        assert!(type_names.contains(&"Boolean"));
+    }
+
+    #[test]
+    fn integration_wrapper_infer_value_scc_defaults_to_empty_errors() {
+        // The no-registry wrapper exists so the vast majority of
+        // existing tests don't have to care about exhaustiveness.
+        // It must still return InferredSchemes with an empty error
+        // list.
+        let src = "module M where\nx = 1\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert!(schemes[0].exhaustiveness_errors.is_empty());
     }
 }

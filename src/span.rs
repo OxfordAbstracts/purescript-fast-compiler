@@ -1,7 +1,9 @@
 use std::fmt::Display;
 
+use serde::{Deserialize, Serialize};
+
 /// Represents a source code position with line and column
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourcePos {
     /// Line number (1-indexed)
     pub line: usize,
@@ -10,7 +12,7 @@ pub struct SourcePos {
 }
 
 /// Represents a span in the source code
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Span {
     /// Start byte offset
     pub start: usize,

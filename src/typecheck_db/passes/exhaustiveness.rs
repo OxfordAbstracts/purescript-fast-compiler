@@ -26,6 +26,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::cst::{Binder, Expr, GuardPattern, GuardedExpr, Literal};
 use crate::typecheck_db::types::Type;
 
@@ -59,7 +61,7 @@ pub type CtorRegistry = HashMap<String, CtorInfo>;
 // ---------------------------------------------------------------------------
 
 /// One exhaustiveness finding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NonExhaustive {
     /// Span of the case expression (or multi-equation group) that's
     /// missing coverage.
@@ -216,7 +218,7 @@ fn is_guard_true_literal(e: &Expr) -> bool {
     }
 }
 
-fn is_refutable(b: &Binder) -> bool {
+pub fn is_refutable(b: &Binder) -> bool {
     !matches!(peel(b), Binder::Wildcard { .. } | Binder::Var { .. })
 }
 

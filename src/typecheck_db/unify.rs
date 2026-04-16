@@ -22,11 +22,67 @@ pub enum UnifyError {
 pub struct UnifyState {
     // bindings[i] = Some(ty) when ?i is solved, None when fresh.
     bindings: Vec<Option<Type>>,
+    // Deferred diagnostics: case expressions / multi-equation groups
+    // encountered during inference that need their scrutinee types
+    // zonked before exhaustiveness can be decided. The caller
+    // (`infer_value_scc_with_registries`) drains this after the SCC
+    // finishes and passes each record to the exhaustiveness pass.
+    //
+    // Lives on UnifyState rather than on a separate context so the
+    // call-chain through infer_* doesn't grow a new parameter. When
+    // the constraint solver lands it'll likely motivate a richer
+    // `InferCtx` wrapper, but until then this is a single-file
+    // change and crucially doesn't touch any existing test.
+    pending_exhaust:
+        Vec<crate::typecheck_db::passes::infer_value::PendingExhaust>,
+    // Name of the decl currently being inferred; read by
+    // `record_pending_exhaust` so each entry is attributed to the
+    // right decl, routed into the matching `InferredScheme`.
+    current_decl: Option<String>,
 }
 
 impl UnifyState {
     pub fn new() -> Self {
-        Self { bindings: Vec::new() }
+        Self {
+            bindings: Vec::new(),
+            pending_exhaust: Vec::new(),
+            current_decl: None,
+        }
+    }
+
+    /// Scope-bind the "currently inferring" decl name. Used by
+    /// `record_pending_exhaust` to stamp each entry with its owning
+    /// decl so downstream drains can route results correctly.
+    pub fn set_current_decl(&mut self, name: Option<String>) {
+        self.current_decl = name;
+    }
+
+    /// The decl name last set via `set_current_decl`, or `None`.
+    pub fn current_decl(&self) -> Option<&str> {
+        self.current_decl.as_deref()
+    }
+
+    /// Record one case / multi-equation group for post-inference
+    /// exhaustiveness analysis. `scrutinee_tys` may still contain
+    /// unification variables at the time of the call; the caller is
+    /// expected to zonk before running the check.
+    ///
+    /// The entry's `decl_name` is overwritten with the currently-set
+    /// decl name so attribution stays consistent regardless of what
+    /// the caller passes.
+    pub fn record_pending_exhaust(
+        &mut self,
+        mut entry: crate::typecheck_db::passes::infer_value::PendingExhaust,
+    ) {
+        entry.decl_name = self.current_decl.clone();
+        self.pending_exhaust.push(entry);
+    }
+
+    /// Drain and return every pending exhaustiveness record.
+    pub fn take_pending_exhaust(
+        &mut self,
+    ) -> Vec<crate::typecheck_db::passes::infer_value::PendingExhaust> {
+        std::mem::take(&mut self.pending_exhaust)
     }
 
     /// Allocate a fresh unification variable.
