@@ -107,13 +107,24 @@ pub enum SolveOutcome {
     Deferred,
 }
 
-/// Shallow dictionary — enough to tell later codegen which instance
-/// to reference; nested dict composition for contexts lands with
-/// Phase E.
+/// Shallow dictionary — enough for codegen to reference the right
+/// instance. Phase E adds `instance_idx` so the reference is exact:
+/// codegen looks up `InstanceIndex::candidates(class)[instance_idx]`
+/// to find the matched instance. Full per-context composition (a
+/// tree of `DictExpr`s rather than a flat context list) can land
+/// without reshaping this struct — the span-keyed lookup on
+/// `InferredScheme` already gives codegen every resolution it
+/// needs, and can walk the context chain via additional
+/// `constraint_dicts` entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDict {
     pub class: crate::typecheck_db::types::QName,
     pub instance_types: Vec<Type>,
+    /// Position of the matched instance in
+    /// `InstanceIndex::candidates(class)`. Stable with respect to
+    /// instance insertion order.
+    #[serde(default)]
+    pub instance_idx: usize,
     /// Instance context left to discharge — stored here so Phase C
     /// can drive recursive solving. Empty when the match was against
     /// a context-free instance.
@@ -191,12 +202,17 @@ pub fn solve_one(
         return SolveOutcome::Deferred;
     }
 
-    for cand in instances.candidates(&pending.constraint.class.name) {
+    for (instance_idx, cand) in instances
+        .candidates(&pending.constraint.class.name)
+        .iter()
+        .enumerate()
+    {
         let snapshot = state.snapshot_bindings();
         if let Some((head, context)) = try_match(state, cand, &pending.constraint.args) {
             return SolveOutcome::Resolved(ResolvedDict {
                 class: pending.constraint.class.clone(),
                 instance_types: head,
+                instance_idx,
                 context,
             });
         }
@@ -314,6 +330,17 @@ pub fn solve_all(
                             origin: ConstraintOrigin::InstanceContext,
                         });
                     }
+                    // Record the outer dict at the call site's span
+                    // *only* for Signature-origin constraints —
+                    // context-induced sub-dicts inherit their
+                    // parent's span and would otherwise overwrite.
+                    if pc.origin == ConstraintOrigin::Signature {
+                        report
+                            .dicts_by_span
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(pc.span, dict.clone());
+                    }
                     report.dicts.entry(owner).or_default().push(dict);
                 }
                 SolveOutcome::NoInstance => {
@@ -377,9 +404,19 @@ pub fn solve_all(
 /// Per-decl aggregate of solving one SCC's worth of constraints.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SolveReport {
-    /// Constraints that matched: one `ResolvedDict` per resolved
-    /// entry, keyed by owning decl.
+    /// Every resolved dict — outer + context-induced — keyed by
+    /// owning decl. Codegen iterates this for the full set of
+    /// references it needs to emit.
     pub dicts: std::collections::HashMap<String, Vec<ResolvedDict>>,
+    /// Outer-only span lookup: maps each call site's span to the
+    /// `ResolvedDict` that satisfies its top-level constraint.
+    /// Sub-constraints born from instance contexts do not appear
+    /// here — they're in `dicts` and navigable via their parent's
+    /// `ResolvedDict::context`.
+    pub dicts_by_span: std::collections::HashMap<
+        String,
+        std::collections::HashMap<crate::span::Span, ResolvedDict>,
+    >,
     /// Unresolved constraints: `NoInstance` for now.
     pub errors: std::collections::HashMap<String, Vec<ConstraintError>>,
     /// Constraints the solver wasn't ready to decide on (still had
@@ -1145,6 +1182,162 @@ g c = eq c c
         assert!(report.errors.is_empty());
         assert_eq!(report.deferred.len(), 1);
         assert_eq!(report.deferred[0].origin, ConstraintOrigin::InstanceContext);
+    }
+
+    // =================================================================
+    // Phase E: dict expression recording
+    //
+    // Each `ResolvedDict` must point at the specific instance it
+    // matched (so codegen can emit the right reference) and each
+    // call site must have a span-keyed lookup into its resolved
+    // dict (so codegen can find "which dict resolves THIS use").
+    // =================================================================
+
+    fn span_at(start: usize, end: usize) -> crate::span::Span {
+        crate::span::Span { start, end }
+    }
+
+    #[test]
+    fn resolved_dict_carries_instance_index() {
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![])); // idx 0
+        ix.insert(mk_instance(
+            "Eq",
+            vec![Type::Con(QName::unqualified("String"))],
+            vec![],
+        )); // idx 1
+        let pc = mk_pending("Eq", vec![int_ty()]);
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::Resolved(dict) => {
+                assert_eq!(dict.instance_idx, 0, "Eq Int should map to idx 0");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_dict_idx_matches_second_candidate() {
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![])); // idx 0
+        let string_ty = Type::Con(QName::unqualified("String"));
+        ix.insert(mk_instance("Eq", vec![string_ty.clone()], vec![])); // idx 1
+        let pc = mk_pending("Eq", vec![string_ty]);
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::Resolved(dict) => assert_eq!(dict.instance_idx, 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_constraint_dicts_map_uses_var_span() {
+        // The span stored in the map should be the span of the Var
+        // reference that triggered the constraint. Use a single
+        // decl with one Eq lookup.
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let schemes = infer_with_ix(
+            "module M where\nf (x :: Int) = eq x x\n",
+            &mut env,
+            &ix,
+        );
+        assert_eq!(schemes[0].constraint_dicts.len(), 1);
+        // The span key should point into the source where `eq` is
+        // referenced — a non-trivial one (not 0..0).
+        let (_span, dict) = schemes[0].constraint_dicts.iter().next().unwrap();
+        assert_eq!(dict.class.name, "Eq");
+    }
+
+    #[test]
+    fn integration_no_instance_leaves_dict_map_empty() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let ix = InstanceIndex::new();
+        let schemes = infer_with_ix(
+            "module M where\nf (x :: Int) = eq x x\n",
+            &mut env,
+            &ix,
+        );
+        // The call didn't resolve — no dict recorded. The error
+        // surfaces through `constraint_errors` as before.
+        assert!(schemes[0].constraint_dicts.is_empty());
+        assert_eq!(schemes[0].constraint_errors.len(), 1);
+    }
+
+    #[test]
+    fn integration_two_call_sites_record_two_dict_entries() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let schemes = infer_with_ix(
+            "\
+module M where
+f (x :: Int) = eq x x
+g (y :: Int) = eq y y
+",
+            &mut env,
+            &ix,
+        );
+        let f = schemes.iter().find(|s| s.name == "f").unwrap();
+        let g = schemes.iter().find(|s| s.name == "g").unwrap();
+        assert_eq!(f.constraint_dicts.len(), 1);
+        assert_eq!(g.constraint_dicts.len(), 1);
+        // And the two spans must be distinct — pointing at the
+        // respective `eq` Var references.
+        let f_span = *f.constraint_dicts.keys().next().unwrap();
+        let g_span = *g.constraint_dicts.keys().next().unwrap();
+        assert_ne!(f_span, g_span);
+        let _ = span_at(0, 0); // silence unused
+        let _ = Decl::Value {
+            span: span_at(0, 0),
+            name: crate::cst::Spanned {
+                span: span_at(0, 0),
+                value: crate::names::value_name("_"),
+            },
+            binders: vec![],
+            guarded: crate::cst::GuardedExpr::Unconditional(Box::new(
+                crate::cst::Expr::Literal {
+                    span: span_at(0, 0),
+                    lit: crate::cst::Literal::Int(0),
+                },
+            )),
+            where_clause: vec![],
+            doc_comments: vec![],
+        }; // silence unused Decl import
+    }
+
+    #[test]
+    fn resolved_context_dict_also_carries_instance_idx() {
+        // `instance Eq a => Eq (Maybe a)` at idx 0, `instance Eq
+        // Int` at idx 1 of the Eq candidates. Solving `Eq (Maybe
+        // Int)` resolves the outer (idx 0) and the context (idx 1);
+        // both dicts should carry their respective indices.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        // Insert in this order so indices are predictable.
+        ix.insert(Instance {
+            class: QName::unqualified("Eq"),
+            types: vec![maybe_ty(Type::Var("a".into()))],
+            context: vec![Constraint {
+                class: QName::unqualified("Eq"),
+                args: vec![Type::Var("a".into())],
+            }],
+            vars: vec!["a".into()],
+            chained: false,
+        });
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let pc = mk_pending_for("f", "Eq", vec![maybe_ty(int_ty())]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        let dicts = report.dicts.get("f").unwrap();
+        assert_eq!(dicts.len(), 2);
+        let indices: std::collections::HashSet<usize> =
+            dicts.iter().map(|d| d.instance_idx).collect();
+        assert!(indices.contains(&0), "expected outer idx 0 in {dicts:?}");
+        assert!(indices.contains(&1), "expected context idx 1 in {dicts:?}");
     }
 
     #[test]

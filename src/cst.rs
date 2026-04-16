@@ -370,7 +370,7 @@ pub struct ClassMember {
 }
 
 /// Operator associativity
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Associativity {
     Left,
     Right,

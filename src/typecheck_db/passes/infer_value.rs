@@ -73,6 +73,23 @@ pub struct InferredScheme {
     #[serde(default)]
     pub constraint_errors:
         Vec<crate::typecheck_db::passes::constraints::ConstraintError>,
+    /// Phase E: per-call-site lookup. Keyed by the `Var`
+    /// reference's span (the site the constraint was born at, not
+    /// the instance's span), mapped to the `ResolvedDict` that
+    /// satisfies it. Codegen consults this to emit the right dict
+    /// reference at each use.
+    ///
+    /// Context-induced sub-constraints pushed by the recursive
+    /// solver inherit their parent's span — they land in this map
+    /// too, but the caller stores only the last resolution per
+    /// span (outer over context) since codegen only emits a
+    /// reference once per site and recovers the sub-dicts from
+    /// `ResolvedDict::context` on demand.
+    #[serde(default)]
+    pub constraint_dicts: std::collections::HashMap<
+        crate::span::Span,
+        crate::typecheck_db::passes::constraints::ResolvedDict,
+    >,
 }
 
 /// Case / multi-equation pattern match recorded during inference so
@@ -346,6 +363,7 @@ pub fn infer_value_scc_with_all(
     );
     let crate::typecheck_db::passes::constraints::SolveReport {
         mut dicts,
+        mut dicts_by_span,
         mut errors,
         deferred,
     } = report;
@@ -369,6 +387,7 @@ pub fn infer_value_scc_with_all(
         let resolved_dicts = dicts.remove(name).unwrap_or_default();
         let constraint_errors = errors.remove(name).unwrap_or_default();
         let pending_constraints = deferred_by_decl.remove(name).unwrap_or_default();
+        let constraint_dicts = dicts_by_span.remove(name).unwrap_or_default();
         out.push(InferredScheme {
             name: name.clone(),
             scheme,
@@ -376,6 +395,7 @@ pub fn infer_value_scc_with_all(
             pending_constraints,
             resolved_dicts,
             constraint_errors,
+            constraint_dicts,
         });
     }
 

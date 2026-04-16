@@ -38,7 +38,7 @@ use crate::typecheck_db::types::Type;
 /// Everything the exhaustiveness checker needs to know about one
 /// constructor. Populated from [`crate::typecheck_db::passes::ctor_details`]
 /// outputs across every data type in scope.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CtorInfo {
     /// Name of the parent `data`/`newtype`.
     pub parent_type: String,
