@@ -16,9 +16,9 @@
 //! After desugar, the resulting [`Decl`] is guaranteed to not contain any of
 //! these forms, and downstream passes can rely on that invariant.
 //!
-//! **Current state (MDb)**: signed literals, operator sections, and
-//! record-literal wildcards are lowered. Do/ado, multi-equation, and
-//! operator rebracketing remain for MDc..MDe.
+//! **Current state (MDc)**: signed literals, operator sections,
+//! record-literal wildcards, and do/ado are all lowered. Multi-equation
+//! merging and operator rebracketing remain for MDd..MDe.
 
 use crate::cst::Decl;
 
@@ -26,6 +26,7 @@ pub mod walk;
 pub mod signed;
 pub mod sections;
 pub mod records;
+pub mod do_notation;
 
 /// Module-scoped inputs that can steer the desugar pipeline.
 ///
@@ -46,13 +47,18 @@ pub struct DesugarContext {
 /// cache keys depend on the output's content hash.
 pub fn desugar(decl: &Decl, _ctx: &DesugarContext) -> Decl {
     let d = decl.clone();
-    // Order matters: handle sections first so that wildcards inside
-    // operator / backtick / app positions become lambdas before
-    // `records` looks for record-literal wildcards (it should only see
-    // wildcards that were still sitting in a `Record { .. }` value slot).
+    // Order matters:
+    // 1. `sections` first — eliminate wildcards in Op/App/BacktickApp so
+    //    later passes see clean shapes.
+    // 2. `records` — eliminate wildcards inside record literals.
+    // 3. `signed` — Expr::Negate → negate application.
+    // 4. `do_notation` — do/ado statements → bind / map / apply. Runs
+    //    late enough that the inner expressions have already been
+    //    simplified by the earlier passes.
     let d = sections::desugar_decl(d);
     let d = records::desugar_decl(d);
     let d = signed::desugar_decl(d);
+    let d = do_notation::desugar_decl(d);
     d
 }
 
