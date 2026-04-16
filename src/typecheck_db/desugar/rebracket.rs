@@ -133,6 +133,12 @@ fn rewrite_node(e: Expr, fixity: &FixityTable) -> Expr {
                 span,
                 name: target_var(info, span),
             },
+            // Preserved by design: at the desugar stage we can't tell
+            // whether a missing fixity entry means "imported module's
+            // fixity decls aren't loaded yet", "user forgot to declare
+            // the operator", or "typo". Leave the node as-is so the
+            // later name-resolution / typecheck passes can surface a
+            // precise error with the original span.
             None => Expr::OpParens { span, op },
         },
         other => other,
@@ -263,8 +269,16 @@ fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: S
                     Expr::Var { span, name: qualified }
                 }
                 None => {
-                    // Symbolic op with no fixity decl in scope — preserve
-                    // the Op so downstream emits a targeted error.
+                    // Preserved by design: a symbolic operator whose
+                    // fixity decl isn't in the table today might be
+                    // (a) defined in an import whose metadata hasn't
+                    // loaded yet during an incremental build, (b)
+                    // genuinely undeclared, or (c) a typo. We can't
+                    // distinguish at the desugar stage — panicking
+                    // would break case (a), and silently fabricating
+                    // a target would hide cases (b)/(c). Leave the Op
+                    // node intact; the downstream typechecker has the
+                    // right context to surface a precise error.
                     return Expr::Op {
                         span,
                         left: Box::new(left),
