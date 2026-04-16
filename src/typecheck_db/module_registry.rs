@@ -174,6 +174,52 @@ pub fn distill_exports(
     let mut scheme_by_name: HashMap<String, Scheme> = HashMap::new();
     for d in &module.decls {
         match d {
+            Decl::Class { name, type_vars, members, .. } => {
+                // Class methods get a constrained scheme:
+                // `forall (class + method vars). C <class vars>
+                //  => <method type>`. Without this they never
+                // appear in ModuleExports.values and downstream
+                // imports fail with UnknownValue.
+                let class_name =
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let class_vars: Vec<String> = type_vars
+                    .iter()
+                    .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
+                    .collect();
+                for m in members {
+                    let method_name =
+                        crate::typecheck_db::util::resolve_symbol(m.name.value.symbol());
+                    let method_ty = crate::typecheck_db::types::convert_type_expr(
+                        &m.ty,
+                        &crate::typecheck_db::types::TypeOpMap::default(),
+                    );
+                    let (method_vars, method_body) = match method_ty {
+                        Type::Forall(qs, body) => {
+                            let ns: Vec<String> =
+                                qs.into_iter().map(|(n, _, _)| n).collect();
+                            (ns, *body)
+                        }
+                        other => (Vec::new(), other),
+                    };
+                    let constraint = crate::typecheck_db::types::Constraint {
+                        class: crate::typecheck_db::types::QName::unqualified(
+                            &class_name,
+                        ),
+                        args: class_vars
+                            .iter()
+                            .map(|v| Type::Var(v.clone()))
+                            .collect(),
+                    };
+                    let constrained =
+                        Type::Constrained(vec![constraint], Box::new(method_body));
+                    let mut all_vars = class_vars.clone();
+                    all_vars.extend(method_vars);
+                    scheme_by_name.insert(
+                        method_name,
+                        Scheme { vars: all_vars, ty: constrained },
+                    );
+                }
+            }
             Decl::Foreign { name, ty, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let declared = crate::typecheck_db::types::convert_type_expr(
@@ -307,7 +353,7 @@ pub fn distill_exports(
     match &module.exports {
         None => {
             // Export everything.
-            out.values = scheme_by_name;
+            out.values = scheme_by_name.clone();
             for (name, info) in ctor_info {
                 out.ctors.insert(name.clone(), info.clone());
             }
@@ -316,10 +362,20 @@ pub fn distill_exports(
             for (name, info) in class_info {
                 out.classes.insert(name.clone(), info.clone());
             }
-            out.value_fixities = value_fixities_all;
+            out.value_fixities = value_fixities_all.clone();
             out.type_fixities = type_fixities_all;
             out.newtypes = newtypes_all;
             out.type_arities = type_arities_all;
+            // Make operators importable under their own name by
+            // cross-referencing their fixity's target's scheme.
+            // `import M (<<<)` parses as `Import::Value("<<<")`;
+            // without this alias the importer can't find `<<<` in
+            // `values`.
+            for (op, fx) in &value_fixities_all {
+                if let Some(scheme) = scheme_by_name.get(&fx.target_name) {
+                    out.values.insert(op.clone(), scheme.clone());
+                }
+            }
         }
         Some(spanned) => {
             for item in &spanned.value.exports {
@@ -327,7 +383,17 @@ pub fn distill_exports(
                     Export::Value(vn) => {
                         let name = crate::typecheck_db::util::resolve_symbol(vn.symbol());
                         if let Some(s) = scheme_by_name.get(&name) {
-                            out.values.insert(name, s.clone());
+                            out.values.insert(name.clone(), s.clone());
+                        } else if let Some(fx) = value_fixities_all.get(&name) {
+                            // Operator alias: `(&&)` → fixity decl
+                            // names `&&` with `conj` as target.
+                            // Expose `&&` in `values` with the
+                            // target's scheme plus copy the fixity
+                            // itself so importers can use both.
+                            if let Some(s) = scheme_by_name.get(&fx.target_name) {
+                                out.values.insert(name.clone(), s.clone());
+                            }
+                            out.value_fixities.insert(name, fx.clone());
                         }
                     }
                     Export::Type(tn, members) => {

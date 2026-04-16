@@ -122,7 +122,13 @@ fn check_one_module(
     // + `f (Just x) = …`) collapse into a single `case`-bodied
     // decl, which is what the inference + exhaustiveness passes
     // expect.
-    let ctx = DesugarContext::default();
+    //
+    // The desugar context carries the module's visible fixity
+    // table (local decls + imported operator fixities from every
+    // resolved import). Without this, MDe's rebracketer would
+    // leave `Op` nodes intact for every imported operator,
+    // which the inferencer flags as `Unsupported("operator")`.
+    let ctx = build_desugar_context(module, registry);
     let desugared: Vec<cst::Decl> = desugar_module(module.decls.clone(), &ctx);
 
     // 3) Build data_constructors + ctor_details from local decls
@@ -303,6 +309,87 @@ fn collect_decl_scope(
 /// For every local data / newtype constructor, synthesize its
 /// value scheme (`forall a. f1 -> ... -> fn -> T a b ...`) and
 /// bind it under its simple name in the env.
+/// Assemble the desugar context for one module: merges fixity
+/// entries from every import (and the module's own `Decl::Fixity`
+/// decls) into a single `FixityTable` so MDe can rebracket
+/// operator chains using real precedence info.
+fn build_desugar_context(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> DesugarContext {
+    use crate::typecheck_db::desugar::{fixity_table_from_decls, FixityInfo, FixityTable};
+
+    // Start with a local fixity table built from the module's
+    // own `Decl::Fixity`. `fixity_table_from_decls` already does
+    // the work; it also stamps the module_fixity_hash for us via
+    // `DesugarContext::module_fixity_hash` below.
+    let (mut table, _local_hash) =
+        fixity_table_from_decls(&module.decls);
+
+    // Merge every imported module's value_fixities. We look up
+    // each import's target in the registry rather than walking
+    // Prim submodules (Prim defines no operators).
+    for imp in &module.imports {
+        let target_name = imp
+            .module
+            .parts
+            .iter()
+            .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+            .collect::<Vec<_>>()
+            .join(".");
+        let target = match registry.get(&target_name) {
+            Some(t) => t,
+            None => continue,
+        };
+        for (op_name, fx) in &target.value_fixities {
+            let op_sym = crate::interner::intern(op_name);
+            let target_module_sym =
+                fx.target_module.as_deref().map(crate::interner::intern);
+            let target_name_sym = crate::interner::intern(&fx.target_name);
+            table.insert(
+                op_sym,
+                FixityInfo {
+                    associativity: fx.associativity,
+                    precedence: fx.precedence,
+                    target_module: target_module_sym,
+                    target_name: target_name_sym,
+                },
+            );
+        }
+    }
+
+    // Re-hash after the imported fixities land so the module's
+    // module_fixity_hash reflects the full visible set.
+    let combined_hash = hash_fixity_table(&table);
+    DesugarContext { module_fixity_hash: combined_hash, fixity_table: table }
+}
+
+fn hash_fixity_table(
+    table: &crate::typecheck_db::desugar::FixityTable,
+) -> [u8; 32] {
+    use string_interner::Symbol as _;
+    let mut h = blake3::Hasher::new();
+    h.update(b"driver_multi::fixity_hash_v1");
+    let mut entries: Vec<_> = table.iter().collect();
+    entries.sort_by_key(|(k, _)| k.to_usize() as u32);
+    h.update(&(entries.len() as u32).to_le_bytes());
+    for (k, v) in entries {
+        h.update(&(k.to_usize() as u32).to_le_bytes());
+        h.update(&[v.associativity as u8, v.precedence]);
+        match v.target_module {
+            None => {
+                h.update(&[0u8]);
+            }
+            Some(m) => {
+                h.update(&[1u8]);
+                h.update(&(m.to_usize() as u32).to_le_bytes());
+            }
+        }
+        h.update(&(v.target_name.to_usize() as u32).to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
 fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
     use crate::typecheck_db::types::{QName, Scheme, Type};
     let type_ops = TypeOpMap::default();

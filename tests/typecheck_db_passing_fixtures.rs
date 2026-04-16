@@ -154,29 +154,56 @@ fn run_fixture_check() {
         }
     }
 
-    // Per-module diagnostics. Fail on the first concrete issue
-    // and print enough context to locate it.
+    // Per-module diagnostics. Aggregate every failure rather than
+    // fail on the first — that way the run surfaces the whole
+    // gap surface, not just the deepest visible bug.
+    let mut failures: Vec<(String, String)> = Vec::new();
     for result in &report.results {
         if let Some(err) = &result.inference_error {
-            panic!("{}: inference error: {err:?}", result.name);
+            failures.push((result.name.clone(), format!("infer: {err:?}")));
+            continue;
         }
         if let Some(ie) = result.import_errors.first() {
-            panic!(
-                "{}: import error: {:?} (span {:?})",
-                result.name, ie.kind, ie.span,
-            );
+            failures.push((
+                result.name.clone(),
+                format!("import: {:?}", ie.kind),
+            ));
+            continue;
         }
         if let Some(ne) = result.exhaustiveness_errors.first() {
-            panic!(
-                "{}: non-exhaustive {} — missing {:?}",
-                result.name, ne.type_name, ne.missing,
-            );
+            failures.push((
+                result.name.clone(),
+                format!("non-exhaustive {} (missing {:?})", ne.type_name, ne.missing),
+            ));
+            continue;
         }
         if let Some(ce) = result.constraint_errors.first() {
-            panic!(
-                "{}: constraint error {:?}: {}",
-                result.name, ce.kind, ce.constraint.class.name,
-            );
+            failures.push((
+                result.name.clone(),
+                format!(
+                    "constraint {:?}: {}",
+                    ce.kind, ce.constraint.class.name,
+                ),
+            ));
+            continue;
         }
     }
+
+    let total = report.results.len();
+    let failing = failures.len();
+    let passing = total - failing;
+    eprintln!("=== fixture acceptance summary ===");
+    eprintln!("modules processed: {total}");
+    eprintln!("passing: {passing}");
+    eprintln!("failing: {failing}");
+    if !failures.is_empty() {
+        eprintln!("--- first 10 failures:");
+        for (name, reason) in failures.iter().take(10) {
+            eprintln!("  {name}: {reason}");
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{failing}/{total} modules failed acceptance check",
+    );
 }
