@@ -15,6 +15,7 @@ pub mod env;
 pub mod generalize;
 pub mod desugar;
 pub mod module_registry;
+pub mod prim;
 pub mod passes;
 
 pub use driver::{CacheOutcome, TypecheckDb};
