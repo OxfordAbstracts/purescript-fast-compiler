@@ -5,9 +5,10 @@
 //! - M4b: `If`, `Let` (with let-polymorphism).
 //! - M4c: `Case` with constructor / `As` / literal / typed patterns, plus
 //!   both `Unconditional` and `Guarded` alternative bodies.
+//! - M4d: records — literals (including puns), field access, field
+//!   update; `Binder::Record` patterns.
 //!
-//! Later sub-milestones fill in `Do`/`Ado` (M4d) and records (M4e). Each new
-//! form is additive — a new match arm plus its helper.
+//! Later sub-milestones fill in arrays and any remaining cleanup.
 //!
 //! The entry point is `infer_value_scc`, which corresponds to the
 //! `infer_value_scc` nanopass in the plan: given an SCC of top-level
@@ -85,12 +86,16 @@ pub fn infer_expr(
             infer_let(state, env, type_ops, bindings, body)
         }
         Expr::Case { exprs, alts, .. } => infer_case(state, env, type_ops, exprs, alts),
+        Expr::Record { fields, .. } => infer_record(state, env, type_ops, fields),
+        Expr::RecordAccess { expr, field, .. } => {
+            infer_record_access(state, env, type_ops, expr, field)
+        }
+        Expr::RecordUpdate { expr, updates, .. } => {
+            infer_record_update(state, env, type_ops, expr, updates)
+        }
 
         // Forms reserved for later sub-milestones.
         Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
-        Expr::Record { .. } | Expr::RecordAccess { .. } | Expr::RecordUpdate { .. } => {
-            Err(InferError::Unsupported("record"))
-        }
         Expr::Op { .. } | Expr::OpParens { .. } | Expr::BacktickApp { .. } => {
             Err(InferError::Unsupported("operator"))
         }
@@ -237,11 +242,50 @@ fn infer_app(
     func: &Expr,
     arg: &Expr,
 ) -> Result<Type, InferError> {
+    // The parser emits record updates (`r { x = 1 }`) as
+    // `App(r, Record { fields: [RecordField{..., is_update: true}] })`,
+    // not as `Expr::RecordUpdate`. Recognize that shape here so the
+    // record-update inference path gets the same treatment as the
+    // direct CST variant.
+    if let Expr::Record { fields, .. } = arg {
+        if !fields.is_empty() && fields.iter().all(|f| f.is_update) {
+            return infer_record_update_from_fields(state, env, type_ops, func, fields);
+        }
+    }
     let func_ty = infer_expr(state, env, type_ops, func)?;
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
     let result = state.fresh();
     state.unify(&func_ty, &Type::fun(arg_ty, result.clone()))?;
     Ok(result)
+}
+
+/// Shared helper: given an "expression being updated" and a list of
+/// `RecordField`s representing the updates, unify against an open record
+/// and return the updated record's type. Used both from `infer_app`
+/// (where the parser emits `App(expr, Record{is_update})`) and from
+/// `infer_record_update` (where a later desugar pass emits the
+/// dedicated `Expr::RecordUpdate` form).
+fn infer_record_update_from_fields(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    expr: &Expr,
+    fields: &[cst::RecordField],
+) -> Result<Type, InferError> {
+    let expr_ty = infer_expr(state, env, type_ops, expr)?;
+    let mut update_fields: Vec<(String, Type)> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let label = crate::typecheck_db::util::resolve_symbol(f.label.value.symbol());
+        // A record update field always has a `value` (it's `x = expr`,
+        // not a pun).
+        let val = f.value.as_ref().expect("parser: update field must carry a value");
+        let new_val_ty = infer_expr(state, env, type_ops, val)?;
+        update_fields.push((label, new_val_ty));
+    }
+    let tail = state.fresh();
+    let expected = Type::Record(update_fields, Some(Box::new(tail)));
+    state.unify(&expr_ty, &expected)?;
+    Ok(expr_ty)
 }
 
 fn infer_lambda(
@@ -301,12 +345,38 @@ fn bind_pattern(
             env.bind_local(n, inner.clone());
             Ok(inner)
         }
-        // Record / Array / Op patterns: later sub-milestones (M4e and
-        // beyond).
-        Binder::Record { .. } => Err(InferError::UnsupportedBinder("record")),
+        Binder::Record { fields, .. } => bind_record_pattern(state, env, type_ops, fields),
+        // Array / Op patterns: future sub-milestones.
         Binder::Array { .. } => Err(InferError::UnsupportedBinder("array")),
         Binder::Op { .. } => Err(InferError::UnsupportedBinder("op")),
     }
+}
+
+/// Match `{ l1, l2: sub2, ... }` against an open record type. Pun
+/// fields (`{ l }`) bind `l` to a fresh unification var; explicit
+/// fields (`{ l: sub }`) recurse into the sub-binder.
+fn bind_record_pattern(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    fields: &[cst::RecordBinderField],
+) -> Result<Type, InferError> {
+    let mut field_tys: Vec<(String, Type)> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let label = crate::typecheck_db::util::resolve_symbol(f.label.value.symbol());
+        let ty = match &f.binder {
+            Some(b) => bind_pattern(state, env, type_ops, b)?,
+            None => {
+                // Pun: `{ x }` binds `x` with a fresh type.
+                let ty = state.fresh();
+                env.bind_local(label.clone(), ty.clone());
+                ty
+            }
+        };
+        field_tys.push((label, ty));
+    }
+    let tail = state.fresh();
+    Ok(Type::Record(field_tys, Some(Box::new(tail))))
 }
 
 /// Match a constructor pattern against its constructor's scheme.
@@ -349,6 +419,85 @@ fn bind_constructor_pattern(
         state.unify(&sub_ty, arg_ty)?;
     }
     Ok(cur)
+}
+
+// ============================================================================
+// M4d: records
+// ============================================================================
+
+fn infer_record(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    fields: &[cst::RecordField],
+) -> Result<Type, InferError> {
+    // A bare `Expr::Record` should only appear as a literal — fields
+    // with `is_update = true` are emitted by the parser exclusively
+    // under an `App` (record update) and are handled in `infer_app`.
+    // A standalone all-update record is a parser invariant violation.
+    assert!(
+        fields.iter().all(|f| !f.is_update),
+        "parser invariant: bare Expr::Record with update fields should appear under App",
+    );
+    let mut inferred: Vec<(String, Type)> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let label = crate::typecheck_db::util::resolve_symbol(f.label.value.symbol());
+        let field_ty = match &f.value {
+            Some(e) => infer_expr(state, env, type_ops, e)?,
+            None => {
+                // Pun: `{ x }` ≡ `{ x: x }`. Look up `x` in the env.
+                match env.lookup_unqualified(&label) {
+                    Lookup::Local(ty) => ty.clone(),
+                    Lookup::Scheme(s) => instantiate(state, s),
+                    Lookup::Missing => return Err(InferError::UnboundVar(label.clone())),
+                }
+            }
+        };
+        inferred.push((label, field_ty));
+    }
+    Ok(Type::Record(inferred, None))
+}
+
+fn infer_record_access(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    expr: &Expr,
+    field: &crate::cst::Spanned<crate::names::LabelName>,
+) -> Result<Type, InferError> {
+    let expr_ty = infer_expr(state, env, type_ops, expr)?;
+    let label = crate::typecheck_db::util::resolve_symbol(field.value.symbol());
+    let field_ty = state.fresh();
+    let tail = state.fresh();
+    let expected = Type::Record(
+        vec![(label, field_ty.clone())],
+        Some(Box::new(tail)),
+    );
+    state.unify(&expr_ty, &expected)?;
+    Ok(field_ty)
+}
+
+fn infer_record_update(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    expr: &Expr,
+    updates: &[cst::RecordUpdate],
+) -> Result<Type, InferError> {
+    let expr_ty = infer_expr(state, env, type_ops, expr)?;
+    // Infer the new value's type for each update field; the updated
+    // record must contain at least those labels with those types.
+    let mut update_fields: Vec<(String, Type)> = Vec::with_capacity(updates.len());
+    for u in updates {
+        let label = crate::typecheck_db::util::resolve_symbol(u.label.value.symbol());
+        let new_val_ty = infer_expr(state, env, type_ops, &u.value)?;
+        update_fields.push((label, new_val_ty));
+    }
+    let tail = state.fresh();
+    let expected = Type::Record(update_fields, Some(Box::new(tail)));
+    state.unify(&expr_ty, &expected)?;
+    // Record update preserves the record's shape.
+    Ok(expr_ty)
 }
 
 fn infer_if(
@@ -1098,6 +1247,176 @@ foo x | x = 1
         // Instead, test by requiring the scheme to end with "Boolean -> Int".
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
         assert_eq!(scheme_display(&schemes[0].scheme), "(Boolean -> Int)");
+    }
+
+    // ------------------------------------------------------------------
+    // M4d: records
+    // ------------------------------------------------------------------
+
+    fn string_ty() -> Type {
+        Type::Con(QName::unqualified("String"))
+    }
+
+    #[test]
+    fn record_literal_infers_closed_record() {
+        let src = "module M where\nr = { x: 1, y: \"hi\" }\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        if let Type::Record(fields, tail) = &schemes[0].scheme.ty {
+            assert!(tail.is_none(), "literal record should be closed");
+            let labels: Vec<_> = fields.iter().map(|(l, _)| l.as_str()).collect();
+            assert!(labels.contains(&"x"));
+            assert!(labels.contains(&"y"));
+        } else {
+            panic!("expected Record, got {:?}", schemes[0].scheme.ty);
+        }
+    }
+
+    #[test]
+    fn record_pun_looks_up_outer_binding() {
+        // `r = { x }` resolves `x` from the surrounding env.
+        let src = "module M where\nx = 1\nr = { x }\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        let r = schemes.iter().find(|s| s.name == "r").unwrap();
+        assert_eq!(scheme_display(&r.scheme), "{ x :: Int }");
+    }
+
+    #[test]
+    fn record_pun_unbound_is_error() {
+        let src = "module M where\nr = { y }\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let err = infer_value_scc(&ops, &mut env, &decls).unwrap_err();
+        assert!(matches!(&err, InferError::UnboundVar(n) if n == "y"), "got: {err:?}");
+    }
+
+    #[test]
+    fn record_access_constrains_record_via_open_row() {
+        // `f r = r.x` should infer `forall a t. { x :: a | t } -> a`.
+        let src = "module M where\nf r = r.x\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        // The type should be a function from an open-record (with an `x`
+        // field) to that x's type.
+        if let Type::Fun(arg, ret) = &schemes[0].scheme.ty {
+            if let Type::Record(fields, tail) = arg.as_ref() {
+                assert!(tail.is_some(), "access constrains only the x field");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].0, "x");
+                // Field type should match the return.
+                assert_eq!(&fields[0].1, ret.as_ref());
+            } else {
+                panic!("expected Record arg, got {arg:?}");
+            }
+        } else {
+            panic!("expected Fun, got {:?}", schemes[0].scheme.ty);
+        }
+    }
+
+    #[test]
+    fn record_access_on_record_with_extra_fields_works() {
+        // `r :: { x :: Int, y :: String }`, `r.x` must yield Int.
+        let src = "module M where\nv = (r :: { x :: Int, y :: String }).x\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        env.bind_scheme(
+            QName::unqualified("r"),
+            Scheme::mono(Type::Record(
+                vec![("x".into(), int()), ("y".into(), string_ty())],
+                None,
+            )),
+        );
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "Int");
+    }
+
+    #[test]
+    fn record_update_preserves_record_type() {
+        // `f r = r { x = 1 }` has the same type as `f :: { x :: Int | t } -> { x :: Int | t }`.
+        let src = "module M where\nf r = r { x = 1 }\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        if let Type::Fun(arg, ret) = &schemes[0].scheme.ty {
+            assert_eq!(arg, ret, "update preserves record shape");
+        } else {
+            panic!("expected Fun, got {:?}", schemes[0].scheme.ty);
+        }
+    }
+
+    #[test]
+    fn record_update_on_wrong_field_type_errors() {
+        // `r :: { x :: Int }`; `r { x = "hi" }` must fail — String doesn't
+        // unify with the existing Int field type.
+        let src = "module M where\nv = r { x = \"hi\" }\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        env.bind_scheme(
+            QName::unqualified("r"),
+            Scheme::mono(Type::Record(vec![("x".into(), int())], None)),
+        );
+        let err = infer_value_scc(&ops, &mut env, &decls).unwrap_err();
+        assert!(matches!(err, InferError::Unify(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn record_pattern_pun_binds_fresh_vars() {
+        // `\{x, y} -> x` should infer `forall a b t. { x :: a, y :: b | t } -> a`.
+        let src = "module M where\nf = \\{x, y} -> x\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        if let Type::Fun(arg, _) = &schemes[0].scheme.ty {
+            if let Type::Record(fields, tail) = arg.as_ref() {
+                assert!(tail.is_some());
+                let labels: Vec<_> = fields.iter().map(|(l, _)| l.as_str()).collect();
+                assert!(labels.contains(&"x"));
+                assert!(labels.contains(&"y"));
+            } else {
+                panic!("expected Record, got {arg:?}");
+            }
+        } else {
+            panic!("expected Fun, got {:?}", schemes[0].scheme.ty);
+        }
+    }
+
+    #[test]
+    fn record_pattern_explicit_field_recurses() {
+        // `\{x: y} -> y` — x must be bound but locally named `y`.
+        let src = "module M where\nf = \\{x: y} -> y\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        // Just check the shape compiles; the scheme is
+        // `forall a t. { x :: a | t } -> a`.
+        match &schemes[0].scheme.ty {
+            Type::Fun(arg, _) => {
+                assert!(matches!(arg.as_ref(), Type::Record(fs, Some(_)) if fs.len() == 1));
+            }
+            other => panic!("expected Fun, got {other:?}"),
+        }
     }
 
     #[test]

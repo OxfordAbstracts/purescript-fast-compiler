@@ -146,6 +146,18 @@ impl Default for UnifyState {
     }
 }
 
+/// Row / record unification with open tails.
+///
+/// Given two record (or row) types `{ f1 | t1 }` and `{ f2 | t2 }`:
+///
+/// 1. For every label present in both: unify the two field types.
+/// 2. Labels only on one side must be absorbed by the other side's tail.
+///    A closed tail (`None`) can't absorb extras — that's a mismatch. An
+///    open tail (`Some(_)`) gets unified with a synthesized row fragment
+///    carrying the missing labels.
+/// 3. When both sides have unique labels, a fresh common tail mediates:
+///    each side's tail is solved to the other side's unique labels plus
+///    the fresh tail.
 fn unify_fields(
     state: &mut UnifyState,
     f1: &[(String, Type)],
@@ -153,25 +165,79 @@ fn unify_fields(
     f2: &[(String, Type)],
     t2: &Option<Box<Type>>,
 ) -> Result<(), UnifyError> {
-    // For M4a we only see closed record/row unification (no open tails yet
-    // — records arrive in M4e). Keep the simple version; M4e will extend.
-    if f1.len() != f2.len() || !(t1.is_none() && t2.is_none()) {
-        return Err(UnifyError::Mismatch(
-            Type::Record(f1.to_vec(), t1.clone()),
-            Type::Record(f2.to_vec(), t2.clone()),
-        ));
-    }
-    let mut f1: Vec<_> = f1.iter().collect();
-    let mut f2: Vec<_> = f2.iter().collect();
-    f1.sort_by(|a, b| a.0.cmp(&b.0));
-    f2.sort_by(|a, b| a.0.cmp(&b.0));
-    for ((l1, t1), (l2, t2)) in f1.iter().zip(f2.iter()) {
-        if l1 != l2 {
-            return Err(UnifyError::Mismatch(t1.clone(), t2.clone()));
+    use std::collections::HashMap;
+
+    let m1: HashMap<&str, &Type> = f1.iter().map(|(l, t)| (l.as_str(), t)).collect();
+    let m2: HashMap<&str, &Type> = f2.iter().map(|(l, t)| (l.as_str(), t)).collect();
+
+    // Step 1: unify common labels.
+    for (l, t1v) in &m1 {
+        if let Some(t2v) = m2.get(l) {
+            state.unify(t1v, t2v)?;
         }
-        state.unify(t1, t2)?;
     }
-    Ok(())
+
+    let only1: Vec<(String, Type)> = f1
+        .iter()
+        .filter(|(l, _)| !m2.contains_key(l.as_str()))
+        .cloned()
+        .collect();
+    let only2: Vec<(String, Type)> = f2
+        .iter()
+        .filter(|(l, _)| !m1.contains_key(l.as_str()))
+        .cloned()
+        .collect();
+
+    match (only1.is_empty(), only2.is_empty()) {
+        (true, true) => unify_opt_tails(state, t1, t2),
+        (false, true) => absorb_extras(state, t2, only1, t1.clone()),
+        (true, false) => absorb_extras(state, t1, only2, t2.clone()),
+        (false, false) => {
+            let fresh = state.fresh();
+            absorb_extras(state, t1, only2, Some(Box::new(fresh.clone())))?;
+            absorb_extras(state, t2, only1, Some(Box::new(fresh)))
+        }
+    }
+}
+
+fn unify_opt_tails(
+    state: &mut UnifyState,
+    t1: &Option<Box<Type>>,
+    t2: &Option<Box<Type>>,
+) -> Result<(), UnifyError> {
+    match (t1, t2) {
+        (None, None) => Ok(()),
+        (Some(a), Some(b)) => state.unify(a, b),
+        // Closed vs open: the open tail must resolve to the empty
+        // closed row.
+        (Some(t), None) | (None, Some(t)) => state.unify(t, &Type::Record(vec![], None)),
+    }
+}
+
+/// `t` must end up containing exactly `extras`, with `rest` as its own
+/// (possibly open) tail. If `t` is closed, it can only match if there
+/// are no extras and `rest` is also closed.
+fn absorb_extras(
+    state: &mut UnifyState,
+    t: &Option<Box<Type>>,
+    extras: Vec<(String, Type)>,
+    rest: Option<Box<Type>>,
+) -> Result<(), UnifyError> {
+    match t {
+        Some(tail) => state.unify(tail, &Type::Record(extras, rest)),
+        None => {
+            if !extras.is_empty() {
+                return Err(UnifyError::Mismatch(
+                    Type::Record(vec![], None),
+                    Type::Record(extras, rest),
+                ));
+            }
+            match rest {
+                None => Ok(()),
+                Some(r) => state.unify(&r, &Type::Record(vec![], None)),
+            }
+        }
+    }
 }
 
 fn occurs_in(id: u32, ty: &Type) -> bool {
