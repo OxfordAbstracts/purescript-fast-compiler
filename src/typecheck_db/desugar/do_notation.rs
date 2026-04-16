@@ -70,16 +70,20 @@ fn rewrite_node(e: Expr) -> Expr {
 // ---------------------------------------------------------------------------
 
 fn desugar_do(span: Span, module: Option<ModuleQualifier>, statements: Vec<DoStatement>) -> Expr {
-    // A well-formed `do` ends in a `Discard` (the result expression). If
-    // the last statement is a Bind or Let we emit a hole so the user gets
-    // a reasonable error later; the parser normally rejects this shape.
-    if statements.is_empty() {
-        return hole(span, "empty_do");
-    }
+    // Every `do`-block the parser emits is non-empty and ends with a
+    // `Discard` (the result expression). Any other shape is a parser
+    // invariant violation — panic immediately so the break is easy to
+    // locate rather than surfacing a garbled AST downstream.
+    assert!(
+        !statements.is_empty(),
+        "parser invariant violated: Do block with zero statements at {span:?}",
+    );
     let mut it = statements.into_iter().rev();
-    let mut acc: Expr = match it.next().unwrap() {
+    let mut acc: Expr = match it.next().expect("at least one statement, checked above") {
         DoStatement::Discard { expr, .. } => expr,
-        DoStatement::Bind { .. } | DoStatement::Let { .. } => return hole(span, "do_missing_result"),
+        other => unreachable!(
+            "parser invariant violated: last statement of a Do block must be Discard, got {other:?} at {span:?}",
+        ),
     };
     for s in it {
         acc = wrap_do_stmt(module, s, acc);
@@ -258,12 +262,6 @@ fn apply2(span: Span, func: Expr, a: Expr, b: Expr) -> Expr {
     apply1(span, apply1(span, func, a), b)
 }
 
-fn hole(span: Span, name: &str) -> Expr {
-    Expr::Hole {
-        span,
-        name: value_name(name),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
