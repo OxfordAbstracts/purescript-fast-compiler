@@ -294,45 +294,12 @@ fn collect_decl_scope(
             }
         }
     }
-    let mut local_instances: Vec<Instance> = Vec::new();
-    for (_, inst_list) in collect_classes(&local_ix) {
-        for inst in inst_list {
-            local_instances.push(inst.clone());
-        }
-    }
+    let local_instances: Vec<Instance> = local_ix
+        .all_instances()
+        .map(|(_, i)| i.clone())
+        .collect();
 
     (data_constructors, ctor_details, local_classes, local_instances)
-}
-
-fn collect_classes<'a>(
-    ix: &'a InstanceIndex,
-) -> Vec<(&'a str, Vec<&'a Instance>)> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut out: Vec<(&str, Vec<&Instance>)> = Vec::new();
-    // Iterate the index via a public accessor; for now use a
-    // workaround: candidates() returns a slice, but we need all
-    // class names. Prim classes have no instances so we only need
-    // to discover classes that have at least one candidate — a
-    // fine approximation until `InstanceIndex` exposes a class
-    // iterator directly.
-    for class in candidate_class_names(ix) {
-        if seen.insert(class) {
-            let cands: Vec<&Instance> = ix.candidates(class).iter().collect();
-            out.push((class, cands));
-        }
-    }
-    out
-}
-
-fn candidate_class_names(ix: &InstanceIndex) -> Vec<&str> {
-    // Access via a bit of reflection: we know `candidates()` is
-    // keyed by name, but there's no `classes()` iterator yet.
-    // A full iterator would require a public API change; for
-    // now, start with an empty list — the caller merges
-    // instances via another path (local_instances accumulator
-    // built from `from_decls` in `collect_decl_scope`).
-    let _ = ix;
-    Vec::new()
 }
 
 /// For every local data / newtype constructor, synthesize its
@@ -343,6 +310,42 @@ fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
     let type_ops = TypeOpMap::default();
     for d in decls {
         match d {
+            cst::Decl::Foreign { name, ty, .. } => {
+                // `foreign import foo :: Type` — FFI value binding.
+                // Put its declared type into the env so downstream
+                // references resolve.
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let declared = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
+                // Strip a leading Forall into the scheme's vars
+                // field so generalization / instantiation treats
+                // quantifiers the standard way.
+                let (vars, body) = match declared {
+                    Type::Forall(qs, body) => {
+                        let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
+                        (names, *body)
+                    }
+                    other => (Vec::new(), other),
+                };
+                env.bind_scheme(QName::unqualified(&n), Scheme { vars, ty: body });
+            }
+            cst::Decl::TypeSignature { name, ty, .. } => {
+                // A top-level `foo :: T` before `foo = …` — bind
+                // the declared scheme so mutual references pick
+                // up the annotated shape. Phase-4-era inference
+                // currently ignores these signatures and infers
+                // fresh; this is an improvement that lets
+                // cross-module references settle faster.
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let declared = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
+                let (vars, body) = match declared {
+                    Type::Forall(qs, body) => {
+                        let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
+                        (names, *body)
+                    }
+                    other => (Vec::new(), other),
+                };
+                env.bind_scheme(QName::unqualified(&n), Scheme { vars, ty: body });
+            }
             cst::Decl::Data { name, type_vars, constructors, .. } => {
                 let type_name =
                     crate::typecheck_db::util::resolve_symbol(name.value.symbol());
@@ -382,6 +385,52 @@ fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
                 let scheme_ty = Type::fun(field_ty, result_ty);
                 let scheme = Scheme { vars: tvars.clone(), ty: scheme_ty };
                 env.bind_scheme(QName::unqualified(&ctor_name), scheme);
+            }
+            cst::Decl::Class { name, type_vars, members, .. } => {
+                // Expose each class method as a constrained scheme:
+                // `forall (class vars + method vars). C <class vars>
+                //  => <method type>`. The `Type::Constrained` layer
+                // is what `infer_var`'s
+                // `instantiate_and_record_constraints` peels at
+                // each call site to register a pending
+                // constraint.
+                let class_name =
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let class_vars: Vec<String> = type_vars
+                    .iter()
+                    .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
+                    .collect();
+                for m in members {
+                    let method_name =
+                        crate::typecheck_db::util::resolve_symbol(m.name.value.symbol());
+                    let method_ty = crate::typecheck_db::types::convert_type_expr(
+                        &m.ty,
+                        &type_ops,
+                    );
+                    let (method_vars, method_body) = match method_ty {
+                        Type::Forall(qs, body) => {
+                            let ns: Vec<String> =
+                                qs.into_iter().map(|(n, _, _)| n).collect();
+                            (ns, *body)
+                        }
+                        other => (Vec::new(), other),
+                    };
+                    let constraint = crate::typecheck_db::types::Constraint {
+                        class: QName::unqualified(&class_name),
+                        args: class_vars
+                            .iter()
+                            .map(|v| Type::Var(v.clone()))
+                            .collect(),
+                    };
+                    let constrained_body =
+                        Type::Constrained(vec![constraint], Box::new(method_body));
+                    let mut all_vars = class_vars.clone();
+                    all_vars.extend(method_vars);
+                    env.bind_scheme(
+                        QName::unqualified(&method_name),
+                        Scheme { vars: all_vars, ty: constrained_body },
+                    );
+                }
             }
             _ => {}
         }

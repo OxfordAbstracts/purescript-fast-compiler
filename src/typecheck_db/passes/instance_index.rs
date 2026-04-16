@@ -155,6 +155,14 @@ impl InstanceIndex {
     pub fn coverage_errors(&self) -> &[CoverageError] {
         &self.coverage_errors
     }
+
+    /// Every `(class_name, instance)` pair the index holds, in
+    /// insertion order per class.
+    pub fn all_instances(&self) -> impl Iterator<Item = (&str, &Instance)> {
+        self.by_class
+            .iter()
+            .flat_map(|(class, list)| list.iter().map(move |i| (class.as_str(), i)))
+    }
 }
 
 // ---------------------------------------------------------------------------
