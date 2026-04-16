@@ -35,6 +35,12 @@ pub struct UnifyState {
     // change and crucially doesn't touch any existing test.
     pending_exhaust:
         Vec<crate::typecheck_db::passes::infer_value::PendingExhaust>,
+    // Constraint collection counterpart to `pending_exhaust`: every
+    // time `infer_var` peels a `Type::Constrained` off a freshly-
+    // instantiated scheme, the leftover constraint lands here and is
+    // drained by the SCC driver into the matching `InferredScheme`.
+    pending_constraints:
+        Vec<crate::typecheck_db::passes::constraints::PendingConstraint>,
     // Name of the decl currently being inferred; read by
     // `record_pending_exhaust` so each entry is attributed to the
     // right decl, routed into the matching `InferredScheme`.
@@ -46,8 +52,43 @@ impl UnifyState {
         Self {
             bindings: Vec::new(),
             pending_exhaust: Vec::new(),
+            pending_constraints: Vec::new(),
             current_decl: None,
         }
+    }
+
+    /// Push one pending constraint, stamping it with the current decl
+    /// name so the draining caller can route it to the right
+    /// `InferredScheme`.
+    pub fn record_pending_constraint(
+        &mut self,
+        mut entry: crate::typecheck_db::passes::constraints::PendingConstraint,
+    ) {
+        entry.decl_name = self.current_decl.clone();
+        self.pending_constraints.push(entry);
+    }
+
+    /// Drain every recorded pending constraint.
+    pub fn take_pending_constraints(
+        &mut self,
+    ) -> Vec<crate::typecheck_db::passes::constraints::PendingConstraint> {
+        std::mem::take(&mut self.pending_constraints)
+    }
+
+    /// Capture the current union-find bindings so a later
+    /// `restore_bindings` call can undo every unification performed
+    /// between the two points. Used by the instance-match trial
+    /// loop to reject a candidate without leaking partial bindings
+    /// into the outer state.
+    pub fn snapshot_bindings(&self) -> Vec<Option<Type>> {
+        self.bindings.clone()
+    }
+
+    /// Restore bindings previously captured via `snapshot_bindings`.
+    /// Safe only when the caller has kept the snapshot's lifetime
+    /// scoped to a single unification attempt.
+    pub fn restore_bindings(&mut self, snapshot: Vec<Option<Type>>) {
+        self.bindings = snapshot;
     }
 
     /// Scope-bind the "currently inferring" decl name. Used by

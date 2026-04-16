@@ -55,6 +55,24 @@ pub struct InferredScheme {
     #[serde(default)]
     pub exhaustiveness_errors:
         Vec<crate::typecheck_db::passes::exhaustiveness::NonExhaustive>,
+    /// Constraints collected from this decl's body but not yet
+    /// discharged. Populated by the M5 Phase A collector; Phase B's
+    /// solver consumes this and writes to `resolved_dicts` /
+    /// `constraint_errors` below.
+    #[serde(default)]
+    pub pending_constraints:
+        Vec<crate::typecheck_db::passes::constraints::PendingConstraint>,
+    /// Phase B: one entry per constraint the solver successfully
+    /// matched to an instance. Shallow dicts for now — Phase E
+    /// nests context resolutions.
+    #[serde(default)]
+    pub resolved_dicts:
+        Vec<crate::typecheck_db::passes::constraints::ResolvedDict>,
+    /// Phase B: unresolvable constraints (no matching instance in
+    /// scope, for now).
+    #[serde(default)]
+    pub constraint_errors:
+        Vec<crate::typecheck_db::passes::constraints::ConstraintError>,
 }
 
 /// Case / multi-equation pattern match recorded during inference so
@@ -90,7 +108,7 @@ pub fn infer_expr(
     expr: &Expr,
 ) -> Result<Type, InferError> {
     match expr {
-        Expr::Var { name, .. } => infer_var(state, env, name),
+        Expr::Var { span, name } => infer_var(state, env, *span, name),
         Expr::Constructor { name, .. } => infer_constructor(state, env, name),
         Expr::Literal { lit, .. } => Ok(type_of_literal(lit)),
         Expr::App { func, arg, .. } => infer_app(state, env, type_ops, func, arg),
@@ -168,17 +186,33 @@ pub fn infer_value_scc(
 /// Like `infer_value_scc`, but also checks exhaustiveness of every
 /// case expression encountered while inferring the SCC's bodies.
 ///
-/// `data_constructors` + `ctor_details` are the two registries the
-/// exhaustiveness pass consumes. Call sites that don't care about
-/// exhaustiveness (most of the existing test suite) use
-/// `infer_value_scc`, which passes empty registries and therefore
-/// never reports anything.
+/// Thin wrapper around [`infer_value_scc_with_all`] with an empty
+/// instance index — no constraint solving runs. Kept so the older
+/// tests that predate Phase B can stay on this entry point.
 pub fn infer_value_scc_with_registries(
     type_ops: &TypeOpMap,
     env: &mut Env,
     decls: &[&Decl],
     data_constructors: &crate::typecheck_db::passes::exhaustiveness::DataConstructors,
     ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
+) -> Result<Vec<InferredScheme>, InferError> {
+    let instances = crate::typecheck_db::passes::instance_index::InstanceIndex::new();
+    infer_value_scc_with_all(type_ops, env, decls, data_constructors, ctor_details, &instances)
+}
+
+/// The real entry point: runs inference, exhaustiveness, *and*
+/// constraint solving for one SCC.
+///
+/// `instances` is the set of instances visible when solving. An
+/// empty index is well-defined — every pending constraint will
+/// either defer (polymorphic) or produce a `NoInstanceFound` error.
+pub fn infer_value_scc_with_all(
+    type_ops: &TypeOpMap,
+    env: &mut Env,
+    decls: &[&Decl],
+    data_constructors: &crate::typecheck_db::passes::exhaustiveness::DataConstructors,
+    ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
+    instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
 ) -> Result<Vec<InferredScheme>, InferError> {
     // Pre-register each SCC member with a fresh unif var so mutual
     // references within the SCC type-check. After inference, we generalize.
@@ -225,6 +259,27 @@ pub fn infer_value_scc_with_registries(
     // owning decl. Running the check here (after unification has
     // settled) means scrutinee types zonk to their final form.
     let pending = state.take_pending_exhaust();
+    // Same treatment for pending constraints: group by owning decl
+    // and zonk each constraint's type arguments so the solver sees
+    // final forms (Phase A collects only; Phase B adds the solver).
+    let pending_constraints_raw = state.take_pending_constraints();
+    let mut constraints_by_decl: HashMap<
+        String,
+        Vec<crate::typecheck_db::passes::constraints::PendingConstraint>,
+    > = HashMap::new();
+    for mut pc in pending_constraints_raw {
+        let owner = match pc.decl_name.clone() {
+            Some(n) => n,
+            None => continue,
+        };
+        pc.constraint.args = pc
+            .constraint
+            .args
+            .iter()
+            .map(|a| state.zonk(a))
+            .collect();
+        constraints_by_decl.entry(owner).or_default().push(pc);
+    }
     let mut errors_by_decl: HashMap<String, Vec<
         crate::typecheck_db::passes::exhaustiveness::NonExhaustive,
     >> = HashMap::new();
@@ -272,15 +327,55 @@ pub fn infer_value_scc_with_registries(
         }
     }
 
+    // Run the Phase B solver over every pending constraint now that
+    // inference has settled. The solver reads bindings out of `state`
+    // (via zonk), so it must see the final solved unif table. After
+    // solving, each constraint is either: resolved (dict attached to
+    // its owning decl), no-instance (error attached), or deferred
+    // (re-surfaced as a pending constraint — Phase D's improvement
+    // loop picks these back up).
+    let all_pending: Vec<_> = constraints_by_decl
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    let report = crate::typecheck_db::passes::constraints::solve_all(
+        &mut state,
+        instances,
+        &all_pending,
+    );
+    let crate::typecheck_db::passes::constraints::SolveReport {
+        mut dicts,
+        mut errors,
+        deferred,
+    } = report;
+    // Deferred constraints get rewritten back onto their owners so a
+    // follow-up pass can revisit them.
+    let mut deferred_by_decl: HashMap<
+        String,
+        Vec<crate::typecheck_db::passes::constraints::PendingConstraint>,
+    > = HashMap::new();
+    for pc in deferred {
+        if let Some(n) = pc.decl_name.clone() {
+            deferred_by_decl.entry(n).or_default().push(pc);
+        }
+    }
+
     let mut out = Vec::new();
     for (_, name) in &decl_refs {
         let ty = slot_of.get(name).cloned().unwrap();
         let scheme = generalize(&state, env, &ty);
         let exhaustiveness_errors = errors_by_decl.remove(name).unwrap_or_default();
+        let resolved_dicts = dicts.remove(name).unwrap_or_default();
+        let constraint_errors = errors.remove(name).unwrap_or_default();
+        let pending_constraints = deferred_by_decl.remove(name).unwrap_or_default();
         out.push(InferredScheme {
             name: name.clone(),
             scheme,
             exhaustiveness_errors,
+            pending_constraints,
+            resolved_dicts,
+            constraint_errors,
         });
     }
 
@@ -313,6 +408,7 @@ fn extract_head_name(ty: &Type) -> Option<String> {
 fn infer_var(
     state: &mut UnifyState,
     env: &Env,
+    span: crate::span::Span,
     name: &crate::names::Qualified<crate::names::ValueName>,
 ) -> Result<Type, InferError> {
     let qi = name.to_qi();
@@ -323,16 +419,40 @@ fn infer_var(
     if let Some(module) = module_str {
         let q = QName { module: Some(module), name: name_str.clone() };
         return match env.lookup_qualified(&q) {
-            Some(scheme) => Ok(instantiate(state, scheme)),
+            Some(scheme) => Ok(instantiate_and_record_constraints(state, scheme, span)),
             None => Err(InferError::UnboundVar(format!("{}", q))),
         };
     }
 
     match env.lookup_unqualified(&name_str) {
         Lookup::Local(ty) => Ok(ty.clone()),
-        Lookup::Scheme(s) => Ok(instantiate(state, s)),
+        Lookup::Scheme(s) => Ok(instantiate_and_record_constraints(state, s, span)),
         Lookup::Missing => Err(InferError::UnboundVar(name_str)),
     }
+}
+
+/// Instantiate a scheme fresh, then peel any outer `Type::Constrained`
+/// layer and record each constraint on `state` for Phase B's solver.
+/// Returns the monotype body.
+fn instantiate_and_record_constraints(
+    state: &mut UnifyState,
+    scheme: &Scheme,
+    span: crate::span::Span,
+) -> Type {
+    use crate::typecheck_db::passes::constraints::{
+        peel_constraints, ConstraintOrigin, PendingConstraint,
+    };
+    let ty = instantiate(state, scheme);
+    let (cs, body) = peel_constraints(ty);
+    for c in cs {
+        state.record_pending_constraint(PendingConstraint {
+            decl_name: None, // stamped by `record_pending_constraint`
+            span,
+            constraint: c,
+            origin: ConstraintOrigin::Signature,
+        });
+    }
+    body
 }
 
 fn infer_constructor(

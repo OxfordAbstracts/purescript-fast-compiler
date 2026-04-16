@@ -1,0 +1,729 @@
+//! Constraint collection and solving for the M5 typechecker.
+//!
+//! Constraint flow, at a glance:
+//!
+//! ```text
+//!    Var lookup
+//!        │
+//!        ▼
+//!  instantiate scheme  ──peel Type::Constrained──▶  PendingConstraint
+//!        │                                                  │
+//!        ▼                                                  │
+//!    monotype body used in inference                        │
+//!                                                           ▼
+//!                                               drained after SCC
+//!                                                           │
+//!                                                           ▼
+//!                                             solver matches against InstanceIndex
+//! ```
+//!
+//! Phase A (this commit): the collection half — wiring `Type::Constrained`
+//! peeling into `infer_var` and attaching the resulting
+//! `PendingConstraint` records to the owning decl, plus the data-
+//! type definitions Phase B's solver will consume.
+//!
+//! Phase B: `solve_pending`, instance matching, "no instance found"
+//! diagnostics.
+//!
+//! Phase D: fundep-driven improvement, coverage, consistency.
+
+use serde::{Deserialize, Serialize};
+
+use crate::typecheck_db::types::{Constraint, Type};
+
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+
+/// One constraint that fell out of a scheme instantiation during
+/// inference. Lives on `UnifyState` until the SCC finishes; at that
+/// point each entry is zonked and handed to the solver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingConstraint {
+    /// The decl whose body produced this constraint — set by
+    /// `UnifyState::record_pending_constraint` via the current-decl
+    /// marker. `None` only if the caller forgot to set it; that's a
+    /// bug in the caller, not the solver.
+    #[serde(default)]
+    pub decl_name: Option<String>,
+    /// Source span (the offending `Var` / `Constructor` site). Used
+    /// for diagnostics; not cache-keyed.
+    pub span: crate::span::Span,
+    /// The constraint itself: `Eq α`, `Show (Maybe Int)`, etc.
+    pub constraint: Constraint,
+    /// Where the constraint came from — a scheme's signature, a
+    /// superclass propagation, or an instance-context expansion. The
+    /// solver uses this to improve diagnostics and to decide whether
+    /// a constraint is "given" (from a class method under its own
+    /// instance) vs "wanted".
+    pub origin: ConstraintOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConstraintOrigin {
+    /// Fell out of a value's declared signature at a reference site.
+    Signature,
+    /// Propagated from an instance's context when the solver matched
+    /// an instance. Phase C attaches this origin.
+    InstanceContext,
+    /// Added by the superclass rule: `class Eq a => Ord a` means
+    /// solving `Ord X` adds `Eq X`. Phase C.
+    Superclass,
+}
+
+/// Lift a potentially-constrained monotype into `(constraints, body)`.
+/// If the outer shape isn't `Constrained`, the returned constraint
+/// list is empty.
+///
+/// This is the entry point that `infer_var` calls right after
+/// `instantiate` so the caller can record the peeled constraints.
+pub fn peel_constraints(ty: Type) -> (Vec<Constraint>, Type) {
+    match ty {
+        Type::Constrained(cs, body) => (cs, *body),
+        other => (Vec::new(), other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solver outputs (Phase B)
+// ---------------------------------------------------------------------------
+
+/// Outcome of trying to discharge one constraint against the
+/// instance index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SolveOutcome {
+    /// Matched against an instance. Carries the instance's head
+    /// types (after freshening + unification) and any context the
+    /// match induces — Phase C will expand those contexts into new
+    /// pending constraints; Phase B leaves them collected but
+    /// doesn't recurse.
+    Resolved(ResolvedDict),
+    /// No instance in scope has a compatible head.
+    NoInstance,
+    /// The constraint still depends on unification variables; try
+    /// again after more inference. Phase B emits `Deferred` and
+    /// lets the caller decide what to do; Phase D's fundep-driven
+    /// improvement loop is what actually consumes these.
+    Deferred,
+}
+
+/// Shallow dictionary — enough to tell later codegen which instance
+/// to reference; nested dict composition for contexts lands with
+/// Phase E.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedDict {
+    pub class: crate::typecheck_db::types::QName,
+    pub instance_types: Vec<Type>,
+    /// Instance context left to discharge — stored here so Phase C
+    /// can drive recursive solving. Empty when the match was against
+    /// a context-free instance.
+    #[serde(default)]
+    pub context: Vec<Constraint>,
+}
+
+/// One diagnostic from the solver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstraintError {
+    pub span: crate::span::Span,
+    pub constraint: Constraint,
+    pub kind: ConstraintErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConstraintErrorKind {
+    NoInstanceFound,
+}
+
+// ---------------------------------------------------------------------------
+// Solver implementation (added by the next commit; stubs below so
+// the test file compiles)
+// ---------------------------------------------------------------------------
+
+/// Try every candidate instance for one pending constraint, stopping
+/// at the first successful unification.
+///
+/// Matching strategy:
+/// 1. If any argument still contains an unsolved unification var
+///    *outside* a type-constructor's arguments, we can't choose an
+///    instance yet — return `Deferred`. (Phase D's fundep-driven
+///    improvement will eventually revisit these.)
+/// 2. Otherwise walk the class's candidates in registration order.
+///    For each candidate: snapshot the unification state, freshen
+///    the instance's quantified vars, unify instance-head with
+///    target args. On success, commit and return `Resolved`; on
+///    failure, rollback and try the next candidate.
+/// 3. Out of candidates with no match → `NoInstance`.
+pub fn solve_one(
+    state: &mut crate::typecheck_db::unify::UnifyState,
+    instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    pending: &PendingConstraint,
+) -> SolveOutcome {
+    if pending.constraint.args.iter().any(|a| is_bare_unif(a, state)) {
+        return SolveOutcome::Deferred;
+    }
+
+    for cand in instances.candidates(&pending.constraint.class.name) {
+        let snapshot = state.snapshot_bindings();
+        if let Some((head, context)) = try_match(state, cand, &pending.constraint.args) {
+            return SolveOutcome::Resolved(ResolvedDict {
+                class: pending.constraint.class.clone(),
+                instance_types: head,
+                context,
+            });
+        }
+        state.restore_bindings(snapshot);
+    }
+    SolveOutcome::NoInstance
+}
+
+/// True when `ty` zonks to a `Type::Unif`. Those can't be used to
+/// pick an instance yet — the solver defers until inference either
+/// solves them or proves they're polymorphic.
+fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
+    matches!(state.zonk(ty), Type::Unif(_))
+}
+
+/// Freshen an instance's quantified vars, unify its head with the
+/// target args, and (on success) return the freshened head + context
+/// so the caller can package a `ResolvedDict`.
+fn try_match(
+    state: &mut crate::typecheck_db::unify::UnifyState,
+    instance: &crate::typecheck_db::passes::instance_index::Instance,
+    target_args: &[Type],
+) -> Option<(Vec<Type>, Vec<Constraint>)> {
+    if instance.types.len() != target_args.len() {
+        return None;
+    }
+    let mut subst: std::collections::HashMap<String, Type> =
+        std::collections::HashMap::new();
+    for v in &instance.vars {
+        subst.insert(v.clone(), state.fresh());
+    }
+    let head: Vec<Type> = instance
+        .types
+        .iter()
+        .map(|t| crate::typecheck_db::generalize::apply_var_subst(t, &subst))
+        .collect();
+    for (inst_ty, target) in head.iter().zip(target_args.iter()) {
+        if state.unify(inst_ty, target).is_err() {
+            return None;
+        }
+    }
+    // Freshen the context with the same subst so constraint args
+    // share the instance's type-var identity.
+    let context: Vec<Constraint> = instance
+        .context
+        .iter()
+        .map(|c| Constraint {
+            class: c.class.clone(),
+            args: c
+                .args
+                .iter()
+                .map(|a| crate::typecheck_db::generalize::apply_var_subst(a, &subst))
+                .collect(),
+        })
+        .collect();
+    Some((head, context))
+}
+
+/// Drain a list of pending constraints and emit per-decl
+/// resolutions + errors. The driver calls this once per SCC.
+pub fn solve_all(
+    state: &mut crate::typecheck_db::unify::UnifyState,
+    instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    pending: &[PendingConstraint],
+) -> SolveReport {
+    let mut report = SolveReport::default();
+    for pc in pending {
+        let owner = match &pc.decl_name {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+        match solve_one(state, instances, pc) {
+            SolveOutcome::Resolved(dict) => {
+                report.dicts.entry(owner).or_default().push(dict);
+            }
+            SolveOutcome::NoInstance => {
+                report
+                    .errors
+                    .entry(owner)
+                    .or_default()
+                    .push(ConstraintError {
+                        span: pc.span,
+                        constraint: pc.constraint.clone(),
+                        kind: ConstraintErrorKind::NoInstanceFound,
+                    });
+            }
+            SolveOutcome::Deferred => {
+                report.deferred.push(pc.clone());
+            }
+        }
+    }
+    report
+}
+
+/// Per-decl aggregate of solving one SCC's worth of constraints.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SolveReport {
+    /// Constraints that matched: one `ResolvedDict` per resolved
+    /// entry, keyed by owning decl.
+    pub dicts: std::collections::HashMap<String, Vec<ResolvedDict>>,
+    /// Unresolved constraints: `NoInstance` for now.
+    pub errors: std::collections::HashMap<String, Vec<ConstraintError>>,
+    /// Constraints the solver wasn't ready to decide on (still had
+    /// unsolved unifs). Callers can re-drive later.
+    pub deferred: Vec<PendingConstraint>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse;
+    use crate::typecheck_db::env::Env;
+    use crate::typecheck_db::passes::infer_value::{
+        infer_value_scc_with_registries, InferredScheme,
+    };
+    use crate::typecheck_db::passes::exhaustiveness::{CtorRegistry, DataConstructors};
+    use crate::typecheck_db::types::{QName, Scheme, TypeOpMap};
+    use crate::cst::Decl;
+
+    // -- helpers ------------------------------------------------------
+
+    fn int_ty() -> Type {
+        Type::Con(QName::unqualified("Int"))
+    }
+
+    fn bool_ty() -> Type {
+        Type::Con(QName::unqualified("Boolean"))
+    }
+
+    fn eq_a_a_to_bool() -> Scheme {
+        // `forall a. Eq a => a -> a -> Boolean`
+        let a = Type::Var("a".into());
+        Scheme {
+            vars: vec!["a".into()],
+            ty: Type::Constrained(
+                vec![Constraint {
+                    class: QName::unqualified("Eq"),
+                    args: vec![a.clone()],
+                }],
+                Box::new(Type::fun(a.clone(), Type::fun(a, bool_ty()))),
+            ),
+        }
+    }
+
+    fn infer(src: &str, env: &mut Env) -> Vec<InferredScheme> {
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let data = DataConstructors::new();
+        let ctors = CtorRegistry::new();
+        infer_value_scc_with_registries(&ops, env, &decls, &data, &ctors).unwrap()
+    }
+
+    // =================================================================
+    // peel_constraints — pure structural helper
+    // =================================================================
+
+    #[test]
+    fn peel_extracts_single_constraint() {
+        let (cs, body) = peel_constraints(Type::Constrained(
+            vec![Constraint {
+                class: QName::unqualified("Eq"),
+                args: vec![int_ty()],
+            }],
+            Box::new(Type::fun(int_ty(), bool_ty())),
+        ));
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].class.name, "Eq");
+        assert_eq!(body, Type::fun(int_ty(), bool_ty()));
+    }
+
+    #[test]
+    fn peel_extracts_multi_constraint() {
+        let a = Type::Var("a".into());
+        let (cs, body) = peel_constraints(Type::Constrained(
+            vec![
+                Constraint { class: QName::unqualified("Eq"), args: vec![a.clone()] },
+                Constraint { class: QName::unqualified("Show"), args: vec![a.clone()] },
+            ],
+            Box::new(a.clone()),
+        ));
+        assert_eq!(cs.len(), 2);
+        assert_eq!(body, a);
+    }
+
+    #[test]
+    fn peel_passthrough_for_non_constrained() {
+        let (cs, body) = peel_constraints(int_ty());
+        assert!(cs.is_empty());
+        assert_eq!(body, int_ty());
+    }
+
+    // =================================================================
+    // Integration: referencing a constrained value collects a constraint
+    //
+    // Expectation: when a Var references a polymorphic value whose
+    // scheme includes `Type::Constrained`, inference instantiates the
+    // scheme fresh, the `Constrained` layer is peeled, and a
+    // `PendingConstraint` gets recorded against the referencing decl.
+    // =================================================================
+
+    #[test]
+    fn referencing_eq_records_one_pending() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let schemes = infer("module M where\nf x = eq x x\n", &mut env);
+        assert_eq!(schemes.len(), 1);
+        assert_eq!(schemes[0].pending_constraints.len(), 1);
+        assert_eq!(schemes[0].pending_constraints[0].constraint.class.name, "Eq");
+    }
+
+    #[test]
+    fn unreferenced_constrained_value_records_nothing() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let schemes = infer("module M where\nx = 1\n", &mut env);
+        assert!(schemes[0].pending_constraints.is_empty());
+    }
+
+    #[test]
+    fn multiple_constraints_recorded_at_one_site() {
+        let a = Type::Var("a".into());
+        let scheme = Scheme {
+            vars: vec!["a".into()],
+            ty: Type::Constrained(
+                vec![
+                    Constraint { class: QName::unqualified("Eq"), args: vec![a.clone()] },
+                    Constraint { class: QName::unqualified("Show"), args: vec![a.clone()] },
+                ],
+                Box::new(Type::fun(a, bool_ty())),
+            ),
+        };
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("p"), scheme);
+        let schemes = infer("module M where\ng y = p y\n", &mut env);
+        assert_eq!(schemes[0].pending_constraints.len(), 2);
+        let class_names: Vec<&str> = schemes[0]
+            .pending_constraints
+            .iter()
+            .map(|c| c.constraint.class.name.as_str())
+            .collect();
+        assert!(class_names.contains(&"Eq"));
+        assert!(class_names.contains(&"Show"));
+    }
+
+    #[test]
+    fn two_call_sites_produce_two_constraints() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let schemes = infer(
+            "\
+module M where
+f a b = eq a a
+g c = eq c c
+",
+            &mut env,
+        );
+        let f = schemes.iter().find(|s| s.name == "f").unwrap();
+        let g = schemes.iter().find(|s| s.name == "g").unwrap();
+        assert_eq!(f.pending_constraints.len(), 1);
+        assert_eq!(g.pending_constraints.len(), 1);
+        // Each call site's instantiation is fresh; the two constraints
+        // can't both be stamped with the same unification var id.
+        match (
+            &f.pending_constraints[0].constraint.args[0],
+            &g.pending_constraints[0].constraint.args[0],
+        ) {
+            (Type::Unif(a), Type::Unif(b)) => assert_ne!(a, b),
+            (a, b) => {
+                // Either side may have been generalized to a Type::Var
+                // by the time the caller sees it — that's fine too as
+                // long as they're not literally the same Unif id.
+                let _ = (a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn origin_is_signature_for_var_site() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let schemes = infer("module M where\nh z = eq z z\n", &mut env);
+        assert_eq!(
+            schemes[0].pending_constraints[0].origin,
+            ConstraintOrigin::Signature,
+        );
+    }
+
+    #[test]
+    fn decl_name_is_stamped_on_pending_constraint() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let schemes = infer("module M where\nfoo x = eq x x\n", &mut env);
+        assert_eq!(
+            schemes[0].pending_constraints[0].decl_name.as_deref(),
+            Some("foo"),
+        );
+    }
+
+    // =================================================================
+    // Phase B: solve_one
+    //
+    // Drive the matcher directly with synthetic `PendingConstraint`s
+    // and a hand-built `InstanceIndex`. These cover the matcher's
+    // invariants without dragging in the rest of inference.
+    // =================================================================
+
+    use crate::typecheck_db::passes::instance_index::{Instance, InstanceIndex};
+    use crate::typecheck_db::unify::UnifyState;
+
+    fn maybe_ty(arg: Type) -> Type {
+        Type::app(Type::Con(QName::unqualified("Maybe")), arg)
+    }
+
+    fn mk_pending(class: &str, args: Vec<Type>) -> PendingConstraint {
+        PendingConstraint {
+            decl_name: None,
+            span: crate::span::Span { start: 0, end: 0 },
+            constraint: Constraint {
+                class: QName::unqualified(class),
+                args,
+            },
+            origin: ConstraintOrigin::Signature,
+        }
+    }
+
+    fn mk_instance(class: &str, types: Vec<Type>, vars: Vec<String>) -> Instance {
+        Instance {
+            class: QName::unqualified(class),
+            types,
+            context: vec![],
+            vars,
+            chained: false,
+        }
+    }
+
+    #[test]
+    fn solve_eq_int_with_matching_instance() {
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let pc = mk_pending("Eq", vec![int_ty()]);
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::Resolved(dict) => {
+                assert_eq!(dict.class.name, "Eq");
+                assert_eq!(dict.instance_types, vec![int_ty()]);
+                assert!(dict.context.is_empty());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn solve_no_matching_instance_returns_no_instance() {
+        let mut state = UnifyState::new();
+        let ix = InstanceIndex::new();
+        let pc = mk_pending("Eq", vec![int_ty()]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::NoInstance);
+    }
+
+    #[test]
+    fn solve_wrong_type_head_returns_no_instance() {
+        // Index has `Eq String`, target is `Eq Int` — no match.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance(
+            "Eq",
+            vec![Type::Con(QName::unqualified("String"))],
+            vec![],
+        ));
+        let pc = mk_pending("Eq", vec![int_ty()]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::NoInstance);
+    }
+
+    #[test]
+    fn solve_polymorphic_instance_unifies_head() {
+        // `instance Eq a => Eq (Maybe a)` (context ignored at Phase B)
+        // against target `Eq (Maybe Int)` → matches, a := Int.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        let maybe_a = maybe_ty(Type::Var("a".into()));
+        ix.insert(Instance {
+            class: QName::unqualified("Eq"),
+            types: vec![maybe_a],
+            context: vec![Constraint {
+                class: QName::unqualified("Eq"),
+                args: vec![Type::Var("a".into())],
+            }],
+            vars: vec!["a".into()],
+            chained: false,
+        });
+        let pc = mk_pending("Eq", vec![maybe_ty(int_ty())]);
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::Resolved(dict) => {
+                // After freshening and unification, the instance's
+                // head should read back as `Maybe Int`.
+                let head = state.zonk(&dict.instance_types[0]);
+                assert_eq!(head, maybe_ty(int_ty()));
+                // Context survives as `Eq Int` after freshening.
+                assert_eq!(dict.context.len(), 1);
+                let ctx_arg = state.zonk(&dict.context[0].args[0]);
+                assert_eq!(ctx_arg, int_ty());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn solve_first_match_wins() {
+        // Two overlapping instances: both match `Eq Int`. Solver
+        // takes the first (insertion-order). Overlap detection +
+        // ambiguity is a later-phase concern.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![])); // first
+        ix.insert(mk_instance("Eq", vec![Type::Var("a".into())], vec!["a".into()]));
+        let pc = mk_pending("Eq", vec![int_ty()]);
+        let out = solve_one(&mut state, &ix, &pc);
+        match out {
+            SolveOutcome::Resolved(dict) => {
+                // First-match returns the concrete (non-var) instance.
+                assert_eq!(dict.instance_types[0], int_ty());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn solve_bare_unif_defers() {
+        // Target is `Eq ?0` where ?0 is still fresh. No specific
+        // instance can be chosen; the solver defers.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let unif = state.fresh();
+        let pc = mk_pending("Eq", vec![unif]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::Deferred);
+    }
+
+    #[test]
+    fn solve_class_name_mismatch_is_no_instance() {
+        // Show Int against an Eq-only index.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let pc = mk_pending("Show", vec![int_ty()]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::NoInstance);
+    }
+
+    #[test]
+    fn solve_failed_match_rolls_back_unifications() {
+        // Instance is `Eq Int`; target is `Eq ?0` where ?0 is first
+        // bound to String. The match must fail (Int ≠ String) and
+        // leave ?0's prior binding untouched.
+        let mut state = UnifyState::new();
+        let string_ty = Type::Con(QName::unqualified("String"));
+        let unif = state.fresh();
+        let unif_id = match &unif {
+            Type::Unif(id) => *id,
+            _ => panic!(),
+        };
+        // Pre-bind ?0 := String.
+        state.unify(&unif, &string_ty).unwrap();
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let pc = mk_pending("Eq", vec![Type::Unif(unif_id)]);
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::NoInstance | SolveOutcome::Deferred => {}
+            other => panic!("expected no-match, got {other:?}"),
+        }
+        // Binding of ?0 must still resolve to String — trial match
+        // didn't corrupt the main state.
+        assert_eq!(state.zonk(&Type::Unif(unif_id)), string_ty);
+    }
+
+    // =================================================================
+    // Phase B: solve_all + integration with infer_value_scc
+    //
+    // `infer_value_scc_with_registries` grows an `InstanceIndex`
+    // parameter (via a new entry point) and routes resolutions /
+    // errors to the owning `InferredScheme`.
+    // =================================================================
+
+    use crate::typecheck_db::passes::infer_value::infer_value_scc_with_all;
+
+    fn infer_with_ix(
+        src: &str,
+        env: &mut Env,
+        instances: &InstanceIndex,
+    ) -> Vec<InferredScheme> {
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let data = DataConstructors::new();
+        let ctors = CtorRegistry::new();
+        infer_value_scc_with_all(&ops, env, &decls, &data, &ctors, instances).unwrap()
+    }
+
+    #[test]
+    fn integration_resolved_constraint_leaves_no_error() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        // `f x = eq x x` — when `x` is pinned to Int (via annotation)
+        // the constraint resolves.
+        let schemes = infer_with_ix(
+            "module M where\nf (x :: Int) = eq x x\n",
+            &mut env,
+            &ix,
+        );
+        assert!(
+            schemes[0].constraint_errors.is_empty(),
+            "got: {:?}",
+            schemes[0].constraint_errors,
+        );
+        assert_eq!(schemes[0].resolved_dicts.len(), 1);
+        assert_eq!(schemes[0].resolved_dicts[0].class.name, "Eq");
+    }
+
+    #[test]
+    fn integration_no_instance_reports_error() {
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let ix = InstanceIndex::new();
+        let schemes = infer_with_ix(
+            "module M where\nf (x :: Int) = eq x x\n",
+            &mut env,
+            &ix,
+        );
+        assert_eq!(schemes[0].constraint_errors.len(), 1);
+        let err = &schemes[0].constraint_errors[0];
+        assert_eq!(err.kind, ConstraintErrorKind::NoInstanceFound);
+        assert_eq!(err.constraint.class.name, "Eq");
+    }
+
+    #[test]
+    fn integration_polymorphic_constraint_defers() {
+        // `f x = eq x x` — `x`'s type stays polymorphic (forall a),
+        // so `Eq ?0` is unresolvable at this phase. The solver
+        // defers; no "no instance" error is raised, but no dict is
+        // resolved either.
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("eq"), eq_a_a_to_bool());
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let schemes = infer_with_ix(
+            "module M where\nf x = eq x x\n",
+            &mut env,
+            &ix,
+        );
+        assert!(schemes[0].constraint_errors.is_empty());
+        assert!(schemes[0].resolved_dicts.is_empty());
+    }
+}
