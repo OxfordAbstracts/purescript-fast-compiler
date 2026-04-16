@@ -15,14 +15,22 @@ pub struct Env {
     /// Qualified top-level schemes (values, constructors, class methods).
     pub top_level: HashMap<QName, Scheme>,
     /// Unqualified local bindings introduced by lambdas, case binders, etc.
-    /// Monomorphic — we don't generalize let-bindings until the appropriate
-    /// sub-milestone (M4b).
+    /// Monomorphic: lambda/pattern binders are not let-polymorphic.
     pub locals: Vec<HashMap<String, Type>>,
+    /// Unqualified local **schemes** introduced by generalized `let`
+    /// bindings. Walked in the same scope order as `locals`; a local scheme
+    /// shadows a same-named top-level entry but is shadowed by a
+    /// same-named monomorphic local.
+    pub local_schemes: Vec<HashMap<String, Scheme>>,
 }
 
 impl Env {
     pub fn new() -> Self {
-        Self { top_level: HashMap::new(), locals: vec![HashMap::new()] }
+        Self {
+            top_level: HashMap::new(),
+            locals: vec![HashMap::new()],
+            local_schemes: vec![HashMap::new()],
+        }
     }
 
     pub fn bind_scheme(&mut self, name: QName, scheme: Scheme) {
@@ -31,12 +39,17 @@ impl Env {
 
     pub fn push_scope(&mut self) {
         self.locals.push(HashMap::new());
+        self.local_schemes.push(HashMap::new());
     }
 
     pub fn pop_scope(&mut self) {
         self.locals.pop();
+        self.local_schemes.pop();
         if self.locals.is_empty() {
             self.locals.push(HashMap::new());
+        }
+        if self.local_schemes.is_empty() {
+            self.local_schemes.push(HashMap::new());
         }
     }
 
@@ -46,12 +59,24 @@ impl Env {
         }
     }
 
-    /// Look up an unqualified name: local scope first, then top-level with
-    /// the unqualified key.
+    pub fn bind_local_scheme(&mut self, name: impl Into<String>, scheme: Scheme) {
+        if let Some(top) = self.local_schemes.last_mut() {
+            top.insert(name.into(), scheme);
+        }
+    }
+
+    /// Look up an unqualified name: monomorphic locals first (walked
+    /// inner-to-outer), then local schemes (inner-to-outer), then top-level
+    /// with the unqualified key.
     pub fn lookup_unqualified(&self, name: &str) -> Lookup<'_> {
         for scope in self.locals.iter().rev() {
             if let Some(ty) = scope.get(name) {
                 return Lookup::Local(ty);
+            }
+        }
+        for scope in self.local_schemes.iter().rev() {
+            if let Some(s) = scope.get(name) {
+                return Lookup::Scheme(s);
             }
         }
         if let Some(s) = self
@@ -84,6 +109,12 @@ impl Env {
         for scheme in self.top_level.values() {
             out.extend(state.free_unif_vars(&scheme.ty));
         }
+        // Same reasoning for local schemes.
+        for scope in &self.local_schemes {
+            for scheme in scope.values() {
+                out.extend(state.free_unif_vars(&scheme.ty));
+            }
+        }
         out
     }
 }
@@ -93,4 +124,13 @@ pub enum Lookup<'a> {
     Scheme(&'a Scheme),
     Local(&'a Type),
     Missing,
+}
+
+impl<'a> Lookup<'a> {
+    pub fn local_ty(&self) -> Option<&'a Type> {
+        match self {
+            Lookup::Local(t) => Some(*t),
+            _ => None,
+        }
+    }
 }

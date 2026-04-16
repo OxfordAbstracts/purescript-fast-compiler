@@ -1,11 +1,11 @@
-//! M4a: bidirectional inference for `Var`, `App`, `Lambda` (and trivial
-//! degenerate forms: `Parens`, `TypeAnnotation`, `Hole`, `Wildcard`,
-//! `Literal`, `Constructor`).
+//! Bidirectional inference. Current coverage:
 //!
-//! Later sub-milestones fill in `Let`/`If` (M4b), `Case` (M4c), `Do`/`Ado`
-//! (M4d), records (M4e). The hooks are written so those additions are
-//! additive — each new form adds a match arm without reshaping the
-//! surrounding API.
+//! - M4a: `Var`, `App`, `Lambda`, `Parens`, `TypeAnnotation`, `Hole`,
+//!   `Wildcard`, `Literal`, `Constructor`.
+//! - M4b: `If`, `Let` (with let-polymorphism).
+//!
+//! Later sub-milestones fill in `Case` (M4c), `Do`/`Ado` (M4d), records
+//! (M4e). Each new form is additive — a new match arm plus its helper.
 //!
 //! The entry point is `infer_value_scc`, which corresponds to the
 //! `infer_value_scc` nanopass in the plan: given an SCC of top-level
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::cst::{self, Binder, Decl, Expr, Literal};
+use crate::cst::{self, Binder, Decl, Expr, LetBinding, Literal};
 use crate::typecheck_db::env::{Env, Lookup};
 use crate::typecheck_db::generalize::{generalize, instantiate};
 use crate::typecheck_db::types::{convert_type_expr, QName, Scheme, Type, TypeOpMap};
@@ -76,9 +76,14 @@ pub fn infer_expr(
         Expr::Wildcard { .. } | Expr::Hole { .. } => Ok(state.fresh()),
         Expr::Negate { expr, .. } => infer_expr(state, env, type_ops, expr),
 
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            infer_if(state, env, type_ops, cond, then_expr, else_expr)
+        }
+        Expr::Let { bindings, body, .. } => {
+            infer_let(state, env, type_ops, bindings, body)
+        }
+
         // Forms reserved for later sub-milestones.
-        Expr::Let { .. } => Err(InferError::Unsupported("let")),
-        Expr::If { .. } => Err(InferError::Unsupported("if")),
         Expr::Case { .. } => Err(InferError::Unsupported("case")),
         Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
         Expr::Record { .. } | Expr::RecordAccess { .. } | Expr::RecordUpdate { .. } => {
@@ -293,6 +298,107 @@ fn bind_pattern(
         Binder::As { .. } => Err(InferError::UnsupportedBinder("as")),
         Binder::Op { .. } => Err(InferError::UnsupportedBinder("op")),
     }
+}
+
+fn infer_if(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    cond: &Expr,
+    then_expr: &Expr,
+    else_expr: &Expr,
+) -> Result<Type, InferError> {
+    check_expr(state, env, type_ops, cond, &Type::Con(QName::unqualified("Boolean")))?;
+    let then_ty = infer_expr(state, env, type_ops, then_expr)?;
+    let else_ty = infer_expr(state, env, type_ops, else_expr)?;
+    state.unify(&then_ty, &else_ty)?;
+    Ok(then_ty)
+}
+
+/// One named value binding lifted out of a `let`.
+struct LetValueBinding<'a> {
+    name: String,
+    /// If a `Signature` binding preceded this one with the same name, its
+    /// converted [`Type`] lives here. Used both as the pre-inserted slot and
+    /// as the declared type to check the body against.
+    sig: Option<Type>,
+    expr: &'a Expr,
+}
+
+fn infer_let(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    bindings: &[LetBinding],
+    body: &Expr,
+) -> Result<Type, InferError> {
+    env.push_scope();
+
+    // Pass 1: collect signatures keyed by name.
+    let mut sigs: HashMap<String, Type> = HashMap::new();
+    for b in bindings {
+        if let LetBinding::Signature { name, ty, .. } = b {
+            let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+            sigs.insert(n, convert_type_expr(ty, type_ops));
+        }
+    }
+
+    // Pass 2: materialize value bindings and pre-insert slots into locals so
+    // mutually-recursive `let`s typecheck.
+    let mut value_bindings: Vec<LetValueBinding<'_>> = Vec::new();
+    for b in bindings {
+        match b {
+            LetBinding::Value { binder: Binder::Var { name, .. }, expr, .. } => {
+                let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+                let sig = sigs.get(&n).cloned();
+                let slot = sig.clone().unwrap_or_else(|| state.fresh());
+                env.bind_local(n.clone(), slot);
+                value_bindings.push(LetValueBinding { name: n, sig, expr });
+            }
+            LetBinding::Value { .. } => {
+                return Err(InferError::UnsupportedBinder("let-pattern"));
+            }
+            LetBinding::Signature { .. } => {}
+        }
+    }
+
+    // Pass 3: infer each body, unify with its pre-inserted slot (or check
+    // against the signature directly if one was supplied).
+    for vb in &value_bindings {
+        let slot_ty = env
+            .lookup_unqualified(&vb.name)
+            .local_ty()
+            .expect("slot pre-inserted above")
+            .clone();
+        if vb.sig.is_some() {
+            check_expr(state, env, type_ops, vb.expr, &slot_ty)?;
+        } else {
+            let actual = infer_expr(state, env, type_ops, vb.expr)?;
+            state.unify(&slot_ty, &actual)?;
+        }
+    }
+
+    // Pass 4: replace each monomorphic slot with a generalized scheme so the
+    // body benefits from let-polymorphism. We remove the slot from `locals`
+    // *before* generalizing so its own unif var isn't considered free in the
+    // surrounding env.
+    let mut finished: Vec<(String, Scheme)> = Vec::new();
+    for vb in &value_bindings {
+        let slot_ty = env
+            .locals
+            .last_mut()
+            .and_then(|s| s.remove(&vb.name))
+            .expect("slot present");
+        let scheme = generalize(state, env, &slot_ty);
+        finished.push((vb.name.clone(), scheme));
+    }
+    for (n, scheme) in finished {
+        env.bind_local_scheme(n, scheme);
+    }
+
+    let body_ty = infer_expr(state, env, type_ops, body)?;
+    env.pop_scope();
+    Ok(body_ty)
 }
 
 fn infer_equation(
@@ -543,6 +649,140 @@ mod tests {
         match (&f.scheme.ty, &g.scheme.ty) {
             (Type::Fun(..), Type::Fun(..)) => {}
             other => panic!("{other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M4b: if / let
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn if_returns_unified_branch_type() {
+        let mut s = UnifyState::new();
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("c"), Scheme::mono(bool_ty()));
+        let ops = TypeOpMap::default();
+        let e = parse_expr_from_val("module M where\nx = if c then 1 else 2\n");
+        let t = infer_expr(&mut s, &mut env, &ops, &e).unwrap();
+        assert_eq!(s.zonk(&t), int());
+    }
+
+    #[test]
+    fn if_cond_must_be_boolean() {
+        let mut s = UnifyState::new();
+        let mut env = Env::new();
+        let ops = TypeOpMap::default();
+        // Condition `1` is Int, not Boolean — unification must fail.
+        let e = parse_expr_from_val("module M where\nx = if 1 then 1 else 2\n");
+        let err = infer_expr(&mut s, &mut env, &ops, &e).unwrap_err();
+        assert!(matches!(err, InferError::Unify(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn if_branches_must_unify() {
+        let mut s = UnifyState::new();
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("c"), Scheme::mono(bool_ty()));
+        let ops = TypeOpMap::default();
+        let e = parse_expr_from_val("module M where\nx = if c then 1 else \"hi\"\n");
+        let err = infer_expr(&mut s, &mut env, &ops, &e).unwrap_err();
+        assert!(matches!(err, InferError::Unify(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn let_binds_simple_value() {
+        let src = "module M where\nfoo = let x = 1 in x\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "Int");
+    }
+
+    #[test]
+    fn let_is_polymorphic() {
+        // `let id = \y -> y in id 1` must type-check: `id` generalizes to
+        // `forall a. a -> a`, then instantiates with `Int` at the call site.
+        let src = "module M where\nfoo = let id = \\y -> y in id 1\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "Int");
+    }
+
+    #[test]
+    fn let_polymorphic_binding_used_at_two_types() {
+        // Same `id` applied to an Int in `then`, a Boolean in `else`.
+        // Branches must unify, so the *expression* is Int-or-Boolean, which
+        // won't match: we expect a Unify error.
+        let src = "module M where\nc = true\nfoo = let id = \\y -> y in if c then id 1 else id true\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        // Seed `true` since our literal handling doesn't know Boolean ctors.
+        env.bind_scheme(QName::unqualified("true"), Scheme::mono(bool_ty()));
+        let err = infer_value_scc(&ops, &mut env, &decls).unwrap_err();
+        assert!(matches!(err, InferError::Unify(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn let_signature_constrains_binding() {
+        // Signature forces Int; body is fine. Subsequent use must match.
+        let src = "\
+module M where
+foo =
+  let
+    x :: Int
+    x = 1
+  in x
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "Int");
+    }
+
+    #[test]
+    fn let_binding_shadows_outer_scheme() {
+        // Outer `foo = 1` is Int. Inner `let foo = "str" in foo` rebinds it
+        // to String locally. The overall expression is String.
+        let src = "module M where\nbar = let foo = \"str\" in foo\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        env.bind_scheme(QName::unqualified("foo"), Scheme::mono(int()));
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "String");
+    }
+
+    #[test]
+    fn let_mutually_recursive() {
+        // Both names are pre-inserted, so `f` can refer to `g` and vice
+        // versa while they're being inferred. Both should generalize.
+        let src = "\
+module M where
+foo =
+  let
+    f x = g x
+    g x = f x
+  in f
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        // The outer `foo` is whatever `f` is — a -> b shape.
+        match &schemes[0].scheme.ty {
+            Type::Fun(..) => {}
+            other => panic!("expected fun, got {other:?}"),
         }
     }
 
