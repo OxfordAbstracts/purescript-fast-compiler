@@ -29,7 +29,7 @@ use crate::typecheck_db::unify::{UnifyError, UnifyState};
 pub const PASS_NAME: &str = "infer_value_scc";
 pub const PASS_VERSION: u32 = 1;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum InferError {
     #[error("unification: {0}")]
     Unify(#[from] UnifyError),

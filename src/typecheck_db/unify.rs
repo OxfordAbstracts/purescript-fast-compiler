@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::typecheck_db::types::{Constraint, Type};
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum UnifyError {
     #[error("cannot unify {0} with {1}")]
     Mismatch(Type, Type),
