@@ -3,9 +3,11 @@
 //! - M4a: `Var`, `App`, `Lambda`, `Parens`, `TypeAnnotation`, `Hole`,
 //!   `Wildcard`, `Literal`, `Constructor`.
 //! - M4b: `If`, `Let` (with let-polymorphism).
+//! - M4c: `Case` with constructor / `As` / literal / typed patterns, plus
+//!   both `Unconditional` and `Guarded` alternative bodies.
 //!
-//! Later sub-milestones fill in `Case` (M4c), `Do`/`Ado` (M4d), records
-//! (M4e). Each new form is additive — a new match arm plus its helper.
+//! Later sub-milestones fill in `Do`/`Ado` (M4d) and records (M4e). Each new
+//! form is additive — a new match arm plus its helper.
 //!
 //! The entry point is `infer_value_scc`, which corresponds to the
 //! `infer_value_scc` nanopass in the plan: given an SCC of top-level
@@ -82,9 +84,9 @@ pub fn infer_expr(
         Expr::Let { bindings, body, .. } => {
             infer_let(state, env, type_ops, bindings, body)
         }
+        Expr::Case { exprs, alts, .. } => infer_case(state, env, type_ops, exprs, alts),
 
         // Forms reserved for later sub-milestones.
-        Expr::Case { .. } => Err(InferError::Unsupported("case")),
         Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
         Expr::Record { .. } | Expr::RecordAccess { .. } | Expr::RecordUpdate { .. } => {
             Err(InferError::Unsupported("record"))
@@ -290,14 +292,63 @@ fn bind_pattern(
         }
         Binder::Parens { binder, .. } => bind_pattern(state, env, type_ops, binder),
         Binder::Literal { lit, .. } => Ok(type_of_literal(lit)),
-        // Constructor / Record / Array / As / Op patterns: later
-        // sub-milestones (M4c / M4e).
-        Binder::Constructor { .. } => Err(InferError::UnsupportedBinder("constructor")),
+        Binder::Constructor { name, args, .. } => {
+            bind_constructor_pattern(state, env, type_ops, name, args)
+        }
+        Binder::As { name, binder, .. } => {
+            let inner = bind_pattern(state, env, type_ops, binder)?;
+            let n = crate::interner::resolve(name.value.symbol()).unwrap_or_default();
+            env.bind_local(n, inner.clone());
+            Ok(inner)
+        }
+        // Record / Array / Op patterns: later sub-milestones (M4e and
+        // beyond).
         Binder::Record { .. } => Err(InferError::UnsupportedBinder("record")),
         Binder::Array { .. } => Err(InferError::UnsupportedBinder("array")),
-        Binder::As { .. } => Err(InferError::UnsupportedBinder("as")),
         Binder::Op { .. } => Err(InferError::UnsupportedBinder("op")),
     }
+}
+
+/// Match a constructor pattern against its constructor's scheme.
+///
+/// A constructor scheme looks like `forall a. Arg1 -> Arg2 -> ... -> T a`.
+/// We instantiate it with fresh unif vars, then peel off `args.len()`
+/// function arrows. Each sub-binder is inferred and unified with the
+/// corresponding argument type. The remainder (the "return type" of the
+/// constructor) is the type of the overall pattern.
+fn bind_constructor_pattern(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    name: &crate::names::Qualified<crate::names::ConstructorName>,
+    args: &[Binder],
+) -> Result<Type, InferError> {
+    let qi = name.to_qi();
+    let name_str = crate::interner::resolve(qi.name).unwrap_or_default();
+    let module_str = qi.module.and_then(crate::interner::resolve);
+    let q = QName { module: module_str, name: name_str.clone() };
+    let scheme = env
+        .lookup_qualified(&q)
+        .or_else(|| match &q.module {
+            Some(_) => None,
+            None => env.top_level.get(&QName::unqualified(name_str.clone())),
+        })
+        .ok_or_else(|| InferError::UnboundConstructor(format!("{}", q)))?;
+
+    let mut cur = instantiate(state, scheme);
+    let mut arg_tys: Vec<Type> = Vec::with_capacity(args.len());
+    for _ in 0..args.len() {
+        let arg = state.fresh();
+        let result = state.fresh();
+        state.unify(&cur, &Type::fun(arg.clone(), result.clone()))?;
+        arg_tys.push(arg);
+        cur = result;
+    }
+    for (sub, arg_ty) in args.iter().zip(arg_tys.iter()) {
+        let sub_ty = bind_pattern(state, env, type_ops, sub)?;
+        state.unify(&sub_ty, arg_ty)?;
+    }
+    Ok(cur)
 }
 
 fn infer_if(
@@ -401,6 +452,86 @@ fn infer_let(
     Ok(body_ty)
 }
 
+fn infer_case(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    scrutinees: &[Expr],
+    alts: &[cst::CaseAlternative],
+) -> Result<Type, InferError> {
+    // Infer each scrutinee's type up front. These are what every alt's
+    // binders must match against, column-wise.
+    let scrut_tys: Vec<Type> = scrutinees
+        .iter()
+        .map(|e| infer_expr(state, env, type_ops, e))
+        .collect::<Result<_, _>>()?;
+
+    // All branches must unify with a single fresh result type.
+    let result_ty = state.fresh();
+
+    for alt in alts {
+        if alt.binders.len() != scrut_tys.len() {
+            return Err(InferError::Unsupported("case alt arity mismatch"));
+        }
+        env.push_scope();
+        for (binder, scrut_ty) in alt.binders.iter().zip(scrut_tys.iter()) {
+            let bt = bind_pattern(state, env, type_ops, binder)?;
+            state.unify(&bt, scrut_ty)?;
+        }
+        let branch_ty = infer_guarded(state, env, type_ops, &alt.result)?;
+        state.unify(&branch_ty, &result_ty)?;
+        env.pop_scope();
+    }
+
+    Ok(result_ty)
+}
+
+/// Infer the result type of a `GuardedExpr`. `Unconditional` defers to
+/// `infer_expr`; `Guarded` threads each guard's patterns (Boolean guards
+/// must be Boolean; pattern guards bind locals in a sub-scope) then infers
+/// the guard's result expression.
+fn infer_guarded(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    guarded: &cst::GuardedExpr,
+) -> Result<Type, InferError> {
+    match guarded {
+        cst::GuardedExpr::Unconditional(e) => infer_expr(state, env, type_ops, e),
+        cst::GuardedExpr::Guarded(guards) => {
+            if guards.is_empty() {
+                return Err(InferError::Unsupported("empty guarded body"));
+            }
+            let result_ty = state.fresh();
+            for g in guards {
+                env.push_scope();
+                for p in &g.patterns {
+                    match p {
+                        cst::GuardPattern::Boolean(e) => {
+                            check_expr(
+                                state,
+                                env,
+                                type_ops,
+                                e,
+                                &Type::Con(QName::unqualified("Boolean")),
+                            )?;
+                        }
+                        cst::GuardPattern::Pattern(binder, expr) => {
+                            let scrut_ty = infer_expr(state, env, type_ops, expr)?;
+                            let bt = bind_pattern(state, env, type_ops, binder)?;
+                            state.unify(&bt, &scrut_ty)?;
+                        }
+                    }
+                }
+                let g_ty = infer_expr(state, env, type_ops, &g.expr)?;
+                state.unify(&g_ty, &result_ty)?;
+                env.pop_scope();
+            }
+            Ok(result_ty)
+        }
+    }
+}
+
 fn infer_equation(
     state: &mut UnifyState,
     env: &mut Env,
@@ -408,16 +539,10 @@ fn infer_equation(
     binders: &[Binder],
     guarded: &cst::GuardedExpr,
 ) -> Result<Type, InferError> {
-    // `foo x y = body` acts as `\x y -> body` at the top level. For M4a we
-    // require Unconditional bodies; guards arrive alongside Case in M4c.
-    let body = match guarded {
-        cst::GuardedExpr::Unconditional(e) => e,
-        cst::GuardedExpr::Guarded(_) => {
-            return Err(InferError::Unsupported("guarded equation"))
-        }
-    };
+    // `foo x y = body` acts as `\x y -> body` at the top level. The body
+    // may be guarded (M4c); `infer_guarded` handles both shapes.
     if binders.is_empty() {
-        return infer_expr(state, env, type_ops, body);
+        return infer_guarded(state, env, type_ops, guarded);
     }
 
     env.push_scope();
@@ -426,7 +551,7 @@ fn infer_equation(
         let ty = bind_pattern(state, env, type_ops, b)?;
         param_tys.push(ty);
     }
-    let body_ty = infer_expr(state, env, type_ops, body)?;
+    let body_ty = infer_guarded(state, env, type_ops, guarded)?;
     env.pop_scope();
 
     let mut out = body_ty;
@@ -784,6 +909,195 @@ foo =
             Type::Fun(..) => {}
             other => panic!("expected fun, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M4c: case / patterns
+    // ------------------------------------------------------------------
+
+    fn seed_maybe(env: &mut Env) {
+        let a = Type::Var("a".into());
+        let maybe_a = Type::app(Type::Con(QName::unqualified("Maybe")), a.clone());
+        env.bind_scheme(
+            QName::unqualified("Just"),
+            Scheme { vars: vec!["a".into()], ty: Type::fun(a.clone(), maybe_a.clone()) },
+        );
+        env.bind_scheme(
+            QName::unqualified("Nothing"),
+            Scheme { vars: vec!["a".into()], ty: maybe_a },
+        );
+    }
+
+    #[test]
+    fn case_with_literal_patterns_returns_branch_type() {
+        let src = "\
+module M where
+foo x = case x of
+  0 -> \"zero\"
+  _ -> \"other\"
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "(Int -> String)");
+    }
+
+    #[test]
+    fn case_constructor_pattern_unwraps_data_type() {
+        // `case m of Just x -> x; Nothing -> 0` requires m :: Maybe Int,
+        // branches unify to Int.
+        let src = "\
+module M where
+foo m = case m of
+  Just x -> x
+  Nothing -> 0
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        seed_maybe(&mut env);
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "((Maybe Int) -> Int)");
+    }
+
+    #[test]
+    fn case_nested_constructor_pattern() {
+        // `Just (Just x)` binds x to the inner type.
+        let src = "\
+module M where
+foo m = case m of
+  Just (Just x) -> x
+  Just Nothing -> 0
+  Nothing -> 1
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        seed_maybe(&mut env);
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(
+            scheme_display(&schemes[0].scheme),
+            "((Maybe (Maybe Int)) -> Int)",
+        );
+    }
+
+    #[test]
+    fn case_branches_must_unify() {
+        // One branch returns Int, the other a String — must fail because
+        // `Just _ -> 1` forces result = Int, `Nothing -> "oops"` forces
+        // result = String, and Int vs String doesn't unify.
+        let src = "\
+module M where
+foo m = case m of
+  Just _ -> 1
+  Nothing -> \"oops\"
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        seed_maybe(&mut env);
+        let err = infer_value_scc(&ops, &mut env, &decls).unwrap_err();
+        assert!(matches!(err, InferError::Unify(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn case_as_pattern_binds_whole_and_parts() {
+        // `all@(Just _)` binds `all` to `Maybe a` and still enforces the
+        // constructor match.
+        let src = "\
+module M where
+foo m = case m of
+  all@(Just _) -> all
+  Nothing -> Nothing
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        seed_maybe(&mut env);
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        // Argument and result must both be `Maybe a` for the same a.
+        assert!(
+            scheme_display(&schemes[0].scheme).contains("Maybe"),
+            "expected Maybe in {}",
+            scheme_display(&schemes[0].scheme),
+        );
+    }
+
+    #[test]
+    fn case_multi_scrutinee_pair() {
+        // PureScript case supports multi-scrutinee: `case x, y of p, q -> ...`.
+        let src = "\
+module M where
+foo m n = case m, n of
+  Just x, Just y -> x
+  _, _ -> 0
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        seed_maybe(&mut env);
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        // The second scrutinee's `y` is unused in the first branch — its
+        // element type stays polymorphic and gets generalized. The first
+        // scrutinee's `x` is returned, so it's forced to Int by the
+        // fallthrough branch.
+        assert_eq!(
+            scheme_display(&schemes[0].scheme),
+            "forall a. ((Maybe Int) -> ((Maybe a) -> Int))",
+        );
+    }
+
+    #[test]
+    fn guarded_equation_boolean_guard() {
+        // `foo x | x == x = 1` — for M4c we accept any Boolean-typed guard
+        // expression. Seed `eq` so the guard expression has a way to type.
+        let src = "\
+module M where
+foo x | isOk x = 1
+      | true = 0
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        env.bind_scheme(
+            QName::unqualified("isOk"),
+            Scheme {
+                vars: vec!["a".into()],
+                ty: Type::fun(Type::Var("a".into()), bool_ty()),
+            },
+        );
+        env.bind_scheme(QName::unqualified("true"), Scheme::mono(bool_ty()));
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        // foo :: forall a. a -> Int (first guard ignores result of isOk,
+        // returns Int; second guard returns Int).
+        let disp = scheme_display(&schemes[0].scheme);
+        assert!(disp.ends_with("Int)"), "got: {disp}");
+    }
+
+    #[test]
+    fn guard_cond_must_be_boolean() {
+        let src = "\
+module M where
+foo x | x = 1
+";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        // Bind x's inferred type loosely; expect the guard to force it to
+        // Boolean. That in itself is fine; the failure here comes if we seed
+        // x :: Int.
+        // Instead, test by requiring the scheme to end with "Boolean -> Int".
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "(Boolean -> Int)");
     }
 
     #[test]
