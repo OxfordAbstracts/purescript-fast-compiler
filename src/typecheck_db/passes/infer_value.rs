@@ -7,8 +7,8 @@
 //!   both `Unconditional` and `Guarded` alternative bodies.
 //! - M4d: records — literals (including puns), field access, field
 //!   update; `Binder::Record` patterns.
-//!
-//! Later sub-milestones fill in arrays and any remaining cleanup.
+//! - M4e: arrays — `Expr::Array` literals and `Binder::Array` patterns
+//!   (elements unify to a single `Array α`).
 //!
 //! The entry point is `infer_value_scc`, which corresponds to the
 //! `infer_value_scc` nanopass in the plan: given an SCC of top-level
@@ -93,6 +93,7 @@ pub fn infer_expr(
         Expr::RecordUpdate { expr, updates, .. } => {
             infer_record_update(state, env, type_ops, expr, updates)
         }
+        Expr::Array { elements, .. } => infer_array(state, env, type_ops, elements),
 
         // Forms reserved for later sub-milestones.
         Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
@@ -100,7 +101,6 @@ pub fn infer_expr(
             Err(InferError::Unsupported("operator"))
         }
         Expr::VisibleTypeApp { .. } => Err(InferError::Unsupported("visible-type-app")),
-        Expr::Array { .. } => Err(InferError::Unsupported("array")),
         Expr::AsPattern { .. } => Err(InferError::Unsupported("as-pattern")),
     }
 }
@@ -346,8 +346,9 @@ fn bind_pattern(
             Ok(inner)
         }
         Binder::Record { fields, .. } => bind_record_pattern(state, env, type_ops, fields),
-        // Array / Op patterns: future sub-milestones.
-        Binder::Array { .. } => Err(InferError::UnsupportedBinder("array")),
+        Binder::Array { elements, .. } => bind_array_pattern(state, env, type_ops, elements),
+        // Op patterns (`x :| xs`) — deferred; they need fixity + data-ctor
+        // resolution, a job for a later milestone.
         Binder::Op { .. } => Err(InferError::UnsupportedBinder("op")),
     }
 }
@@ -498,6 +499,50 @@ fn infer_record_update(
     state.unify(&expr_ty, &expected)?;
     // Record update preserves the record's shape.
     Ok(expr_ty)
+}
+
+// ============================================================================
+// M4e: arrays
+// ============================================================================
+
+/// Build `Array α` for the current element type.
+fn array_of(elem: Type) -> Type {
+    Type::app(Type::Con(QName::unqualified("Array")), elem)
+}
+
+fn infer_array(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    elements: &[Expr],
+) -> Result<Type, InferError> {
+    // A single fresh element type links every item in the literal.
+    // Empty arrays leave the element type polymorphic; generalization
+    // picks it up later.
+    let elem = state.fresh();
+    for e in elements {
+        let t = infer_expr(state, env, type_ops, e)?;
+        state.unify(&t, &elem)?;
+    }
+    Ok(array_of(elem))
+}
+
+fn bind_array_pattern(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    elements: &[Binder],
+) -> Result<Type, InferError> {
+    // Length isn't constrained by the type — an `[a, b]` pattern
+    // matches any `Array α`; exhaustiveness over arrays is a later
+    // milestone. Element types are pairwise unified through one fresh
+    // `α`, same as a literal.
+    let elem = state.fresh();
+    for b in elements {
+        let t = bind_pattern(state, env, type_ops, b)?;
+        state.unify(&t, &elem)?;
+    }
+    Ok(array_of(elem))
 }
 
 fn infer_if(
@@ -1417,6 +1462,80 @@ foo x | x = 1
             }
             other => panic!("expected Fun, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M4e: arrays
+    // ------------------------------------------------------------------
+
+    fn array_ty(elem: Type) -> Type {
+        Type::app(Type::Con(QName::unqualified("Array")), elem)
+    }
+
+    #[test]
+    fn array_literal_infers_array_of_elem() {
+        let src = "module M where\nxs = [1, 2, 3]\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(schemes[0].scheme.ty, array_ty(int()));
+    }
+
+    #[test]
+    fn array_elements_must_unify() {
+        // Mixed element types: Int and String must unify → fails.
+        let src = "module M where\nxs = [1, \"hi\"]\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let err = infer_value_scc(&ops, &mut env, &decls).unwrap_err();
+        assert!(matches!(err, InferError::Unify(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn empty_array_generalizes_element_type() {
+        let src = "module M where\nxs = []\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(scheme_display(&schemes[0].scheme), "forall a. (Array a)");
+    }
+
+    #[test]
+    fn array_pattern_unifies_elements_with_fresh_var() {
+        // `\[x, y] -> x` infers `forall a. Array a -> a`.
+        let src = "module M where\nfst2 = \\[x, y] -> x\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(
+            scheme_display(&schemes[0].scheme),
+            "forall a. ((Array a) -> a)",
+        );
+    }
+
+    #[test]
+    fn array_pattern_with_typed_outer_constrains_element() {
+        // `f (xs :: Array Int) = ...` constrains the element via the
+        // annotation; an array pattern inside unifies each position with
+        // the same Int.
+        let src = "module M where\ng (xs :: Array Int) = xs\n";
+        let m = parse(src).unwrap();
+        let decls: Vec<&Decl> = m.decls.iter().collect();
+        let ops = TypeOpMap::default();
+        let mut env = Env::new();
+        let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
+        assert_eq!(
+            scheme_display(&schemes[0].scheme),
+            "((Array Int) -> (Array Int))",
+        );
     }
 
     #[test]
