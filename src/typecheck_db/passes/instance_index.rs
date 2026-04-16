@@ -55,10 +55,56 @@ pub struct Instance {
     pub chained: bool,
 }
 
-/// Class-keyed lookup of instances in scope.
+/// Per-class metadata the solver uses for fundep-driven matching.
+///
+/// Populated from each `Decl::Class` the scanner sees. Without
+/// fundeps, `fundeps` is empty — the solver falls back to the
+/// conservative rule (any unsolved unif argument → defer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassInfo {
+    /// The class's declared type parameters, in source order.
+    pub type_vars: Vec<String>,
+    /// Functional dependencies. Each entry `(determiners, determined)`
+    /// is a list of *positions* into `type_vars`.
+    pub fundeps: Vec<FunDep>,
+}
+
+/// One functional dependency, stored positionally so solver
+/// look-ups don't have to re-resolve var names at match time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunDep {
+    /// Positions (indices into `ClassInfo::type_vars`) whose values
+    /// determine the RHS.
+    pub determiners: Vec<usize>,
+    /// Positions whose values follow from the determiners.
+    pub determined: Vec<usize>,
+}
+
+/// Class-keyed lookup of instances in scope, plus per-class metadata
+/// the solver consults during matching (`ClassInfo` for fundeps).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceIndex {
     by_class: HashMap<String, Vec<Instance>>,
+    classes: HashMap<String, ClassInfo>,
+    /// Coverage-check findings from `from_decls`. An instance whose
+    /// head violates its class's fundep coverage lands here rather
+    /// than being inserted — Phase D's solver honors the check at
+    /// registration time so buggy instances can't corrupt matching.
+    #[serde(default)]
+    coverage_errors: Vec<CoverageError>,
+}
+
+/// Fundep coverage-rule violation: an instance's determined
+/// positions mention type variables that its determiner positions
+/// don't.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageError {
+    pub class: crate::typecheck_db::types::QName,
+    pub instance_types: Vec<Type>,
+    pub fundep_index: usize,
+    /// Type variable names present in determined positions but not
+    /// covered by determiners.
+    pub uncovered_vars: Vec<String>,
 }
 
 impl InstanceIndex {
@@ -91,16 +137,69 @@ impl InstanceIndex {
     pub fn is_empty(&self) -> bool {
         self.by_class.is_empty()
     }
+
+    /// Register metadata about a class. Replaces any previous entry
+    /// under the same simple name.
+    pub fn insert_class(&mut self, class_name: String, info: ClassInfo) {
+        self.classes.insert(class_name, info);
+    }
+
+    /// Metadata for `class_name`, if the scanner knows about it.
+    pub fn class_info(&self, class_name: &str) -> Option<&ClassInfo> {
+        self.classes.get(class_name)
+    }
+
+    /// Every coverage-rule violation the scanner caught when building
+    /// the index. An empty slice means the in-scope instances are
+    /// all well-formed with respect to their classes' fundeps.
+    pub fn coverage_errors(&self) -> &[CoverageError] {
+        &self.coverage_errors
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Scanner
 // ---------------------------------------------------------------------------
 
-/// Pure scanner: walks a decl list and extracts every `Decl::Instance`
-/// into an `InstanceIndex`. Non-instance decls are ignored.
+/// Pure scanner: walks a decl list and extracts every `Decl::Class`
+/// + `Decl::Instance` into an `InstanceIndex`. Classes must be
+/// registered before the instances that depend on them so the
+/// coverage check has metadata to consult; to avoid caller-ordering
+/// constraints, we do two passes.
 pub fn from_decls(decls: &[Decl], type_ops: &TypeOpMap) -> InstanceIndex {
     let mut ix = InstanceIndex::new();
+    // Pass 1: classes. Fundeps live here; instance coverage in
+    // Pass 2 queries them by name.
+    for d in decls {
+        if let Decl::Class { name, type_vars, fundeps, .. } = d {
+            let class_name =
+                crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+            let vars: Vec<String> = type_vars
+                .iter()
+                .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
+                .collect();
+            let fundeps_pos: Vec<FunDep> = fundeps
+                .iter()
+                .map(|fd| FunDep {
+                    determiners: fd
+                        .lhs
+                        .iter()
+                        .filter_map(|v| position_of(&vars, v))
+                        .collect(),
+                    determined: fd
+                        .rhs
+                        .iter()
+                        .filter_map(|v| position_of(&vars, v))
+                        .collect(),
+                })
+                .collect();
+            ix.insert_class(
+                class_name,
+                ClassInfo { type_vars: vars, fundeps: fundeps_pos },
+            );
+        }
+    }
+    // Pass 2: instances.
     for d in decls {
         if let Decl::Instance {
             constraints,
@@ -125,6 +224,27 @@ pub fn from_decls(decls: &[Decl], type_ops: &TypeOpMap) -> InstanceIndex {
                 })
                 .collect();
             let vars = collect_instance_vars(&head_tys, &context);
+            // Coverage check: for every fundep, determined-position
+            // vars must be a subset of determiner-position vars.
+            let class_info_opt = ix.class_info(&class.name).cloned();
+            if let Some(info) = class_info_opt {
+                for (idx, fd) in info.fundeps.iter().enumerate() {
+                    let lhs_vars = collect_vars_at_positions(&head_tys, &fd.determiners);
+                    let rhs_vars = collect_vars_at_positions(&head_tys, &fd.determined);
+                    let uncovered: Vec<String> = rhs_vars
+                        .into_iter()
+                        .filter(|v| !lhs_vars.contains(v))
+                        .collect();
+                    if !uncovered.is_empty() {
+                        ix.coverage_errors.push(CoverageError {
+                            class: class.clone(),
+                            instance_types: head_tys.clone(),
+                            fundep_index: idx,
+                            uncovered_vars: uncovered,
+                        });
+                    }
+                }
+            }
             ix.insert(Instance {
                 class,
                 types: head_tys,
@@ -146,6 +266,25 @@ fn cst_constraint_qname(
             .map(|m| crate::typecheck_db::util::resolve_symbol(m.symbol())),
         name: crate::typecheck_db::util::resolve_symbol(q.name.symbol()),
     }
+}
+
+fn position_of(vars: &[String], tv: &crate::names::TypeVarName) -> Option<usize> {
+    let name = crate::typecheck_db::util::resolve_symbol(tv.symbol());
+    vars.iter().position(|v| v == &name)
+}
+
+/// Collect the free type variables that appear in the type
+/// arguments at the given positions. Used by the coverage check
+/// to compare determiner-position vars with determined-position
+/// vars.
+fn collect_vars_at_positions(types: &[Type], positions: &[usize]) -> Vec<String> {
+    let mut out = Vec::new();
+    for &p in positions {
+        if let Some(ty) = types.get(p) {
+            collect_vars_into(ty, &mut out);
+        }
+    }
+    out
 }
 
 /// Best-effort collector for free type variables in an instance's
@@ -490,5 +629,134 @@ instance (Eq a, Show a) => Pretty (Maybe a) where
             .collect();
         assert!(names.contains(&"Eq"));
         assert!(names.contains(&"Show"));
+    }
+
+    // =================================================================
+    // Phase D: class metadata + fundeps
+    // =================================================================
+
+    #[test]
+    fn scanner_registers_class_with_no_fundeps() {
+        let decls = parse_module(
+            "\
+module M where
+class Eq a where
+  eq :: a -> a -> Boolean
+",
+        );
+        let ix = from_decls(&decls, &TypeOpMap::default());
+        let info = ix.class_info("Eq").expect("class Eq registered");
+        assert_eq!(info.type_vars, vec!["a".to_string()]);
+        assert!(info.fundeps.is_empty());
+    }
+
+    #[test]
+    fn scanner_registers_single_fundep() {
+        // `class MonadState s m | m -> s`: determiners = [m] = [1],
+        // determined = [s] = [0].
+        let decls = parse_module(
+            "\
+module M where
+class MonadState s m | m -> s where
+  get :: m
+",
+        );
+        let ix = from_decls(&decls, &TypeOpMap::default());
+        let info = ix.class_info("MonadState").unwrap();
+        assert_eq!(info.type_vars, vec!["s".to_string(), "m".to_string()]);
+        assert_eq!(info.fundeps.len(), 1);
+        assert_eq!(info.fundeps[0].determiners, vec![1]);
+        assert_eq!(info.fundeps[0].determined, vec![0]);
+    }
+
+    #[test]
+    fn scanner_registers_multi_fundep_bidirectional() {
+        // Row.Cons-style multi-fundep.
+        let decls = parse_module(
+            "\
+module M where
+class Cons h t from to | h t -> from, h t -> to, from h -> t where
+  push :: h
+",
+        );
+        let ix = from_decls(&decls, &TypeOpMap::default());
+        let info = ix.class_info("Cons").unwrap();
+        assert_eq!(info.type_vars, vec!["h".to_string(), "t".into(), "from".into(), "to".into()]);
+        assert_eq!(info.fundeps.len(), 3);
+        // First fundep: h t -> from
+        assert_eq!(info.fundeps[0].determiners, vec![0, 1]);
+        assert_eq!(info.fundeps[0].determined, vec![2]);
+        // Second: h t -> to
+        assert_eq!(info.fundeps[1].determiners, vec![0, 1]);
+        assert_eq!(info.fundeps[1].determined, vec![3]);
+        // Third: from h -> t
+        assert_eq!(info.fundeps[2].determiners, vec![2, 0]);
+        assert_eq!(info.fundeps[2].determined, vec![1]);
+    }
+
+    #[test]
+    fn scanner_accepts_instance_with_good_coverage() {
+        // `class C a b | a -> b`; `instance C Int Bool` — both
+        // positions concrete, no uncovered var.
+        let decls = parse_module(
+            "\
+module M where
+class C a b | a -> b where
+  m :: a -> b
+instance C Int Boolean where
+  m _ = true
+",
+        );
+        let ix = from_decls(&decls, &TypeOpMap::default());
+        assert!(
+            ix.coverage_errors().is_empty(),
+            "got: {:?}",
+            ix.coverage_errors(),
+        );
+    }
+
+    #[test]
+    fn scanner_flags_coverage_violation_when_rhs_var_is_free() {
+        // `class C a b | a -> b`; `instance C Int c` — c is declared
+        // on the RHS of the fundep but not present in the LHS
+        // position. Coverage rule violated.
+        let decls = parse_module(
+            "\
+module M where
+class C a b | a -> b where
+  m :: a -> b
+instance C Int c where
+  m _ = m'
+",
+        );
+        let ix = from_decls(&decls, &TypeOpMap::default());
+        let errs = ix.coverage_errors();
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert_eq!(errs[0].class.name, "C");
+        assert_eq!(errs[0].fundep_index, 0);
+        assert_eq!(errs[0].uncovered_vars, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn scanner_does_not_flag_when_rhs_fully_covered_via_ctor_args() {
+        // `class C a b | a -> b`; `instance C (Maybe a) (List a)` —
+        // the var `a` appears on both sides, so coverage holds.
+        let decls = parse_module(
+            "\
+module M where
+class C a b | a -> b where
+  m :: a -> b
+instance C (Maybe a) (List a) where
+  m _ = nil
+",
+        );
+        let ix = from_decls(&decls, &TypeOpMap::default());
+        assert!(ix.coverage_errors().is_empty(), "got: {:?}", ix.coverage_errors());
+    }
+
+    #[test]
+    fn class_info_missing_for_unknown_class_is_none() {
+        let ix = InstanceIndex::new();
+        assert!(ix.class_info("DoesNotExist").is_none());
     }
 }

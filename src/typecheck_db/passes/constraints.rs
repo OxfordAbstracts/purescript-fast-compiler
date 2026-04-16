@@ -158,7 +158,31 @@ pub fn solve_one(
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> SolveOutcome {
-    if pending.constraint.args.iter().any(|a| is_bare_unif(a, state)) {
+    // Fundep-aware defer: if the class declares fundeps, a position
+    // is "free to improve" when it appears in at least one fundep's
+    // determined list. Bare unifs in all other positions (keys or
+    // unmentioned) can't be discriminated by the matcher and force
+    // a defer. Without fundeps we fall back to the conservative
+    // rule (any bare unif defers).
+    let class_info = instances.class_info(&pending.constraint.class.name);
+    let improvable: std::collections::HashSet<usize> = match class_info {
+        Some(info) if !info.fundeps.is_empty() => {
+            info.fundeps.iter().flat_map(|fd| fd.determined.iter().copied()).collect()
+        }
+        _ => std::collections::HashSet::new(),
+    };
+    let needs_defer = match class_info {
+        Some(info) if !info.fundeps.is_empty() => {
+            pending
+                .constraint
+                .args
+                .iter()
+                .enumerate()
+                .any(|(i, a)| !improvable.contains(&i) && is_bare_unif(a, state))
+        }
+        _ => pending.constraint.args.iter().any(|a| is_bare_unif(a, state)),
+    };
+    if needs_defer {
         return SolveOutcome::Deferred;
     }
 
@@ -706,6 +730,183 @@ g c = eq c c
         let err = &schemes[0].constraint_errors[0];
         assert_eq!(err.kind, ConstraintErrorKind::NoInstanceFound);
         assert_eq!(err.constraint.class.name, "Eq");
+    }
+
+    // =================================================================
+    // Phase D: fundep-driven improvement
+    //
+    // Scenarios in PureScript's fundep semantics:
+    // - `class MonadState s m | m -> s`: knowing m picks s.
+    // - Matching `MonadState ?s MyMonad` against `instance MonadState
+    //   Int MyMonad` must unify ?s with Int even though ?s was fresh.
+    // - Matching `MonadState ?s ?m` (both unknown) must defer.
+    // - Without fundeps, `Eq ?x` still defers conservatively.
+    // =================================================================
+
+    fn monad_state_class() -> crate::typecheck_db::passes::instance_index::ClassInfo {
+        use crate::typecheck_db::passes::instance_index::{ClassInfo, FunDep};
+        ClassInfo {
+            // type_vars = [s, m]; fundep m -> s means determiners=[1],
+            // determined=[0].
+            type_vars: vec!["s".into(), "m".into()],
+            fundeps: vec![FunDep { determiners: vec![1], determined: vec![0] }],
+        }
+    }
+
+    #[test]
+    fn fundep_improves_determined_slot_from_unif() {
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class("MonadState".into(), monad_state_class());
+        // instance MonadState Int MyMonad
+        let my_monad = Type::Con(QName::unqualified("MyMonad"));
+        ix.insert(mk_instance("MonadState", vec![int_ty(), my_monad.clone()], vec![]));
+        // Target: MonadState ?s MyMonad — ?s is in the DETERMINED
+        // position (s), which the fundep `m -> s` makes improvable.
+        let unif = state.fresh();
+        let unif_id = match unif {
+            Type::Unif(id) => id,
+            _ => panic!(),
+        };
+        let pc = mk_pending("MonadState", vec![Type::Unif(unif_id), my_monad]);
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::Resolved(_) => {}
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        // Improvement: ?s must now zonk to Int.
+        assert_eq!(state.zonk(&Type::Unif(unif_id)), int_ty());
+    }
+
+    #[test]
+    fn fundep_defers_when_determiner_is_unif() {
+        // Target: MonadState Int ?m — ?m is the DETERMINER; without
+        // it, we can't discriminate between potentially-matching
+        // instances. Must defer.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class("MonadState".into(), monad_state_class());
+        ix.insert(mk_instance(
+            "MonadState",
+            vec![int_ty(), Type::Con(QName::unqualified("MyMonad"))],
+            vec![],
+        ));
+        let unif_m = state.fresh();
+        let pc = mk_pending("MonadState", vec![int_ty(), unif_m]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::Deferred);
+    }
+
+    #[test]
+    fn fundep_defers_when_both_positions_unif() {
+        // Target: MonadState ?s ?m. Both unknown → defer.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class("MonadState".into(), monad_state_class());
+        ix.insert(mk_instance(
+            "MonadState",
+            vec![int_ty(), Type::Con(QName::unqualified("MyMonad"))],
+            vec![],
+        ));
+        let unif_s = state.fresh();
+        let unif_m = state.fresh();
+        let pc = mk_pending("MonadState", vec![unif_s, unif_m]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::Deferred);
+    }
+
+    #[test]
+    fn fundep_multi_determiner_improves_two_slots() {
+        use crate::typecheck_db::passes::instance_index::{ClassInfo, FunDep};
+        // `class Cons h t from to | h t -> from, h t -> to`: h,t are
+        // determiners; from,to both determined.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class(
+            "Cons".into(),
+            ClassInfo {
+                type_vars: vec!["h".into(), "t".into(), "from".into(), "to".into()],
+                fundeps: vec![
+                    FunDep { determiners: vec![0, 1], determined: vec![2] },
+                    FunDep { determiners: vec![0, 1], determined: vec![3] },
+                ],
+            },
+        );
+        // instance Cons "x" Int R1 R2
+        let lit_x = Type::TypeString("x".into());
+        let r1 = Type::Con(QName::unqualified("R1"));
+        let r2 = Type::Con(QName::unqualified("R2"));
+        ix.insert(mk_instance(
+            "Cons",
+            vec![lit_x.clone(), int_ty(), r1.clone(), r2.clone()],
+            vec![],
+        ));
+        // Target: Cons "x" Int ?from ?to
+        let uf = state.fresh();
+        let uf_id = match uf {
+            Type::Unif(id) => id,
+            _ => panic!(),
+        };
+        let ut = state.fresh();
+        let ut_id = match ut {
+            Type::Unif(id) => id,
+            _ => panic!(),
+        };
+        let pc = mk_pending(
+            "Cons",
+            vec![lit_x, int_ty(), Type::Unif(uf_id), Type::Unif(ut_id)],
+        );
+        match solve_one(&mut state, &ix, &pc) {
+            SolveOutcome::Resolved(_) => {}
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        assert_eq!(state.zonk(&Type::Unif(uf_id)), r1);
+        assert_eq!(state.zonk(&Type::Unif(ut_id)), r2);
+    }
+
+    #[test]
+    fn no_fundeps_keeps_conservative_defer_rule() {
+        // `class Eq a` without fundeps. Target `Eq ?x` should still
+        // defer (improvement isn't guaranteed safe without fundep
+        // coverage).
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class(
+            "Eq".into(),
+            crate::typecheck_db::passes::instance_index::ClassInfo {
+                type_vars: vec!["a".into()],
+                fundeps: vec![],
+            },
+        );
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        let unif = state.fresh();
+        let pc = mk_pending("Eq", vec![unif]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::Deferred);
+    }
+
+    #[test]
+    fn fundep_unmentioned_position_still_requires_concrete() {
+        use crate::typecheck_db::passes::instance_index::{ClassInfo, FunDep};
+        // `class B a b c | a -> b`: c is neither determiner nor
+        // determined — unmentioned. Bare unif at c must defer.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class(
+            "B".into(),
+            ClassInfo {
+                type_vars: vec!["a".into(), "b".into(), "c".into()],
+                fundeps: vec![FunDep { determiners: vec![0], determined: vec![1] }],
+            },
+        );
+        ix.insert(mk_instance(
+            "B",
+            vec![
+                int_ty(),
+                Type::Con(QName::unqualified("BOut")),
+                Type::Con(QName::unqualified("CPos")),
+            ],
+            vec![],
+        ));
+        let uc = state.fresh();
+        let pc = mk_pending("B", vec![int_ty(), int_ty(), uc]);
+        assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::Deferred);
     }
 
     #[test]
