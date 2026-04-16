@@ -157,8 +157,7 @@ impl ModuleScope {
         h.update(&(imports.len() as u32).to_le_bytes());
         for (r, res) in &imports {
             h.update(&[r.kind as u8]);
-            h.update(r.module.as_deref().unwrap_or("").as_bytes());
-            h.update(&[0u8]);
+            crate::typecheck_db::util::hash_opt_str(&mut h, r.module.as_deref());
             h.update(r.name.as_bytes());
             h.update(&[0u8]);
             h.update(&[res.kind as u8]);
@@ -307,7 +306,9 @@ pub mod resolve_names {
     use crate::typecheck_db::store::DepEdge;
 
     pub const PASS_NAME: &str = "resolve_names";
-    pub const PASS_VERSION: u32 = 1;
+    // v2: the ModuleScope hasher's `ImportRef.module` encoding gained a
+    // 0/1 discriminator, invalidating v1 cache rows.
+    pub const PASS_VERSION: u32 = 2;
 
     /// Given already-computed `free_names` + a module scope, produce a
     /// resolution for each reference.

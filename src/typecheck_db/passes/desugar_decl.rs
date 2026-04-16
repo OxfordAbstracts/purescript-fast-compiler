@@ -21,7 +21,9 @@ use crate::typecheck_db::driver::{CacheOutcome, DriverError, TypecheckDb};
 use crate::typecheck_db::key::{InputHasher, OutputHash, PassKey};
 
 pub const PASS_NAME: &str = "desugar_decl";
-pub const PASS_VERSION: u32 = 1;
+// v2: `module_fixity_hash` now uses a collision-free encoding for
+// `Option<Symbol>`. Pre-v2 cache rows would unknowingly be invalid.
+pub const PASS_VERSION: u32 = 2;
 
 /// Cache payload.
 ///

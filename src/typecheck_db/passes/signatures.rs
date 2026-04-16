@@ -20,7 +20,9 @@ use crate::typecheck_db::key::{InputHash, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::types::{convert_type_expr, hash_type_ops, Scheme, Type, TypeOpMap};
 
 pub const PASS_NAME: &str = "convert_signature";
-pub const PASS_VERSION: u32 = 1;
+// v2: `hash_type_ops` encoding changed — `Option<String>` now takes a
+// 0/1 discriminator, invalidating any v1 cache rows.
+pub const PASS_VERSION: u32 = 2;
 
 /// Output of this pass: either the converted signature or a marker that
 /// the decl wasn't a type signature at all.

@@ -291,17 +291,16 @@ fn resolve(sym: crate::interner::Symbol) -> String {
 /// Deterministic hash of a [`TypeOpMap`], used by passes that fold this map
 /// into their input hash.
 pub fn hash_type_ops(type_ops: &TypeOpMap) -> [u8; 32] {
+    use crate::typecheck_db::util::hash_opt_str;
     let mut sorted: Vec<(&(Option<String>, String), &QName)> = type_ops.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let mut h = blake3::Hasher::new();
     h.update(&(sorted.len() as u32).to_le_bytes());
     for ((mod_opt, op_name), target) in sorted {
-        h.update(mod_opt.as_deref().unwrap_or("").as_bytes());
-        h.update(&[0u8]);
+        hash_opt_str(&mut h, mod_opt.as_deref());
         h.update(op_name.as_bytes());
         h.update(&[0u8]);
-        h.update(target.module.as_deref().unwrap_or("").as_bytes());
-        h.update(&[0u8]);
+        hash_opt_str(&mut h, target.module.as_deref());
         h.update(target.name.as_bytes());
         h.update(&[0u8]);
     }

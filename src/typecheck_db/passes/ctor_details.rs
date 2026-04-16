@@ -13,7 +13,8 @@ use crate::typecheck_db::key::{InputHash, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::types::{convert_type_expr, hash_type_ops, Type, TypeOpMap};
 
 pub const PASS_NAME: &str = "ctor_details";
-pub const PASS_VERSION: u32 = 1;
+// v2: `hash_type_ops` encoding changed, invalidating v1 cache rows.
+pub const PASS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CtorDetails {

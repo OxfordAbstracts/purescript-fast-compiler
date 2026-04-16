@@ -94,16 +94,18 @@ pub fn fixity_table_from_decls(decls: &[Decl]) -> (FixityTable, [u8; 32]) {
 }
 
 fn hash_table(t: &FixityTable) -> [u8; 32] {
-    // Deterministic hash: sort keys by their u32 repr.
+    // Deterministic hash: sort keys by their u32 repr. Version string is
+    // bumped whenever this function's output encoding changes so that any
+    // cached `desugar_decl` rows from before the change are invalidated.
     let mut entries: Vec<(Ident, FixityInfo)> = t.iter().map(|(k, v)| (*k, *v)).collect();
     entries.sort_by_key(|(k, _)| key_to_u32(*k));
     let mut h = blake3::Hasher::new();
-    h.update(b"desugar/rebracket::fixity_table_v1");
+    h.update(b"desugar/rebracket::fixity_table_v2");
     h.update(&(entries.len() as u32).to_le_bytes());
     for (k, v) in entries {
         h.update(&key_to_u32(k).to_le_bytes());
         h.update(&[v.associativity as u8, v.precedence]);
-        h.update(&v.target_module.map(key_to_u32).unwrap_or(0).to_le_bytes());
+        crate::typecheck_db::util::hash_opt_symbol(&mut h, v.target_module);
         h.update(&key_to_u32(v.target_name).to_le_bytes());
     }
     *h.finalize().as_bytes()
