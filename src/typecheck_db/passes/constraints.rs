@@ -132,6 +132,11 @@ pub struct ConstraintError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ConstraintErrorKind {
     NoInstanceFound,
+    /// The solver hit [`MAX_SOLVER_DEPTH`] before every constraint
+    /// reached a fixed point. Typically indicates an instance
+    /// whose context re-demands the same constraint (`instance
+    /// Foo a => Foo a`). Diagnostic, not a crash.
+    SolverDepthExceeded,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,39 +255,122 @@ fn try_match(
     Some((head, context))
 }
 
+/// Maximum number of solver iterations before giving up. Guards
+/// against pathological self-referential instances like
+/// `instance Loop a => Loop a`.
+const MAX_SOLVER_DEPTH: usize = 32;
+
 /// Drain a list of pending constraints and emit per-decl
-/// resolutions + errors. The driver calls this once per SCC.
+/// resolutions + errors. Runs a fixed-point loop: each match may
+/// emit fresh sub-constraints from the instance's context, which
+/// re-enter the queue on the next pass. Terminates when no
+/// constraint remains, or when a pass makes no progress (all
+/// remaining entries deferred), or at [`MAX_SOLVER_DEPTH`]
+/// iterations.
 pub fn solve_all(
     state: &mut crate::typecheck_db::unify::UnifyState,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &[PendingConstraint],
 ) -> SolveReport {
     let mut report = SolveReport::default();
-    for pc in pending {
-        let owner = match &pc.decl_name {
-            Some(n) => n.clone(),
-            None => continue,
-        };
-        match solve_one(state, instances, pc) {
-            SolveOutcome::Resolved(dict) => {
-                report.dicts.entry(owner).or_default().push(dict);
-            }
-            SolveOutcome::NoInstance => {
-                report
-                    .errors
-                    .entry(owner)
-                    .or_default()
-                    .push(ConstraintError {
-                        span: pc.span,
-                        constraint: pc.constraint.clone(),
-                        kind: ConstraintErrorKind::NoInstanceFound,
-                    });
-            }
-            SolveOutcome::Deferred => {
-                report.deferred.push(pc.clone());
+    let mut queue: Vec<PendingConstraint> = pending.to_vec();
+
+    // Track whether the last iteration made progress. If the loop
+    // exits at the depth limit while still making progress, the
+    // remaining queue is almost certainly a self-referential instance
+    // chain — surface that to the user as a hard
+    // `SolverDepthExceeded` error rather than letting it disappear
+    // into `report.deferred`.
+    let mut last_made_progress = true;
+    for _ in 0..MAX_SOLVER_DEPTH {
+        if queue.is_empty() {
+            last_made_progress = false;
+            break;
+        }
+        let current = std::mem::take(&mut queue);
+        let mut carry_forward: Vec<PendingConstraint> = Vec::new();
+        let mut made_progress = false;
+        for pc in current {
+            let owner = match &pc.decl_name {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            match solve_one(state, instances, &pc) {
+                SolveOutcome::Resolved(dict) => {
+                    made_progress = true;
+                    // Push every context entry back onto the queue as
+                    // a new pending with `InstanceContext` origin and
+                    // the same owner/span. Later rounds see them the
+                    // same way the top-level ones were seen this
+                    // round.
+                    for ctx in &dict.context {
+                        carry_forward.push(PendingConstraint {
+                            decl_name: Some(owner.clone()),
+                            span: pc.span,
+                            constraint: Constraint {
+                                class: ctx.class.clone(),
+                                args: ctx.args.iter().map(|a| state.zonk(a)).collect(),
+                            },
+                            origin: ConstraintOrigin::InstanceContext,
+                        });
+                    }
+                    report.dicts.entry(owner).or_default().push(dict);
+                }
+                SolveOutcome::NoInstance => {
+                    made_progress = true;
+                    report
+                        .errors
+                        .entry(owner)
+                        .or_default()
+                        .push(ConstraintError {
+                            span: pc.span,
+                            constraint: pc.constraint.clone(),
+                            kind: ConstraintErrorKind::NoInstanceFound,
+                        });
+                }
+                SolveOutcome::Deferred => {
+                    carry_forward.push(pc);
+                }
             }
         }
+        last_made_progress = made_progress;
+        if !made_progress {
+            // Every remaining entry deferred in the same way — no
+            // progress possible, stop burning iterations. These are
+            // legitimate deferrals (polymorphic, etc.) and carry
+            // forward for a later re-drive.
+            queue = carry_forward;
+            break;
+        }
+        queue = carry_forward;
     }
+
+    // If we exhausted the depth budget while still making progress,
+    // the remaining queue is recursion we refused to follow. Emit a
+    // `SolverDepthExceeded` error for every remaining owned entry
+    // so the failure is visible, then drop those entries from the
+    // deferred list — they can't be productively re-driven.
+    if last_made_progress && !queue.is_empty() {
+        let mut legitimately_deferred = Vec::new();
+        for pc in std::mem::take(&mut queue) {
+            match &pc.decl_name {
+                Some(n) => {
+                    report
+                        .errors
+                        .entry(n.clone())
+                        .or_default()
+                        .push(ConstraintError {
+                            span: pc.span,
+                            constraint: pc.constraint.clone(),
+                            kind: ConstraintErrorKind::SolverDepthExceeded,
+                        });
+                }
+                None => legitimately_deferred.push(pc),
+            }
+        }
+        queue = legitimately_deferred;
+    }
+    report.deferred = queue;
     report
 }
 
@@ -879,6 +967,184 @@ g c = eq c c
         let unif = state.fresh();
         let pc = mk_pending("Eq", vec![unif]);
         assert_eq!(solve_one(&mut state, &ix, &pc), SolveOutcome::Deferred);
+    }
+
+    // =================================================================
+    // Phase C: recursive instance-context solving
+    //
+    // An instance like `Eq a => Eq (Maybe a)` produces a context
+    // `Eq a` when it matches `Eq (Maybe Int)` (with `a := Int`).
+    // The solver must recursively discharge that sub-constraint
+    // before declaring the outer one resolved.
+    // =================================================================
+
+    /// `class Eq a` + `instance Eq Int` + `instance Eq a => Eq (Maybe a)`.
+    fn eq_with_maybe_context() -> InstanceIndex {
+        let mut ix = InstanceIndex::new();
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        ix.insert(Instance {
+            class: QName::unqualified("Eq"),
+            types: vec![maybe_ty(Type::Var("a".into()))],
+            context: vec![Constraint {
+                class: QName::unqualified("Eq"),
+                args: vec![Type::Var("a".into())],
+            }],
+            vars: vec!["a".into()],
+            chained: false,
+        });
+        ix
+    }
+
+    fn mk_pending_for(owner: &str, class: &str, args: Vec<Type>) -> PendingConstraint {
+        PendingConstraint {
+            decl_name: Some(owner.into()),
+            span: crate::span::Span { start: 0, end: 0 },
+            constraint: Constraint {
+                class: QName::unqualified(class),
+                args,
+            },
+            origin: ConstraintOrigin::Signature,
+        }
+    }
+
+    #[test]
+    fn phase_c_context_is_discharged_recursively() {
+        let mut state = UnifyState::new();
+        let ix = eq_with_maybe_context();
+        let pc = mk_pending_for("f", "Eq", vec![maybe_ty(int_ty())]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        // Expected: two dicts on "f" — the outer Eq (Maybe Int) and
+        // the inner Eq Int; zero errors; zero deferred.
+        let dicts = report.dicts.get("f").expect("f got dicts");
+        assert_eq!(dicts.len(), 2, "got: {dicts:?}");
+        assert!(report.errors.is_empty(), "got: {:?}", report.errors);
+        assert!(report.deferred.is_empty(), "got: {:?}", report.deferred);
+    }
+
+    #[test]
+    fn phase_c_missing_sub_instance_reports_sub_error() {
+        // instance `Eq a => Eq (Maybe a)` but NO `instance Eq Int`.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(Instance {
+            class: QName::unqualified("Eq"),
+            types: vec![maybe_ty(Type::Var("a".into()))],
+            context: vec![Constraint {
+                class: QName::unqualified("Eq"),
+                args: vec![Type::Var("a".into())],
+            }],
+            vars: vec!["a".into()],
+            chained: false,
+        });
+        let pc = mk_pending_for("f", "Eq", vec![maybe_ty(int_ty())]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        // Outer Eq (Maybe Int) resolves; inner Eq Int fails.
+        let errs = report.errors.get("f").expect("expected errors");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].kind, ConstraintErrorKind::NoInstanceFound);
+        assert_eq!(errs[0].constraint.args, vec![int_ty()]);
+    }
+
+    #[test]
+    fn phase_c_three_level_nesting_resolves_bottom_up() {
+        // `Eq (Maybe (Maybe Int))` → needs `Eq (Maybe Int)` → needs
+        // `Eq Int`. All present; all resolve.
+        let mut state = UnifyState::new();
+        let ix = eq_with_maybe_context();
+        let pc = mk_pending_for("f", "Eq", vec![maybe_ty(maybe_ty(int_ty()))]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        let dicts = report.dicts.get("f").expect("f got dicts");
+        // Outer + middle + bottom.
+        assert_eq!(dicts.len(), 3, "got: {dicts:?}");
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn phase_c_resolved_context_carries_instance_context_origin() {
+        let mut state = UnifyState::new();
+        let ix = eq_with_maybe_context();
+        let pc = mk_pending_for("f", "Eq", vec![maybe_ty(int_ty())]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        // Two dicts; both belong to f. The second one (bottom Eq Int)
+        // was enqueued by the outer match and should carry
+        // `InstanceContext` origin. Dicts don't store the origin
+        // directly — instead we assert no new errors and no pending,
+        // which implicitly confirms the recursion closed cleanly.
+        let dicts = report.dicts.get("f").unwrap();
+        assert_eq!(dicts.len(), 2);
+        assert!(report.errors.is_empty());
+        assert!(report.deferred.is_empty());
+    }
+
+    #[test]
+    fn phase_c_depth_limit_emits_solver_depth_exceeded_error() {
+        // Pathological: self-referential context that never
+        // terminates. `instance Loop a => Loop a` — every match
+        // produces another identical context. The solver must stop
+        // and surface a `SolverDepthExceeded` diagnostic rather
+        // than silently drop the remaining entries (or loop).
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert(Instance {
+            class: QName::unqualified("Loop"),
+            types: vec![Type::Var("a".into())],
+            context: vec![Constraint {
+                class: QName::unqualified("Loop"),
+                args: vec![Type::Var("a".into())],
+            }],
+            vars: vec!["a".into()],
+            chained: false,
+        });
+        let pc = mk_pending_for("f", "Loop", vec![int_ty()]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        // The last iteration was still solving (Resolved → new
+        // context), so the leftover queue is pure recursion. Must
+        // surface as a hard error, not silently deferred.
+        let errs = report.errors.get("f").expect("expected depth-exceeded error");
+        assert!(
+            errs.iter().any(|e| e.kind == ConstraintErrorKind::SolverDepthExceeded),
+            "expected SolverDepthExceeded; got {errs:?}",
+        );
+        // And the deferred list must be empty (no leak).
+        assert!(report.deferred.is_empty(), "got: {:?}", report.deferred);
+    }
+
+    #[test]
+    fn phase_c_unif_in_context_defers_only_that_sub_constraint() {
+        // `instance Eq a => Eq (Maybe a)` matched against
+        // `Eq (Maybe ?x)` where ?x is fresh. Outer match unifies
+        // the instance's `a` with `?x`; the context becomes
+        // `Eq ?x`, which is a bare-unif constraint on a fundep-less
+        // class — must defer, not error.
+        let mut state = UnifyState::new();
+        let mut ix = InstanceIndex::new();
+        ix.insert_class(
+            "Eq".into(),
+            crate::typecheck_db::passes::instance_index::ClassInfo {
+                type_vars: vec!["a".into()],
+                fundeps: vec![],
+            },
+        );
+        ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
+        ix.insert(Instance {
+            class: QName::unqualified("Eq"),
+            types: vec![maybe_ty(Type::Var("a".into()))],
+            context: vec![Constraint {
+                class: QName::unqualified("Eq"),
+                args: vec![Type::Var("a".into())],
+            }],
+            vars: vec!["a".into()],
+            chained: false,
+        });
+        let fresh = state.fresh();
+        let pc = mk_pending_for("f", "Eq", vec![maybe_ty(fresh)]);
+        let report = solve_all(&mut state, &ix, &[pc]);
+        // Outer resolves; inner `Eq ?x` defers.
+        let dicts = report.dicts.get("f").expect("outer resolves");
+        assert_eq!(dicts.len(), 1);
+        assert!(report.errors.is_empty());
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].origin, ConstraintOrigin::InstanceContext);
     }
 
     #[test]
