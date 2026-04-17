@@ -30,3 +30,5 @@ mod harness;
 mod single_module;
 mod multi_module;
 mod failures;
+mod incremental;
+mod passing_fixtures;

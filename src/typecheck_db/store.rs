@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS pass_output (
     input_hash  BLOB NOT NULL,
     output_hash BLOB NOT NULL,
     output_blob BLOB NOT NULL,
+    decl_debug  TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (module, decl, pass)
 );
 
@@ -36,6 +37,23 @@ CREATE TABLE IF NOT EXISTS module_source (
     decl_index_blob BLOB NOT NULL
 );
 "#;
+
+/// Best-effort migration for pre-`decl_debug` databases. We detect the
+/// missing column by trying to select it and, if it errors, apply the
+/// ALTER. Idempotent on fresh DBs because `CREATE TABLE IF NOT EXISTS`
+/// above already declares the column.
+fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    let has_col: bool = conn
+        .prepare("SELECT decl_debug FROM pass_output LIMIT 0")
+        .is_ok();
+    if !has_col {
+        conn.execute(
+            "ALTER TABLE pass_output ADD COLUMN decl_debug TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -80,6 +98,7 @@ impl Store {
             conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -113,13 +132,29 @@ impl Store {
         output_hash: OutputHash,
         output_blob: &[u8],
     ) -> Result<(), StoreError> {
+        self.put_output_with_debug(key, input_hash, output_hash, output_blob, "")
+    }
+
+    /// Like [`put_output`](Self::put_output) but attaches a
+    /// human-readable debug label to the row. Surfaced by the
+    /// `decl_debug` column for ad-hoc cache inspection; ignored by
+    /// cache correctness.
+    pub fn put_output_with_debug(
+        &self,
+        key: &PassKey,
+        input_hash: InputHash,
+        output_hash: OutputHash,
+        output_blob: &[u8],
+        decl_debug: &str,
+    ) -> Result<(), StoreError> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO pass_output (module, decl, pass, input_hash, output_hash, output_blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO pass_output (module, decl, pass, input_hash, output_hash, output_blob, decl_debug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (module, decl, pass) DO UPDATE SET
                 input_hash  = excluded.input_hash,
                 output_hash = excluded.output_hash,
-                output_blob = excluded.output_blob",
+                output_blob = excluded.output_blob,
+                decl_debug  = excluded.decl_debug",
         )?;
         stmt.execute(params![
             &key.module,
@@ -128,6 +163,7 @@ impl Store {
             &input_hash[..],
             &output_hash[..],
             output_blob,
+            decl_debug,
         ])?;
         Ok(())
     }

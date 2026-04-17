@@ -1,0 +1,37 @@
+# Build units in `tests/fixtures/original-compiler/passing/` that
+# don't yet typecheck under our new typechecker. Each entry is a
+# fixture name (the .purs filename without extension). Lines
+# starting with `#` are comments; blank lines are ignored.
+#
+# Format:
+#   # reason: <one-line justification, optional>
+#   <fixture_name>
+#
+# When a fixture starts passing, delete its line. The build script
+# at `build.rs` validates that every entry here corresponds to a
+# real fixture, so leftovers fail the build.
+#
+# ----------------------------------------------------------------
+# Bootstrap note
+# ----------------------------------------------------------------
+# This file ships empty. Each test loads every `.purs` under
+# `tests/fixtures/packages/` (~8888 modules) before running the
+# build unit, so the *first* test pays a multi-second cache-warming
+# cost; subsequent tests in the same `cargo test` invocation reuse
+# the shared TypecheckDb cache and finish quickly.
+#
+# To populate this file with the real failing set:
+#
+#   cargo test --test passing_fixtures 2>&1 \
+#     | grep "^test passes_" | grep "FAILED" \
+#     | sed 's/^test passes_\(.*\) \.\.\..*/\1/' \
+#     >> tests/passing_fixtures_ignore.txt
+#
+# Then `cargo test` runs the green ones; `cargo test -- --ignored`
+# still runs the broken ones as a forcing function.
+
+# Stale-entry check: the build script panics if any name below
+# doesn't match a real fixture. This is intentional — when a
+# fixture is renamed or removed, the build break makes the
+# surplus line obvious.
+

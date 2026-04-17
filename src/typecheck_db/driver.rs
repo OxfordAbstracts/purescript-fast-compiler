@@ -97,9 +97,24 @@ impl TypecheckDb {
         input_hash: InputHash,
         value: &T,
     ) -> Result<OutputHash, DriverError> {
+        self.put_with_debug(key, input_hash, value, "")
+    }
+
+    /// Like [`put`](Self::put) but attaches a human-readable label to
+    /// the SQLite row (via `pass_output.decl_debug`). Useful for
+    /// inspecting the cache after the fact without changing any hash
+    /// semantics.
+    pub fn put_with_debug<T: Serialize>(
+        &mut self,
+        key: &PassKey,
+        input_hash: InputHash,
+        value: &T,
+        decl_debug: &str,
+    ) -> Result<OutputHash, DriverError> {
         let blob = bincode::serialize(value)?;
         let output_hash = hash_bytes(&blob);
-        self.store.put_output(key, input_hash, output_hash, &blob)?;
+        self.store
+            .put_output_with_debug(key, input_hash, output_hash, &blob, decl_debug)?;
         self.memo.insert(key.clone(), MemoEntry {
             input_hash,
             output_hash,

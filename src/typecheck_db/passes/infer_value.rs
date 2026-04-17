@@ -21,8 +21,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::cst::{self, Binder, Decl, Expr, LetBinding, Literal};
+use crate::typecheck_db::driver::{DriverError, TypecheckDb};
 use crate::typecheck_db::env::{Env, Lookup};
 use crate::typecheck_db::generalize::{generalize, instantiate};
+use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
+use crate::typecheck_db::store::DepEdge;
 use crate::typecheck_db::types::{convert_type_expr, QName, Scheme, Type, TypeOpMap};
 use crate::typecheck_db::unify::{UnifyError, UnifyState};
 
@@ -417,6 +420,95 @@ pub fn infer_value_scc_with_all(
     }
 
     Ok(out)
+}
+
+/// Compute the `input_hash` for one SCC-inference cache entry.
+///
+/// Folds in the SCC's source hash, a module-context hash (covering local
+/// class / instance / data state the module contributes to inference),
+/// and every direct dep's scheme-only `output_hash`.
+fn scc_input_hash(
+    scc_source_hash: [u8; 32],
+    dep_output_hashes: &[(String, String, OutputHash)],
+    module_context_hash: [u8; 32],
+) -> crate::typecheck_db::key::InputHash {
+    let mut hasher = InputHasher::new(PASS_NAME, PASS_VERSION)
+        .with_source_hash(scc_source_hash)
+        .with_module_context(module_context_hash);
+    for (dep_mod, dep_decl, oh) in dep_output_hashes {
+        hasher.add_dep(dep_mod.clone(), dep_decl.clone(), PASS_NAME, *oh);
+    }
+    hasher.finish()
+}
+
+/// Look up a cached SCC inference result. On hit, binds each cached
+/// scheme into `env` so later SCCs that reference them resolve.
+///
+/// Returns `Some((schemes, scheme_only_output_hash))` on hit, `None` on
+/// miss.
+pub fn try_get_cached(
+    db: &mut TypecheckDb,
+    module: &str,
+    scc_key: &str,
+    scc_source_hash: [u8; 32],
+    dep_output_hashes: &[(String, String, OutputHash)],
+    module_context_hash: [u8; 32],
+    env: &mut Env,
+) -> Result<Option<(Vec<InferredScheme>, OutputHash)>, DriverError> {
+    let key = PassKey::new(module, scc_key, PASS_NAME);
+    let input_hash =
+        scc_input_hash(scc_source_hash, dep_output_hashes, module_context_hash);
+    if let Some((schemes, _blob_oh)) = db.get_cached::<Vec<InferredScheme>>(&key, input_hash)? {
+        for s in &schemes {
+            env.bind_scheme(QName::unqualified(&s.name), s.scheme.clone());
+        }
+        let scheme_oh = scheme_only_output_hash(&schemes);
+        return Ok(Some((schemes, scheme_oh)));
+    }
+    Ok(None)
+}
+
+/// Persist a fresh SCC inference result and record its direct deps.
+/// Returns the scheme-only output hash (what downstream SCCs key on).
+pub fn put_cached(
+    db: &mut TypecheckDb,
+    module: &str,
+    scc_key: &str,
+    scc_source_hash: [u8; 32],
+    dep_output_hashes: &[(String, String, OutputHash)],
+    module_context_hash: [u8; 32],
+    schemes: &[InferredScheme],
+) -> Result<OutputHash, DriverError> {
+    let key = PassKey::new(module, scc_key, PASS_NAME);
+    let input_hash =
+        scc_input_hash(scc_source_hash, dep_output_hashes, module_context_hash);
+
+    let schemes_vec: Vec<InferredScheme> = schemes.to_vec();
+    db.put(&key, input_hash, &schemes_vec)?;
+    let dep_edges: Vec<DepEdge> = dep_output_hashes
+        .iter()
+        .map(|(m, d, _)| DepEdge {
+            dep_module: m.clone(),
+            dep_decl: d.clone(),
+            dep_pass: PASS_NAME.to_string(),
+        })
+        .collect();
+    db.put_deps(&key, &dep_edges)?;
+    Ok(scheme_only_output_hash(schemes))
+}
+
+/// Hash the SCC's schemes only, ignoring body-derived diagnostics
+/// (exhaustiveness errors, dict resolutions, etc.). Downstream passes
+/// key off this hash, so body edits that preserve the inferred schemes
+/// don't ripple.
+pub fn scheme_only_output_hash(schemes: &[InferredScheme]) -> OutputHash {
+    let mut pairs: Vec<(String, Scheme)> = schemes
+        .iter()
+        .map(|s| (s.name.clone(), s.scheme.clone()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let bytes = bincode::serialize(&pairs).expect("scheme serialization");
+    hash_bytes(&bytes)
 }
 
 /// Walk an `App` chain down to its head `Con` and return the

@@ -102,9 +102,33 @@ pub struct ModuleExports {
 
 /// In-process cache of every compiled module's export surface,
 /// keyed by canonical module name ("Data.Maybe", "Prim.Row", …).
+///
+/// Also carries the scheme-only `output_hash` of each top-level value
+/// decl (populated by the multi-module driver during a cached run). The
+/// hash is the cross-module cache's version stamp: an importer's
+/// `infer_value_scc` `input_hash` folds in the relevant
+/// `scheme_hashes[decl]`, so body-only edits in an exporter — which
+/// preserve the schemes and thus their hashes — don't invalidate
+/// importers, while signature changes do.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleRegistry {
     modules: HashMap<String, ModuleExports>,
+    scheme_hashes: HashMap<String, HashMap<String, [u8; 32]>>,
+    /// Per-module cached output hashes for every non-value decl
+    /// kind. Keyed by `(module, kind_prefix, simple_name)` — e.g.
+    /// `("Data.Maybe", "d", "Maybe")` for `data Maybe`. Instances
+    /// (keyed by content-hash) also land here under prefix `"i"`.
+    /// Downstream value SCCs pull these hashes into their
+    /// `dep_output_hashes` for precise invalidation.
+    nonvalue_hashes: HashMap<String, HashMap<(String, String), [u8; 32]>>,
+    /// Per-module: every instance decl key in that module. The
+    /// value-SCC dep resolver walks this list to find in-scope
+    /// instances for each class reference.
+    module_instances: HashMap<String, Vec<String>>,
+    /// Per-module, per-class: instance decl keys. Lets callers look
+    /// up exactly the instances of a given class without scanning
+    /// every instance in the module.
+    instances_by_class: HashMap<(String, String), Vec<String>>,
 }
 
 impl ModuleRegistry {
@@ -114,6 +138,97 @@ impl ModuleRegistry {
 
     pub fn insert(&mut self, name: impl Into<String>, exports: ModuleExports) {
         self.modules.insert(name.into(), exports);
+    }
+
+    /// Record the scheme-only output hash of one value decl in `module`.
+    /// Overwrites any prior entry for the same `(module, decl)` pair.
+    pub fn set_scheme_hash(
+        &mut self,
+        module: impl Into<String>,
+        decl: impl Into<String>,
+        hash: [u8; 32],
+    ) {
+        self.scheme_hashes
+            .entry(module.into())
+            .or_default()
+            .insert(decl.into(), hash);
+    }
+
+    /// Look up the scheme-only output hash for a specific decl, if one
+    /// was recorded.
+    pub fn scheme_hash(&self, module: &str, decl: &str) -> Option<[u8; 32]> {
+        self.scheme_hashes
+            .get(module)
+            .and_then(|m| m.get(decl))
+            .copied()
+    }
+
+    /// Record a non-value decl's check output hash. `kind_prefix` is
+    /// one of `"d"` / `"n"` / `"ta"` / `"c"` / `"i"` / `"f"` / `"fv"`
+    /// / `"ft"` (matching `decl_key_for_nonvalue`).
+    pub fn set_nonvalue_hash(
+        &mut self,
+        module: impl Into<String>,
+        kind_prefix: impl Into<String>,
+        name: impl Into<String>,
+        hash: [u8; 32],
+    ) {
+        let m = module.into();
+        self.nonvalue_hashes
+            .entry(m)
+            .or_default()
+            .insert((kind_prefix.into(), name.into()), hash);
+    }
+
+    pub fn nonvalue_hash(
+        &self,
+        module: &str,
+        kind_prefix: &str,
+        name: &str,
+    ) -> Option<[u8; 32]> {
+        self.nonvalue_hashes
+            .get(module)
+            .and_then(|m| m.get(&(kind_prefix.to_string(), name.to_string())))
+            .copied()
+    }
+
+    /// Record one instance decl key (content-hashed) for a module,
+    /// along with the class it implements. The class entry enables
+    /// fine-grained dep tracking: callers pulling in "every in-scope
+    /// instance of class C" walk only the `instances_by_class` slice.
+    pub fn push_module_instance(
+        &mut self,
+        module: impl Into<String>,
+        class_name: impl Into<String>,
+        decl_key: impl Into<String>,
+    ) {
+        let m = module.into();
+        let cn = class_name.into();
+        let dk = decl_key.into();
+        self.module_instances
+            .entry(m.clone())
+            .or_default()
+            .push(dk.clone());
+        self.instances_by_class
+            .entry((m, cn))
+            .or_default()
+            .push(dk);
+    }
+
+    /// All instance decl keys recorded for a module.
+    pub fn module_instances(&self, module: &str) -> &[String] {
+        self.module_instances
+            .get(module)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Instance decl keys in `module` that implement `class_name`.
+    pub fn instances_of_class(&self, module: &str, class_name: &str) -> &[String] {
+        self.instances_by_class
+            .get(&(module.to_string(), class_name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn get(&self, name: &str) -> Option<&ModuleExports> {

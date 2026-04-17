@@ -14,8 +14,10 @@
 
 use crate::cst;
 use crate::parser::parse;
+use crate::typecheck_db::driver::{CacheOutcome, TypecheckDb};
 use crate::typecheck_db::driver_multi::{
-    check_many_modules, ModuleCheckReport, ModuleCheckResult, MultiModuleError,
+    check_many_modules, check_many_modules_with_db, ModuleCheckReport, ModuleCheckResult,
+    ModuleInput, MultiModuleError,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,7 +57,7 @@ pub fn module_name(m: &cst::Module) -> String {
 pub fn assert_typechecks(src: &str) {
     let module = parse_source(src);
     let name = module_name(&module);
-    let report = check_many_modules(vec![(name, module)]);
+    let report = check_many_modules(vec![ModuleInput::new(name, src, module)]);
     assert_report_clean(&report);
 }
 
@@ -63,10 +65,10 @@ pub fn assert_typechecks(src: &str) {
 /// checked in the driver's topo order, and the whole report
 /// must be clean.
 pub fn assert_typechecks_multi(sources: &[&str]) {
-    let mut parsed: Vec<(String, cst::Module)> = Vec::with_capacity(sources.len());
+    let mut parsed: Vec<ModuleInput> = Vec::with_capacity(sources.len());
     for src in sources {
         let m = parse_source(src);
-        parsed.push((module_name(&m), m));
+        parsed.push(ModuleInput::new(module_name(&m), *src, m));
     }
     let report = check_many_modules(parsed);
     assert_report_clean(&report);
@@ -114,7 +116,7 @@ fn assert_report_clean(report: &ModuleCheckReport) {
 pub fn check_single(src: &str) -> ModuleCheckResult {
     let module = parse_source(src);
     let name = module_name(&module);
-    let mut report = check_many_modules(vec![(name, module)]);
+    let mut report = check_many_modules(vec![ModuleInput::new(name, src, module)]);
     assert_eq!(
         report.results.len(),
         1,
@@ -128,12 +130,56 @@ pub fn check_single(src: &str) -> ModuleCheckResult {
 /// all — `failures::` tests use this to assert on driver-level
 /// errors like module cycles.
 pub fn check_multi(sources: &[&str]) -> ModuleCheckReport {
-    let mut parsed: Vec<(String, cst::Module)> = Vec::with_capacity(sources.len());
+    let mut parsed: Vec<ModuleInput> = Vec::with_capacity(sources.len());
     for src in sources {
         let m = parse_source(src);
-        parsed.push((module_name(&m), m));
+        parsed.push(ModuleInput::new(module_name(&m), *src, m));
     }
     check_many_modules(parsed)
+}
+
+/// Incremental helper: parse `sources` and drive them through the
+/// supplied `db`. Call twice with the same db to observe cache-hit
+/// behavior.
+pub fn run_with_shared_db(
+    db: &mut TypecheckDb,
+    sources: &[(&str, &str)],
+) -> ModuleCheckReport {
+    let mut parsed: Vec<ModuleInput> = Vec::with_capacity(sources.len());
+    for (name, src) in sources {
+        let m = parse_source(src);
+        parsed.push(ModuleInput::new(name.to_string(), *src, m));
+    }
+    check_many_modules_with_db(db, parsed)
+}
+
+/// Convenience: pluck a specific `(module, decl)` cache outcome out
+/// of a report. Panics if the module or decl isn't present, so
+/// tests fail fast on a typo instead of silently returning `None`.
+pub fn outcome_of(
+    report: &ModuleCheckReport,
+    module: &str,
+    decl: &str,
+) -> CacheOutcome {
+    let result = report
+        .results
+        .iter()
+        .find(|r| r.name == module)
+        .unwrap_or_else(|| {
+            panic!(
+                "module {module:?} not in report; modules present: {:?}",
+                report.results.iter().map(|r| &r.name).collect::<Vec<_>>()
+            )
+        });
+    *result
+        .decl_outcomes
+        .get(decl)
+        .unwrap_or_else(|| {
+            panic!(
+                "decl {decl:?} not in {module:?} decl_outcomes; present: {:?}",
+                result.decl_outcomes.keys().collect::<Vec<_>>()
+            )
+        })
 }
 
 // Silence unused-import noise when a sub-module only uses one of

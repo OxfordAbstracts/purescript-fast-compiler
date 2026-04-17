@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use purescript_fast_compiler::cst;
 use purescript_fast_compiler::parser::parse;
 use purescript_fast_compiler::typecheck_db::driver_multi::{
-    check_many_modules, MultiModuleError,
+    check_many_modules, ModuleInput, MultiModuleError,
 };
 
 /// Root under which both package sources and passing fixtures
@@ -118,7 +118,7 @@ fn run_fixture_check() {
 
     // Parse every file; bail on the first parse error (parsing
     // isn't this pass's responsibility — someone else owns it).
-    let mut parsed: Vec<(String, cst::Module)> = Vec::with_capacity(files.len());
+    let mut parsed: Vec<ModuleInput> = Vec::with_capacity(files.len());
     let mut seen_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for file in &files {
@@ -135,7 +135,7 @@ fn run_fixture_check() {
         // (two files declare the same module). Surface but don't
         // crash — pick the first one for checking.
         if seen_names.insert(name.clone()) {
-            parsed.push((name, module));
+            parsed.push(ModuleInput::new(name, src, module));
         }
     }
 
