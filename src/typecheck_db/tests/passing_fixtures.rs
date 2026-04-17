@@ -5,15 +5,14 @@
 //! `2018/`) holds additional supporting modules that compile
 //! together with the primary file.
 //!
-//! The build script ([build.rs](../../../../../build.rs)) scans
-//! the fixtures directory and writes one `check_build_unit!(...)`
-//! invocation per build unit into
-//! `$OUT_DIR/passing_fixtures_gen.rs`, which we `include!()` at
-//! the bottom of this file. The list of build units known to fail
-//! is in [passing_fixtures_ignore.txt] — those entries get the
-//! `_ignored` macro variant so `cargo test` stays green while
-//! still surfacing them under `cargo test -- --ignored`.
+//! The list of build units lives in [passing_fixtures_list.rs],
+//! one `check_build_unit!(ident, "fixture")` (or
+//! `check_build_unit_ignored!(ident, "fixture", "reason")`) per
+//! line. `include!`d at the bottom of this file so the macros and
+//! the `run_build_unit` helper are in scope when each entry
+//! expands.
 
+use ntest_timeout::timeout;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -94,14 +93,67 @@ fn package_modules() -> &'static Vec<ModuleInput> {
     })
 }
 
-/// Process-wide `TypecheckDb` shared across every test. Tests
-/// serialize on its mutex, but in exchange the per-decl cache
-/// from the first test makes every subsequent test's package
-/// work a near-free hit.
-fn shared_db() -> &'static Mutex<TypecheckDb> {
-    static DB: OnceLock<Mutex<TypecheckDb>> = OnceLock::new();
-    DB.get_or_init(|| {
-        Mutex::new(TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb"))
+/// State shared across every fixture test. Built once on first
+/// access: open an in-memory `TypecheckDb`, type-check the entire
+/// package set against it (so subsequent tests cache-hit on every
+/// unchanged package decl), and record any panic as
+/// `warmup_error`. A poisoned or broken warmup short-circuits
+/// every test with the same error message — thousands of tests
+/// don't each re-hit the same typechecker bug.
+struct SharedState {
+    db: Mutex<TypecheckDb>,
+    /// `Some` iff package warmup panicked; holds the panic
+    /// message so tests can report it without re-running.
+    warmup_error: Option<String>,
+}
+
+fn shared_state() -> &'static SharedState {
+    static STATE: OnceLock<SharedState> = OnceLock::new();
+    STATE.get_or_init(|| {
+        // Warmup runs on a dedicated 64MB-stack thread — same as
+        // the per-test thread below. Prelude-driven AST walks
+        // legitimately go deep and overflow the default 2–8MB
+        // test-thread stack.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut db =
+                    TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb");
+                let pkgs = package_modules();
+                let mut inputs: Vec<ModuleInput> = Vec::with_capacity(pkgs.len());
+                for m in pkgs {
+                    inputs.push(ModuleInput::new(
+                        m.name.clone(),
+                        m.source.clone(),
+                        m.module.clone(),
+                    ));
+                }
+                let previous_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || check_many_modules_with_db(&mut db, inputs),
+                ));
+                std::panic::set_hook(previous_hook);
+                let warmup_error = match outcome {
+                    Ok(_) => None,
+                    Err(payload) => Some(format!(
+                        "package warmup panicked: {}",
+                        extract_panic_msg(payload),
+                    )),
+                };
+                (db, warmup_error)
+            })
+            .expect("spawn warmup thread");
+        let (db, warmup_error) = handle.join().unwrap_or_else(|payload| {
+            (
+                TypecheckDb::open_in_memory().expect("fallback TypecheckDb"),
+                Some(format!(
+                    "package warmup thread crashed: {}",
+                    extract_panic_msg(payload),
+                )),
+            )
+        });
+        SharedState { db: Mutex::new(db), warmup_error }
     })
 }
 
@@ -148,33 +200,72 @@ fn module_name_of(m: &cst::Module) -> String {
         .join(".")
 }
 
-pub(crate) fn run_build_unit(name: &str) {
-    // Spawn on a dedicated 64MB-stack thread — Prelude + a fixture
-    // can build deep AST walks that overflow the default stack.
-    let owned_name = name.to_string();
-    let join_result = std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_inner(&owned_name))
-        .expect("spawn fixture-check thread")
-        .join();
-    if let Err(payload) = join_result {
-        // Propagate the inner panic message so test output points
-        // at the real failure instead of a generic "thread panicked".
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "fixture-check thread panicked (non-string payload)".to_string()
-        };
-        panic!("{msg}");
+/// Extract a readable string from a panic payload. Handles the
+/// two common shapes (`&'static str` and `String`) plus a
+/// fallback for exotic payloads.
+fn extract_panic_msg(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panicked (non-string payload)".to_string()
     }
 }
 
-fn run_inner(name: &str) {
-    // Start from the cached parsed package modules. Clone so we
-    // don't hand the cached vec out by reference (each test owns
-    // its own input list because dedup may overwrite entries).
+pub(crate) fn run_build_unit(name: &str) {
+    let state = shared_state();
+    if let Some(msg) = &state.warmup_error {
+        // Every test fails with the same message until the
+        // underlying typechecker bug is fixed — fast + obvious.
+        eprintln!("build unit {name}: {msg}");
+        panic!("build unit {name}: {msg}");
+    }
+
+    // Spawn on a dedicated 64MB-stack thread — some fixtures +
+    // Prelude trigger deep AST walks that overflow the default
+    // stack. `catch_unwind` inside the thread silences the
+    // default panic-print so we control the output formatting.
+    let owned_name = name.to_string();
+    let join_result: Result<Result<Vec<String>, String>, _> =
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || run_inner(&owned_name),
+                ));
+                std::panic::set_hook(previous);
+                match outcome {
+                    Ok(res) => res,
+                    Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+                }
+            })
+            .expect("spawn fixture-check thread")
+            .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "worker thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    match inner {
+        Ok(_errors) => { /* success */ }
+        Err(msg) => {
+            eprintln!("build unit {name}: {msg}");
+            panic!("build unit {name}: {msg}");
+        }
+    }
+}
+
+/// Runs the actual check. Returns `Err(msg)` on a detected
+/// diagnostic; `Ok(_)` on a clean report.
+fn run_inner(name: &str) -> Result<Vec<String>, String> {
+    // Build-unit's own files: parsed fresh each test (fast — at
+    // most a handful per build unit). Overlaid onto the cached
+    // package-module map.
     let pkgs = package_modules();
     let mut by_name: std::collections::HashMap<String, ModuleInput> =
         std::collections::HashMap::with_capacity(pkgs.len() + 4);
@@ -184,72 +275,64 @@ fn run_inner(name: &str) {
             ModuleInput::new(m.name.clone(), m.source.clone(), m.module.clone()),
         );
     }
-
-    // Build-unit's own files: parsed fresh each test (fast — at
-    // most a handful per build unit) and overwriting any package
-    // module of the same name.
     for (path, src) in build_unit_sources(name) {
         let module = match parse(&src) {
             Ok(m) => m,
-            Err(e) => panic!("parse error in {}: {e:?}", path.display()),
+            Err(e) => return Err(format!("parse error in {}: {e:?}", path.display())),
         };
         let mod_name = module_name_of(&module);
         by_name.insert(mod_name.clone(), ModuleInput::new(mod_name, src, module));
     }
     let parsed: Vec<ModuleInput> = by_name.into_values().collect();
 
-    // Acquire the shared DB. The first test through pays the full
-    // package-typecheck cost; subsequent tests cache-hit on every
-    // unchanged package decl. `unwrap_or_else(|p| p.into_inner())`
-    // recovers from a poisoned mutex (a previous test's panic) so
-    // one failure doesn't poison the entire run.
-    let mutex = shared_db();
-    let mut db = mutex.lock().unwrap_or_else(|p| p.into_inner());
+    // The shared DB is already pre-warmed with packages — this
+    // call only does real work for the few build-unit modules.
+    // `unwrap_or_else(|p| p.into_inner())` recovers from a
+    // poisoned mutex (a previous test's panic) so one failure
+    // doesn't poison the entire run.
+    let state = shared_state();
+    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
     let report = check_many_modules_with_db(&mut db, parsed);
     drop(db);
 
-    // Cycles are fatal — the modules in them never get checked.
     for e in &report.errors {
         match e {
             MultiModuleError::CycleInModules(cycle) => {
-                panic!(
-                    "cycle among modules in build unit {name}: {}",
+                return Err(format!(
+                    "cycle among modules: {}",
                     cycle.join(" \u{2194} "),
-                );
+                ));
             }
-            other => panic!("driver error in build unit {name}: {other:?}"),
+            other => return Err(format!("driver error: {other:?}")),
         }
     }
-
-    // Per-module diagnostics. Surface the first failure with a
-    // clear attribution to (build unit, module, kind, detail).
-    // Subsequent failures are likely cascades from the first.
     for result in &report.results {
         if let Some(err) = &result.inference_error {
-            panic!(
-                "build unit {name}: inference error in {}: {err:?}",
+            return Err(format!(
+                "inference error in {}: {err:?}",
                 result.name,
-            );
+            ));
         }
         if let Some(ie) = result.import_errors.first() {
-            panic!(
-                "build unit {name}: import error in {}: {:?}",
+            return Err(format!(
+                "import error in {}: {:?}",
                 result.name, ie.kind,
-            );
+            ));
         }
         if let Some(ne) = result.exhaustiveness_errors.first() {
-            panic!(
-                "build unit {name}: non-exhaustive pattern in {} ({}: missing {:?})",
+            return Err(format!(
+                "non-exhaustive pattern in {} ({}: missing {:?})",
                 result.name, ne.type_name, ne.missing,
-            );
+            ));
         }
         if let Some(ce) = result.constraint_errors.first() {
-            panic!(
-                "build unit {name}: constraint error in {} ({:?} on {})",
+            return Err(format!(
+                "constraint error in {} ({:?} on {})",
                 result.name, ce.kind, ce.constraint.class.name,
-            );
+            ));
         }
     }
+    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +343,7 @@ fn run_inner(name: &str) {
 macro_rules! check_build_unit {
     ($test_name:ident, $fixture:literal) => {
         #[test]
+        #[timeout(20000)]
         #[allow(non_snake_case)]
         fn $test_name() {
             run_build_unit($fixture);
@@ -270,6 +354,7 @@ macro_rules! check_build_unit {
 macro_rules! check_build_unit_ignored {
     ($test_name:ident, $fixture:literal, $reason:literal) => {
         #[test]
+        #[timeout(20000)]
         #[ignore = $reason]
         #[allow(non_snake_case)]
         fn $test_name() {
@@ -278,7 +363,6 @@ macro_rules! check_build_unit_ignored {
     };
 }
 
-// `include!` wires in the build-script-generated test list. If
-// the file doesn't exist, the build hasn't run; cargo will surface
-// that as a compile error pointing at this line.
-include!(concat!(env!("OUT_DIR"), "/passing_fixtures_gen.rs"));
+// `include!` wires in the hand-maintained test list. Each entry
+// is a macro invocation that expands to a `#[test]` function.
+include!("passing_fixtures_list.rs");

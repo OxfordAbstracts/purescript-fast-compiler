@@ -799,14 +799,13 @@ fn infer_record(
     type_ops: &TypeOpMap,
     fields: &[cst::RecordField],
 ) -> Result<Type, InferError> {
-    // A bare `Expr::Record` should only appear as a literal — fields
-    // with `is_update = true` are emitted by the parser exclusively
-    // under an `App` (record update) and are handled in `infer_app`.
-    // A standalone all-update record is a parser invariant violation.
-    assert!(
-        fields.iter().all(|f| !f.is_update),
-        "parser invariant: bare Expr::Record with update fields should appear under App",
-    );
+    // A bare `Expr::Record` with `is_update` fields is an unusual
+    // but not impossible shape — some Prelude fixtures produce it.
+    // Surface as a soft "unsupported" error instead of panicking
+    // so the rest of the module can still finish checking.
+    if fields.iter().any(|f| f.is_update) {
+        return Err(InferError::Unsupported("bare record with update fields"));
+    }
     let mut inferred: Vec<(String, Type)> = Vec::with_capacity(fields.len());
     for f in fields {
         let label = crate::typecheck_db::util::resolve_symbol(f.label.value.symbol());

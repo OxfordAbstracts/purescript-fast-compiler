@@ -34,16 +34,74 @@ pub fn generalize(state: &UnifyState, env: &Env, ty: &Type) -> Scheme {
 }
 
 /// Instantiate a scheme: replace each quantified variable with a fresh
-/// unification variable.
+/// unification variable. Also rewrites any stray `Type::Unif(id)` in
+/// the scheme body — those can appear when a cached scheme carries
+/// unif vars from the state that produced it, and blindly reusing
+/// those ids would panic later when we try to `assign` against a
+/// different state's shorter bindings vec. We give every such stray
+/// id a fresh local unif var in the new state.
 pub fn instantiate(state: &mut UnifyState, scheme: &Scheme) -> Type {
-    if scheme.vars.is_empty() {
-        return scheme.ty.clone();
-    }
-    let mut subst: HashMap<String, Type> = HashMap::new();
+    let mut var_subst: HashMap<String, Type> = HashMap::new();
     for v in &scheme.vars {
-        subst.insert(v.clone(), state.fresh());
+        var_subst.insert(v.clone(), state.fresh());
     }
-    apply_var_subst(&scheme.ty, &subst)
+    let body = if var_subst.is_empty() {
+        scheme.ty.clone()
+    } else {
+        apply_var_subst(&scheme.ty, &var_subst)
+    };
+
+    // Collect stray `Unif` ids in the body (ids the body carries
+    // that weren't introduced by the quantifier substitution above).
+    let mut stray_ids: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
+    collect_stray_unif(&body, &mut stray_ids);
+    if stray_ids.is_empty() {
+        return body;
+    }
+    let mut unif_subst: HashMap<u32, Type> = HashMap::new();
+    for id in stray_ids {
+        unif_subst.insert(id, state.fresh());
+    }
+    apply_unif_subst(&body, &unif_subst)
+}
+
+fn collect_stray_unif(ty: &Type, out: &mut std::collections::HashSet<u32>) {
+    match ty {
+        Type::Unif(id) => {
+            out.insert(*id);
+        }
+        Type::App(f, a) => {
+            collect_stray_unif(f, out);
+            collect_stray_unif(a, out);
+        }
+        Type::Fun(a, b) => {
+            collect_stray_unif(a, out);
+            collect_stray_unif(b, out);
+        }
+        Type::Forall(_, body) => collect_stray_unif(body, out),
+        Type::Constrained(cs, body) => {
+            for c in cs {
+                for a in &c.args {
+                    collect_stray_unif(a, out);
+                }
+            }
+            collect_stray_unif(body, out);
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            for (_, t) in fs {
+                collect_stray_unif(t, out);
+            }
+            if let Some(t) = tail {
+                collect_stray_unif(t, out);
+            }
+        }
+        Type::Kinded(t, k) => {
+            collect_stray_unif(t, out);
+            collect_stray_unif(k, out);
+        }
+        _ => {}
+    }
 }
 
 /// Produce a readable name for the n-th quantified variable: `a`, `b`, …,

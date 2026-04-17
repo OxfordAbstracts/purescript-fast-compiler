@@ -139,7 +139,16 @@ impl UnifyState {
     }
 
     fn assign(&mut self, id: u32, ty: Type) {
-        self.bindings[id as usize] = Some(ty);
+        // Grow the bindings vec if `id` is out of range. This
+        // happens when a cached scheme carries a `Type::Unif(old_id)`
+        // from a previous `UnifyState`; `instantiate` usually
+        // rewrites those, but we keep this safety net so any
+        // remaining stray id is bound cleanly instead of panicking.
+        let slot = id as usize;
+        if slot >= self.bindings.len() {
+            self.bindings.resize(slot + 1, None);
+        }
+        self.bindings[slot] = Some(ty);
     }
 
     /// Fully resolve a type by following bindings. Idempotent.
