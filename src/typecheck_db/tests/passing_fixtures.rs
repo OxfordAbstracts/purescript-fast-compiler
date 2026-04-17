@@ -15,7 +15,7 @@
 use ntest_timeout::timeout;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use crate::cst;
 use crate::parser::parse;
@@ -144,17 +144,6 @@ fn transitive_imports(
     out
 }
 
-/// Process-wide `TypecheckDb` shared across every fixture test.
-/// Lazy — the first test that runs initializes it. Tests serialize
-/// on its mutex, but the per-decl cache absorbs the cost of every
-/// package module they've already typechecked, so repeat work
-/// across 394 tests drops to near-zero.
-fn shared_db() -> &'static Mutex<TypecheckDb> {
-    static DB: OnceLock<Mutex<TypecheckDb>> = OnceLock::new();
-    DB.get_or_init(|| {
-        Mutex::new(TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb"))
-    })
-}
 
 /// Gather the build unit's own source files: the primary `.purs`
 /// plus every `.purs` inside the same-named directory (if any).
@@ -284,17 +273,12 @@ fn run_inner(name: &str) -> Result<Vec<String>, String> {
     }
     let parsed: Vec<ModuleInput> = by_name.into_values().collect();
 
-    // 4) Drive the multi-module check. The shared `TypecheckDb`
-    //    carries the per-decl cache across tests — on repeat
-    //    invocations (second, third test onward) every
-    //    previously-seen module hits cache and adds near-zero cost.
-    //    `unwrap_or_else(|p| p.into_inner())` recovers from a
-    //    poisoned mutex (a previous test's panic) so one failure
-    //    doesn't poison the entire run.
-    let mutex = shared_db();
-    let mut db = mutex.lock().unwrap_or_else(|p| p.into_inner());
+    // 4) Drive the multi-module check against a fresh
+    //    `TypecheckDb`. Each fixture test owns its own empty cache
+    //    so a bug one test triggers can't bleed into the next.
+    let mut db = TypecheckDb::open_in_memory()
+        .expect("open in-memory TypecheckDb");
     let report = check_many_modules_with_db(&mut db, parsed);
-    drop(db);
 
     for e in &report.errors {
         match e {
