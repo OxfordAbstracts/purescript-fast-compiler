@@ -711,13 +711,21 @@ fn check_one_module(
         resolved_dicts.extend(s.resolved_dicts.iter().cloned());
     }
 
-    // 6) Distill exports + register.
-    let exports = distill_exports(
+    // 6) Distill exports + register. `module X` re-export clauses
+    // need a second pass because their expansion requires a
+    // `ModuleRegistry` reference, which `distill_exports` doesn't
+    // hold.
+    let mut exports = distill_exports(
         module,
         &all_schemes,
         &local_instances,
         &local_classes,
         &ctor_details,
+    );
+    crate::typecheck_db::module_registry::expand_module_reexports(
+        &mut exports,
+        module,
+        registry,
     );
     registry.insert(name.clone(), exports);
 

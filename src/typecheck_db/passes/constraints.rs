@@ -78,9 +78,23 @@ pub enum ConstraintOrigin {
 /// This is the entry point that `infer_var` calls right after
 /// `instantiate` so the caller can record the peeled constraints.
 pub fn peel_constraints(ty: Type) -> (Vec<Constraint>, Type) {
-    match ty {
-        Type::Constrained(cs, body) => (cs, *body),
-        other => (Vec::new(), other),
+    // Peel every `Constrained` layer, not just the outermost one.
+    // Nested constraints appear when a method signature quantifies
+    // over multiple class-constrained variables:
+    // `forall a b. Eq a => Eq b => a -> b -> Bool` instantiates to
+    // `Constrained([Eq α], Constrained([Eq β], Fun(α, Fun(β, Bool))))`
+    // and leaving the inner layer in place makes the body unify as
+    // a `Constrained(…)` where a function is expected.
+    let mut all: Vec<Constraint> = Vec::new();
+    let mut cur = ty;
+    loop {
+        match cur {
+            Type::Constrained(cs, body) => {
+                all.extend(cs);
+                cur = *body;
+            }
+            other => return (all, other),
+        }
     }
 }
 

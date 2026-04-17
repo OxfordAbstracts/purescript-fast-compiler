@@ -198,8 +198,25 @@ fn apply_explicit(
             let name = crate::typecheck_db::util::resolve_symbol(vn.value.symbol());
             match target.values.get(&name) {
                 Some(scheme) => {
-                    let key = QName { module: qualifier, name: name.clone() };
+                    let key = QName { module: qualifier.clone(), name: name.clone() };
                     env.bind_scheme(key, scheme.clone());
+                    // If this Value-import is actually an operator
+                    // alias (e.g. `import M ((==))` where `==` aliases
+                    // `eq`), also bring the underlying target into
+                    // scope. After desugar, call-site code references
+                    // the target directly, not the operator, so the
+                    // target must be resolvable.
+                    if let Some(fx) = target.value_fixities.get(&name) {
+                        if let Some(target_scheme) = target.values.get(&fx.target_name) {
+                            env.bind_scheme(
+                                QName {
+                                    module: qualifier.clone(),
+                                    name: fx.target_name.clone(),
+                                },
+                                target_scheme.clone(),
+                            );
+                        }
+                    }
                 }
                 None => errors.push(ImportError {
                     span,

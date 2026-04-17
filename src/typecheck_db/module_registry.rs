@@ -572,7 +572,10 @@ pub fn distill_exports(
                         }
                     }
                     Export::Module(_) => {
-                        // Re-export `module N` — deferred.
+                        // Handled in a second pass outside this
+                        // function — see `expand_module_reexports`,
+                        // which has access to the `ModuleRegistry`
+                        // needed to look up the target's exports.
                     }
                 }
             }
@@ -591,6 +594,111 @@ pub fn distill_exports(
     }
 
     out
+}
+
+/// Second pass over `out` to handle `module N` re-export clauses.
+/// For every `module X` in the export list, find the matching
+/// import (by alias or raw target name), look up the imported
+/// module's `ModuleExports` in the registry, and merge those
+/// items into `out`. `distill_exports` itself can't do this
+/// because it doesn't hold a registry reference — so this lives
+/// here and is called from the driver after the primary distill.
+pub fn expand_module_reexports(
+    out: &mut ModuleExports,
+    module: &crate::cst::Module,
+    registry: &ModuleRegistry,
+) {
+    use crate::cst::Export;
+    let spanned = match &module.exports {
+        Some(s) => s,
+        None => return,
+    };
+    for item in &spanned.value.exports {
+        if let Export::Module(mn) = item {
+            let re_exported_name: String = mn
+                .parts
+                .iter()
+                .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                .collect::<Vec<_>>()
+                .join(".");
+
+            // Find which import target this `module X` clause
+            // refers to: either an `import M as X` aliased as
+            // `re_exported_name`, or the raw target `import
+            // re_exported_name`.
+            let mut target_module: Option<String> = None;
+            for imp in &module.imports {
+                let imp_target: String = imp
+                    .module
+                    .parts
+                    .iter()
+                    .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if imp_target == re_exported_name {
+                    target_module = Some(imp_target);
+                    break;
+                }
+                if let Some(alias) = &imp.qualified {
+                    let alias_str: String = alias
+                        .parts
+                        .iter()
+                        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if alias_str == re_exported_name {
+                        target_module = Some(imp_target);
+                        break;
+                    }
+                }
+            }
+            let Some(target_name) = target_module else {
+                continue;
+            };
+            let Some(target_exports) = registry.get(&target_name) else {
+                continue;
+            };
+
+            // Merge everything from the target. The target's items
+            // become re-exported under this module.
+            for (k, v) in &target_exports.values {
+                out.values.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &target_exports.ctors {
+                out.ctors.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &target_exports.data_constructors {
+                out.data_constructors.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &target_exports.type_aliases {
+                out.type_aliases.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &target_exports.classes {
+                out.classes.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            // Instances are global — already carried via the
+            // importer's own `instances` field, but re-exporting
+            // them again is harmless and matches PureScript
+            // semantics.
+            for inst in &target_exports.instances {
+                if !out.instances.iter().any(|i| i == inst) {
+                    out.instances.push(inst.clone());
+                }
+            }
+            for (k, v) in &target_exports.value_fixities {
+                out.value_fixities.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &target_exports.type_fixities {
+                out.type_fixities.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for n in &target_exports.newtypes {
+                out.newtypes.insert(n.clone());
+            }
+            for (k, v) in &target_exports.type_arities {
+                out.type_arities.entry(k.clone()).or_insert(*v);
+            }
+        }
+    }
 }
 
 fn is_operator_in_export_list(exports: &[crate::cst::Export], op: &str) -> bool {

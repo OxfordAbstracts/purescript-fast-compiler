@@ -67,16 +67,17 @@ fn collect_purs_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// All package modules already parsed into `ModuleInput`, cached
-/// so the 394 generated tests don't each pay the
-/// "read + parse ~8888 package files" cost. `cst::Module: Clone`,
-/// so we hand each test its own clone.
-fn package_modules() -> &'static Vec<ModuleInput> {
-    static CACHE: OnceLock<Vec<ModuleInput>> = OnceLock::new();
+/// All package modules already parsed, indexed by canonical
+/// module name. Tests pick only the ones they transitively import
+/// rather than dragging in all ~8888 modules, so per-test
+/// typecheck work scales with the fixture's import closure.
+fn package_modules_by_name() -> &'static std::collections::HashMap<String, ModuleInput> {
+    static CACHE: OnceLock<std::collections::HashMap<String, ModuleInput>> =
+        OnceLock::new();
     CACHE.get_or_init(|| {
         let root = packages_root();
         let files = collect_purs_files(&root);
-        let mut out = Vec::with_capacity(files.len());
+        let mut out = std::collections::HashMap::with_capacity(files.len());
         for file in files {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
@@ -87,73 +88,71 @@ fn package_modules() -> &'static Vec<ModuleInput> {
                 Err(e) => panic!("parse error in {}: {e:?}", file.display()),
             };
             let name = module_name_of(&module);
-            out.push(ModuleInput::new(name, src, module));
+            // First write wins — some packages redefine the same
+            // module (diamond-dep duplicates in spago); the
+            // typechecker needs exactly one copy.
+            out.entry(name.clone()).or_insert(ModuleInput::new(name, src, module));
         }
         out
     })
 }
 
-/// State shared across every fixture test. Built once on first
-/// access: open an in-memory `TypecheckDb`, type-check the entire
-/// package set against it (so subsequent tests cache-hit on every
-/// unchanged package decl), and record any panic as
-/// `warmup_error`. A poisoned or broken warmup short-circuits
-/// every test with the same error message — thousands of tests
-/// don't each re-hit the same typechecker bug.
-struct SharedState {
-    db: Mutex<TypecheckDb>,
-    /// `Some` iff package warmup panicked; holds the panic
-    /// message so tests can report it without re-running.
-    warmup_error: Option<String>,
+/// Pull out each top-level import target from a CST.
+fn imports_of(module: &cst::Module) -> Vec<String> {
+    module
+        .imports
+        .iter()
+        .map(|imp| {
+            imp.module
+                .parts
+                .iter()
+                .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect()
 }
 
-fn shared_state() -> &'static SharedState {
-    static STATE: OnceLock<SharedState> = OnceLock::new();
-    STATE.get_or_init(|| {
-        // Warmup runs on a dedicated 64MB-stack thread — same as
-        // the per-test thread below. Prelude-driven AST walks
-        // legitimately go deep and overflow the default 2–8MB
-        // test-thread stack.
-        let handle = std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(|| {
-                let mut db =
-                    TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb");
-                let pkgs = package_modules();
-                let mut inputs: Vec<ModuleInput> = Vec::with_capacity(pkgs.len());
-                for m in pkgs {
-                    inputs.push(ModuleInput::new(
-                        m.name.clone(),
-                        m.source.clone(),
-                        m.module.clone(),
-                    ));
-                }
-                let previous_hook = std::panic::take_hook();
-                std::panic::set_hook(Box::new(|_| {}));
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || check_many_modules_with_db(&mut db, inputs),
-                ));
-                std::panic::set_hook(previous_hook);
-                let warmup_error = match outcome {
-                    Ok(_) => None,
-                    Err(payload) => Some(format!(
-                        "package warmup panicked: {}",
-                        extract_panic_msg(payload),
-                    )),
-                };
-                (db, warmup_error)
-            })
-            .expect("spawn warmup thread");
-        let (db, warmup_error) = handle.join().unwrap_or_else(|payload| {
-            (
-                TypecheckDb::open_in_memory().expect("fallback TypecheckDb"),
-                Some(format!(
-                    "package warmup thread crashed: {}",
-                    extract_panic_msg(payload),
-                )),
-            )
-        });
-        SharedState { db: Mutex::new(db), warmup_error }
+/// Compute the transitive import closure of `seed_names` against
+/// the package map. Only modules that live in the packages map
+/// (and haven't already been seeded by the build unit) come back.
+fn transitive_imports(
+    seed_modules: &[ModuleInput],
+    pkgs: &std::collections::HashMap<String, ModuleInput>,
+) -> Vec<ModuleInput> {
+    let already: std::collections::HashSet<String> =
+        seed_modules.iter().map(|m| m.name.clone()).collect();
+    let mut visited: std::collections::HashSet<String> = already.clone();
+    let mut stack: Vec<String> = seed_modules
+        .iter()
+        .flat_map(|m| imports_of(&m.module))
+        .collect();
+    let mut out: Vec<ModuleInput> = Vec::new();
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        if let Some(m) = pkgs.get(&name) {
+            stack.extend(imports_of(&m.module));
+            out.push(ModuleInput::new(
+                m.name.clone(),
+                m.source.clone(),
+                m.module.clone(),
+            ));
+        }
+    }
+    out
+}
+
+/// Process-wide `TypecheckDb` shared across every fixture test.
+/// Lazy — the first test that runs initializes it. Tests serialize
+/// on its mutex, but the per-decl cache absorbs the cost of every
+/// package module they've already typechecked, so repeat work
+/// across 394 tests drops to near-zero.
+fn shared_db() -> &'static Mutex<TypecheckDb> {
+    static DB: OnceLock<Mutex<TypecheckDb>> = OnceLock::new();
+    DB.get_or_init(|| {
+        Mutex::new(TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb"))
     })
 }
 
@@ -214,14 +213,6 @@ fn extract_panic_msg(payload: Box<dyn std::any::Any + Send + 'static>) -> String
 }
 
 pub(crate) fn run_build_unit(name: &str) {
-    let state = shared_state();
-    if let Some(msg) = &state.warmup_error {
-        // Every test fails with the same message until the
-        // underlying typechecker bug is fixed — fast + obvious.
-        eprintln!("build unit {name}: {msg}");
-        panic!("build unit {name}: {msg}");
-    }
-
     // Spawn on a dedicated 64MB-stack thread — some fixtures +
     // Prelude trigger deep AST walks that overflow the default
     // stack. `catch_unwind` inside the thread silences the
@@ -263,35 +254,45 @@ pub(crate) fn run_build_unit(name: &str) {
 /// Runs the actual check. Returns `Err(msg)` on a detected
 /// diagnostic; `Ok(_)` on a clean report.
 fn run_inner(name: &str) -> Result<Vec<String>, String> {
-    // Build-unit's own files: parsed fresh each test (fast — at
-    // most a handful per build unit). Overlaid onto the cached
-    // package-module map.
-    let pkgs = package_modules();
-    let mut by_name: std::collections::HashMap<String, ModuleInput> =
-        std::collections::HashMap::with_capacity(pkgs.len() + 4);
-    for m in pkgs {
-        by_name.insert(
-            m.name.clone(),
-            ModuleInput::new(m.name.clone(), m.source.clone(), m.module.clone()),
-        );
-    }
+    // 1) Parse the build-unit's own files (fast — a handful at
+    //    most).
+    let mut fixture_modules: Vec<ModuleInput> = Vec::new();
     for (path, src) in build_unit_sources(name) {
         let module = match parse(&src) {
             Ok(m) => m,
             Err(e) => return Err(format!("parse error in {}: {e:?}", path.display())),
         };
         let mod_name = module_name_of(&module);
-        by_name.insert(mod_name.clone(), ModuleInput::new(mod_name, src, module));
+        fixture_modules.push(ModuleInput::new(mod_name, src, module));
+    }
+
+    // 2) Pull in only the packages this fixture transitively
+    //    imports. This replaces the "load all 8888 packages"
+    //    warmup with a per-test closure that's usually < 100
+    //    modules — each test finishes in seconds.
+    let pkgs = package_modules_by_name();
+    let closure = transitive_imports(&fixture_modules, pkgs);
+
+    // 3) Dedupe by module name; fixture wins on collision.
+    let mut by_name: std::collections::HashMap<String, ModuleInput> =
+        std::collections::HashMap::with_capacity(fixture_modules.len() + closure.len());
+    for m in closure {
+        by_name.insert(m.name.clone(), m);
+    }
+    for m in fixture_modules {
+        by_name.insert(m.name.clone(), m);
     }
     let parsed: Vec<ModuleInput> = by_name.into_values().collect();
 
-    // The shared DB is already pre-warmed with packages — this
-    // call only does real work for the few build-unit modules.
-    // `unwrap_or_else(|p| p.into_inner())` recovers from a
-    // poisoned mutex (a previous test's panic) so one failure
-    // doesn't poison the entire run.
-    let state = shared_state();
-    let mut db = state.db.lock().unwrap_or_else(|p| p.into_inner());
+    // 4) Drive the multi-module check. The shared `TypecheckDb`
+    //    carries the per-decl cache across tests — on repeat
+    //    invocations (second, third test onward) every
+    //    previously-seen module hits cache and adds near-zero cost.
+    //    `unwrap_or_else(|p| p.into_inner())` recovers from a
+    //    poisoned mutex (a previous test's panic) so one failure
+    //    doesn't poison the entire run.
+    let mutex = shared_db();
+    let mut db = mutex.lock().unwrap_or_else(|p| p.into_inner());
     let report = check_many_modules_with_db(&mut db, parsed);
     drop(db);
 
