@@ -19,6 +19,9 @@ pub mod prim;
 pub mod driver_multi;
 pub mod passes;
 
+#[cfg(test)]
+mod tests;
+
 pub use driver::{CacheOutcome, TypecheckDb};
 pub use key::{InputHash, InputHasher, OutputHash, PassKey};
 pub use store::{PassRow, Store, StoreError};
