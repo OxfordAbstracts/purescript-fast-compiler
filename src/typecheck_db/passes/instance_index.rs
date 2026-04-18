@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cst::Decl;
+use crate::typecheck_db::ir::Decl;
 use crate::typecheck_db::types::{convert_type_expr, Constraint, QName, Type, TypeOpMap};
 
 // ---------------------------------------------------------------------------
@@ -384,7 +384,10 @@ mod tests {
     }
 
     fn parse_module(src: &str) -> Vec<Decl> {
-        parse(src).unwrap().decls
+        let cst_mod = parse(src).unwrap();
+        crate::typecheck_db::ir::lower_module(cst_mod)
+            .expect("cst → ir lowering")
+            .decls
     }
 
     // =================================================================

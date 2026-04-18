@@ -163,9 +163,16 @@ fn check_one_module(
     let (mut env, mut instance_index, import_errors) =
         build_env_from_imports(module, registry);
 
-    // 2) Desugar the module as a whole.
+    // 2) Desugar the module as a whole, then lower cst → ir so
+    //    every downstream pass consumes an `ir::Decl` that has no
+    //    residual operator nodes (Op / OpParens / BacktickApp).
     let ctx = build_desugar_context(module, registry);
-    let desugared: Vec<cst::Decl> = desugar_module(module.decls.clone(), &ctx);
+    let desugared_cst: Vec<cst::Decl> = desugar_module(module.decls.clone(), &ctx);
+    let desugared: Vec<crate::typecheck_db::ir::Decl> = desugared_cst
+        .into_iter()
+        .map(crate::typecheck_db::ir::lower_decl)
+        .collect::<Result<_, _>>()
+        .expect("cst → ir lowering");
 
     let type_ops = TypeOpMap::default();
 
@@ -224,7 +231,7 @@ fn check_one_module(
             &local_foreign_value_hashes,
         );
         match d {
-            cst::Decl::Data { .. } | cst::Decl::Newtype { .. } => {
+            crate::typecheck_db::ir::Decl::Data { .. } | crate::typecheck_db::ir::Decl::Newtype { .. } => {
                 let (shape, oh, outcome) = check_data::run(
                     db,
                     &name,
@@ -250,7 +257,7 @@ fn check_one_module(
                 local_type_hashes.insert(shape.name.clone(), oh);
                 decl_outcomes.insert(decl_key.clone(), outcome);
             }
-            cst::Decl::TypeAlias { .. } => {
+            crate::typecheck_db::ir::Decl::TypeAlias { .. } => {
                 let (shape, oh, outcome) = check_type_alias::run(
                     db,
                     &name,
@@ -266,7 +273,7 @@ fn check_one_module(
                 local_type_hashes.insert(shape.name.clone(), oh);
                 decl_outcomes.insert(decl_key.clone(), outcome);
             }
-            cst::Decl::Class { .. } => {
+            crate::typecheck_db::ir::Decl::Class { .. } => {
                 let (shape, oh, outcome) = check_class::run(
                     db,
                     &name,
@@ -291,7 +298,7 @@ fn check_one_module(
                 }
                 decl_outcomes.insert(decl_key.clone(), outcome);
             }
-            cst::Decl::Instance { .. } | cst::Decl::Derive { .. } => {
+            crate::typecheck_db::ir::Decl::Instance { .. } | crate::typecheck_db::ir::Decl::Derive { .. } => {
                 let (shape, oh, outcome) = check_instance::run(
                     db,
                     &name,
@@ -313,7 +320,7 @@ fn check_one_module(
                     .push((decl_key.clone(), oh));
                 decl_outcomes.insert(decl_key.clone(), outcome);
             }
-            cst::Decl::Fixity { operator, .. } => {
+            crate::typecheck_db::ir::Decl::Fixity { operator, .. } => {
                 let (_shape, oh, outcome) = check_fixity::run(
                     db,
                     &name,
@@ -330,7 +337,7 @@ fn check_one_module(
                 local_fixity_hashes.insert(op_name, oh);
                 decl_outcomes.insert(decl_key.clone(), outcome);
             }
-            cst::Decl::Foreign { .. } => {
+            crate::typecheck_db::ir::Decl::Foreign { .. } => {
                 let (_shape, oh, outcome) = check_foreign::run(
                     db,
                     &name,
@@ -343,7 +350,7 @@ fn check_one_module(
                 )
                 .expect("check_foreign");
                 let fname = match d {
-                    cst::Decl::Foreign { name, .. } => {
+                    crate::typecheck_db::ir::Decl::Foreign { name, .. } => {
                         crate::typecheck_db::util::resolve_symbol(name.value.symbol())
                     }
                     _ => unreachable!(),
@@ -352,7 +359,7 @@ fn check_one_module(
                 local_foreign_value_hashes.insert(fname, oh);
                 decl_outcomes.insert(decl_key.clone(), outcome);
             }
-            cst::Decl::ForeignData { .. } => {
+            crate::typecheck_db::ir::Decl::ForeignData { .. } => {
                 let (shape, oh, outcome) = check_foreign_data::run(
                     db,
                     &name,
@@ -426,10 +433,10 @@ fn check_one_module(
     // inference; everything else (data, class, instance, fixity)
     // contributes to env / registry but isn't a cacheable SCC unit.
     let mut value_idxs: Vec<usize> = Vec::new();
-    let mut non_value_decls: Vec<&cst::Decl> = Vec::new();
+    let mut non_value_decls: Vec<&crate::typecheck_db::ir::Decl> = Vec::new();
     for (i, d) in desugared.iter().enumerate() {
         match d {
-            cst::Decl::Value { .. } => value_idxs.push(i),
+            crate::typecheck_db::ir::Decl::Value { .. } => value_idxs.push(i),
             _ => non_value_decls.push(d),
         }
     }
@@ -442,7 +449,7 @@ fn check_one_module(
     for &i in &value_idxs {
         let d = &desugared[i];
         let (n, span) = match d {
-            cst::Decl::Value { name, span, .. } => (
+            crate::typecheck_db::ir::Decl::Value { name, span, .. } => (
                 crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
                 (span.start, span.end),
             ),
@@ -490,7 +497,7 @@ fn check_one_module(
     let mut sig_free_by_name: HashMap<String, Vec<crate::typecheck_db::passes::names::Reference>> =
         HashMap::new();
     for d in &desugared {
-        if let cst::Decl::TypeSignature { name, .. } = d {
+        if let crate::typecheck_db::ir::Decl::TypeSignature { name, .. } = d {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             let free = free_names::compute(d);
             sig_free_by_name.entry(n).or_default().extend(free.refs);
@@ -631,7 +638,7 @@ fn check_one_module(
         }
         let _ = add_dep; // closure kept for potential future use
 
-        let scc_decl_refs: Vec<&cst::Decl> = scc
+        let scc_decl_refs: Vec<&crate::typecheck_db::ir::Decl> = scc
             .iter()
             .map(|&i| &desugared[value_idxs[i]])
             .collect();
@@ -975,7 +982,7 @@ fn add_class_method_deps(
 /// treating the returned slice as unordered.
 #[allow(clippy::too_many_arguments)]
 fn collect_nonvalue_dep_hashes(
-    decl: &cst::Decl,
+    decl: &crate::typecheck_db::ir::Decl,
     self_module: &str,
     module: &cst::Module,
     registry: &ModuleRegistry,
@@ -1306,7 +1313,7 @@ fn join_module_name(mn: &cst::ModuleName) -> String {
 /// module's decls. Returns the exhaustiveness-shaped maps plus
 /// local class + instance records.
 fn collect_decl_scope(
-    decls: &[cst::Decl],
+    decls: &[crate::typecheck_db::ir::Decl],
 ) -> (
     DataConstructors,
     CtorRegistry,
@@ -1319,7 +1326,7 @@ fn collect_decl_scope(
     let type_ops = TypeOpMap::default();
     for d in decls {
         match d {
-            cst::Decl::Data { name, type_vars, constructors, .. } => {
+            crate::typecheck_db::ir::Decl::Data { name, type_vars, constructors, .. } => {
                 let type_name =
                     crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let tvars: Vec<String> = type_vars
@@ -1353,7 +1360,7 @@ fn collect_decl_scope(
                     );
                 }
             }
-            cst::Decl::Newtype { name, type_vars, constructor, ty, .. } => {
+            crate::typecheck_db::ir::Decl::Newtype { name, type_vars, constructor, ty, .. } => {
                 let type_name =
                     crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let ctor_name =
@@ -1383,7 +1390,7 @@ fn collect_decl_scope(
     let local_ix = crate::typecheck_db::passes::instance_index::from_decls(decls, &type_ops);
     let mut local_classes: HashMap<String, ClassInfo> = HashMap::new();
     for d in decls {
-        if let cst::Decl::Class { name, .. } = d {
+        if let crate::typecheck_db::ir::Decl::Class { name, .. } = d {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             if let Some(info) = local_ix.class_info(&n) {
                 local_classes.insert(n, info.clone());
@@ -1482,12 +1489,12 @@ fn hash_fixity_table(
     *h.finalize().as_bytes()
 }
 
-fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
+fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
     use crate::typecheck_db::types::{QName, Scheme, Type};
     let type_ops = TypeOpMap::default();
     for d in decls {
         match d {
-            cst::Decl::Foreign { name, ty, .. } => {
+            crate::typecheck_db::ir::Decl::Foreign { name, ty, .. } => {
                 // `foreign import foo :: Type` — FFI value binding.
                 // Put its declared type into the env so downstream
                 // references resolve.
@@ -1505,7 +1512,7 @@ fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
                 };
                 env.bind_scheme(QName::unqualified(&n), Scheme { vars, ty: body });
             }
-            cst::Decl::TypeSignature { name, ty, .. } => {
+            crate::typecheck_db::ir::Decl::TypeSignature { name, ty, .. } => {
                 // A top-level `foo :: T` before `foo = …` — bind
                 // the declared scheme so mutual references pick
                 // up the annotated shape. Phase-4-era inference
@@ -1523,7 +1530,7 @@ fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
                 };
                 env.bind_scheme(QName::unqualified(&n), Scheme { vars, ty: body });
             }
-            cst::Decl::Data { name, type_vars, constructors, .. } => {
+            crate::typecheck_db::ir::Decl::Data { name, type_vars, constructors, .. } => {
                 let type_name =
                     crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let tvars: Vec<String> = type_vars
@@ -1547,7 +1554,7 @@ fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
                     env.bind_scheme(QName::unqualified(&ctor_name), scheme);
                 }
             }
-            cst::Decl::Newtype { name, type_vars, constructor, ty, .. } => {
+            crate::typecheck_db::ir::Decl::Newtype { name, type_vars, constructor, ty, .. } => {
                 let type_name =
                     crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let tvars: Vec<String> = type_vars
@@ -1563,7 +1570,7 @@ fn bind_local_ctors(decls: &[cst::Decl], env: &mut Env) {
                 let scheme = Scheme { vars: tvars.clone(), ty: scheme_ty };
                 env.bind_scheme(QName::unqualified(&ctor_name), scheme);
             }
-            cst::Decl::Class { name, type_vars, members, .. } => {
+            crate::typecheck_db::ir::Decl::Class { name, type_vars, members, .. } => {
                 // Expose each class method as a constrained scheme:
                 // `forall (class vars + method vars). C <class vars>
                 //  => <method type>`. The `Type::Constrained` layer

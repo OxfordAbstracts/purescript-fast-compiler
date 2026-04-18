@@ -19,12 +19,14 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::cst::{
-    Binder, CaseAlternative, ClassMember, Constraint, DataConstructor, Decl, DoStatement,
-    Expr, GuardedExpr, GuardPattern, LetBinding, Literal, Module, ModuleName, QualifiedIdent,
-    TypeExpr,
+    ClassMember, Constraint, DataConstructor, Module, ModuleName, QualifiedIdent, TypeExpr,
 };
 use crate::interner::{self, Symbol};
 use crate::typecheck_db::driver::{CacheOutcome, DriverError, TypecheckDb};
+use crate::typecheck_db::ir::{
+    Binder, CaseAlternative, Decl, DoStatement, Expr, GuardPattern, GuardedExpr, LetBinding,
+    Literal,
+};
 use crate::typecheck_db::key::{hash_bytes, InputHash, InputHasher, OutputHash, PassKey};
 
 // ============================================================================
@@ -583,14 +585,9 @@ impl Collector {
                 self.visit_expr(body);
                 self.pop_scope();
             }
-            Expr::Op { left, op, right, .. } => {
-                self.visit_expr(left);
-                self.emit_op_ref(&op.value.to_qi());
-                self.visit_expr(right);
-            }
-            Expr::OpParens { op, .. } => {
-                self.emit_op_ref(&op.value.to_qi());
-            }
+            // `Expr::Op` / `OpParens` / `BacktickApp` don't exist
+            // in `ir::Expr` — the lowering pass rebrackets them into
+            // plain applications before names runs.
             Expr::If { cond, then_expr, else_expr, .. } => {
                 self.visit_expr(cond);
                 self.visit_expr(then_expr);
@@ -666,11 +663,6 @@ impl Collector {
                 // layer (parser uses it for do-bind sugar).
                 self.visit_expr(name);
                 self.visit_expr(pattern);
-            }
-            Expr::BacktickApp { func, left, right, .. } => {
-                self.visit_expr(func);
-                self.visit_expr(left);
-                self.visit_expr(right);
             }
             Expr::Wildcard { .. } | Expr::Hole { .. } => {}
         }
@@ -792,10 +784,7 @@ impl Collector {
                     self.bind_binder_names(e);
                 }
             }
-            Binder::Op { left, right, .. } => {
-                self.bind_binder_names(left);
-                self.bind_binder_names(right);
-            }
+            // `Binder::Op` doesn't exist in `ir::Binder`.
             Binder::Typed { binder, .. } => self.bind_binder_names(binder),
         }
     }
@@ -833,11 +822,8 @@ impl Collector {
                     self.visit_binder_for_refs(e);
                 }
             }
-            Binder::Op { left, op, right, .. } => {
-                self.visit_binder_for_refs(left);
-                self.emit_op_ref(&op.value.to_qi());
-                self.visit_binder_for_refs(right);
-            }
+            // `Binder::Op` doesn't exist in `ir::Binder` — the
+            // lowering pass rebrackets operator patterns.
             Binder::Typed { binder, ty, .. } => {
                 self.visit_binder_for_refs(binder);
                 self.visit_type(ty);
@@ -991,7 +977,7 @@ pub fn module_name_string(m: &ModuleName) -> String {
 pub fn decls_with_source_hashes<'a>(
     module: &'a Module,
     source: &'a str,
-) -> Vec<(&'a Decl, [u8; 32])> {
+) -> Vec<(&'a crate::cst::Decl, [u8; 32])> {
     module
         .decls
         .iter()
@@ -1016,7 +1002,9 @@ mod tests {
 
     fn parse_single_decl(src: &str) -> Decl {
         let module = parse(src).expect("parse");
-        module
+        let ir_module = crate::typecheck_db::ir::lower_module(module)
+            .expect("cst → ir lowering");
+        ir_module
             .decls
             .into_iter()
             .find(|d| !matches!(d, Decl::TypeSignature { .. }))
@@ -1025,7 +1013,9 @@ mod tests {
 
     fn parse_decl_by_index(src: &str, i: usize) -> Decl {
         let module = parse(src).expect("parse");
-        module.decls.into_iter().nth(i).expect("decl at index")
+        let ir_module = crate::typecheck_db::ir::lower_module(module)
+            .expect("cst → ir lowering");
+        ir_module.decls.into_iter().nth(i).expect("decl at index")
     }
 
     // ---- defined_names -------------------------------------------------------

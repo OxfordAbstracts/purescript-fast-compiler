@@ -14,6 +14,7 @@ pub mod unify;
 pub mod env;
 pub mod generalize;
 pub mod desugar;
+pub mod ir;
 pub mod module_registry;
 pub mod prim;
 pub mod driver_multi;

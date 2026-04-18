@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cst::{Binder, Expr, GuardPattern, GuardedExpr, Literal};
+use crate::typecheck_db::ir::{Binder, Expr, GuardPattern, GuardedExpr, Literal};
 use crate::typecheck_db::types::Type;
 
 // ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ pub fn is_unconditional_for_exhaustiveness(g: &GuardedExpr) -> bool {
     }
 }
 
-fn guard_is_fallback(guard: &crate::cst::Guard) -> bool {
+fn guard_is_fallback(guard: &crate::typecheck_db::ir::Guard) -> bool {
     // Only single-pattern guards qualify — multi-pattern guards can
     // always fail on any of their sub-patterns.
     if guard.patterns.len() != 1 {
@@ -361,8 +361,8 @@ fn wrap_with_ctor(ctor: &str, inner: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cst::{self, Decl};
     use crate::parser::parse;
+    use crate::typecheck_db::ir::{self, Decl};
     use crate::typecheck_db::types::QName;
 
     // -- helpers ------------------------------------------------------
@@ -375,11 +375,16 @@ mod tests {
         Type::app(f, a)
     }
 
+    fn lower(src: &str) -> ir::Module {
+        let cst_mod = parse(src).unwrap();
+        ir::lower_module(cst_mod).expect("lowering")
+    }
+
     /// Parse a single `f _ = case SCRUTINEE of <alts>` and return the
     /// first binder from each alt. The dummy `_` parameter side-steps
     /// parser requirements for top-level bodies.
     fn case_binders(src: &str) -> Vec<Binder> {
-        let m = parse(src).unwrap();
+        let m = lower(src);
         let body = m
             .decls
             .into_iter()
@@ -398,7 +403,7 @@ mod tests {
     }
 
     fn first_guarded(src: &str) -> GuardedExpr {
-        let m = parse(src).unwrap();
+        let m = lower(src);
         for d in m.decls {
             if let Decl::Value { guarded, .. } = d {
                 return guarded;

@@ -15,7 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cst::{self, Decl};
+use crate::cst;
+use crate::typecheck_db::ir::Decl;
 use crate::typecheck_db::driver::{CacheOutcome, DriverError, TypecheckDb};
 use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::passes::exhaustiveness::CtorInfo;

@@ -445,14 +445,19 @@ pub struct SolveReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
+    use crate::parser::parse as parse_cst;
     use crate::typecheck_db::env::Env;
+    use crate::typecheck_db::ir::Decl;
     use crate::typecheck_db::passes::infer_value::{
         infer_value_scc_with_registries, InferredScheme,
     };
     use crate::typecheck_db::passes::exhaustiveness::{CtorRegistry, DataConstructors};
     use crate::typecheck_db::types::{QName, Scheme, TypeOpMap};
-    use crate::cst::Decl;
+
+    fn parse(src: &str) -> crate::typecheck_db::ir::Module {
+        let cst_mod = parse_cst(src).unwrap();
+        crate::typecheck_db::ir::lower_module(cst_mod).expect("lower")
+    }
 
     // -- helpers ------------------------------------------------------
 
@@ -480,7 +485,7 @@ mod tests {
     }
 
     fn infer(src: &str, env: &mut Env) -> Vec<InferredScheme> {
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let data = DataConstructors::new();
@@ -825,7 +830,7 @@ g c = eq c c
         env: &mut Env,
         instances: &InstanceIndex,
     ) -> Vec<InferredScheme> {
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let data = DataConstructors::new();
@@ -1313,10 +1318,10 @@ g (y :: Int) = eq y y
                 value: crate::names::value_name("_"),
             },
             binders: vec![],
-            guarded: crate::cst::GuardedExpr::Unconditional(Box::new(
-                crate::cst::Expr::Literal {
+            guarded: crate::typecheck_db::ir::GuardedExpr::Unconditional(Box::new(
+                crate::typecheck_db::ir::Expr::Literal {
                     span: span_at(0, 0),
-                    lit: crate::cst::Literal::Int(0),
+                    lit: crate::typecheck_db::ir::Literal::Int(0),
                 },
             )),
             where_clause: vec![],

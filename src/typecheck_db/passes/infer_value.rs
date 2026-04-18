@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::cst::{self, Binder, Decl, Expr, LetBinding, Literal};
 use crate::typecheck_db::driver::{DriverError, TypecheckDb};
+use crate::typecheck_db::ir::{self as ir, Binder, Decl, Expr, LetBinding, Literal};
 use crate::typecheck_db::env::{Env, Lookup};
 use crate::typecheck_db::generalize::{generalize, instantiate};
 use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
@@ -112,7 +112,7 @@ pub struct PendingExhaust {
 #[derive(Debug, Clone)]
 pub struct PendingAlt {
     pub binders: Vec<Binder>,
-    pub guarded: cst::GuardedExpr,
+    pub guarded: ir::GuardedExpr,
 }
 
 // ============================================================================
@@ -163,10 +163,11 @@ pub fn infer_expr(
         Expr::Array { elements, .. } => infer_array(state, env, type_ops, elements),
 
         // Forms reserved for later sub-milestones.
+        // Operators (`Expr::Op`, `OpParens`, `BacktickApp`) don't
+        // exist in `ir::Expr` — they're eliminated at lowering
+        // time, which is why this match doesn't need an arm for
+        // them any more.
         Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
-        Expr::Op { .. } | Expr::OpParens { .. } | Expr::BacktickApp { .. } => {
-            Err(InferError::Unsupported("operator"))
-        }
         Expr::VisibleTypeApp { .. } => Err(InferError::Unsupported("visible-type-app")),
         Expr::AsPattern { .. } => Err(InferError::Unsupported("as-pattern")),
     }
@@ -637,7 +638,7 @@ fn infer_record_update_from_fields(
     env: &mut Env,
     type_ops: &TypeOpMap,
     expr: &Expr,
-    fields: &[cst::RecordField],
+    fields: &[ir::RecordField],
 ) -> Result<Type, InferError> {
     let expr_ty = infer_expr(state, env, type_ops, expr)?;
     let mut update_fields: Vec<(String, Type)> = Vec::with_capacity(fields.len());
@@ -714,9 +715,9 @@ fn bind_pattern(
         }
         Binder::Record { fields, .. } => bind_record_pattern(state, env, type_ops, fields),
         Binder::Array { elements, .. } => bind_array_pattern(state, env, type_ops, elements),
-        // Op patterns (`x :| xs`) — deferred; they need fixity + data-ctor
-        // resolution, a job for a later milestone.
-        Binder::Op { .. } => Err(InferError::UnsupportedBinder("op")),
+        // `Binder::Op` doesn't exist in `ir::Binder` — the lowering
+        // pass rebrackets operator patterns to `Binder::Constructor`
+        // before they reach inference.
     }
 }
 
@@ -727,7 +728,7 @@ fn bind_record_pattern(
     state: &mut UnifyState,
     env: &mut Env,
     type_ops: &TypeOpMap,
-    fields: &[cst::RecordBinderField],
+    fields: &[ir::RecordBinderField],
 ) -> Result<Type, InferError> {
     let mut field_tys: Vec<(String, Type)> = Vec::with_capacity(fields.len());
     for f in fields {
@@ -797,7 +798,7 @@ fn infer_record(
     state: &mut UnifyState,
     env: &mut Env,
     type_ops: &TypeOpMap,
-    fields: &[cst::RecordField],
+    fields: &[ir::RecordField],
 ) -> Result<Type, InferError> {
     // A bare `Expr::Record` with `is_update` fields is an unusual
     // but not impossible shape — some Prelude fixtures produce it.
@@ -849,7 +850,7 @@ fn infer_record_update(
     env: &mut Env,
     type_ops: &TypeOpMap,
     expr: &Expr,
-    updates: &[cst::RecordUpdate],
+    updates: &[ir::RecordUpdate],
 ) -> Result<Type, InferError> {
     let expr_ty = infer_expr(state, env, type_ops, expr)?;
     // Infer the new value's type for each update field; the updated
@@ -1029,7 +1030,7 @@ fn infer_case(
     type_ops: &TypeOpMap,
     span: crate::span::Span,
     scrutinees: &[Expr],
-    alts: &[cst::CaseAlternative],
+    alts: &[ir::CaseAlternative],
 ) -> Result<Type, InferError> {
     // Infer each scrutinee's type up front. These are what every alt's
     // binders must match against, column-wise.
@@ -1082,11 +1083,11 @@ fn infer_guarded(
     state: &mut UnifyState,
     env: &mut Env,
     type_ops: &TypeOpMap,
-    guarded: &cst::GuardedExpr,
+    guarded: &ir::GuardedExpr,
 ) -> Result<Type, InferError> {
     match guarded {
-        cst::GuardedExpr::Unconditional(e) => infer_expr(state, env, type_ops, e),
-        cst::GuardedExpr::Guarded(guards) => {
+        ir::GuardedExpr::Unconditional(e) => infer_expr(state, env, type_ops, e),
+        ir::GuardedExpr::Guarded(guards) => {
             if guards.is_empty() {
                 return Err(InferError::Unsupported("empty guarded body"));
             }
@@ -1095,7 +1096,7 @@ fn infer_guarded(
                 env.push_scope();
                 for p in &g.patterns {
                     match p {
-                        cst::GuardPattern::Boolean(e) => {
+                        ir::GuardPattern::Boolean(e) => {
                             check_expr(
                                 state,
                                 env,
@@ -1104,7 +1105,7 @@ fn infer_guarded(
                                 &Type::Con(QName::unqualified("Boolean")),
                             )?;
                         }
-                        cst::GuardPattern::Pattern(binder, expr) => {
+                        ir::GuardPattern::Pattern(binder, expr) => {
                             let scrut_ty = infer_expr(state, env, type_ops, expr)?;
                             let bt = bind_pattern(state, env, type_ops, binder)?;
                             state.unify(&bt, &scrut_ty)?;
@@ -1125,7 +1126,7 @@ fn infer_equation(
     env: &mut Env,
     type_ops: &TypeOpMap,
     binders: &[Binder],
-    guarded: &cst::GuardedExpr,
+    guarded: &ir::GuardedExpr,
 ) -> Result<Type, InferError> {
     // `foo x y = body` acts as `\x y -> body` at the top level. The body
     // may be guarded (M4c); `infer_guarded` handles both shapes.
@@ -1178,25 +1179,25 @@ fn infer_equation(
 /// `foo … | g = e where h = …` program behaves the same through
 /// both paths (merged via multi_eq or direct).
 fn wrap_guarded_with_where(
-    g: cst::GuardedExpr,
+    g: ir::GuardedExpr,
     where_clause: Vec<LetBinding>,
-) -> cst::GuardedExpr {
+) -> ir::GuardedExpr {
     if where_clause.is_empty() {
         return g;
     }
     match g {
-        cst::GuardedExpr::Unconditional(e) => {
+        ir::GuardedExpr::Unconditional(e) => {
             let span = e.span();
-            cst::GuardedExpr::Unconditional(Box::new(Expr::Let {
+            ir::GuardedExpr::Unconditional(Box::new(Expr::Let {
                 span,
                 bindings: where_clause,
                 body: e,
             }))
         }
-        cst::GuardedExpr::Guarded(guards) => cst::GuardedExpr::Guarded(
+        ir::GuardedExpr::Guarded(guards) => ir::GuardedExpr::Guarded(
             guards
                 .into_iter()
-                .map(|grd| cst::Guard {
+                .map(|grd| ir::Guard {
                     span: grd.span,
                     patterns: grd.patterns,
                     expr: Box::new(Expr::Let {
@@ -1228,7 +1229,14 @@ fn type_of_literal(lit: &Literal) -> Type {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
+    use crate::parser::parse as parse_cst;
+
+    /// Parse + lower — every test in this module works in `ir::*`
+    /// land since that's what the infer pipeline consumes.
+    fn parse(src: &str) -> crate::typecheck_db::ir::Module {
+        let cst_mod = parse_cst(src).unwrap();
+        crate::typecheck_db::ir::lower_module(cst_mod).expect("cst → ir lowering")
+    }
 
     fn int() -> Type {
         Type::Con(QName::unqualified("Int"))
@@ -1239,10 +1247,10 @@ mod tests {
     }
 
     fn parse_expr_from_val(src: &str) -> Expr {
-        let m = parse(src).unwrap();
+        let m = parse(src);
         for d in m.decls {
             if let Decl::Value { guarded, .. } = d {
-                if let cst::GuardedExpr::Unconditional(e) = guarded {
+                if let ir::GuardedExpr::Unconditional(e) = guarded {
                     return *e;
                 }
             }
@@ -1284,7 +1292,7 @@ mod tests {
     #[test]
     fn identity_lambda_generalizes_to_forall_a_a_to_a() {
         let src = "module M where\nident x = x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1296,7 +1304,7 @@ mod tests {
     #[test]
     fn const_lambda_generalizes_to_two_vars() {
         let src = "module M where\nkonst x y = x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1356,7 +1364,7 @@ mod tests {
     fn typed_binder_constrains_lambda() {
         // `\(x :: Int) -> x` must infer Int -> Int (no generalization).
         let src = "module M where\nfoo = \\(x :: Int) -> x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1410,7 +1418,7 @@ mod tests {
         // f calls g, g calls f. Without explicit signatures both must
         // unify through their pre-inserted slots.
         let src = "module M where\nf x = g x\ng x = f x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1466,7 +1474,7 @@ mod tests {
     #[test]
     fn let_binds_simple_value() {
         let src = "module M where\nfoo = let x = 1 in x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1479,7 +1487,7 @@ mod tests {
         // `let id = \y -> y in id 1` must type-check: `id` generalizes to
         // `forall a. a -> a`, then instantiates with `Int` at the call site.
         let src = "module M where\nfoo = let id = \\y -> y in id 1\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1493,7 +1501,7 @@ mod tests {
         // Branches must unify, so the *expression* is Int-or-Boolean, which
         // won't match: we expect a Unify error.
         let src = "module M where\nc = true\nfoo = let id = \\y -> y in if c then id 1 else id true\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1514,7 +1522,7 @@ foo =
     x = 1
   in x
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1527,7 +1535,7 @@ foo =
         // Outer `foo = 1` is Int. Inner `let foo = "str" in foo` rebinds it
         // to String locally. The overall expression is String.
         let src = "module M where\nbar = let foo = \"str\" in foo\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1548,7 +1556,7 @@ foo =
     g x = f x
   in f
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1585,7 +1593,7 @@ foo x = case x of
   0 -> \"zero\"
   _ -> \"other\"
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1603,7 +1611,7 @@ foo m = case m of
   Just x -> x
   Nothing -> 0
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1622,7 +1630,7 @@ foo m = case m of
   Just Nothing -> 0
   Nothing -> 1
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1645,7 +1653,7 @@ foo m = case m of
   Just _ -> 1
   Nothing -> \"oops\"
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1664,7 +1672,7 @@ foo m = case m of
   all@(Just _) -> all
   Nothing -> Nothing
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1687,7 +1695,7 @@ foo m n = case m, n of
   Just x, Just y -> x
   _, _ -> 0
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1712,7 +1720,7 @@ module M where
 foo x | isOk x = 1
       | true = 0
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1737,7 +1745,7 @@ foo x | isOk x = 1
 module M where
 foo x | x = 1
 ";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1760,7 +1768,7 @@ foo x | x = 1
     #[test]
     fn record_literal_infers_closed_record() {
         let src = "module M where\nr = { x: 1, y: \"hi\" }\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1779,7 +1787,7 @@ foo x | x = 1
     fn record_pun_looks_up_outer_binding() {
         // `r = { x }` resolves `x` from the surrounding env.
         let src = "module M where\nx = 1\nr = { x }\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1791,7 +1799,7 @@ foo x | x = 1
     #[test]
     fn record_pun_unbound_is_error() {
         let src = "module M where\nr = { y }\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1803,7 +1811,7 @@ foo x | x = 1
     fn record_access_constrains_record_via_open_row() {
         // `f r = r.x` should infer `forall a t. { x :: a | t } -> a`.
         let src = "module M where\nf r = r.x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1829,7 +1837,7 @@ foo x | x = 1
     fn record_access_on_record_with_extra_fields_works() {
         // `r :: { x :: Int, y :: String }`, `r.x` must yield Int.
         let src = "module M where\nv = (r :: { x :: Int, y :: String }).x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1848,7 +1856,7 @@ foo x | x = 1
     fn record_update_preserves_record_type() {
         // `f r = r { x = 1 }` has the same type as `f :: { x :: Int | t } -> { x :: Int | t }`.
         let src = "module M where\nf r = r { x = 1 }\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1865,7 +1873,7 @@ foo x | x = 1
         // `r :: { x :: Int }`; `r { x = "hi" }` must fail — String doesn't
         // unify with the existing Int field type.
         let src = "module M where\nv = r { x = \"hi\" }\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1881,7 +1889,7 @@ foo x | x = 1
     fn record_pattern_pun_binds_fresh_vars() {
         // `\{x, y} -> x` should infer `forall a b t. { x :: a, y :: b | t } -> a`.
         let src = "module M where\nf = \\{x, y} -> x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1904,7 +1912,7 @@ foo x | x = 1
     fn record_pattern_explicit_field_recurses() {
         // `\{x: y} -> y` — x must be bound but locally named `y`.
         let src = "module M where\nf = \\{x: y} -> y\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1930,7 +1938,7 @@ foo x | x = 1
     #[test]
     fn array_literal_infers_array_of_elem() {
         let src = "module M where\nxs = [1, 2, 3]\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1942,7 +1950,7 @@ foo x | x = 1
     fn array_elements_must_unify() {
         // Mixed element types: Int and String must unify → fails.
         let src = "module M where\nxs = [1, \"hi\"]\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1953,7 +1961,7 @@ foo x | x = 1
     #[test]
     fn empty_array_generalizes_element_type() {
         let src = "module M where\nxs = []\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1965,7 +1973,7 @@ foo x | x = 1
     fn array_pattern_unifies_elements_with_fresh_var() {
         // `\[x, y] -> x` infers `forall a. Array a -> a`.
         let src = "module M where\nfst2 = \\[x, y] -> x\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -1982,7 +1990,7 @@ foo x | x = 1
         // annotation; an array pattern inside unifies each position with
         // the same Int.
         let src = "module M where\ng (xs :: Array Int) = xs\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
@@ -2085,7 +2093,7 @@ foo x | x = 1
         data: &DataConstructors,
         ctors: &CtorRegistry,
     ) -> Vec<InferredScheme> {
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         infer_value_scc_with_registries(&ops, env, &decls, data, ctors).unwrap()
@@ -2211,14 +2219,18 @@ f x = case x of
         // Pre-merge decls first (the desugar is currently only used by
         // the cached pass; for this direct test we invoke the merger
         // manually).
-        let m = parse(
+        let cst_m = parse_cst(
             "\
 module M where
 f (Just y) = y
 ",
         )
         .unwrap();
-        let merged = crate::typecheck_db::desugar::multi_eq::merge(m.decls);
+        let merged_cst = crate::typecheck_db::desugar::multi_eq::merge(cst_m.decls);
+        let merged: Vec<Decl> = merged_cst
+            .into_iter()
+            .map(|d| crate::typecheck_db::ir::lower_decl(d).expect("lower"))
+            .collect();
         let decls: Vec<&Decl> = merged.iter().collect();
         let ops = TypeOpMap::default();
         let schemes =
@@ -2354,7 +2366,7 @@ f m n = case m, n of
         // It must still return InferredSchemes with an empty error
         // list.
         let src = "module M where\nx = 1\n";
-        let m = parse(src).unwrap();
+        let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
