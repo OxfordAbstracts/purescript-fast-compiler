@@ -188,6 +188,15 @@ pub fn solve_one(
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> SolveOutcome {
+    // Compiler-magic auto-dispatch: some Prim classes discharge
+    // purely from the constraint's shape and don't rely on user
+    // instance declarations. Handle them up-front so a fixture
+    // that only reaches these via a Prelude call-site doesn't
+    // trip over a `NoInstanceFound`.
+    if let Some(dict) = try_magic(state, pending) {
+        return SolveOutcome::Resolved(dict);
+    }
+
     // Fundep-aware defer: if the class declares fundeps, a position
     // is "free to improve" when it appears in at least one fundep's
     // determined list. Bare unifs in all other positions (keys or
@@ -276,6 +285,61 @@ fn contains_rigid_var(ty: &Type, state: &crate::typecheck_db::unify::UnifyState)
 /// solves them or proves they're polymorphic.
 fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
     matches!(state.zonk(ty), Type::Unif(_))
+}
+
+/// Try to discharge a constraint via built-in compiler magic.
+///
+/// * `IsSymbol "literal"` — every symbol literal has an
+///   `IsSymbol` instance by construction. Discharge as long as
+///   the single argument zonks to a concrete `Type::TypeString`.
+/// * `Row.Nub` / `Row.Lacks` / `Row.Cons` / `Row.Union` — the
+///   row-manipulation classes auto-solve when the participating
+///   rows are fully known. For now we handle `Nub row result`
+///   where `row` is a closed row: the result is the same row
+///   (deduplication is a no-op if there are no duplicate labels,
+///   and our checker already prevents those).
+fn try_magic(
+    state: &mut crate::typecheck_db::unify::UnifyState,
+    pending: &PendingConstraint,
+) -> Option<ResolvedDict> {
+    let class_name = pending.constraint.class.name.as_str();
+    let args: Vec<Type> = pending
+        .constraint
+        .args
+        .iter()
+        .map(|a| state.zonk(a))
+        .collect();
+    match class_name {
+        "IsSymbol" => {
+            if let [Type::TypeString(_)] = args.as_slice() {
+                return Some(ResolvedDict {
+                    class: pending.constraint.class.clone(),
+                    instance_types: args,
+                    instance_idx: 0,
+                    context: Vec::new(),
+                });
+            }
+        }
+        "Nub" => {
+            // `Nub row result | row -> result`. If `row` is a
+            // closed record/row, `result = row` works (no
+            // duplicate labels by parser invariant).
+            if args.len() == 2 {
+                if let Type::Row(_, None) | Type::Record(_, None) = &args[0] {
+                    if state.unify(&args[0], &args[1]).is_ok() {
+                        return Some(ResolvedDict {
+                            class: pending.constraint.class.clone(),
+                            instance_types: args,
+                            instance_idx: 0,
+                            context: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Freshen an instance's quantified vars, unify its head with the

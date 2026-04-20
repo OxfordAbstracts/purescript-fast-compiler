@@ -20,17 +20,18 @@ pub fn desugar_decl(decl: crate::cst::Decl) -> crate::cst::Decl {
 
 fn rewrite_node(e: Expr, counter: &mut u32) -> Expr {
     match e {
-        Expr::Record { span, fields } => {
-            // Only fire for record *literals* whose values contain at
-            // least one `_` in a value slot.
-            let is_literal = fields.iter().all(|f| !f.is_update);
+        // `{ x: _, y: 1 }` → `\a -> { x: a, y: 1 }`. Only applies
+        // to record *literals* (no `is_update` fields). Leaving
+        // record-update records alone here lets the
+        // `App(r, Record{is_update})` case at the outer level
+        // wrap the whole thing in a lambda together.
+        Expr::Record { span, fields } if fields.iter().all(|f| !f.is_update) => {
             let has_hole = fields.iter().any(|f| {
                 matches!(f.value.as_ref(), Some(Expr::Wildcard { .. }))
             });
-            if !is_literal || !has_hole {
+            if !has_hole {
                 return Expr::Record { span, fields };
             }
-
             let mut params: Vec<Binder> = Vec::new();
             let new_fields: Vec<RecordField> = fields
                 .into_iter()
@@ -40,6 +41,75 @@ fn rewrite_node(e: Expr, counter: &mut u32) -> Expr {
                 span,
                 binders: params,
                 body: Box::new(Expr::Record { span, fields: new_fields }),
+            }
+        }
+        // `record { field = _ }` parses as `App(record, Record
+        // { fields: [{is_update: true, value: Wildcard}] })`.
+        // Wrap in a lambda that binds each wildcard to a fresh
+        // param, keeping the underlying `App(record, Record)`
+        // shape so downstream inference still recognises it as
+        // a record update.
+        //
+        // `_ { field = v }` adds the outer wildcard as an extra
+        // lambda binder (first position).
+        Expr::App { span, func, arg }
+            if matches!(
+                arg.as_ref(),
+                Expr::Record { fields, .. }
+                    if !fields.is_empty() && fields.iter().all(|f| f.is_update)
+            ) =>
+        {
+            let (record_expr_fields, record_span) = match *arg {
+                Expr::Record { span, fields } => (fields, span),
+                _ => unreachable!(),
+            };
+            let any_field_hole = record_expr_fields.iter().any(|f| {
+                matches!(f.value.as_ref(), Some(Expr::Wildcard { .. }))
+            });
+            let outer_wildcard = matches!(func.as_ref(), Expr::Wildcard { .. });
+            if !any_field_hole && !outer_wildcard {
+                // Nothing to desugar — rebuild unchanged.
+                return Expr::App {
+                    span,
+                    func,
+                    arg: Box::new(Expr::Record {
+                        span: record_span,
+                        fields: record_expr_fields,
+                    }),
+                };
+            }
+            let mut params: Vec<Binder> = Vec::new();
+            let new_func: Box<Expr> = if outer_wildcard {
+                let wspan = match func.as_ref() {
+                    Expr::Wildcard { span } => *span,
+                    _ => span,
+                };
+                let name = value_name(&format!("$rec_{}", counter));
+                *counter += 1;
+                params.push(Binder::Var {
+                    span: wspan,
+                    name: Spanned { span: wspan, value: name.clone() },
+                });
+                Box::new(Expr::Var {
+                    span: wspan,
+                    name: crate::names::Qualified::unqualified(name),
+                })
+            } else {
+                func
+            };
+            let new_fields: Vec<RecordField> = record_expr_fields
+                .into_iter()
+                .map(|f| swap_field_wildcard(f, counter, &mut params))
+                .collect();
+            let new_record = Expr::Record { span: record_span, fields: new_fields };
+            Expr::Lambda {
+                span,
+                binders: params,
+                body: Box::new(Expr::App {
+                    span,
+                    func: new_func,
+                    arg: Box::new(new_record),
+                }),
             }
         }
         other => other,
