@@ -150,19 +150,20 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                         .collect(),
                 ),
             };
-            let where_clause: Vec<LetBinding> = where_clause
-                .into_iter()
-                .map(|b| match b {
-                    LetBinding::Value { span, binder, expr } => LetBinding::Value {
-                        span,
-                        binder: rewrite_binder(binder, fixity),
-                        expr: rewrite_expr(expr, fixity),
-                    },
-                    LetBinding::Signature { span, name, ty } => {
-                        LetBinding::Signature { span, name, ty }
-                    }
-                })
-                .collect();
+            let where_clause: Vec<LetBinding> =
+                super::multi_eq::merge_let_bindings(where_clause)
+                    .into_iter()
+                    .map(|b| match b {
+                        LetBinding::Value { span, binder, expr } => LetBinding::Value {
+                            span,
+                            binder: rewrite_binder(binder, fixity),
+                            expr: rewrite_expr(expr, fixity),
+                        },
+                        LetBinding::Signature { span, name, ty } => {
+                            LetBinding::Signature { span, name, ty }
+                        }
+                    })
+                    .collect();
             Decl::Value { name, binders, guarded, where_clause, span, doc_comments }
         }
         // Instance and Derive declarations hold `Decl::Value`
@@ -491,7 +492,10 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
         },
         Expr::Let { span, bindings, body } => Expr::Let {
             span,
-            bindings: bindings.into_iter().map(|b| rec_let(b, fixity)).collect(),
+            bindings: super::multi_eq::merge_let_bindings(bindings)
+                .into_iter()
+                .map(|b| rec_let(b, fixity))
+                .collect(),
             body: rec_box(body, fixity),
         },
         Expr::Do { span, module, statements } => Expr::Do {

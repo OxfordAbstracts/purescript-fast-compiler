@@ -226,6 +226,129 @@ fn wrap_guard(g: Guard, where_clause: Vec<LetBinding>) -> Guard {
     }
 }
 
+/// Multi-equation merge for `let` / `where` bindings. The parser
+/// lowers `go (Loop a) = e1; go (Done b) = e2` into two
+/// `LetBinding::Value { binder: Var(go), expr: Lambda(…) }`
+/// rows. This helper collapses adjacent same-name runs with
+/// matching lambda arities into one `LetBinding` whose body is a
+/// case-dispatch lambda — same shape as the top-level merger
+/// produces for `Decl::Value`.
+pub fn merge_let_bindings(bindings: Vec<LetBinding>) -> Vec<LetBinding> {
+    let mut out: Vec<LetBinding> = Vec::with_capacity(bindings.len());
+    let mut group: Vec<LetBinding> = Vec::new();
+    for b in bindings {
+        if extend_let_group(&group, &b) {
+            group.push(b);
+        } else {
+            flush_let(&mut out, std::mem::take(&mut group));
+            match &b {
+                LetBinding::Value { binder: Binder::Var { .. }, expr, .. }
+                    if matches!(expr, Expr::Lambda { .. }) =>
+                {
+                    group.push(b);
+                }
+                _ => out.push(b),
+            }
+        }
+    }
+    flush_let(&mut out, group);
+    out
+}
+
+fn extend_let_group(group: &[LetBinding], candidate: &LetBinding) -> bool {
+    let Some(first) = group.first() else {
+        return false;
+    };
+    let (first_name, first_arity) = match first {
+        LetBinding::Value {
+            binder: Binder::Var { name, .. },
+            expr: Expr::Lambda { binders, .. },
+            ..
+        } => (name.value.symbol(), binders.len()),
+        _ => return false,
+    };
+    match candidate {
+        LetBinding::Value {
+            binder: Binder::Var { name, .. },
+            expr: Expr::Lambda { binders, .. },
+            ..
+        } => name.value.symbol() == first_name && binders.len() == first_arity,
+        _ => false,
+    }
+}
+
+fn flush_let(out: &mut Vec<LetBinding>, group: Vec<LetBinding>) {
+    match group.len() {
+        0 => {}
+        1 => out.push(group.into_iter().next().unwrap()),
+        _ => out.push(merge_let_equations(group)),
+    }
+}
+
+fn merge_let_equations(equations: Vec<LetBinding>) -> LetBinding {
+    // Grab span + name + arity from the first row.
+    let (merged_span, name, arity) = match &equations[0] {
+        LetBinding::Value {
+            span,
+            binder: Binder::Var { name, .. },
+            expr: Expr::Lambda { binders, .. },
+        } => (*span, name.clone(), binders.len()),
+        _ => unreachable!("group only contains Var-binder lambda LetBindings"),
+    };
+
+    // Fresh outer params `$le_0` … `$le_{arity-1}` — same trick
+    // as the top-level multi-eq merger.
+    let fresh: Vec<ValueName> = (0..arity)
+        .map(|i| value_name(&format!("$le_{}", i)))
+        .collect();
+    let scrutinees: Vec<Expr> = fresh
+        .iter()
+        .map(|n| Expr::Var {
+            span: merged_span,
+            name: Qualified::unqualified(n.clone()),
+        })
+        .collect();
+
+    let mut alts: Vec<CaseAlternative> = Vec::with_capacity(equations.len());
+    for b in equations {
+        if let LetBinding::Value {
+            span,
+            expr: Expr::Lambda { binders, body, .. },
+            ..
+        } = b
+        {
+            alts.push(CaseAlternative {
+                span,
+                binders,
+                result: GuardedExpr::Unconditional(body),
+            });
+        }
+    }
+
+    let case_expr = Expr::Case {
+        span: merged_span,
+        exprs: scrutinees,
+        alts,
+    };
+    let new_binders: Vec<Binder> = fresh
+        .iter()
+        .map(|n| Binder::Var {
+            span: merged_span,
+            name: Spanned { span: merged_span, value: n.clone() },
+        })
+        .collect();
+    let lambda = Expr::Lambda {
+        span: merged_span,
+        binders: new_binders,
+        body: Box::new(case_expr),
+    };
+    LetBinding::Value {
+        span: merged_span,
+        binder: Binder::Var { span: name.span, name },
+        expr: lambda,
+    }
+}
+
 // Silence unused `Span` import warning in the bare case — reserved for
 // future use in this file.
 #[allow(dead_code)]

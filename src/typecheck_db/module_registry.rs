@@ -551,6 +551,13 @@ pub fn distill_exports(
                 if let Some(scheme) = scheme_by_name.get(&fx.target_name) {
                     out.values.insert(op.clone(), scheme.clone());
                     out.value_origins.insert(op.clone(), self_module_name.clone());
+                } else if let Some(info) = ctor_info.get(&fx.target_name) {
+                    // Constructor-operator alias (`infixl 6
+                    // Tuple as /\`): the target is a ctor, not a
+                    // value. Synthesize its ctor scheme so the
+                    // operator is importable as a value too.
+                    out.values.insert(op.clone(), crate::typecheck_db::passes::imports::synth_ctor_scheme(info));
+                    out.value_origins.insert(op.clone(), self_module_name.clone());
                 }
             }
         }
@@ -571,6 +578,10 @@ pub fn distill_exports(
                             if let Some(s) = scheme_by_name.get(&fx.target_name) {
                                 out.values.insert(name.clone(), s.clone());
                                 out.value_origins.insert(name.clone(), self_module_name.clone());
+                            } else if let Some(info) = ctor_info.get(&fx.target_name) {
+                                out.values.insert(name.clone(), crate::typecheck_db::passes::imports::synth_ctor_scheme(info));
+                                out.value_origins
+                                    .insert(name.clone(), self_module_name.clone());
                             }
                             out.value_fixities.insert(name, fx.clone());
                         }

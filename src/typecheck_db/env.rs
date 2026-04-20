@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::typecheck_db::types::{QName, Scheme, Type};
+use crate::typecheck_db::types::{AliasMap, QName, Scheme, Type};
 use crate::typecheck_db::unify::UnifyState;
 
 #[derive(Debug, Clone, Default)]
@@ -22,6 +22,14 @@ pub struct Env {
     /// shadows a same-named top-level entry but is shadowed by a
     /// same-named monomorphic local.
     pub local_schemes: Vec<HashMap<String, Scheme>>,
+    /// Type-alias map visible in this module's scope. Populated at
+    /// module-check time (local `type Foo = …` decls + every
+    /// imported module's exported aliases). Consumed by
+    /// `convert_type_expr`-calling passes (type annotations,
+    /// let-binding sigs, constructor fields) to expand aliases
+    /// before unification — so `Foo Number` unifies with
+    /// `Array Number` when `type Foo a = Array a`.
+    pub aliases: AliasMap,
 }
 
 impl Env {
@@ -30,6 +38,7 @@ impl Env {
             top_level: HashMap::new(),
             locals: vec![HashMap::new()],
             local_schemes: vec![HashMap::new()],
+            aliases: AliasMap::default(),
         }
     }
 
@@ -89,8 +98,21 @@ impl Env {
     }
 
     /// Look up a qualified name against the top-level scheme map.
+    /// Falls back to the unqualified key when the module-qualified
+    /// form isn't bound — this handles the case where a fixity
+    /// target was canonicalized to its origin module (e.g.
+    /// `$` → `Data.Function.apply`) but the current module
+    /// hides that import and shadows it with a local `apply`.
     pub fn lookup_qualified(&self, q: &QName) -> Option<&Scheme> {
-        self.top_level.get(q)
+        if let Some(s) = self.top_level.get(q) {
+            return Some(s);
+        }
+        if q.module.is_some() {
+            return self
+                .top_level
+                .get(&QName { module: None, name: q.name.clone() });
+        }
+        None
     }
 
     /// Every unification variable free in any local or top-level type.

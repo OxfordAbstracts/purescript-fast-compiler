@@ -144,7 +144,10 @@ pub fn infer_expr(
             // unify normally. Returning the raw `Forall` here
             // pollutes surrounding unifications with a scheme
             // they can't look through.
-            let declared = convert_type_expr(ty, type_ops);
+            let declared = crate::typecheck_db::types::expand_aliases(
+                convert_type_expr(ty, type_ops),
+                &env.aliases,
+            );
             let monotype = instantiate_sig_as_monotype(state, declared);
             check_expr(state, env, type_ops, expr, &monotype)?;
             Ok(monotype)
@@ -749,7 +752,10 @@ fn bind_pattern(
             Ok(v)
         }
         Binder::Typed { binder, ty, .. } => {
-            let declared = convert_type_expr(ty, type_ops);
+            let declared = crate::typecheck_db::types::expand_aliases(
+                convert_type_expr(ty, type_ops),
+                &env.aliases,
+            );
             let inferred = bind_pattern(state, env, type_ops, binder)?;
             state.unify(&inferred, &declared)?;
             Ok(declared)
@@ -998,12 +1004,15 @@ fn infer_let(
 ) -> Result<Type, InferError> {
     env.push_scope();
 
-    // Pass 1: collect signatures keyed by name.
+    // Pass 1: collect signatures keyed by name. Aliases are
+    // expanded here so downstream `check_expr` calls unify
+    // against the canonical form (see `Env::aliases`).
     let mut sigs: HashMap<String, Type> = HashMap::new();
     for b in bindings {
         if let LetBinding::Signature { name, ty, .. } = b {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-            sigs.insert(n, convert_type_expr(ty, type_ops));
+            let converted = convert_type_expr(ty, type_ops);
+            sigs.insert(n, crate::typecheck_db::types::expand_aliases(converted, &env.aliases));
         }
     }
 

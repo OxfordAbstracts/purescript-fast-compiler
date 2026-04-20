@@ -487,6 +487,11 @@ fn check_one_module(
     // so `instance Foo SynString` should match a `String` call.
     instance_index.expand_aliases_in_place(&alias_map);
 
+    // Make the alias map available to every inference-side
+    // `convert_type_expr` caller (type annotations, let-sigs,
+    // `check_value` sigs) via the env.
+    env.aliases = alias_map.clone();
+
     bind_local_ctors(&desugared, &mut env, &alias_map);
 
     // 4) Value decls: split into SCCs + cached per-SCC inference.

@@ -199,16 +199,23 @@ fn import_all_except(
         );
     }
     // Data constructors: synthesize each one's value scheme
-    // (`forall a b. f1 -> f2 -> … -> T a b …`) and bind it.
-    // Without this, cross-module pattern matches and uses like
-    // `Just 1` fail with `UnboundConstructor`.
+    // (`forall a b. f1 -> f2 -> … -> T a b …`) and bind it
+    // under both the import qualifier and the origin module.
+    // The origin-qualified key lets a rebracketer-produced
+    // `Expr::Constructor { name: Lib.Tuple }` resolve even when
+    // `Lib` was imported unqualified (i.e. `qualifier: None`).
     for (ctor_name, info) in &target.ctors {
         if hidden.ctors.contains(ctor_name.as_str()) {
             continue;
         }
         let scheme = synth_ctor_scheme(info);
         let key = QName { module: qualifier.clone(), name: ctor_name.clone() };
-        env.bind_scheme(key, scheme);
+        env.bind_scheme(key, scheme.clone());
+        let origin_key = QName {
+            module: Some(target_name.to_string()),
+            name: ctor_name.clone(),
+        };
+        env.bind_scheme(origin_key, scheme);
     }
     // Instances + class info: always propagated.
     merge_instances_and_classes(target, ix);
@@ -281,6 +288,34 @@ fn apply_explicit(
                                 target_scheme.clone(),
                             );
                         }
+                        // Constructor-operator alias: `infixr 6
+                        // Tuple as /\` — fixity target is in
+                        // `target.ctors`, not `target.values`.
+                        // Synthesize the ctor's value scheme and
+                        // bind under qualifier + origin keys so
+                        // rebracketed `a /\ b` → `Constructor
+                        // A.Tuple` resolves.
+                        if let Some(info) = target.ctors.get(&fx.target_name) {
+                            let ctor_scheme = synth_ctor_scheme(info);
+                            env.bind_scheme(
+                                QName {
+                                    module: qualifier.clone(),
+                                    name: fx.target_name.clone(),
+                                },
+                                ctor_scheme.clone(),
+                            );
+                            let fixity_origin = fx
+                                .target_module
+                                .clone()
+                                .unwrap_or_else(|| target_name.to_string());
+                            env.bind_scheme(
+                                QName {
+                                    module: Some(fixity_origin),
+                                    name: fx.target_name.clone(),
+                                },
+                                ctor_scheme,
+                            );
+                        }
                     }
                 }
                 None => errors.push(ImportError {
@@ -332,11 +367,17 @@ fn apply_explicit(
                         continue;
                     }
                     if let Some(info) = target.ctors.get(&ctor) {
+                        let scheme = synth_ctor_scheme(info);
                         let key = QName {
                             module: qualifier.clone(),
                             name: ctor.clone(),
                         };
-                        env.bind_scheme(key, synth_ctor_scheme(info));
+                        env.bind_scheme(key, scheme.clone());
+                        let origin_key = QName {
+                            module: Some(target_name.to_string()),
+                            name: ctor.clone(),
+                        };
+                        env.bind_scheme(origin_key, scheme);
                     }
                 }
             }
@@ -389,7 +430,7 @@ fn merge_instances_and_classes(target: &ModuleExports, ix: &mut InstanceIndex) {
 
 /// Synthesize the value-level `Scheme` for a constructor:
 /// `forall <type_vars>. f1 -> f2 -> … -> Parent <type_vars>`.
-fn synth_ctor_scheme(
+pub(crate) fn synth_ctor_scheme(
     info: &crate::typecheck_db::passes::exhaustiveness::CtorInfo,
 ) -> crate::typecheck_db::types::Scheme {
     use crate::typecheck_db::types::{Scheme, Type};
