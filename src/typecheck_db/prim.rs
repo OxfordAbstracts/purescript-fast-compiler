@@ -168,8 +168,14 @@ fn prim_int() -> ModuleExports {
 fn prim_ordering() -> ModuleExports {
     let mut e = ModuleExports::default();
     // type Ordering with constructors LT, EQ, GT. Kind-level
-    // type; expose as type + ctor names.
+    // type; expose as type + ctor names. LT / EQ / GT also exist
+    // as 0-arity type constants at the kind level so
+    // `Proxy LT` and `compareInt "…" "…" LT` parse — downstream
+    // kind machinery relies on them being known types.
     e.type_arities.insert("Ordering".into(), 0);
+    e.type_arities.insert("LT".into(), 0);
+    e.type_arities.insert("EQ".into(), 0);
+    e.type_arities.insert("GT".into(), 0);
     e.data_constructors.insert(
         "Ordering".into(),
         vec!["LT".into(), "EQ".into(), "GT".into()],

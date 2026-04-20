@@ -123,7 +123,7 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
     use crate::cst::{GuardedExpr, Guard, GuardPattern, LetBinding};
     match decl {
         Decl::Value { name, binders, guarded, where_clause, span, doc_comments } => {
-            let binders = binders.into_iter().map(rewrite_binder).collect();
+            let binders = binders.into_iter().map(|b| rewrite_binder(b, fixity)).collect();
             let guarded = match guarded {
                 GuardedExpr::Unconditional(e) => {
                     GuardedExpr::Unconditional(Box::new(rewrite_expr(*e, fixity)))
@@ -140,7 +140,7 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                                         GuardPattern::Boolean(Box::new(rewrite_expr(*e, fixity)))
                                     }
                                     GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
-                                        rewrite_binder(b),
+                                        rewrite_binder(b, fixity),
                                         Box::new(rewrite_expr(*e, fixity)),
                                     ),
                                 })
@@ -155,7 +155,7 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                 .map(|b| match b {
                     LetBinding::Value { span, binder, expr } => LetBinding::Value {
                         span,
-                        binder: rewrite_binder(binder),
+                        binder: rewrite_binder(binder, fixity),
                         expr: rewrite_expr(expr, fixity),
                     },
                     LetBinding::Signature { span, name, ty } => {
@@ -200,18 +200,27 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
 /// so the output contains no `Binder::Op` anywhere. The IR
 /// lowering assumes this invariant and returns
 /// `LoweringError::ResidualBinderOperator` if it sees one.
-fn rewrite_binder(b: crate::cst::Binder) -> crate::cst::Binder {
+///
+/// The fixity table resolves operator aliases like `infixr 6
+/// Cons as :` so `x : xs` lowers to
+/// `Binder::Constructor { name: Cons, .. }` rather than a
+/// constructor literally named `:` (which would be unbound at
+/// inference time).
+fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Binder {
     use crate::cst::Binder;
     use crate::names::{ConstructorName, Qualified};
     match b {
         Binder::Op { span, left, op, right } => {
-            let left = rewrite_binder(*left);
-            let right = rewrite_binder(*right);
+            let left = rewrite_binder(*left, fixity);
+            let right = rewrite_binder(*right, fixity);
             let op_sym = op.value.name.symbol();
-            let op_str = resolve_sym(op_sym);
-            let cn = ConstructorName::new(crate::interner::intern(&op_str));
-            let name = match op.value.module {
-                Some(m) => Qualified::qualified(m, cn),
+            let (ctor_str, ctor_module) = match fixity.get(&op_sym) {
+                Some(info) => (resolve_sym(info.target_name), info.target_module),
+                None => (resolve_sym(op_sym), op.value.module.map(|m| m.symbol())),
+            };
+            let cn = ConstructorName::new(crate::interner::intern(&ctor_str));
+            let name = match ctor_module {
+                Some(m) => Qualified::qualified(crate::names::ModuleQualifier::new(m), cn),
                 None => Qualified::unqualified(cn),
             };
             Binder::Constructor { span, name, args: vec![left, right] }
@@ -219,7 +228,7 @@ fn rewrite_binder(b: crate::cst::Binder) -> crate::cst::Binder {
         Binder::Constructor { span, name, args } => Binder::Constructor {
             span,
             name,
-            args: args.into_iter().map(rewrite_binder).collect(),
+            args: args.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
         },
         Binder::Record { span, fields } => Binder::Record {
             span,
@@ -228,26 +237,26 @@ fn rewrite_binder(b: crate::cst::Binder) -> crate::cst::Binder {
                 .map(|f| crate::cst::RecordBinderField {
                     span: f.span,
                     label: f.label,
-                    binder: f.binder.map(rewrite_binder),
+                    binder: f.binder.map(|b| rewrite_binder(b, fixity)),
                 })
                 .collect(),
         },
         Binder::As { span, name, binder } => Binder::As {
             span,
             name,
-            binder: Box::new(rewrite_binder(*binder)),
+            binder: Box::new(rewrite_binder(*binder, fixity)),
         },
         Binder::Parens { span, binder } => Binder::Parens {
             span,
-            binder: Box::new(rewrite_binder(*binder)),
+            binder: Box::new(rewrite_binder(*binder, fixity)),
         },
         Binder::Array { span, elements } => Binder::Array {
             span,
-            elements: elements.into_iter().map(rewrite_binder).collect(),
+            elements: elements.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
         },
         Binder::Typed { span, binder, ty } => Binder::Typed {
             span,
-            binder: Box::new(rewrite_binder(*binder)),
+            binder: Box::new(rewrite_binder(*binder, fixity)),
             ty,
         },
         leaf @ (Binder::Wildcard { .. }
@@ -285,6 +294,10 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
             shunt(operands, ops, fixity, root_span)
         }
         Expr::OpParens { span, op } => match lookup_op(&op, fixity) {
+            Some(info) if target_is_constructor(info) => Expr::Constructor {
+                span,
+                name: target_ctor(info, span),
+            },
             Some(info) => Expr::Var {
                 span,
                 name: target_var(info, span),
@@ -393,7 +406,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
                             .map(|p| match p {
                                 GuardPattern::Boolean(e) => GuardPattern::Boolean(rec_box(e, fixity)),
                                 GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
-                                    rewrite_binder(b),
+                                    rewrite_binder(b, fixity),
                                     rec_box(e, fixity),
                                 ),
                             })
@@ -408,7 +421,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
         match b {
             LetBinding::Value { span, binder, expr } => LetBinding::Value {
                 span,
-                binder: rewrite_binder(binder),
+                binder: rewrite_binder(binder, fixity),
                 expr: rec(expr, fixity),
             },
             LetBinding::Signature { span, name, ty } => LetBinding::Signature { span, name, ty },
@@ -417,7 +430,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
     fn rec_alt(a: CaseAlternative, fixity: &FixityTable) -> CaseAlternative {
         CaseAlternative {
             span: a.span,
-            binders: a.binders.into_iter().map(rewrite_binder).collect(),
+            binders: a.binders.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
             result: rec_guarded(a.result, fixity),
         }
     }
@@ -425,7 +438,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
         match s {
             DoStatement::Bind { span, binder, expr } => DoStatement::Bind {
                 span,
-                binder: rewrite_binder(binder),
+                binder: rewrite_binder(binder, fixity),
                 expr: rec(expr, fixity),
             },
             DoStatement::Let { span, bindings } => DoStatement::Let {
@@ -461,7 +474,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
         },
         Expr::Lambda { span, binders, body } => Expr::Lambda {
             span,
-            binders: binders.into_iter().map(rewrite_binder).collect(),
+            binders: binders.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
             body: rec_box(body, fixity),
         },
         Expr::Op { .. } | Expr::BacktickApp { .. } => rewrite_expr(e, fixity),
@@ -592,6 +605,17 @@ fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: S
         ChainOp::Named(n) => {
             let sym = n.value.name.symbol();
             match fixity.get(&sym) {
+                Some(info) if target_is_constructor(*info) => {
+                    // Constructor operator (e.g. `infixr 6 Cons as :`).
+                    // Emit an `Expr::Constructor` node so downstream
+                    // binder/inference passes treat the operands as
+                    // constructor arguments rather than looking the
+                    // name up in the value namespace.
+                    Expr::Constructor {
+                        span,
+                        name: target_ctor(*info, span),
+                    }
+                }
                 Some(info) => Expr::Var {
                     span,
                     name: target_var(*info, span),
@@ -640,6 +664,20 @@ fn is_identifier_op(sym: Ident) -> bool {
 
 fn lookup_op(op: &Spanned<Qualified<crate::names::OpName>>, fixity: &FixityTable) -> Option<FixityInfo> {
     fixity.get(&op.value.name.symbol()).copied()
+}
+
+fn target_is_constructor(info: FixityInfo) -> bool {
+    let s = resolve_sym(info.target_name);
+    s.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+}
+
+fn target_ctor(info: FixityInfo, _span: Span) -> Qualified<crate::names::ConstructorName> {
+    use crate::names::ConstructorName;
+    let cn = ConstructorName::new(crate::interner::intern(&resolve_sym(info.target_name)));
+    match info.target_module {
+        Some(m) => Qualified::qualified(crate::names::ModuleQualifier::new(m), cn),
+        None => Qualified::unqualified(cn),
+    }
 }
 
 fn target_var(info: FixityInfo, span: Span) -> Qualified<ValueName> {

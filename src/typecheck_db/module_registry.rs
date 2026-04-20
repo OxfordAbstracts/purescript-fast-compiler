@@ -720,8 +720,17 @@ pub fn expand_module_reexports(
             let Some(target_name) = target_module else {
                 continue;
             };
-            let Some(target_exports) = registry.get(&target_name) else {
-                continue;
+            // Re-export target may be a user module (in the
+            // registry) OR a Prim submodule (not in the registry,
+            // built from `prim::prim_exports`). Safe.Coerce relies
+            // on the latter when it writes `module Prim.Coerce`.
+            let prim_map = crate::typecheck_db::prim::prim_exports();
+            let target_exports = match registry.get(&target_name) {
+                Some(t) => t,
+                None => match prim_map.get(&target_name) {
+                    Some(t) => t,
+                    None => continue,
+                },
             };
 
             // Merge everything from the target. The target's items

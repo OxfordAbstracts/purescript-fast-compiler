@@ -759,6 +759,30 @@ fn check_one_module(
         module,
         registry,
     );
+    // PureScript instances are globally visible — they must flow
+    // through the import chain, not just through `module X`
+    // re-exports. Merge every directly-imported module's
+    // `instances` into ours so downstream consumers that only
+    // `import` this module still see the whole transitively
+    // reachable instance set (e.g. `main = do …` in a fixture
+    // that only imports `Effect.Console` still needs
+    // `instance bindEffect` from `Effect`).
+    let prim_map = crate::typecheck_db::prim::prim_exports();
+    for imp in &module.imports {
+        let imp_name = join_module_name(&imp.module);
+        let source = match registry.get(&imp_name) {
+            Some(s) => s,
+            None => match prim_map.get(&imp_name) {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        for inst in &source.instances {
+            if !exports.instances.iter().any(|i| i == inst) {
+                exports.instances.push(inst.clone());
+            }
+        }
+    }
     registry.insert(name.clone(), exports);
 
     ModuleCheckResult {
@@ -1467,6 +1491,13 @@ fn build_desugar_context(
         };
         for (op_name, fx) in &target.value_fixities {
             let op_sym = crate::interner::intern(op_name);
+            // Local fixities take precedence — don't let an
+            // imported `infixl 6 sub as -` overwrite a module's
+            // own `infixl 6 Tuple as -`. This matches PureScript's
+            // ambiguity-free local-wins rule.
+            if table.contains_key(&op_sym) {
+                continue;
+            }
             let target_module_sym =
                 fx.target_module.as_deref().map(crate::interner::intern);
             let target_name_sym = crate::interner::intern(&fx.target_name);

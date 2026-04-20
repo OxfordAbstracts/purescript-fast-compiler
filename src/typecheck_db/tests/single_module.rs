@@ -421,6 +421,94 @@ go p
 }
 
 #[test]
+fn do_notation_binds_maybe_via_local_instance() {
+    // Mirror `passing/Do.purs`: a local `Bind Maybe` instance and
+    // a `do`-block that should desugar to `bind` calls. The
+    // `Bind Maybe` constraint arising from the first `Just 1.0`
+    // must be discharged against the local instance.
+    assert_typechecks(
+        "\
+module M where
+
+data Maybe a = Nothing | Just a
+
+class Functor f where
+  map :: forall a b. (a -> b) -> f a -> f b
+
+class Functor f <= Apply f where
+  apply :: forall a b. f (a -> b) -> f a -> f b
+
+class Apply f <= Bind f where
+  bind :: forall a b. f a -> (a -> f b) -> f b
+
+instance functorMaybe :: Functor Maybe where
+  map fn (Just x) = Just (fn x)
+  map _  _        = Nothing
+
+instance applyMaybe :: Apply Maybe where
+  apply (Just fn) (Just x) = Just (fn x)
+  apply _         _        = Nothing
+
+instance bindMaybe :: Bind Maybe where
+  bind Nothing  _ = Nothing
+  bind (Just a) f = f a
+
+test = \\_ -> do
+  x <- Just 1
+  y <- Just 2
+  Just x
+",
+    );
+}
+
+#[test]
+fn multi_equation_first_clause_has_constructor_in_later_column() {
+    // Regression: `maybe b _ Nothing = b; maybe _ f (Just a) = f a`
+    // from Data.Maybe. The first equation has a `Nothing` pattern
+    // in column 2 while its earlier columns are variables. The
+    // exhaustiveness check must walk each alt's column 2 binders
+    // to see both `Nothing` and `Just a`. A prior bug ignored
+    // alts whose earlier columns contained no refutable patterns,
+    // leading to a spurious "missing Nothing" diagnostic.
+    assert_typechecks(
+        "\
+module M where
+
+data Maybe a = Nothing | Just a
+
+maybe :: forall a b. b -> (a -> b) -> Maybe a -> b
+maybe b _ Nothing = b
+maybe _ f (Just a) = f a
+",
+    );
+}
+
+#[test]
+fn instance_method_multi_equation_merges() {
+    // Regression: two adjacent `map` equations inside an
+    // `instance Functor Maybe` block must merge into a single
+    // case expression so exhaustiveness sees both alternatives.
+    // Without the recursive `multi_eq::merge` call inside
+    // `Decl::Instance.members`, only the first equation reaches
+    // inference and the checker reports a spurious
+    // "missing Nothing" case.
+    assert_typechecks(
+        "\
+module M where
+
+data Maybe a = Nothing | Just a
+
+class Functor f where
+  map :: forall a b. (a -> b) -> f a -> f b
+
+instance functorMaybe :: Functor Maybe where
+  map fn (Just x) = Just (fn x)
+  map _  _        = Nothing
+",
+    );
+}
+
+#[test]
 fn data_monoid_guard_pattern_via_multi_equation() {
     // Mirror `Data.Monoid.guard`: a value with two equations,
     // pattern-matching on a Boolean literal in the first arg.

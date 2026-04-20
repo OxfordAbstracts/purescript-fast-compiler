@@ -137,9 +137,17 @@ pub fn infer_expr(
         }
         Expr::Parens { expr, .. } => infer_expr(state, env, type_ops, expr),
         Expr::TypeAnnotation { expr, ty, .. } => {
+            // The declared type may be polymorphic (outer `Forall`
+            // and/or a `Constrained` layer). Check the inner
+            // expression against the instantiated monotype, and
+            // return that same monotype — leaving the caller to
+            // unify normally. Returning the raw `Forall` here
+            // pollutes surrounding unifications with a scheme
+            // they can't look through.
             let declared = convert_type_expr(ty, type_ops);
-            check_expr(state, env, type_ops, expr, &declared)?;
-            Ok(declared)
+            let monotype = instantiate_sig_as_monotype(state, declared);
+            check_expr(state, env, type_ops, expr, &monotype)?;
+            Ok(monotype)
         }
         Expr::Wildcard { .. } | Expr::Hole { .. } => Ok(state.fresh()),
         Expr::Negate { expr, .. } => infer_expr(state, env, type_ops, expr),
@@ -168,7 +176,19 @@ pub fn infer_expr(
         // time, which is why this match doesn't need an arm for
         // them any more.
         Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
-        Expr::VisibleTypeApp { .. } => Err(InferError::Unsupported("visible-type-app")),
+        Expr::VisibleTypeApp { func, .. } => {
+            // Visible type applications (`f @Int x`) pin the next
+            // quantified type variable of `f` to the annotated
+            // type. A precise implementation would instantiate
+            // `f`'s scheme with the explicit type in place of the
+            // first fresh unif; we don't track quantifier order
+            // through instantiation yet, so fall back to ignoring
+            // the annotation and inferring `f` normally. Wrong for
+            // pathological cases that only work with the
+            // annotation, but correct for the majority where the
+            // annotation just echoes inference's result.
+            infer_expr(state, env, type_ops, func)
+        }
         Expr::AsPattern { .. } => Err(InferError::Unsupported("as-pattern")),
     }
 }
@@ -241,10 +261,21 @@ pub fn infer_value_scc_with_all(
 
     let mut slot_of: HashMap<String, Type> = HashMap::new();
     let mut decl_refs: Vec<(&Decl, String)> = Vec::new();
+    // Track decls whose declared signature carries a `Partial`
+    // constraint. Those decls are allowed to be non-exhaustive:
+    // the caller has promised via the constraint that the
+    // uncovered cases never arise at runtime. Skipping
+    // exhaustiveness for them is how `fromJust (Just x) = x`
+    // stays clean.
+    let mut partial_decls: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for decl in decls {
         if let Decl::Value { name, .. } = decl {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+            if has_partial_constraint(env, &n) {
+                partial_decls.insert(n.clone());
+            }
             let v = state.fresh();
             env.bind_local(n.clone(), v.clone());
             slot_of.insert(n.clone(), v);
@@ -321,6 +352,12 @@ pub fn infer_value_scc_with_all(
             Some(n) => n.clone(),
             None => continue,
         };
+        // Decls whose signature carries `Partial =>` opt out of
+        // exhaustiveness — the user is asserting the missing
+        // cases never arise at runtime.
+        if partial_decls.contains(&owner) {
+            continue;
+        }
         // For each scrutinee column: gather the column's binders from
         // each unconditional-enough alt, zonk the scrutinee, run the
         // check.
@@ -970,39 +1007,68 @@ fn infer_let(
         }
     }
 
-    // Pass 2: materialize value bindings and pre-insert slots into locals so
-    // mutually-recursive `let`s typecheck.
+    // Pass 2: materialize value bindings.
+    //
+    // * `LetBinding::Value` with a bare `Binder::Var` is the
+    //   standard case: pre-insert a slot so mutual recursion
+    //   resolves, then (Pass 3) infer the body.
+    // * `LetBinding::Value` with a *pattern* binder (e.g.
+    //   `let X a = e`, `let {x, y} = r`) deconstructs the RHS
+    //   into its sub-binders. We infer the RHS, bind the
+    //   pattern against it, and skip slot/generalize logic —
+    //   pattern bindings aren't let-polymorphic (each binder
+    //   gets a monomorphic type).
     let mut value_bindings: Vec<LetValueBinding<'_>> = Vec::new();
+    let mut pattern_bindings: Vec<(&Binder, &Expr)> = Vec::new();
     for b in bindings {
         match b {
             LetBinding::Value { binder: Binder::Var { name, .. }, expr, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let sig = sigs.get(&n).cloned();
-                let slot = sig.clone().unwrap_or_else(|| state.fresh());
-                env.bind_local(n.clone(), slot);
+                if let Some(sig_ty) = sig.clone() {
+                    let scheme = sig_to_scheme(sig_ty.clone());
+                    env.bind_local_scheme(n.clone(), scheme);
+                } else {
+                    let slot = state.fresh();
+                    env.bind_local(n.clone(), slot);
+                }
                 value_bindings.push(LetValueBinding { name: n, sig, expr });
             }
-            LetBinding::Value { .. } => {
-                return Err(InferError::UnsupportedBinder("let-pattern"));
+            LetBinding::Value { binder, expr, .. } => {
+                pattern_bindings.push((binder, expr));
             }
             LetBinding::Signature { .. } => {}
         }
     }
 
-    // Pass 3: infer each body, unify with its pre-inserted slot (or check
-    // against the signature directly if one was supplied).
+    // Pass 3: infer each body. For signed bindings, check against
+    // a freshly-instantiated monotype of the sig (so constraints
+    // surface as pending and match the body's types correctly).
+    // For unsigned bindings, infer + unify with the pre-inserted
+    // monomorphic slot as before.
     for vb in &value_bindings {
-        let slot_ty = env
-            .lookup_unqualified(&vb.name)
-            .local_ty()
-            .expect("slot pre-inserted above")
-            .clone();
-        if vb.sig.is_some() {
-            check_expr(state, env, type_ops, vb.expr, &slot_ty)?;
+        if let Some(sig_ty) = vb.sig.clone() {
+            let monotype = instantiate_sig_as_monotype(state, sig_ty);
+            check_expr(state, env, type_ops, vb.expr, &monotype)?;
         } else {
+            let slot_ty = env
+                .lookup_unqualified(&vb.name)
+                .local_ty()
+                .expect("slot pre-inserted above")
+                .clone();
             let actual = infer_expr(state, env, type_ops, vb.expr)?;
             state.unify(&slot_ty, &actual)?;
         }
+    }
+
+    // Pass 3b: pattern bindings. Infer the RHS, bind the pattern
+    // against it. Each name introduced by the pattern becomes a
+    // local monotype — pattern bindings don't participate in
+    // let-polymorphism the way bare-name bindings do.
+    for (binder, expr) in &pattern_bindings {
+        let rhs_ty = infer_expr(state, env, type_ops, expr)?;
+        let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+        state.unify(&pat_ty, &rhs_ty)?;
     }
 
     // Pass 4: replace each monomorphic slot with a generalized scheme so the
@@ -1020,6 +1086,13 @@ fn infer_let(
         std::collections::HashSet::new();
     for vb in &value_bindings {
         if !generalized.insert(vb.name.clone()) {
+            continue;
+        }
+        // Signed bindings already have their scheme in
+        // `local_schemes` from Pass 2; skip generalization for
+        // them. Unsigned bindings need their fresh unif-slot
+        // plucked out and generalized.
+        if vb.sig.is_some() {
             continue;
         }
         let slot_ty = env
@@ -1224,6 +1297,70 @@ fn wrap_guarded_with_where(
                 .collect(),
         ),
     }
+}
+
+/// Convert a user-written signature type (as `Type`, coming from
+/// `convert_type_expr`) into a `Scheme`. Peels any outer
+/// `Type::Forall` into the scheme's `vars`; the body keeps any
+/// `Type::Constrained` layer so `infer_var`'s
+/// `instantiate_and_record_constraints` can peel it at each use
+/// site.
+fn sig_to_scheme(sig_ty: Type) -> Scheme {
+    match sig_ty {
+        Type::Forall(qs, body) => {
+            let vars = qs.into_iter().map(|(n, _, _)| n).collect();
+            Scheme { vars, ty: *body }
+        }
+        other => Scheme { vars: Vec::new(), ty: other },
+    }
+}
+
+/// Instantiate a let-binding signature into a fresh monotype
+/// suitable for `check_expr`. Any top-level `Forall` introduces
+/// fresh unif vars; any `Constrained` layer is peeled and each
+/// constraint is recorded as a pending constraint on the
+/// surrounding SCC state — mirrors what
+/// `instantiate_and_record_constraints` does at reference sites
+/// so the body's constraints and the signature's constraints
+/// share the same unif identities.
+fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
+    use crate::typecheck_db::generalize::instantiate;
+    use crate::typecheck_db::passes::constraints::{
+        peel_constraints, ConstraintOrigin, PendingConstraint,
+    };
+    let scheme = sig_to_scheme(sig_ty);
+    let instantiated = instantiate(state, &scheme);
+    let (cs, body) = peel_constraints(instantiated);
+    for c in cs {
+        state.record_pending_constraint(PendingConstraint {
+            decl_name: None,
+            span: crate::span::Span { start: 0, end: 0 },
+            constraint: c,
+            origin: ConstraintOrigin::Signature,
+        });
+    }
+    body
+}
+
+/// Does the env's scheme for `name` carry a `Partial` constraint?
+/// A decl whose signature declares `Partial =>` is allowed to be
+/// non-exhaustive — the signature is the user's way of saying
+/// "I promise uncovered cases can't happen at runtime."
+fn has_partial_constraint(env: &Env, name: &str) -> bool {
+    let scheme = match env.lookup_unqualified(name) {
+        Lookup::Scheme(s) => s,
+        _ => return false,
+    };
+    fn walk(ty: &Type) -> bool {
+        match ty {
+            Type::Constrained(cs, body) => {
+                cs.iter().any(|c| c.class.name == "Partial") || walk(body)
+            }
+            Type::Forall(_, body) => walk(body),
+            _ => false,
+        }
+    }
+    walk(&scheme.ty)
 }
 
 fn type_of_literal(lit: &Literal) -> Type {
