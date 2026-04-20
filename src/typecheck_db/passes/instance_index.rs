@@ -163,6 +163,37 @@ impl InstanceIndex {
             .iter()
             .flat_map(|(class, list)| list.iter().map(move |i| (class.as_str(), i)))
     }
+
+    /// Walk every instance head + context and expand type
+    /// aliases in-place. Used after the index has been seeded
+    /// from imports so that the solver matches on the expanded
+    /// form (e.g. a `SynString` → `String` alias in the
+    /// importing module canonicalizes instance heads that came
+    /// through unexpanded).
+    pub fn expand_aliases_in_place(
+        &mut self,
+        aliases: &crate::typecheck_db::types::AliasMap,
+    ) {
+        if aliases.is_empty() {
+            return;
+        }
+        for (_, list) in self.by_class.iter_mut() {
+            for inst in list.iter_mut() {
+                inst.types = inst
+                    .types
+                    .drain(..)
+                    .map(|t| crate::typecheck_db::types::expand_aliases(t, aliases))
+                    .collect();
+                for c in &mut inst.context {
+                    c.args = c
+                        .args
+                        .drain(..)
+                        .map(|t| crate::typecheck_db::types::expand_aliases(t, aliases))
+                        .collect();
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

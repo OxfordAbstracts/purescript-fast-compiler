@@ -178,6 +178,44 @@ fn check_one_module(
 
     let type_ops = TypeOpMap::default();
 
+    // Build a consolidated alias map: local `type Foo = …` decls
+    // plus every imported module's exported aliases. Passed into
+    // inference / class-method binding so aliases like
+    // `type SynString = String` expand to `String` before we try
+    // to unify — otherwise `newtype NT = NT SynString` fields
+    // refuse to unify with `String`.
+    let alias_map: crate::typecheck_db::types::AliasMap = {
+        let mut m: crate::typecheck_db::types::AliasMap = HashMap::new();
+        // Local aliases from the (raw) CST so forward references
+        // don't need the registry.
+        for d in &module.decls {
+            if let cst::Decl::TypeAlias { name, type_vars, ty, .. } = d {
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let vars: Vec<String> = type_vars
+                    .iter()
+                    .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
+                    .collect();
+                let body = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
+                m.insert(n, (vars, body));
+            }
+        }
+        // Every directly-imported module's aliases. Deeper
+        // transitive aliases already land here because
+        // `expand_module_reexports` merges them into each
+        // module's exports, so `import Prelude` pulls in the
+        // whole chain.
+        for imp in &module.imports {
+            let imp_name = join_module_name(&imp.module);
+            if let Some(e) = registry.get(&imp_name) {
+                for (k, a) in &e.type_aliases {
+                    m.entry(k.clone())
+                        .or_insert_with(|| (a.type_vars.clone(), a.body.clone()));
+                }
+            }
+        }
+        m
+    };
+
     // 3) Run per-decl cached check passes for every non-value decl.
     //    Each pass produces a structural `Shape` + an `output_hash`.
     //    The hashes feed into the value-SCC dep tracking below, so
@@ -312,7 +350,26 @@ fn check_one_module(
                     &type_ops,
                 )
                 .expect("check_instance");
-                let inst = instance_from_shape(&shape);
+                let mut inst = instance_from_shape(&shape);
+                // Expand any type aliases in the instance head
+                // (e.g. `instance Foo SynString` → `instance
+                // Foo String`). The solver matches on concrete
+                // head shapes; without expansion a user's
+                // `SynString` vs. the call-site's `String` is a
+                // spurious mismatch.
+                inst.types = inst
+                    .types
+                    .into_iter()
+                    .map(|t| crate::typecheck_db::types::expand_aliases(t, &alias_map))
+                    .collect();
+                for c in &mut inst.context {
+                    c.args = c
+                        .args
+                        .iter()
+                        .cloned()
+                        .map(|t| crate::typecheck_db::types::expand_aliases(t, &alias_map))
+                        .collect();
+                }
                 local_instances.push(inst);
                 registry.set_nonvalue_hash(&name, "i", &decl_key, oh);
                 registry.push_module_instance(&name, &shape.class.name, decl_key.clone());
@@ -423,8 +480,14 @@ fn check_one_module(
     for (class_name, info) in &local_classes {
         instance_index.insert_class(class_name.clone(), info.clone());
     }
+    // Expand aliases across every instance in the index using
+    // the current module's alias map. Imported instances come
+    // in with source-module type names (which may be aliases);
+    // unification on the call site uses the *expanded* form,
+    // so `instance Foo SynString` should match a `String` call.
+    instance_index.expand_aliases_in_place(&alias_map);
 
-    bind_local_ctors(&desugared, &mut env);
+    bind_local_ctors(&desugared, &mut env, &alias_map);
 
     // 4) Value decls: split into SCCs + cached per-SCC inference.
     //    `module_context_hash` is now zero — all context dependencies
@@ -1545,9 +1608,16 @@ fn hash_fixity_table(
     *h.finalize().as_bytes()
 }
 
-fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
-    use crate::typecheck_db::types::{QName, Scheme, Type};
+fn bind_local_ctors(
+    decls: &[crate::typecheck_db::ir::Decl],
+    env: &mut Env,
+    aliases: &crate::typecheck_db::types::AliasMap,
+) {
+    use crate::typecheck_db::types::{expand_aliases, QName, Scheme, Type};
     let type_ops = TypeOpMap::default();
+    let conv = |ty: &crate::cst::TypeExpr| -> Type {
+        expand_aliases(crate::typecheck_db::types::convert_type_expr(ty, &type_ops), aliases)
+    };
     for d in decls {
         match d {
             crate::typecheck_db::ir::Decl::Foreign { name, ty, .. } => {
@@ -1555,7 +1625,7 @@ fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
                 // Put its declared type into the env so downstream
                 // references resolve.
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-                let declared = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
+                let declared = conv(ty);
                 // Strip a leading Forall into the scheme's vars
                 // field so generalization / instantiation treats
                 // quantifiers the standard way.
@@ -1576,7 +1646,7 @@ fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
                 // fresh; this is an improvement that lets
                 // cross-module references settle faster.
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-                let declared = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
+                let declared = conv(ty);
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {
                         let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
@@ -1598,13 +1668,7 @@ fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
                 for c in constructors {
                     let ctor_name =
                         crate::typecheck_db::util::resolve_symbol(c.name.value.symbol());
-                    let fields: Vec<Type> = c
-                        .fields
-                        .iter()
-                        .map(|f| {
-                            crate::typecheck_db::types::convert_type_expr(f, &type_ops)
-                        })
-                        .collect();
+                    let fields: Vec<Type> = c.fields.iter().map(|f| conv(f)).collect();
                     let scheme_ty = build_fn_chain(&fields, &result_ty);
                     let scheme = Scheme { vars: tvars.clone(), ty: scheme_ty };
                     env.bind_scheme(QName::unqualified(&ctor_name), scheme);
@@ -1619,7 +1683,7 @@ fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
                     .collect();
                 let result_ty =
                     apply_type_vars(&Type::Con(QName::unqualified(&type_name)), &tvars);
-                let field_ty = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
+                let field_ty = conv(ty);
                 let ctor_name =
                     crate::typecheck_db::util::resolve_symbol(constructor.value.symbol());
                 let scheme_ty = Type::fun(field_ty, result_ty);
@@ -1643,10 +1707,7 @@ fn bind_local_ctors(decls: &[crate::typecheck_db::ir::Decl], env: &mut Env) {
                 for m in members {
                     let method_name =
                         crate::typecheck_db::util::resolve_symbol(m.name.value.symbol());
-                    let method_ty = crate::typecheck_db::types::convert_type_expr(
-                        &m.ty,
-                        &type_ops,
-                    );
+                    let method_ty = conv(&m.ty);
                     let (method_vars, method_body) = match method_ty {
                         Type::Forall(qs, body) => {
                             let ns: Vec<String> =

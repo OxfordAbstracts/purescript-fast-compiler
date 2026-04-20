@@ -197,6 +197,128 @@ impl Scheme {
 /// module-qualified) to `QName { module: Some("Data.Tuple"), name: "Tuple" }`.
 pub type TypeOpMap = HashMap<(Option<String>, String), QName>;
 
+/// Map from a type-alias name to its `(type_vars, body)`. Built
+/// once per module check (local aliases + every imported
+/// module's aliases) and passed to `expand_aliases` so
+/// signatures, constructor fields, instance heads, and the like
+/// all get their aliases unfolded before unification compares
+/// them. Without this, unifying `SynString` (an alias for
+/// `String`) against `String` fails as a `Mismatch`.
+pub type AliasMap = HashMap<String, (Vec<String>, Type)>;
+
+/// Walk `ty` and replace every `Type::Con(name)` / applied
+/// `App(Con(name), ...)` whose simple name matches an alias
+/// with the alias body, substituting each type argument for the
+/// corresponding alias variable. Runs to a fixed point to
+/// handle nested aliases (`type A = B; type B = Int`). Bare
+/// `Type::Con(alias)` with no application only expands when the
+/// alias itself has no parameters.
+pub fn expand_aliases(ty: Type, aliases: &AliasMap) -> Type {
+    if aliases.is_empty() {
+        return ty;
+    }
+    // Fixed-point guard against ill-formed recursive aliases —
+    // give up after `MAX_EXPANSIONS` so a broken user alias
+    // can't hang the typechecker. 64 is generous; most real
+    // alias chains are 1–3 deep.
+    const MAX_EXPANSIONS: usize = 64;
+    let mut current = ty;
+    for _ in 0..MAX_EXPANSIONS {
+        let expanded = expand_once(&current, aliases);
+        if expanded == current {
+            return expanded;
+        }
+        current = expanded;
+    }
+    current
+}
+
+fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
+    // Collect the Con head + its App spine so we can try to
+    // match the whole applied form against an alias. Anything
+    // that isn't head-shaped (e.g. Fun, Forall, Record) or that
+    // doesn't have a matching alias falls through to a
+    // structural recurse.
+    let spine = collect_app_spine(ty);
+    if let Some((Type::Con(qn), args)) = spine {
+        if let Some((vars, body)) = aliases.get(&qn.name) {
+            // Only expand saturated applications (vars.len() ==
+            // args.len()) for now — partial aliases need the
+            // leftover args re-applied to the expanded body and
+            // that interacts badly with some of our existing
+            // fixtures. Saturated covers the overwhelming common
+            // case (`type SynString = String`, `type Fn a = a ->
+            // a`).
+            if vars.len() == args.len() {
+                let mut subst: std::collections::HashMap<String, Type> =
+                    std::collections::HashMap::with_capacity(vars.len());
+                for (v, a) in vars.iter().zip(args.iter()) {
+                    subst.insert(v.clone(), expand_once(a, aliases));
+                }
+                return crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+            }
+        }
+    }
+    // No alias match — walk children, expand each subterm once.
+    match ty {
+        Type::App(f, a) => Type::app(expand_once(f, aliases), expand_once(a, aliases)),
+        Type::Fun(a, b) => Type::fun(expand_once(a, aliases), expand_once(b, aliases)),
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(expand_once(body, aliases)))
+        }
+        Type::Constrained(cs, body) => {
+            let cs = cs
+                .iter()
+                .map(|c| Constraint {
+                    class: c.class.clone(),
+                    args: c.args.iter().map(|x| expand_once(x, aliases)).collect(),
+                })
+                .collect();
+            Type::Constrained(cs, Box::new(expand_once(body, aliases)))
+        }
+        Type::Record(fs, tail) => Type::Record(
+            fs.iter()
+                .map(|(l, t)| (l.clone(), expand_once(t, aliases)))
+                .collect(),
+            tail.as_ref().map(|t| Box::new(expand_once(t, aliases))),
+        ),
+        Type::Row(fs, tail) => Type::Row(
+            fs.iter()
+                .map(|(l, t)| (l.clone(), expand_once(t, aliases)))
+                .collect(),
+            tail.as_ref().map(|t| Box::new(expand_once(t, aliases))),
+        ),
+        Type::Kinded(t, k) => Type::Kinded(
+            Box::new(expand_once(t, aliases)),
+            Box::new(expand_once(k, aliases)),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Flatten an `App` spine: `App(App(f, a), b) → (f, [a, b])`.
+/// Only returns the spine when the head is reachable through
+/// `Type::App` nests; stops at anything else.
+fn collect_app_spine(ty: &Type) -> Option<(Type, Vec<Type>)> {
+    let mut args: Vec<Type> = Vec::new();
+    let mut cursor = ty.clone();
+    loop {
+        match cursor {
+            Type::App(f, a) => {
+                args.push(*a);
+                cursor = *f;
+            }
+            other => {
+                if args.is_empty() {
+                    return Some((other, Vec::new()));
+                }
+                args.reverse();
+                return Some((other, args));
+            }
+        }
+    }
+}
+
 /// Convert a CST `TypeExpr` into a serializable wire [`Type`].
 ///
 /// Type-level operators are desugared to applications: `a /\ b` becomes
