@@ -315,6 +315,34 @@ fn apply_explicit(
                                 },
                                 ctor_scheme,
                             );
+                        } else if let Some(origin) = fx.target_module.clone() {
+                            // Re-exporter path: the fixity's
+                            // target lives in `qualified_values`
+                            // because it was resolved through an
+                            // imported module's exports rather
+                            // than this one. Bind both the
+                            // unqualified form (for the common
+                            // fallback lookup) and the
+                            // origin-qualified form.
+                            if let Some(scheme) = target
+                                .qualified_values
+                                .get(&(origin.clone(), fx.target_name.clone()))
+                            {
+                                env.bind_scheme(
+                                    QName {
+                                        module: qualifier.clone(),
+                                        name: fx.target_name.clone(),
+                                    },
+                                    scheme.clone(),
+                                );
+                                env.bind_scheme(
+                                    QName {
+                                        module: Some(origin),
+                                        name: fx.target_name.clone(),
+                                    },
+                                    scheme.clone(),
+                                );
+                            }
                         }
                     }
                 }

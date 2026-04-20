@@ -464,28 +464,42 @@ pub fn distill_exports(
                     .module
                     .map(|m| crate::typecheck_db::util::resolve_symbol(m));
                 let target_name = crate::typecheck_db::util::resolve_symbol(target.name);
-                // If the user wrote a bare target (`infixr 0 apply
-                // as $`), pin the target's module to *this* module
-                // so downstream importers can disambiguate against
-                // other modules that also export a `apply`. Without
-                // this, Prelude re-exports collide when multiple
-                // modules (e.g. `Data.Function.apply` and
-                // `Control.Apply.apply`) share a bare name —
-                // whichever was imported last wins, and `$` gets
-                // lowered to the wrong `apply`.
+                // Canonicalization:
+                // * If the user wrote an explicit module qualifier
+                //   (`infixl 6 MyMod.add as +`), keep it.
+                // * If the target is defined *in this module*
+                //   (value scheme or data ctor), pin it to this
+                //   module — lets Prelude distinguish
+                //   `Data.Function.apply` from
+                //   `Control.Apply.apply`.
+                // * If the target is an *imported* name (e.g.
+                //   `Data.Tuple.Nested`'s `infixr 6 Tuple as /\`
+                //   where `Tuple` came from `Data.Tuple`), pin it
+                //   to the origin module so downstream importers
+                //   of the operator alias find `Data.Tuple.Tuple`
+                //   even without a direct `import Data.Tuple`.
+                //   Otherwise leave as `None`.
+                let target_is_local_value = scheme_by_name.contains_key(&target_name);
+                let target_is_local_ctor = ctor_info.contains_key(&target_name);
+                let self_module_name_str: String = module
+                    .name
+                    .value
+                    .parts
+                    .iter()
+                    .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                    .collect::<Vec<_>>()
+                    .join(".");
                 let target_module = match user_target_module {
                     Some(m) => Some(m),
-                    None => {
-                        let module_name: String = module
-                            .name
-                            .value
-                            .parts
-                            .iter()
-                            .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        Some(module_name)
+                    None if target_is_local_value || target_is_local_ctor => {
+                        Some(self_module_name_str.clone())
                     }
+                    // Non-local target (e.g. `infixr 6 Tuple as
+                    // /\` where `Tuple` came from an import).
+                    // Left as `None` here; a post-distill pass
+                    // in `driver_multi` re-resolves against the
+                    // `ModuleRegistry` and fills in the origin.
+                    None => None,
                 };
                 let decl = FixityDecl {
                     associativity: *associativity,

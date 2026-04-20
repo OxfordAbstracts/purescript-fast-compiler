@@ -25,7 +25,7 @@ use crate::typecheck_db::desugar::{desugar_module, DesugarContext};
 use crate::typecheck_db::driver::{CacheOutcome, TypecheckDb};
 use crate::typecheck_db::env::Env;
 use crate::typecheck_db::key::{hash_bytes, OutputHash};
-use crate::typecheck_db::module_registry::{distill_exports, ModuleExports, ModuleRegistry};
+use crate::typecheck_db::module_registry::{distill_exports, FixityDecl, ModuleExports, ModuleRegistry};
 use crate::typecheck_db::passes::constraints::{ConstraintError, PendingConstraint, ResolvedDict};
 use crate::typecheck_db::passes::exhaustiveness::{CtorInfo, CtorRegistry, DataConstructors, NonExhaustive};
 use crate::typecheck_db::passes::check_nonvalue::{
@@ -827,6 +827,100 @@ fn check_one_module(
         module,
         registry,
     );
+    // Post-distill: resolve fixity targets that weren't local
+    // against our imports. `infixr 6 Tuple as /\` in a module
+    // that imports `Tuple` from `Data.Tuple` needs the fixity's
+    // `target_module` filled in with `Data.Tuple` so downstream
+    // importers of the operator alias find the ctor. We also
+    // surface the target's value scheme under the alias name
+    // so `import M ((/\))` brings it into scope.
+    {
+        let prim_map_rs = crate::typecheck_db::prim::prim_exports();
+        let import_targets: Vec<String> = module
+            .imports
+            .iter()
+            .map(|imp| join_module_name(&imp.module))
+            .collect();
+        let mut inserts: Vec<(String, String, FixityDecl)> = Vec::new();
+        // Each entry: (op_alias, target_name, origin_module, scheme).
+        let mut value_inserts: Vec<(
+            String,
+            String,
+            String,
+            crate::typecheck_db::types::Scheme,
+        )> = Vec::new();
+        for (op, fx) in &exports.value_fixities {
+            if fx.target_module.is_some() {
+                continue;
+            }
+            for imp_name in &import_targets {
+                let source = match registry.get(imp_name) {
+                    Some(s) => Some(s),
+                    None => prim_map_rs.get(imp_name),
+                };
+                let Some(source) = source else { continue };
+                if source.values.contains_key(&fx.target_name)
+                    || source.ctors.contains_key(&fx.target_name)
+                {
+                    let origin = source
+                        .value_origins
+                        .get(&fx.target_name)
+                        .cloned()
+                        .unwrap_or_else(|| imp_name.clone());
+                    let mut new_fx = fx.clone();
+                    new_fx.target_module = Some(origin.clone());
+                    inserts.push((op.clone(), origin.clone(), new_fx));
+                    // Surface the target's scheme so `import M
+                    // ((/\))` fills `exports.values` with an
+                    // entry for `/\` AND for the target
+                    // constructor under its origin module —
+                    // downstream `Expr::Constructor(origin.Tuple)`
+                    // then resolves.
+                    let scheme = source
+                        .values
+                        .get(&fx.target_name)
+                        .cloned()
+                        .or_else(|| {
+                            source
+                                .ctors
+                                .get(&fx.target_name)
+                                .map(|info| crate::typecheck_db::passes::imports::synth_ctor_scheme(info))
+                        });
+                    if let Some(s) = scheme {
+                        value_inserts.push((
+                            op.clone(),
+                            fx.target_name.clone(),
+                            origin.clone(),
+                            s,
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        for (op, _origin, new_fx) in inserts {
+            exports.value_fixities.insert(op, new_fx);
+        }
+        for (op, target_name, origin, scheme) in value_inserts {
+            exports.values.entry(op.clone()).or_insert_with(|| scheme.clone());
+            exports
+                .value_origins
+                .entry(op.clone())
+                .or_insert(origin.clone());
+            // Also thread the target name through as a
+            // qualified binding. `import M ((/\))` then brings
+            // the target's scheme into the importer's env via
+            // `qualified_values` under `(origin, target_name)`.
+            exports
+                .qualified_values
+                .entry((origin.clone(), op.clone()))
+                .or_insert_with(|| scheme.clone());
+            exports
+                .qualified_values
+                .entry((origin, target_name))
+                .or_insert(scheme);
+        }
+    }
     // PureScript instances are globally visible — they must flow
     // through the import chain, not just through `module X`
     // re-exports. Merge every directly-imported module's
