@@ -270,8 +270,43 @@ impl UnifyState {
             }
             (Type::TypeString(s1), Type::TypeString(s2)) if s1 == s2 => Ok(()),
             (Type::TypeInt(n1), Type::TypeInt(n2)) if n1 == n2 => Ok(()),
+            // Forall-vs-Forall: accept the simplest case where
+            // both sides quantify over the same number of vars
+            // and the bodies unify after alpha-renaming one
+            // side's vars to match the other's. Avoids spurious
+            // mismatches when the same polymorphic type appears
+            // on both sides of an annotation (e.g. declaring
+            // `x :: forall a. Array a` and using `x` at a call
+            // site that also expects `forall a. Array a`).
+            (Type::Forall(vs1, body1), Type::Forall(vs2, body2)) if vs1.len() == vs2.len() => {
+                let mut renamed = (**body1).clone();
+                if vs1.iter().zip(vs2.iter()).any(|((n1, _, _), (n2, _, _))| n1 != n2) {
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::new();
+                    for ((n1, _, _), (n2, _, _)) in vs1.iter().zip(vs2.iter()) {
+                        subst.insert(n1.clone(), Type::Var(n2.clone()));
+                    }
+                    renamed = crate::typecheck_db::generalize::apply_var_subst(&renamed, &subst);
+                }
+                self.unify(&renamed, body2)
+            }
             (Type::Record(f1, t1), Type::Record(f2, t2)) => unify_fields(self, f1, t1, f2, t2),
             (Type::Row(f1, t1), Type::Row(f2, t2)) => unify_fields(self, f1, t1, f2, t2),
+            // `Record r` (parsed as `App(Con("Record"), r)`) is
+            // equivalent to `{ | r }` — an open record whose
+            // tail is `r`. Unify as `Record([], Some(r))` so
+            // call-site `{ a :: Int }` literal records align
+            // with the kind-level `Record` constructor.
+            (Type::App(f, row), Type::Record(fields, tail))
+            | (Type::Record(fields, tail), Type::App(f, row))
+                if matches!(f.as_ref(), Type::Con(qn) if qn.name == "Record") =>
+            {
+                let empty: Vec<(String, Type)> = Vec::new();
+                let tail_box: Option<Box<Type>> = Some(Box::new((**row).clone()));
+                // Canonical order: `Record` side as the first arg
+                // keeps diagnostic messages consistent.
+                unify_fields(self, &empty, &tail_box, fields, tail)
+            }
             (Type::Kinded(t, _), other) | (other, Type::Kinded(t, _)) => self.unify(t, other),
             (Type::Wildcard, _) | (_, Type::Wildcard) => Ok(()),
             _ => Err(UnifyError::Mismatch(a.clone(), b.clone())),
