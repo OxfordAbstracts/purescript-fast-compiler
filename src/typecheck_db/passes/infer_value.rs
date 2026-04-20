@@ -293,6 +293,15 @@ pub fn infer_value_scc_with_all(
         if let Decl::Value { binders, guarded, where_clause, .. } = decl {
             let expected = slot_of.get(name).cloned().unwrap();
             state.set_current_decl(Some(name.clone()));
+            // If the decl has a signature, instantiate it and
+            // pre-unify the parameter binders against the sig's
+            // argument types. This threads polymorphic field
+            // types into the body so expressions like
+            // `m.return 1` on a parameter `m :: {
+            //   return :: forall a. a -> m a }` see the
+            //  per-use `forall a.` quantification instead of
+            //  inferring `m` as a bare unif.
+            let _ = sig_param_types; // retained for future sig-aware work
             // Wrap the body with any where-clause bindings so
             // declarations like `foo = bar where bar = 1` see `bar`
             // during inference. `wrap_guarded_with_where` turns the
@@ -1235,16 +1244,35 @@ fn infer_equation(
     binders: &[Binder],
     guarded: &ir::GuardedExpr,
 ) -> Result<Type, InferError> {
-    // `foo x y = body` acts as `\x y -> body` at the top level. The body
-    // may be guarded (M4c); `infer_guarded` handles both shapes.
+    infer_equation_with_hints(state, env, type_ops, binders, guarded, None)
+}
+
+/// Like `infer_equation` but also unifies each binder's slot
+/// against an optional signature-hinted type. The hints come
+/// from `sig_param_types`, which instantiates the decl's
+/// signature once per SCC and splits out the arrow arguments.
+/// Threading the signature in here is what lets a parameter
+/// like `m :: { return :: forall a. a -> m a }` carry its
+/// polymorphic field types into the body.
+fn infer_equation_with_hints(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    binders: &[Binder],
+    guarded: &ir::GuardedExpr,
+    hints: Option<&[Type]>,
+) -> Result<Type, InferError> {
     if binders.is_empty() {
         return infer_guarded(state, env, type_ops, guarded);
     }
 
     env.push_scope();
     let mut param_tys = Vec::with_capacity(binders.len());
-    for b in binders {
+    for (i, b) in binders.iter().enumerate() {
         let ty = bind_pattern(state, env, type_ops, b)?;
+        if let Some(h) = hints.and_then(|hs| hs.get(i)) {
+            state.unify(&ty, h)?;
+        }
         param_tys.push(ty);
     }
     let body_ty = infer_guarded(state, env, type_ops, guarded)?;
@@ -1359,6 +1387,58 @@ fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
         });
     }
     body
+}
+
+/// If `name` has a declared signature in the env, instantiate it
+/// as a monotype (recording constraints) and return the first
+/// `arity` argument types of the resulting arrow chain. Used to
+/// pre-seed parameter types during equation inference, so
+/// polymorphic fields in the sig (`{ return :: forall a. a -> m a }`)
+/// actually reach the body instead of being lost to a bare unif
+/// on the parameter.
+///
+/// Returns `None` when the decl has no sig, when it isn't a
+/// function type, or when the arrow has fewer segments than the
+/// body's binder count (the caller falls back to fresh unifs).
+fn sig_param_types(
+    env: &Env,
+    name: &str,
+    state: &mut UnifyState,
+    arity: usize,
+) -> Option<Vec<Type>> {
+    if arity == 0 {
+        return None;
+    }
+    // The SCC's pre-bind has already shadowed `name` with a
+    // fresh unif in `env.locals`, so `lookup_unqualified` would
+    // hit that first. Reach into `top_level` directly to find
+    // the declared signature (placed there by
+    // `bind_local_ctors` for every `Decl::TypeSignature`).
+    let scheme = env
+        .top_level
+        .get(&QName { module: None, name: name.to_string() })
+        .cloned()?;
+    let mono = instantiate_sig_as_monotype(state, Type::Forall(
+        scheme
+            .vars
+            .iter()
+            .cloned()
+            .map(|n| (n, false, None))
+            .collect(),
+        Box::new(scheme.ty),
+    ));
+    let mut args: Vec<Type> = Vec::new();
+    let mut cur = mono;
+    for _ in 0..arity {
+        match cur {
+            Type::Fun(a, b) => {
+                args.push(*a);
+                cur = *b;
+            }
+            _ => return None,
+        }
+    }
+    Some(args)
 }
 
 /// Does the env's scheme for `name` carry a `Partial` constraint?

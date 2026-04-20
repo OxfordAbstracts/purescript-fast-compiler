@@ -270,6 +270,32 @@ impl UnifyState {
             }
             (Type::TypeString(s1), Type::TypeString(s2)) if s1 == s2 => Ok(()),
             (Type::TypeInt(n1), Type::TypeInt(n2)) if n1 == n2 => Ok(()),
+            // Two constrained types: unify constraints + bodies.
+            // Constraint lists must match in length, and args
+            // unify pairwise.
+            (Type::Constrained(cs1, b1), Type::Constrained(cs2, b2))
+                if cs1.len() == cs2.len() =>
+            {
+                for (c1, c2) in cs1.iter().zip(cs2.iter()) {
+                    if c1.class != c2.class || c1.args.len() != c2.args.len() {
+                        return Err(UnifyError::Mismatch(a.clone(), b.clone()));
+                    }
+                    for (x, y) in c1.args.iter().zip(c2.args.iter()) {
+                        self.unify(x, y)?;
+                    }
+                }
+                self.unify(b1, b2)
+            }
+            // A `Constrained(cs, body)` against a non-constrained
+            // type: only compatible if `cs` is empty (no
+            // obligations left). Otherwise leave as Mismatch so
+            // the caller sees the stuck constraint.
+            (Type::Constrained(cs, body), other)
+            | (other, Type::Constrained(cs, body))
+                if cs.is_empty() =>
+            {
+                self.unify(body, other)
+            }
             // Forall-vs-Forall: accept the simplest case where
             // both sides quantify over the same number of vars
             // and the bodies unify after alpha-renaming one
