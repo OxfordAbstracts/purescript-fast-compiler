@@ -329,7 +329,7 @@ macro_rules! check_build_unit {
     ($test_name:ident, $fixture:literal) => {
         #[test]
         #[timeout(20000)]
-        #[ignore]
+        // #[ignore]
         #[allow(non_snake_case)]
         fn $test_name() {
             run_build_unit($fixture);
