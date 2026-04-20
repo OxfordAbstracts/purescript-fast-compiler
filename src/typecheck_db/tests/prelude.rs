@@ -63,9 +63,6 @@ fn module_name_of(m: &cst::Module) -> String {
 }
 
 #[test]
-#[ignore = "typechecker still has gaps that surface in Prelude (e.g. Data.Ord); \
-            run with `cargo test -- --ignored prelude_typechecks_clean` as a \
-            forcing function until the gaps close"]
 fn prelude_typechecks_clean() {
     // Spawn on a 64MB-stack thread — Prelude's mutual-instance
     // chains exercise deep typechecker recursion that overflows

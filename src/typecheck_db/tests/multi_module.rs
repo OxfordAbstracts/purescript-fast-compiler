@@ -8,6 +8,98 @@ use crate::typecheck_db::driver_multi::MultiModuleError;
 use crate::typecheck_db::passes::imports::ImportErrorKind;
 
 #[test]
+fn prelude_style_generic_via_reexport_chain() {
+    // Multi-module mirror of Prelude's failing path: `F` defines
+    // `apply` + `$`, `Rep` defines the `Generic a rep | a -> rep`
+    // class, `P` re-exports both via `module ...` clauses, and
+    // consumer `G` imports `P` unqualified. Without tracking the
+    // origin of re-exported values, `$` rewrites to
+    // `Var("F.apply")` but the env only has `(None, "apply")`
+    // / `(Some("P"), "apply")`, producing an UnboundVar surprise
+    // that matched the real Prelude regression.
+    assert_typechecks_multi(&[
+        "\
+module F
+  ( apply, ($)
+  ) where
+
+apply :: forall a b. (a -> b) -> a -> b
+apply f x = f x
+
+infixr 0 apply as $
+",
+        "\
+module Rep
+  ( class Generic, from, to
+  ) where
+
+class Generic a rep | a -> rep where
+  from :: a -> rep
+  to :: rep -> a
+",
+        "\
+module P
+  ( module F
+  , module Rep
+  ) where
+
+import F
+import Rep
+",
+        "\
+module G where
+
+import P
+
+class GR r where
+  gsub' :: r -> r -> r
+
+gsub :: forall a rep. Generic a rep => GR rep => a -> a -> a
+gsub x y = to $ from x `gsub'` from y
+",
+    ]);
+}
+
+#[test]
+fn reexport_preserves_fixity_target_origin() {
+    // Mirror the Prelude re-export chain that triggered
+    // `UnboundVar("Data.Function.apply")`: module `F` defines
+    // `apply` and `($)` with `$` aliased to `apply`; module `P`
+    // only re-exports `F` via a `module F` clause; module `U`
+    // imports `P` and uses `$`. With fixity-target
+    // canonicalization, `$` lowers to `Var("F.apply")` — so the
+    // env populated from `P`'s re-exports must bind `F.apply`.
+    assert_typechecks_multi(&[
+        "\
+module F
+  ( apply, ($)
+  ) where
+
+apply :: forall a b. (a -> b) -> a -> b
+apply f x = f x
+
+infixr 0 apply as $
+",
+        "\
+module P (module F) where
+
+import F
+",
+        "\
+module U where
+
+import P
+
+id :: forall a. a -> a
+id x = x
+
+use :: Int
+use = id $ 1
+",
+    ]);
+}
+
+#[test]
 fn generic_sub_cross_module_with_imported_fundep_class() {
     // Multi-module mirror of `Data.Ring.Generic.genericSub`:
     // module A exports the `Generic a rep | a -> rep` class plus

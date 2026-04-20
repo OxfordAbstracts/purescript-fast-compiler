@@ -75,7 +75,7 @@ pub fn build_env_from_imports(
     // Every user module implicitly sees `Prim` unqualified.
     let prims = prim_exports();
     if let Some(prim) = prims.get("Prim") {
-        import_all(prim, /*qualifier=*/ None, &mut env, &mut ix);
+        import_all("Prim", prim, /*qualifier=*/ None, &mut env, &mut ix);
     }
 
     for imp in &module.imports {
@@ -124,7 +124,7 @@ fn apply_import(
     match &imp.imports {
         None => {
             // `import M` or `import M as Q` — take everything.
-            import_all(target, qualifier.clone(), env, ix);
+            import_all(target_name, target, qualifier.clone(), env, ix);
         }
         Some(ImportList::Explicit(items)) => {
             for item in items {
@@ -138,34 +138,65 @@ fn apply_import(
             for item in hidden {
                 filter.insert(item);
             }
-            import_all_except(target, qualifier.clone(), &filter, env, ix);
+            import_all_except(target_name, target, qualifier.clone(), &filter, env, ix);
         }
     }
 }
 
 fn import_all(
+    target_name: &str,
     target: &ModuleExports,
     qualifier: Option<String>,
     env: &mut Env,
     ix: &mut InstanceIndex,
 ) {
-    import_all_except(target, qualifier, &HideFilter::default(), env, ix)
+    import_all_except(target_name, target, qualifier, &HideFilter::default(), env, ix)
 }
 
 fn import_all_except(
+    target_name: &str,
     target: &ModuleExports,
     qualifier: Option<String>,
     hidden: &HideFilter,
     env: &mut Env,
     ix: &mut InstanceIndex,
 ) {
-    // Values.
+    // Values. Bind each scheme under both the import-chosen
+    // qualifier key (`qualifier.name`) AND an origin-module key
+    // (`target.value_origins[name].name`, falling back to the
+    // importee itself). The origin key is what rebracket-time
+    // fixity lowering looks up when a fixity decl's target has
+    // been canonicalized to its defining module — without it,
+    // `Var("Data.Function.apply")` would not resolve when the
+    // module was imported unqualified through a re-exporter.
     for (name, scheme) in &target.values {
         if hidden.values.contains(name.as_str()) {
             continue;
         }
         let key = QName { module: qualifier.clone(), name: name.clone() };
         env.bind_scheme(key, scheme.clone());
+        let origin = target
+            .value_origins
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| target_name.to_string());
+        env.bind_scheme(
+            QName { module: Some(origin), name: name.clone() },
+            scheme.clone(),
+        );
+    }
+    // Also bind every extra origin-qualified scheme the
+    // re-exporter surfaced — e.g. `Prelude.qualified_values`
+    // holds `Data.Function.apply` even when its primary `values`
+    // entry was won by `Control.Apply.apply`.
+    for ((origin, name), scheme) in &target.qualified_values {
+        if hidden.values.contains(name.as_str()) {
+            continue;
+        }
+        env.bind_scheme(
+            QName { module: Some(origin.clone()), name: name.clone() },
+            scheme.clone(),
+        );
     }
     // Data constructors: synthesize each one's value scheme
     // (`forall a b. f1 -> f2 -> … -> T a b …`) and bind it.
@@ -200,6 +231,25 @@ fn apply_explicit(
                 Some(scheme) => {
                     let key = QName { module: qualifier.clone(), name: name.clone() };
                     env.bind_scheme(key, scheme.clone());
+                    // Also bind under the origin module's qualified
+                    // key so a rebracketer-produced `Var("A.foo")`
+                    // can resolve even when `foo` was imported
+                    // unqualified. Matches the `import_all_except`
+                    // path — every imported scheme is findable both
+                    // by the user's chosen qualifier and by its
+                    // defining module.
+                    let origin = target
+                        .value_origins
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.to_string());
+                    env.bind_scheme(
+                        QName {
+                            module: Some(origin),
+                            name: name.clone(),
+                        },
+                        scheme.clone(),
+                    );
                     // If this Value-import is actually an operator
                     // alias (e.g. `import M ((==))` where `==` aliases
                     // `eq`), also bring the underlying target into
@@ -211,6 +261,21 @@ fn apply_explicit(
                             env.bind_scheme(
                                 QName {
                                     module: qualifier.clone(),
+                                    name: fx.target_name.clone(),
+                                },
+                                target_scheme.clone(),
+                            );
+                            // Mirror under the fixity's own
+                            // origin-module (may differ from
+                            // `target_name` when a re-export chain
+                            // is at play).
+                            let fixity_origin = fx
+                                .target_module
+                                .clone()
+                                .unwrap_or_else(|| target_name.to_string());
+                            env.bind_scheme(
+                                QName {
+                                    module: Some(fixity_origin),
                                     name: fx.target_name.clone(),
                                 },
                                 target_scheme.clone(),

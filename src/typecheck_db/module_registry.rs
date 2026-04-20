@@ -98,6 +98,28 @@ pub struct ModuleExports {
 
     /// Type constructor arities (Int=0, Array=1, Function=2, …).
     pub type_arities: HashMap<String, usize>,
+
+    /// For each exported value, the *defining* module. When a
+    /// module only re-exports a name (via `module Other` re-export
+    /// clauses), the origin here is the module that actually
+    /// declared it — not the re-exporter. Used by import
+    /// resolution to bind each scheme under its origin-qualified
+    /// key so downstream code compiled against a canonicalized
+    /// fixity target (e.g. `$` → `Data.Function.apply`) still
+    /// resolves even when the importer only saw the
+    /// re-exporter's name.
+    #[serde(default)]
+    pub value_origins: HashMap<String, String>,
+
+    /// Extra origin-qualified value bindings. Needed when a
+    /// module re-exports multiple distinct values under the same
+    /// simple name (e.g. Prelude re-exports both
+    /// `Data.Function.apply` and `Control.Apply.apply`). The
+    /// primary `values` entry holds one of them; this map holds
+    /// any additional `(origin, name) → scheme` pair so the
+    /// importer can still bind all distinct origin keys.
+    #[serde(default)]
+    pub qualified_values: HashMap<(String, String), Scheme>,
 }
 
 /// In-process cache of every compiled module's export surface,
@@ -438,10 +460,33 @@ pub fn distill_exports(
             }
             Decl::Fixity { associativity, precedence, target, operator, is_type, .. } => {
                 let op = crate::typecheck_db::util::resolve_symbol(operator.value.symbol());
-                let target_module = target
+                let user_target_module = target
                     .module
                     .map(|m| crate::typecheck_db::util::resolve_symbol(m));
                 let target_name = crate::typecheck_db::util::resolve_symbol(target.name);
+                // If the user wrote a bare target (`infixr 0 apply
+                // as $`), pin the target's module to *this* module
+                // so downstream importers can disambiguate against
+                // other modules that also export a `apply`. Without
+                // this, Prelude re-exports collide when multiple
+                // modules (e.g. `Data.Function.apply` and
+                // `Control.Apply.apply`) share a bare name —
+                // whichever was imported last wins, and `$` gets
+                // lowered to the wrong `apply`.
+                let target_module = match user_target_module {
+                    Some(m) => Some(m),
+                    None => {
+                        let module_name: String = module
+                            .name
+                            .value
+                            .parts
+                            .iter()
+                            .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        Some(module_name)
+                    }
+                };
                 let decl = FixityDecl {
                     associativity: *associativity,
                     precedence: *precedence,
@@ -465,10 +510,26 @@ pub fn distill_exports(
     // Always: instances are globally visible in PureScript.
     out.instances = instances.to_vec();
 
+    // Origin for every value this module defines — used by import
+    // resolution to bind the scheme under its origin-qualified key
+    // (`Data.Function.apply`) so canonicalized fixity targets
+    // resolve across re-exports.
+    let self_module_name: String = module
+        .name
+        .value
+        .parts
+        .iter()
+        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+        .collect::<Vec<_>>()
+        .join(".");
+
     match &module.exports {
         None => {
             // Export everything.
             out.values = scheme_by_name.clone();
+            for name in scheme_by_name.keys() {
+                out.value_origins.insert(name.clone(), self_module_name.clone());
+            }
             for (name, info) in ctor_info {
                 out.ctors.insert(name.clone(), info.clone());
             }
@@ -489,6 +550,7 @@ pub fn distill_exports(
             for (op, fx) in &value_fixities_all {
                 if let Some(scheme) = scheme_by_name.get(&fx.target_name) {
                     out.values.insert(op.clone(), scheme.clone());
+                    out.value_origins.insert(op.clone(), self_module_name.clone());
                 }
             }
         }
@@ -499,6 +561,7 @@ pub fn distill_exports(
                         let name = crate::typecheck_db::util::resolve_symbol(vn.symbol());
                         if let Some(s) = scheme_by_name.get(&name) {
                             out.values.insert(name.clone(), s.clone());
+                            out.value_origins.insert(name.clone(), self_module_name.clone());
                         } else if let Some(fx) = value_fixities_all.get(&name) {
                             // Operator alias: `(&&)` → fixity decl
                             // names `&&` with `conj` as target.
@@ -507,6 +570,7 @@ pub fn distill_exports(
                             // itself so importers can use both.
                             if let Some(s) = scheme_by_name.get(&fx.target_name) {
                                 out.values.insert(name.clone(), s.clone());
+                                out.value_origins.insert(name.clone(), self_module_name.clone());
                             }
                             out.value_fixities.insert(name, fx.clone());
                         }
@@ -561,6 +625,7 @@ pub fn distill_exports(
                             for m in methods {
                                 if let Some(s) = scheme_by_name.get(m) {
                                     out.values.insert(m.clone(), s.clone());
+                                    out.value_origins.insert(m.clone(), self_module_name.clone());
                                 }
                             }
                         }
@@ -660,9 +725,32 @@ pub fn expand_module_reexports(
             };
 
             // Merge everything from the target. The target's items
-            // become re-exported under this module.
+            // become re-exported under this module — but the value
+            // origin stays pointed at the *original* defining
+            // module (follow the chain: if target has a recorded
+            // origin, keep it; else fall back to the target itself).
+            // When multiple re-exports contribute distinct
+            // schemes under the same simple name, the primary
+            // `values` map keeps the first (preserving existing
+            // behavior) and the `qualified_values` map records
+            // the rest so importers can still bind every origin
+            // key.
             for (k, v) in &target_exports.values {
+                let origin = target_exports
+                    .value_origins
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| target_name.clone());
+                out.qualified_values
+                    .entry((origin.clone(), k.clone()))
+                    .or_insert_with(|| v.clone());
                 out.values.entry(k.clone()).or_insert_with(|| v.clone());
+                out.value_origins.entry(k.clone()).or_insert(origin);
+            }
+            for (key, scheme) in &target_exports.qualified_values {
+                out.qualified_values
+                    .entry(key.clone())
+                    .or_insert_with(|| scheme.clone());
             }
             for (k, v) in &target_exports.ctors {
                 out.ctors.entry(k.clone()).or_insert_with(|| v.clone());
