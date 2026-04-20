@@ -164,9 +164,9 @@ fn var_name(n: usize) -> String {
 pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
     match ty {
         Type::Unif(id) => subst.get(id).cloned().unwrap_or_else(|| ty.clone()),
-        Type::App(f, a) => Type::App(
-            Box::new(apply_unif_subst(f, subst)),
-            Box::new(apply_unif_subst(a, subst)),
+        Type::App(f, a) => Type::app(
+            apply_unif_subst(f, subst),
+            apply_unif_subst(a, subst),
         ),
         Type::Fun(a, b) => Type::Fun(
             Box::new(apply_unif_subst(a, subst)),
@@ -219,9 +219,9 @@ pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
 pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Type::App(f, a) => Type::App(
-            Box::new(apply_var_subst(f, subst)),
-            Box::new(apply_var_subst(a, subst)),
+        Type::App(f, a) => Type::app(
+            apply_var_subst(f, subst),
+            apply_var_subst(a, subst),
         ),
         Type::Fun(a, b) => Type::Fun(
             Box::new(apply_var_subst(a, subst)),

@@ -158,7 +158,7 @@ impl UnifyState {
                 Some(bound) => self.zonk(&bound.clone()),
                 None => ty.clone(),
             },
-            Type::App(f, a) => Type::App(Box::new(self.zonk(f)), Box::new(self.zonk(a))),
+            Type::App(f, a) => Type::app(self.zonk(f), self.zonk(a)),
             Type::Fun(a, b) => Type::Fun(Box::new(self.zonk(a)), Box::new(self.zonk(b))),
             Type::Forall(vars, body) => {
                 let vars = vars
@@ -214,6 +214,59 @@ impl UnifyState {
             (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
                 self.unify(a1, a2)?;
                 self.unify(b1, b2)
+            }
+            // `Fun(a, b) ↔ App(App(α, x), y)` where α is an unif var
+            // arises when a class method like `identity :: forall a t.
+            // Category a => a t t` gets instantiated inside a body
+            // that expects a function type. The `Category (->)`
+            // instance will eventually pin `α = Con("->")` so the
+            // heads align, but the unifier sees the raw shapes first.
+            // Equate them proactively: bind `α = Con("->")` and
+            // unify the spine pairwise. `Type::app` then rewrites any
+            // concrete `App(App(Con("->"), _), _)` back into `Fun`.
+            (Type::Fun(fa, fb), Type::App(outer_f, outer_a))
+            | (Type::App(outer_f, outer_a), Type::Fun(fa, fb)) => {
+                // Two-arg form: `App(App(head, x), y) ↔ Fun(a, b)`.
+                // Head must be `Con("->")` (or a unif var that we
+                // bind to `Con("->")`); then the spine unifies
+                // pairwise.
+                if let Type::App(inner_f, inner_a) = outer_f.as_ref() {
+                    let head_ok = match inner_f.as_ref() {
+                        Type::Unif(_) => {
+                            self.unify(
+                                inner_f,
+                                &Type::Con(
+                                    crate::typecheck_db::types::QName::unqualified("->"),
+                                ),
+                            )?;
+                            true
+                        }
+                        Type::Con(qn) if qn.name == "->" || qn.name == "Function" => true,
+                        _ => false,
+                    };
+                    if head_ok {
+                        self.unify(fa, inner_a)?;
+                        return self.unify(fb, outer_a);
+                    }
+                }
+                // One-arg form: `App(α, x) ↔ Fun(a, b)`. The only
+                // way this can hold is `α = App(Con("->"), a)` and
+                // `x = b`. Arises when class methods like
+                // `identity :: forall a t. Category a => a t t`
+                // get instantiated in positions expecting a
+                // function type — the constructor half of the
+                // arrow stays folded inside the head unif until
+                // the solver discharges `Category a` with `->`.
+                if let Type::Unif(_) = outer_f.as_ref() {
+                    let arrow =
+                        Type::Con(crate::typecheck_db::types::QName::unqualified("->"));
+                    self.unify(
+                        outer_f,
+                        &Type::App(Box::new(arrow), Box::new((**fa).clone())),
+                    )?;
+                    return self.unify(outer_a, fb);
+                }
+                Err(UnifyError::Mismatch(a.clone(), b.clone()))
             }
             (Type::TypeString(s1), Type::TypeString(s2)) if s1 == s2 => Ok(()),
             (Type::TypeInt(n1), Type::TypeInt(n2)) if n1 == n2 => Ok(()),

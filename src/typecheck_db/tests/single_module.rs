@@ -279,6 +279,72 @@ f x y z
 
 
 #[test]
+fn generic_sub_style_with_fundep_class() {
+    // Mirror `Data.Ring.Generic.genericSub`: a polymorphic value
+    // `x y = to $ from x `genericSub'` from y` over a class
+    // `Generic a rep | a -> rep` with a fundep. Both `from`/`to`
+    // are class methods of the fundep'd class; `genericSub'` is a
+    // local class method. Reproduces the
+    // `NoInstanceFound on Generic [Fun(..)]` path surfaced by the
+    // full Prelude run.
+    assert_typechecks(
+        "\
+module M where
+
+class Generic a rep | a -> rep where
+  from :: a -> rep
+  to :: rep -> a
+
+class GenericRing r where
+  genericSub' :: r -> r -> r
+
+apply :: forall a b. (a -> b) -> a -> b
+apply f x = f x
+
+infixr 0 apply as $
+
+genericSub :: forall a rep. Generic a rep => GenericRing rep => a -> a -> a
+genericSub x y = to $ from x `genericSub'` from y
+",
+    );
+}
+
+#[test]
+fn apply_second_const_identity_chain() {
+    // Mirror `Control.Apply.applySecond`: the body
+    // `const identity <$> a <*> b` forces the unifier to match
+    // `f (a -> b)` from `apply`'s scheme against the
+    // already-inferred `f (y -> y)` from `map (const identity)`.
+    // Before normalizing `App(App(Con("->"), x), y)` → `Fun(x, y)`
+    // at substitution time, that unification failed because the
+    // instance-substituted `f` expanded into a constructor-form
+    // function type while the body used `Type::Fun`.
+    assert_typechecks(
+        "\
+module M where
+
+class Functor f where
+  map :: forall a b. (a -> b) -> f a -> f b
+
+class Functor f <= Apply f where
+  apply :: forall a b. f (a -> b) -> f a -> f b
+
+const :: forall a b. a -> b -> a
+const x _ = x
+
+identity :: forall a. a -> a
+identity x = x
+
+infixl 4 map as <$>
+infixl 4 apply as <*>
+
+applySecond :: forall a b f. Apply f => f a -> f b -> f b
+applySecond a b = const identity <$> a <*> b
+",
+    );
+}
+
+#[test]
 fn control_apply_apply_first_style() {
     // Mirror `Control.Apply.applyFirst`: a polymorphic value
     // whose body is two operator applications. Triggers the

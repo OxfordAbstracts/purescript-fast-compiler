@@ -148,6 +148,22 @@ impl Type {
     }
 
     pub fn app(f: Type, arg: Type) -> Type {
+        // Normalize `App(App(Con("->"|"Function"), a), b)` into
+        // `Type::Fun(a, b)` so value-level function types unify
+        // with constructor-applied ones (e.g. instance heads like
+        // `Apply ((->) r)` substituted into `f (a -> b) -> f a -> f b`).
+        // Catches both the convert-time and substitution-time
+        // construction paths — `apply_var_subst` builds App nodes
+        // directly via `Type::App(...)` rather than `Type::app`,
+        // but every non-substitution entry point funnels through
+        // here.
+        if let Type::App(inner_f, inner_a) = &f {
+            if let Type::Con(qn) = inner_f.as_ref() {
+                if qn.name == "->" || qn.name == "Function" {
+                    return Type::Fun(Box::new(inner_a.as_ref().clone()), Box::new(arg));
+                }
+            }
+        }
         Type::App(Box::new(f), Box::new(arg))
     }
 }
