@@ -37,7 +37,6 @@ use crate::span::Span;
 // the module doesn't depend on a cross-crate re-export.
 type Ident = Symbol;
 
-use super::walk::fold_decl_exprs;
 
 // ---------------------------------------------------------------------------
 // Fixity table
@@ -121,13 +120,80 @@ fn key_to_u32(s: Ident) -> u32 {
 // ---------------------------------------------------------------------------
 
 pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
-    fold_decl_exprs(decl, &mut |e| rewrite_node(e, fixity))
+    use crate::cst::{GuardedExpr, Guard, GuardPattern, LetBinding};
+    match decl {
+        Decl::Value { name, binders, guarded, where_clause, span, doc_comments } => {
+            let guarded = match guarded {
+                GuardedExpr::Unconditional(e) => {
+                    GuardedExpr::Unconditional(Box::new(rewrite_expr(*e, fixity)))
+                }
+                GuardedExpr::Guarded(gs) => GuardedExpr::Guarded(
+                    gs.into_iter()
+                        .map(|g| Guard {
+                            span: g.span,
+                            patterns: g
+                                .patterns
+                                .into_iter()
+                                .map(|p| match p {
+                                    GuardPattern::Boolean(e) => {
+                                        GuardPattern::Boolean(Box::new(rewrite_expr(*e, fixity)))
+                                    }
+                                    GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
+                                        b,
+                                        Box::new(rewrite_expr(*e, fixity)),
+                                    ),
+                                })
+                                .collect(),
+                            expr: Box::new(rewrite_expr(*g.expr, fixity)),
+                        })
+                        .collect(),
+                ),
+            };
+            let where_clause: Vec<LetBinding> = where_clause
+                .into_iter()
+                .map(|b| match b {
+                    LetBinding::Value { span, binder, expr } => {
+                        LetBinding::Value { span, binder, expr: rewrite_expr(expr, fixity) }
+                    }
+                    LetBinding::Signature { span, name, ty } => {
+                        LetBinding::Signature { span, name, ty }
+                    }
+                })
+                .collect();
+            Decl::Value { name, binders, guarded, where_clause, span, doc_comments }
+        }
+        other => other,
+    }
 }
 
-fn rewrite_node(e: Expr, fixity: &FixityTable) -> Expr {
+/// Pre-order rewrite for Op chains. The CST parses
+/// `a == b || c == d` as a right-leaning chain
+/// `Op(a, ==, Op(b, ||, Op(c, ==, d)))`. A plain post-order
+/// walker would lower the inner `Op(c, ==, d)` to `App` first,
+/// hiding the outer chain's `==` entirely and leaving `||` to
+/// capture `b` as its left operand. Flattening the whole chain
+/// at the outermost Op preserves precedence; we then recurse
+/// into each individual operand to handle nested expressions.
+fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
     match e {
-        // Any top of an Op / BacktickApp chain: flatten + shunt + rebuild.
-        Expr::Op { .. } | Expr::BacktickApp { .. } => rebracket_chain(e, fixity),
+        Expr::Op { .. } | Expr::BacktickApp { .. } => {
+            let (operands_raw, ops_raw, root_span) = flatten_chain(e);
+            let operands: Vec<Expr> = operands_raw
+                .into_iter()
+                .map(|x| rewrite_expr(x, fixity))
+                .collect();
+            let ops: Vec<ChainOp> = ops_raw
+                .into_iter()
+                .map(|c| match c {
+                    ChainOp::Named(n) => ChainOp::Named(n),
+                    ChainOp::Backtick { span, func } => ChainOp::Backtick {
+                        span,
+                        func: rewrite_expr(func, fixity),
+                    },
+                })
+                .collect();
+            shunt(operands, ops, fixity, root_span)
+        }
         Expr::OpParens { span, op } => match lookup_op(&op, fixity) {
             Some(info) => Expr::Var {
                 span,
@@ -141,7 +207,7 @@ fn rewrite_node(e: Expr, fixity: &FixityTable) -> Expr {
             // precise error with the original span.
             None => Expr::OpParens { span, op },
         },
-        other => other,
+        other => recurse_children(other, fixity),
     }
 }
 
@@ -157,10 +223,11 @@ enum ChainOp {
     Backtick { span: Span, func: Expr },
 }
 
-fn rebracket_chain(root: Expr, fixity: &FixityTable) -> Expr {
-    // Flatten a right-leaning chain. The CST tends to parse chains as
-    // `Op(left, op, Op(...))`; keep walking down the `right` slot until
-    // a non-op shows up.
+/// Walk a right-leaning chain of `Op` / `BacktickApp` nodes and
+/// return the `operands`, `ops`, and the chain's span. Operands
+/// are returned untouched — callers (today: only `rewrite_expr`)
+/// are responsible for recursively rewriting them before shunting.
+fn flatten_chain(root: Expr) -> (Vec<Expr>, Vec<ChainOp>, Span) {
     let mut operands: Vec<Expr> = Vec::new();
     let mut ops: Vec<ChainOp> = Vec::new();
     let root_span = span_of(&root);
@@ -183,9 +250,176 @@ fn rebracket_chain(root: Expr, fixity: &FixityTable) -> Expr {
             }
         }
     }
+    (operands, ops, root_span)
+}
 
-    // Shunting-yard: re-associate `operands`/`ops` into a single tree.
-    shunt(operands, ops, fixity, root_span)
+/// Recurse into `e`'s children with `rewrite_expr`. Mirrors
+/// `super::walk::recurse_children` but invokes our pre-order
+/// rewriter on each child so nested chains are caught at their
+/// outermost Op.
+fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
+    use crate::cst::{
+        CaseAlternative, DoStatement, Guard, GuardPattern, GuardedExpr, LetBinding, Literal,
+        RecordField, RecordUpdate,
+    };
+
+    fn rec(e: Expr, fixity: &FixityTable) -> Expr {
+        rewrite_expr(e, fixity)
+    }
+    fn rec_box(e: Box<Expr>, fixity: &FixityTable) -> Box<Expr> {
+        Box::new(rec(*e, fixity))
+    }
+    fn rec_field(r: RecordField, fixity: &FixityTable) -> RecordField {
+        RecordField {
+            span: r.span,
+            label: r.label,
+            value: r.value.map(|e| rec(e, fixity)),
+            type_ann: r.type_ann,
+            is_update: r.is_update,
+            is_nested: r.is_nested,
+        }
+    }
+    fn rec_update(u: RecordUpdate, fixity: &FixityTable) -> RecordUpdate {
+        RecordUpdate { span: u.span, label: u.label, value: rec(u.value, fixity) }
+    }
+    fn rec_guarded(g: GuardedExpr, fixity: &FixityTable) -> GuardedExpr {
+        match g {
+            GuardedExpr::Unconditional(e) => GuardedExpr::Unconditional(rec_box(e, fixity)),
+            GuardedExpr::Guarded(gs) => GuardedExpr::Guarded(
+                gs.into_iter()
+                    .map(|guard| Guard {
+                        span: guard.span,
+                        patterns: guard
+                            .patterns
+                            .into_iter()
+                            .map(|p| match p {
+                                GuardPattern::Boolean(e) => GuardPattern::Boolean(rec_box(e, fixity)),
+                                GuardPattern::Pattern(b, e) => {
+                                    GuardPattern::Pattern(b, rec_box(e, fixity))
+                                }
+                            })
+                            .collect(),
+                        expr: rec_box(guard.expr, fixity),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+    fn rec_let(b: LetBinding, fixity: &FixityTable) -> LetBinding {
+        match b {
+            LetBinding::Value { span, binder, expr } => {
+                LetBinding::Value { span, binder, expr: rec(expr, fixity) }
+            }
+            LetBinding::Signature { span, name, ty } => LetBinding::Signature { span, name, ty },
+        }
+    }
+    fn rec_alt(a: CaseAlternative, fixity: &FixityTable) -> CaseAlternative {
+        CaseAlternative {
+            span: a.span,
+            binders: a.binders,
+            result: rec_guarded(a.result, fixity),
+        }
+    }
+    fn rec_do(s: DoStatement, fixity: &FixityTable) -> DoStatement {
+        match s {
+            DoStatement::Bind { span, binder, expr } => {
+                DoStatement::Bind { span, binder, expr: rec(expr, fixity) }
+            }
+            DoStatement::Let { span, bindings } => DoStatement::Let {
+                span,
+                bindings: bindings.into_iter().map(|b| rec_let(b, fixity)).collect(),
+            },
+            DoStatement::Discard { span, expr } => DoStatement::Discard { span, expr: rec(expr, fixity) },
+        }
+    }
+
+    match e {
+        Expr::Var { .. }
+        | Expr::Constructor { .. }
+        | Expr::Wildcard { .. }
+        | Expr::Hole { .. }
+        | Expr::OpParens { .. } => e,
+        Expr::Literal { span, lit } => match lit {
+            Literal::Array(xs) => Expr::Literal {
+                span,
+                lit: Literal::Array(xs.into_iter().map(|x| rec(x, fixity)).collect()),
+            },
+            other => Expr::Literal { span, lit: other },
+        },
+        Expr::App { span, func, arg } => Expr::App {
+            span,
+            func: rec_box(func, fixity),
+            arg: rec_box(arg, fixity),
+        },
+        Expr::VisibleTypeApp { span, func, ty } => Expr::VisibleTypeApp {
+            span,
+            func: rec_box(func, fixity),
+            ty,
+        },
+        Expr::Lambda { span, binders, body } => Expr::Lambda {
+            span,
+            binders,
+            body: rec_box(body, fixity),
+        },
+        Expr::Op { .. } | Expr::BacktickApp { .. } => rewrite_expr(e, fixity),
+        Expr::If { span, cond, then_expr, else_expr } => Expr::If {
+            span,
+            cond: rec_box(cond, fixity),
+            then_expr: rec_box(then_expr, fixity),
+            else_expr: rec_box(else_expr, fixity),
+        },
+        Expr::Case { span, exprs, alts } => Expr::Case {
+            span,
+            exprs: exprs.into_iter().map(|e| rec(e, fixity)).collect(),
+            alts: alts.into_iter().map(|a| rec_alt(a, fixity)).collect(),
+        },
+        Expr::Let { span, bindings, body } => Expr::Let {
+            span,
+            bindings: bindings.into_iter().map(|b| rec_let(b, fixity)).collect(),
+            body: rec_box(body, fixity),
+        },
+        Expr::Do { span, module, statements } => Expr::Do {
+            span,
+            module,
+            statements: statements.into_iter().map(|s| rec_do(s, fixity)).collect(),
+        },
+        Expr::Ado { span, module, statements, result } => Expr::Ado {
+            span,
+            module,
+            statements: statements.into_iter().map(|s| rec_do(s, fixity)).collect(),
+            result: rec_box(result, fixity),
+        },
+        Expr::Record { span, fields } => Expr::Record {
+            span,
+            fields: fields.into_iter().map(|r| rec_field(r, fixity)).collect(),
+        },
+        Expr::RecordAccess { span, expr, field } => Expr::RecordAccess {
+            span,
+            expr: rec_box(expr, fixity),
+            field,
+        },
+        Expr::RecordUpdate { span, expr, updates } => Expr::RecordUpdate {
+            span,
+            expr: rec_box(expr, fixity),
+            updates: updates.into_iter().map(|u| rec_update(u, fixity)).collect(),
+        },
+        Expr::Parens { span, expr } => Expr::Parens { span, expr: rec_box(expr, fixity) },
+        Expr::TypeAnnotation { span, expr, ty } => Expr::TypeAnnotation {
+            span,
+            expr: rec_box(expr, fixity),
+            ty,
+        },
+        Expr::Array { span, elements } => Expr::Array {
+            span,
+            elements: elements.into_iter().map(|e| rec(e, fixity)).collect(),
+        },
+        Expr::Negate { span, expr } => Expr::Negate { span, expr: rec_box(expr, fixity) },
+        Expr::AsPattern { span, name, pattern } => Expr::AsPattern {
+            span,
+            name: rec_box(name, fixity),
+            pattern: rec_box(pattern, fixity),
+        },
+    }
 }
 
 fn shunt(
@@ -235,16 +469,18 @@ fn op_fixity(op: &ChainOp, fixity: &FixityTable) -> (Associativity, u8) {
             let sym = n.value.name.symbol();
             match fixity.get(&sym) {
                 Some(info) => (info.associativity, info.precedence),
-                // Unknown op:
-                //   identifier-looking name (a `f` b parses as Op with
-                //   `f` as the op name) → default backtick fixity infixl 1
-                //   symbolic op with no fixity decl available → infixl 9
-                //   (conservative, parser-consistent)
-                None if is_identifier_op(sym) => (Associativity::Left, 1),
+                // Unknown op: default to `infixl 9` per the
+                // PureScript reference. Both identifier-shaped
+                // backtick syntax (`a `f` b` parsed as Op) and
+                // bare symbolic ops fall here when their fixity
+                // decl isn't visible — matching the language
+                // default keeps us aligned with how programs like
+                // `Data.EuclideanRing.power` rely on `p `mod` 2`
+                // binding tighter than `==`.
                 None => (Associativity::Left, 9),
             }
         }
-        ChainOp::Backtick { .. } => (Associativity::Left, 1),
+        ChainOp::Backtick { .. } => (Associativity::Left, 9),
     }
 }
 
@@ -480,6 +716,46 @@ bar = (+)
         let out = desugar_decl(value, &table);
         if let Decl::Value { guarded: crate::cst::GuardedExpr::Unconditional(body), .. } = &out {
             assert!(matches!(body.as_ref(), Expr::Var { .. }), "(+) → Var, got {body:?}");
+        }
+    }
+
+    #[test]
+    fn higher_precedence_subchains_inside_lower_precedence_chain() {
+        // `a == zero || b == zero` with `==` at infixl 4 and `||` at
+        // infixr 2 must reassociate as `(a == zero) || (b == zero)`,
+        // i.e. `disj (eq a zero) (eq b zero)`. A naive post-order
+        // walker rewrites the inner `Op(b, ==, zero)` first, which
+        // hides the outer chain's structure and lets `||` capture
+        // `zero` and `b`. This regression test pins the correct
+        // reassociation.
+        let (table, decls) = module_table("\
+module M where
+infixl 4 eq as ==
+infixr 2 disj as ||
+foo a b zero = a == zero || b == zero
+");
+        let value = decls.into_iter().find(|d| matches!(d, Decl::Value { .. })).unwrap();
+        let out = desugar_decl(value, &table);
+        assert_eq!(count_op(&out), 0, "all Op nodes should be lowered: {out:#?}");
+        // Outermost call should be to `disj`, not `eq`. Walk down
+        // the function-of-function pattern: App(App(Var(disj), _), _).
+        if let Decl::Value { guarded: crate::cst::GuardedExpr::Unconditional(body), .. } = &out {
+            let head = match body.as_ref() {
+                Expr::App { func, .. } => match func.as_ref() {
+                    Expr::App { func, .. } => func.as_ref(),
+                    other => panic!("expected App-App, got {other:?}"),
+                },
+                other => panic!("expected outer App, got {other:?}"),
+            };
+            if let Expr::Var { name, .. } = head {
+                assert_eq!(
+                    crate::interner::resolve(name.name.symbol()).as_deref(),
+                    Some("disj"),
+                    "outermost call must be disj (the lower-precedence op), got {name:?}",
+                );
+            } else {
+                panic!("expected Var head, got {head:?}");
+            }
         }
     }
 

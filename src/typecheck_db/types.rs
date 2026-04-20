@@ -197,10 +197,25 @@ pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
             name.module.map(|m| m.symbol()),
             name.name.symbol(),
         )),
-        TE::App { constructor, arg, .. } => Type::app(
-            convert_type_expr(constructor, type_ops),
-            convert_type_expr(arg, type_ops),
-        ),
+        TE::App { constructor, arg, .. } => {
+            let f = convert_type_expr(constructor, type_ops);
+            let a = convert_type_expr(arg, type_ops);
+            // Normalize `(->) x y` (which parses to a 2-step App
+            // chain) into the canonical `Type::Fun(x, y)`. Without
+            // this, instance heads like `Apply ((->) r)` carry the
+            // function type as `App(App(Con("->"), r), arg)` while
+            // value-level lambdas use `Fun(...)` — the unifier
+            // treats those as distinct shapes and breaks instance
+            // matching for `(->) r`-style instances.
+            if let Type::App(inner_f, inner_a) = &f {
+                if let Type::Con(qn) = inner_f.as_ref() {
+                    if qn.name == "->" || qn.name == "Function" {
+                        return Type::fun(inner_a.as_ref().clone(), a);
+                    }
+                }
+            }
+            Type::app(f, a)
+        }
         TE::Function { from, to, .. } => Type::fun(
             convert_type_expr(from, type_ops),
             convert_type_expr(to, type_ops),

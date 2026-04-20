@@ -398,12 +398,27 @@ pub fn infer_value_scc_with_all(
     let mut out = Vec::new();
     for (_, name) in &decl_refs {
         let ty = slot_of.get(name).cloned().unwrap();
-        let scheme = generalize(&state, env, &ty);
         let exhaustiveness_errors = errors_by_decl.remove(name).unwrap_or_default();
         let resolved_dicts = dicts.remove(name).unwrap_or_default();
         let constraint_errors = errors.remove(name).unwrap_or_default();
         let pending_constraints = deferred_by_decl.remove(name).unwrap_or_default();
         let constraint_dicts = dicts_by_span.remove(name).unwrap_or_default();
+        // Fold deferred constraints into the scheme using a single
+        // shared unif→typevar substitution. Importers see the
+        // constraints in the bound scheme and re-instantiate them at
+        // each use-site; without this they'd see `forall a. a -> ..`
+        // and miss the `Eq a => Semiring a =>` requirements.
+        let constraint_args: Vec<crate::typecheck_db::types::Constraint> =
+            pending_constraints
+                .iter()
+                .map(|pc| pc.constraint.clone())
+                .collect();
+        let scheme = crate::typecheck_db::generalize::generalize_with_constraints(
+            &state,
+            env,
+            &ty,
+            &constraint_args,
+        );
         out.push(InferredScheme {
             name: name.clone(),
             scheme,

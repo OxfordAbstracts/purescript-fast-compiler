@@ -232,7 +232,43 @@ pub fn solve_one(
         }
         state.restore_bindings(snapshot);
     }
+    // No instance matched. Before declaring failure, check whether
+    // any argument contains a rigid `Type::Var`. Rigid type vars
+    // here come from a surrounding signature (e.g. inside `power
+    // :: forall m. Monoid m => …`, the body sees `m` as a Var).
+    // The instance for that variable must come from a "given" the
+    // outer scope provides; we don't track givens explicitly, so
+    // defer the constraint and let it bubble up into the inferred
+    // scheme via `generalize_with_constraints`. The importer then
+    // re-instantiates fresh unifs and the solver retries at each
+    // concrete use-site.
+    if pending.constraint.args.iter().any(|a| contains_rigid_var(a, state)) {
+        return SolveOutcome::Deferred;
+    }
     SolveOutcome::NoInstance
+}
+
+/// True when the zonked form of `ty` mentions a rigid `Type::Var`
+/// anywhere. Used by `solve_one` to defer constraints that can
+/// only be discharged via a caller-supplied given.
+fn contains_rigid_var(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
+    fn walk(t: &Type) -> bool {
+        match t {
+            Type::Var(_) => true,
+            Type::App(f, a) | Type::Fun(f, a) => walk(f) || walk(a),
+            Type::Forall(_, body) => walk(body),
+            Type::Constrained(cs, body) => {
+                cs.iter().any(|c| c.args.iter().any(walk)) || walk(body)
+            }
+            Type::Record(fs, tail) | Type::Row(fs, tail) => {
+                fs.iter().any(|(_, t)| walk(t))
+                    || tail.as_deref().map(walk).unwrap_or(false)
+            }
+            Type::Kinded(t, k) => walk(t) || walk(k),
+            _ => false,
+        }
+    }
+    walk(&state.zonk(ty))
 }
 
 /// True when `ty` zonks to a `Type::Unif`. Those can't be used to

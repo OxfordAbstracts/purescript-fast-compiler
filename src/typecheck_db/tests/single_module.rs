@@ -258,12 +258,12 @@ between low hi x
 
 #[test]
 fn ord_methods_as_top_level_values() {
-    // Mirror Data.Ord's exact shape: `lessThan` / `greaterThan`
-    // are *top-level value bindings* (with explicit constraint
-    // sigs), not class methods. `<` / `>` are operator aliases
-    // pointing at those values. `between` references both via
-    // operators in boolean guards. This is the exact SCC the
-    // real Prelude module presents.
+    // Regression sentinel for the cross-SCC scheme-binding bug
+    // that caused `Prelude::Data.Ord` to fail with
+    // `Unify(Mismatch(Bool, Fun(_, Bool)))`. Two SCCs (`lt`, `f`)
+    // each get a fresh `UnifyState` starting at `Unif(0)`; if `f`
+    // sees a stale local-slot for `lt` instead of its scheme, it
+    // unifies the wrong arity.
     assert_typechecks(
         "\
 module M where
@@ -273,6 +273,191 @@ lt a b = true
 f x y z
   | lt x y = false
   | true = true
+",
+    );
+}
+
+
+#[test]
+fn control_apply_apply_first_style() {
+    // Mirror `Control.Apply.applyFirst`: a polymorphic value
+    // whose body is two operator applications. Triggers the
+    // `Apply ((->) r)`-related path that surfaced as
+    // `Mismatch(Fun(...), App(App(...)))` when checking Prelude.
+    assert_typechecks(
+        "\
+module M where
+
+class Functor f where
+  map :: forall a b. (a -> b) -> f a -> f b
+
+class Functor f <= Apply f where
+  apply :: forall a b. f (a -> b) -> f a -> f b
+
+const :: forall a b. a -> b -> a
+const x _ = x
+
+infixl 4 map as <$>
+infixl 4 apply as <*>
+
+identity :: forall a. a -> a
+identity x = x
+
+applyFirst :: forall a b f. Apply f => f a -> f b -> f a
+applyFirst a b = const <$> a <*> b
+
+applySecond :: forall a b f. Apply f => f a -> f b -> f b
+applySecond a b = const identity <$> a <*> b
+
+lift2 :: forall a b c f. Apply f => (a -> b -> c) -> f a -> f b -> f c
+lift2 f a b = f <$> a <*> b
+
+lift3 :: forall a b c d f. Apply f => (a -> b -> c -> d) -> f a -> f b -> f c -> f d
+lift3 f a b c = f <$> a <*> b <*> c
+",
+    );
+}
+
+#[test]
+fn backtick_default_precedence_nine_binds_tighter_than_named_op() {
+    // Sentinel: `p `mod` 2 == 0` must rebracket as `(p `mod` 2)
+    // == 0`, not as `p `mod` (eq 2 0)`. Backtick application
+    // defaults to `infixl 9` (PureScript reference) so it binds
+    // tighter than `==` (infixl 4). With the wrong default
+    // (`infixl 1`) the inner `eq 2 0` becomes the second
+    // operand to `mod` and forces `EuclideanRing Boolean`.
+    assert_typechecks(
+        "\
+module M where
+
+class Eq a where
+  eq :: a -> a -> Boolean
+
+class EuclideanRing a where
+  div :: a -> a -> a
+  mod :: a -> a -> a
+
+instance eqInt :: Eq Int where
+  eq _ _ = true
+
+instance euclideanRingInt :: EuclideanRing Int where
+  div _ _ = 0
+  mod _ _ = 0
+
+infixl 4 eq as ==
+
+go :: Int -> Boolean
+go p
+  | p `mod` 2 == 0 = true
+  | true = false
+",
+    );
+}
+
+#[test]
+fn data_monoid_guard_pattern_via_multi_equation() {
+    // Mirror `Data.Monoid.guard`: a value with two equations,
+    // pattern-matching on a Boolean literal in the first arg.
+    // Multi-equation merge turns this into a case expression;
+    // the second equation's body uses a class method (`mempty`)
+    // whose constraint must defer cleanly.
+    assert_typechecks(
+        "\
+module M where
+
+class Monoid m where
+  mempty :: m
+
+guard :: forall m. Monoid m => Boolean -> m -> m
+guard true a = a
+guard false _ = mempty
+",
+    );
+}
+
+#[test]
+fn euclidean_ring_style_with_disj_in_guard() {
+    // Closer mirror of `Data.EuclideanRing.lcm`: the `if`'s
+    // condition uses `disj` (the `||` operator), which is
+    // `HeytingAlgebra a => a -> a -> a`. The two operands have
+    // type `Boolean` (from `eq`), so `||` resolves at `Boolean`.
+    // The `then` branch is `zero` — its type must NOT collapse
+    // to `Boolean` (it's `α`, the lcm's parameter type) even
+    // though the condition's type is `Boolean`.
+    assert_typechecks(
+        "\
+module M where
+class Eq a where
+  eq :: a -> a -> Boolean
+
+class Semiring a where
+  zero :: a
+  one :: a
+  add :: a -> a -> a
+  mul :: a -> a -> a
+
+class HeytingAlgebra a where
+  disj :: a -> a -> a
+
+instance heytingAlgebraBoolean :: HeytingAlgebra Boolean where
+  disj _ _ = true
+
+infixl 4 eq as ==
+infixr 2 disj as ||
+
+lcm :: forall a. Eq a => Semiring a => a -> a -> a
+lcm a b = if a == zero || b == zero then zero else zero
+",
+    );
+}
+
+#[test]
+fn euclidean_ring_style_recursive_with_classes() {
+    // Mirror `Data.EuclideanRing.gcd`: a polymorphic value with
+    // an explicit `Eq a => EuclideanRing a =>` signature whose
+    // body uses class methods (`zero` from `Semiring`, `==`
+    // from `Eq`, `mod` from `EuclideanRing`) plus a recursive
+    // call to itself. Constraints involving fresh unif vars
+    // should defer, not surface as `NoInstanceFound`.
+    assert_typechecks(
+        "\
+module M where
+
+data Ordering = LT | EQ | GT
+
+class Eq a where
+  eq :: a -> a -> Boolean
+
+class Semiring a where
+  zero :: a
+  one :: a
+  add :: a -> a -> a
+  mul :: a -> a -> a
+
+class Semiring a <= Ring a where
+  sub :: a -> a -> a
+
+class Ring a <= CommutativeRing a
+
+class CommutativeRing a <= EuclideanRing a where
+  div :: a -> a -> a
+  mod :: a -> a -> a
+
+infixl 4 eq as ==
+
+infixl 7 mul as *
+infixl 7 div as /
+
+gcd :: forall a. Eq a => EuclideanRing a => a -> a -> a
+gcd a b =
+  if b == zero then a
+  else gcd b (a `mod` b)
+
+lcm :: forall a. Eq a => EuclideanRing a => a -> a -> a
+lcm a b =
+  if a == zero then zero
+  else if b == zero then zero
+  else (a * b) / gcd a b
 ",
     );
 }

@@ -98,8 +98,12 @@ fn assert_report_clean(report: &ModuleCheckReport) {
         }
         if let Some(ce) = result.constraint_errors.first() {
             panic!(
-                "{}: constraint {:?} on {}",
-                result.name, ce.kind, ce.constraint.class.name,
+                "{}: constraint {:?} on {} args={:?} span={:?}",
+                result.name,
+                ce.kind,
+                ce.constraint.class.name,
+                ce.constraint.args,
+                ce.span,
             );
         }
     }

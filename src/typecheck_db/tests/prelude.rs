@@ -149,8 +149,12 @@ fn run() {
         }
         if let Some(ce) = result.constraint_errors.first() {
             panic!(
-                "Prelude::{}: constraint {:?} on {}",
-                result.name, ce.kind, ce.constraint.class.name,
+                "Prelude::{}: constraint {:?} on {} args={:?} span={:?}",
+                result.name,
+                ce.kind,
+                ce.constraint.class.name,
+                ce.constraint.args,
+                ce.span,
             );
         }
     }

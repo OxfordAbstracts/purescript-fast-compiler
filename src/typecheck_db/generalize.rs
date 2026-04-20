@@ -16,10 +16,41 @@ use crate::typecheck_db::unify::UnifyState;
 /// Generate a fresh Scheme from `ty` by quantifying over unif vars not in
 /// `env`.
 pub fn generalize(state: &UnifyState, env: &Env, ty: &Type) -> Scheme {
-    let zonked = state.zonk(ty);
+    generalize_with_constraints(state, env, ty, &[])
+}
+
+/// Like `generalize`, but also folds a list of pending constraints into
+/// the resulting scheme as a `Type::Constrained` layer. Both the body's
+/// unif vars and the constraints' unif vars share the *same* unif→typevar
+/// substitution, so `Eq α` and the body's `α` end up referring to the
+/// same `Type::Var("a")`. Without this, importers re-instantiate the
+/// scheme and the constraint args carry orphan unif ids that never
+/// connect to the use-site type.
+pub fn generalize_with_constraints(
+    state: &UnifyState,
+    env: &Env,
+    ty: &Type,
+    constraints: &[Constraint],
+) -> Scheme {
+    let zonked_ty = state.zonk(ty);
+    let zonked_constraints: Vec<Constraint> = constraints
+        .iter()
+        .map(|c| Constraint {
+            class: c.class.clone(),
+            args: c.args.iter().map(|a| state.zonk(a)).collect(),
+        })
+        .collect();
+
     let env_free = env.free_unif_vars(state);
-    let ty_free = state.free_unif_vars(&zonked);
-    let mut to_generalize: Vec<u32> = ty_free.difference(&env_free).copied().collect();
+    let mut all_free: std::collections::HashSet<u32> =
+        state.free_unif_vars(&zonked_ty);
+    for c in &zonked_constraints {
+        for a in &c.args {
+            all_free.extend(state.free_unif_vars(a));
+        }
+    }
+    let mut to_generalize: Vec<u32> =
+        all_free.difference(&env_free).copied().collect();
     to_generalize.sort();
 
     let mut subst: HashMap<u32, Type> = HashMap::new();
@@ -29,8 +60,21 @@ pub fn generalize(state: &UnifyState, env: &Env, ty: &Type) -> Scheme {
         names.push(name.clone());
         subst.insert(*id, Type::Var(name));
     }
-    let body = apply_unif_subst(&zonked, &subst);
-    Scheme { vars: names, ty: body }
+    let body = apply_unif_subst(&zonked_ty, &subst);
+    if zonked_constraints.is_empty() {
+        return Scheme { vars: names, ty: body };
+    }
+    let lifted_constraints: Vec<Constraint> = zonked_constraints
+        .iter()
+        .map(|c| Constraint {
+            class: c.class.clone(),
+            args: c.args.iter().map(|a| apply_unif_subst(a, &subst)).collect(),
+        })
+        .collect();
+    Scheme {
+        vars: names,
+        ty: Type::Constrained(lifted_constraints, Box::new(body)),
+    }
 }
 
 /// Instantiate a scheme: replace each quantified variable with a fresh
