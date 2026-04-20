@@ -900,6 +900,16 @@ fn infer_record_access(
         Some(Box::new(tail)),
     );
     state.unify(&expr_ty, &expected)?;
+    // If the field's declared type is polymorphic (a nested
+    // `Forall` — e.g. `{ return :: forall a. a -> m a }`), each
+    // access site should see a fresh instantiation, not the
+    // `Forall` itself, so repeated uses (`m.return 1`, then
+    // `m.return "x"`) don't accidentally unify their result
+    // types. Zonk the slot and instantiate any surfaced forall.
+    let zonked = state.zonk(&field_ty);
+    if matches!(&zonked, Type::Forall(_, _)) {
+        return Ok(instantiate_sig_as_monotype(state, zonked));
+    }
     Ok(field_ty)
 }
 

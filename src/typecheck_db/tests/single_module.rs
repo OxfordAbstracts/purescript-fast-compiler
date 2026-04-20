@@ -484,6 +484,30 @@ maybe _ f (Just a) = f a
 }
 
 #[test]
+fn record_with_polymorphic_fields_instantiates_per_access() {
+    // Mirror `passing/Monad.purs`: the record stored in `m` has
+    // polymorphic fields (`return :: forall a. a -> m a`); each
+    // access `m.return` has to instantiate the quantifier fresh
+    // so repeated uses pick independent `a`s.
+    assert_typechecks(
+        "\
+module M where
+
+data Id a = Id a
+data Maybe a = Nothing | Just a
+
+type Mon m = { return :: forall a. a -> m a }
+
+test :: forall m. Mon m -> m Number
+test m = m.return 1.0
+
+test2 :: forall m. Mon m -> m String
+test2 m = m.return \"hi\"
+",
+    );
+}
+
+#[test]
 fn tail_rec_exact_reproduction() {
     // Exact copy of Control.Monad.Rec.Class.tailRec.
     assert_typechecks(
