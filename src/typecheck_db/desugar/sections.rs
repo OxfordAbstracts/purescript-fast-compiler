@@ -63,6 +63,16 @@ fn has_section_wildcard(e: &Expr) -> bool {
             }
         }
         Expr::BacktickApp { left, right, .. } => is_wildcard(left) || is_wildcard(right),
+        // `if _ then _ else _` sections: any direct wildcard in
+        // cond/then/else slots produces a lambda of the
+        // corresponding arity.
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            is_wildcard(cond) || is_wildcard(then_expr) || is_wildcard(else_expr)
+        }
+        // `case _, x, _ of …` sections: any scrutinee slot that
+        // is a direct wildcard becomes a fresh lambda binder,
+        // bound around the whole case expression.
+        Expr::Case { exprs, .. } => exprs.iter().any(is_wildcard),
         _ => false,
     }
 }
@@ -103,6 +113,20 @@ fn replace_one_level_wildcards(
             func,
             left: Box::new(swap_if_wildcard(*left, counter, params)),
             right: Box::new(swap_if_wildcard(*right, counter, params)),
+        },
+        Expr::If { span, cond, then_expr, else_expr } => Expr::If {
+            span,
+            cond: Box::new(swap_if_wildcard(*cond, counter, params)),
+            then_expr: Box::new(swap_if_wildcard(*then_expr, counter, params)),
+            else_expr: Box::new(swap_if_wildcard(*else_expr, counter, params)),
+        },
+        Expr::Case { span, exprs, alts } => Expr::Case {
+            span,
+            exprs: exprs
+                .into_iter()
+                .map(|e| swap_if_wildcard(e, counter, params))
+                .collect(),
+            alts,
         },
         other => other,
     }

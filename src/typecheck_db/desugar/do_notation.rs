@@ -97,11 +97,13 @@ fn wrap_do_stmt(module: Option<ModuleQualifier>, stmt: DoStatement, rest: Expr) 
             bind_app(module, span, expr, binder, rest)
         }
         DoStatement::Discard { span, expr } => {
-            // `e; rest` → `bind e (\_ -> rest)`. PureScript uses the
-            // `Discard` class to allow non-Unit `m a` values; using
-            // `bind` with a wildcard binder produces the same effect
-            // and keeps us in vanilla monadic territory.
-            bind_app(module, span, expr, Binder::Wildcard { span }, rest)
+            // `e; rest` → `discard e (\_ -> rest)`. PureScript's
+            // `discard` class is what makes non-Unit effects
+            // permissible; modules commonly `import Prelude
+            // (discard)` but NOT `bind`, so desugaring this to
+            // plain `bind` would spuriously fail when the user
+            // only imported `discard`.
+            discard_app(module, span, expr, Binder::Wildcard { span }, rest)
         }
         DoStatement::Let { span, bindings } => Expr::Let {
             span,
@@ -109,6 +111,22 @@ fn wrap_do_stmt(module: Option<ModuleQualifier>, stmt: DoStatement, rest: Expr) 
             body: Box::new(rest),
         },
     }
+}
+
+/// Build `discard expr (\binder -> rest)`.
+fn discard_app(
+    module: Option<ModuleQualifier>,
+    span: Span,
+    expr: Expr,
+    binder: Binder,
+    rest: Expr,
+) -> Expr {
+    let lam = Expr::Lambda {
+        span,
+        binders: vec![binder],
+        body: Box::new(rest),
+    };
+    apply2(span, prelude_fn(module, span, "discard"), expr, lam)
 }
 
 /// Build `bind expr (\binder -> rest)`.

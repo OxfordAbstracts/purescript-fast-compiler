@@ -484,6 +484,104 @@ maybe _ f (Just a) = f a
 }
 
 #[test]
+fn tail_rec_exact_reproduction() {
+    // Exact copy of Control.Monad.Rec.Class.tailRec.
+    assert_typechecks(
+        "\
+module M where
+
+data Step a b = Loop a | Done b
+data Unit = Unit
+
+class Functor f where
+  map :: forall a b. (a -> b) -> f a -> f b
+
+voidRight :: forall f a b. Functor f => a -> f b -> f a
+voidRight x f = map (\\_ -> x) f
+
+class Functor f <= Apply f where
+  apply :: forall a b. f (a -> b) -> f a -> f b
+
+class Apply f <= Bind f where
+  bind :: forall a b. f a -> (a -> f b) -> f b
+
+class Apply f <= Applicative f where
+  pure :: forall a. a -> f a
+
+class (Applicative m, Bind m) <= Monad m
+class Monad m <= MonadRec m where
+  tailRecM :: forall a b. (a -> m (Step a b)) -> a -> m b
+
+compose :: forall a b c. (b -> c) -> (a -> b) -> a -> c
+compose f g x = f (g x)
+
+infixr 9 compose as <<<
+infixl 4 voidRight as <$
+
+unit :: Unit
+unit = Unit
+
+tailRec :: forall a b. (a -> Step a b) -> a -> b
+tailRec f = go <<< f
+  where
+  go (Loop a) = go (f a)
+  go (Done b) = b
+
+forever :: forall m a b. MonadRec m => m a -> m b
+forever ma = tailRecM (\\u -> Loop u <$ ma) unit
+",
+    );
+}
+
+#[test]
+fn where_clause_multi_equation_step_dispatch() {
+    // Mirror `Control.Monad.Rec.Class.tailRec`'s where-clause
+    // shape: `go` defined by two pattern-matching equations
+    // against a `Step` constructor. The let-binding multi-eq
+    // merger has to collapse them into one case-dispatched
+    // lambda so inference sees both branches.
+    assert_typechecks(
+        "\
+module M where
+
+data Step a b = Loop a | Done b
+
+tailRec :: forall a b. (a -> Step a b) -> a -> b
+tailRec f = go
+  where
+  go x = case f x of
+    Loop a -> go a
+    Done b -> b
+",
+    );
+}
+
+#[test]
+fn where_clause_multi_equation_pattern_matched_lambda() {
+    // Same as `where_clause_multi_equation_step_dispatch` but
+    // written in the multi-equation style that the let-binding
+    // merger has to desugar into a case-dispatched lambda.
+    assert_typechecks(
+        "\
+module M where
+
+data Step a b = Loop a | Done b
+
+compose :: forall a b c. (b -> c) -> (a -> b) -> a -> c
+compose f g x = f (g x)
+
+infixr 9 compose as <<<
+
+tailRec :: forall a b. (a -> Step a b) -> a -> b
+tailRec f = go <<< f
+  where
+  go (Loop a) = go (f a)
+  go (Done b) = b
+",
+    );
+}
+
+#[test]
 fn instance_method_multi_equation_merges() {
     // Regression: two adjacent `map` equations inside an
     // `instance Functor Maybe` block must merge into a single
