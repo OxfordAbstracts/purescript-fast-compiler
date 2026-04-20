@@ -68,3 +68,211 @@ fn where_clause_bindings() {
     // inference.
     assert_typechecks(include_str!("fixtures/single_succeeds/where_clause.purs"));
 }
+
+#[test]
+fn comparing_style_higher_order_class_method() {
+    // Mirrors `Data.Ord.comparing` — a polymorphic helper that
+    // applies a user-supplied function `f :: a -> b` to two
+    // arguments and feeds the results into a class method on
+    // `b`. Triggers the kind of inference path that previously
+    // produced `Unify(Infinite { var: 1, ty: Fun(Unif(1),
+    // Unif(1)) })` when class-method dispatch interacted with
+    // SCC pre-registration.
+    assert_typechecks(
+        "\
+module M where
+
+class Ord a where
+  compare :: a -> a -> Int
+
+comparing :: forall a b. Ord b => (a -> b) -> a -> a -> Int
+comparing f x y = compare (f x) (f y)
+",
+    );
+}
+
+#[test]
+fn data_ord_style_module() {
+    // Whittled-down reproduction of `Data.Ord`'s shape: a class
+    // with a single method, an `Ordering` data type, a fixity
+    // declaration aliasing the method to an operator, and a
+    // top-level value that uses both the operator and the class
+    // method directly. Stresses the same SCC of mutually-related
+    // bindings that `Data.Ord` itself does.
+    assert_typechecks(
+        "\
+module M where
+
+data Ordering = LT | EQ | GT
+
+class Ord a where
+  compare :: a -> a -> Ordering
+
+lessThan :: forall a. Ord a => a -> a -> Boolean
+lessThan a1 a2 = case compare a1 a2 of
+  LT -> true
+  _ -> false
+
+infixl 4 lessThan as <
+
+comparing :: forall a b. Ord b => (a -> b) -> a -> a -> Ordering
+comparing f x y = compare (f x) (f y)
+",
+    );
+}
+
+#[test]
+fn class_method_via_backtick_application() {
+    // Variant of `data_ord_style_module` that uses backtick syntax
+    // (`a `compare` b`) to invoke the class method, mirroring
+    // Data.Ord.lessThan's actual style. Backticks are lowered to
+    // App nodes; this checks that path stays infinite-type-free.
+    assert_typechecks(
+        "\
+module M where
+
+data Ordering = LT | EQ | GT
+
+class Ord a where
+  compare :: a -> a -> Ordering
+
+lessThan :: forall a. Ord a => a -> a -> Boolean
+lessThan a1 a2 = case a1 `compare` a2 of
+  LT -> true
+  _ -> false
+",
+    );
+}
+
+#[test]
+fn data_ord_with_full_instance_set() {
+    // Closer mirror of Data.Ord: includes the multi-equation
+    // `instance ordOrdering` plus a polymorphic value that uses
+    // the operator alias. Stresses interaction between
+    // multi-equation merge, fixity-target import, and class
+    // dispatch — the combination that lights up
+    // `Unify(Infinite { var: 1, ty: Fun(Unif(1), Unif(1)) })`
+    // when checking the real Prelude module.
+    assert_typechecks(
+        "\
+module M where
+
+data Ordering = LT | EQ | GT
+
+class Ord a where
+  compare :: a -> a -> Ordering
+
+instance ordOrdering :: Ord Ordering where
+  compare LT LT = EQ
+  compare EQ EQ = EQ
+  compare GT GT = EQ
+  compare LT _ = LT
+  compare EQ LT = GT
+  compare EQ GT = LT
+  compare GT _ = GT
+
+lessThan :: forall a. Ord a => a -> a -> Boolean
+lessThan a1 a2 = case a1 `compare` a2 of
+  LT -> true
+  _ -> false
+
+greaterThan :: forall a. Ord a => a -> a -> Boolean
+greaterThan a1 a2 = case a1 `compare` a2 of
+  GT -> true
+  _ -> false
+
+infixl 4 lessThan as <
+infixl 4 greaterThan as >
+",
+    );
+}
+
+#[test]
+fn boolean_guard_with_constraint_call() {
+    // Smaller still: a value with a boolean guard whose pattern
+    // calls a class-constrained function. Reproduces the Data.Ord
+    // `between low hi x | x < low = false ...` shape without the
+    // surrounding instance/data noise.
+    assert_typechecks(
+        "\
+module M where
+
+class Ord a where
+  lt :: a -> a -> Boolean
+
+f :: forall a. Ord a => a -> a -> Boolean
+f x y
+  | lt x y = false
+  | true = true
+",
+    );
+}
+
+#[test]
+fn boolean_guard_with_operator_call() {
+    // Same as above but the predicate uses an aliased operator
+    // (`x < y`) instead of calling the function directly. This
+    // should rebracket to `lt x y` during desugar; if it doesn't
+    // we'd hit a type mismatch in the guard.
+    assert_typechecks(
+        "\
+module M where
+
+class Ord a where
+  lt :: a -> a -> Boolean
+
+infixl 4 lt as <
+
+f :: forall a. Ord a => a -> a -> Boolean
+f x y
+  | x < y = false
+  | true = true
+",
+    );
+}
+
+#[test]
+fn between_three_arg_with_two_operators() {
+    // Closer to `Data.Ord.between`: a 3-arg function whose body
+    // uses two operator aliases in two boolean guards plus a
+    // catch-all `true` clause.
+    assert_typechecks(
+        "\
+module M where
+
+class Ord a where
+  lt :: a -> a -> Boolean
+  gt :: a -> a -> Boolean
+
+infixl 4 lt as <
+infixl 4 gt as >
+
+between :: forall a. Ord a => a -> a -> a -> Boolean
+between low hi x
+  | x < low = false
+  | x > hi = false
+  | true = true
+",
+    );
+}
+
+#[test]
+fn ord_methods_as_top_level_values() {
+    // Mirror Data.Ord's exact shape: `lessThan` / `greaterThan`
+    // are *top-level value bindings* (with explicit constraint
+    // sigs), not class methods. `<` / `>` are operator aliases
+    // pointing at those values. `between` references both via
+    // operators in boolean guards. This is the exact SCC the
+    // real Prelude module presents.
+    assert_typechecks(
+        "\
+module M where
+
+lt a b = true
+
+f x y z
+  | lt x y = false
+  | true = true
+",
+    );
+}

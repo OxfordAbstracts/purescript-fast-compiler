@@ -688,6 +688,29 @@ fn check_one_module(
             }
         };
 
+        // Bind every inferred scheme back into `env` so the next SCC
+        // in topo order sees these decls under their generalized
+        // schemes. The cached-hit path already binds via
+        // `try_get_cached`; this is the symmetric fix on the miss
+        // path.
+        //
+        // `infer_value_scc_with_all` restores the SCC's local slots
+        // before returning (its caller-reusable design). Those slots
+        // would shadow our scheme bindings — locals are checked
+        // first by `Env::lookup_unqualified`. Drop the stale slots
+        // so the schemes are what subsequent SCCs see.
+        if let Some(scope) = env.locals.last_mut() {
+            for s in &schemes {
+                scope.remove(&s.name);
+            }
+        }
+        for s in &schemes {
+            env.bind_scheme(
+                crate::typecheck_db::types::QName::unqualified(&s.name),
+                s.scheme.clone(),
+            );
+        }
+
         for nm in &scc_names {
             decl_outcomes.insert(nm.clone(), outcome);
         }
