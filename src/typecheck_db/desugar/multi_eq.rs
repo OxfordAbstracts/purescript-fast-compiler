@@ -60,10 +60,31 @@ pub fn merge(decls: Vec<Decl>) -> Vec<Decl> {
             group.push(d);
         } else {
             flush(&mut out, std::mem::take(&mut group));
-            if matches!(d, Decl::Value { .. }) {
-                group.push(d);
-            } else {
-                out.push(d);
+            match d {
+                Decl::Value { .. } => group.push(d),
+                // Recurse into instance method bodies so runs of
+                // same-name `Decl::Value` members get merged the
+                // same way top-level equations do.
+                Decl::Instance {
+                    span,
+                    name,
+                    constraints,
+                    class_name,
+                    types,
+                    members,
+                    chain,
+                    doc_comments,
+                } => out.push(Decl::Instance {
+                    span,
+                    name,
+                    constraints,
+                    class_name,
+                    types,
+                    members: merge(members),
+                    chain,
+                    doc_comments,
+                }),
+                other => out.push(other),
             }
         }
     }

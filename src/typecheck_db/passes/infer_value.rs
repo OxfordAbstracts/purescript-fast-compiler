@@ -1246,11 +1246,22 @@ mod tests {
     use super::*;
     use crate::parser::parse as parse_cst;
 
-    /// Parse + lower — every test in this module works in `ir::*`
-    /// land since that's what the infer pipeline consumes.
+    /// Parse + desugar + lower — every test in this module works in
+    /// `ir::*` land since that's what the infer pipeline consumes.
+    /// Desugar is mandatory: the IR lowering rejects any surviving
+    /// `Op` / `OpParens` / `BacktickApp` / `Binder::Op` as
+    /// `LoweringError::Residual*`, so test sources that use
+    /// operators need the full pipeline.
     fn parse(src: &str) -> crate::typecheck_db::ir::Module {
+        use crate::typecheck_db::desugar::{
+            desugar_module, fixity_table_from_decls, DesugarContext,
+        };
         let cst_mod = parse_cst(src).unwrap();
-        crate::typecheck_db::ir::lower_module(cst_mod).expect("cst → ir lowering")
+        let (fixity_table, module_fixity_hash) = fixity_table_from_decls(&cst_mod.decls);
+        let ctx = DesugarContext { module_fixity_hash, fixity_table };
+        let decls = desugar_module(cst_mod.decls.clone(), &ctx);
+        let desugared = crate::cst::Module { decls, ..cst_mod };
+        crate::typecheck_db::ir::lower_module(desugared).expect("cst → ir lowering")
     }
 
     fn int() -> Type {

@@ -123,6 +123,7 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
     use crate::cst::{GuardedExpr, Guard, GuardPattern, LetBinding};
     match decl {
         Decl::Value { name, binders, guarded, where_clause, span, doc_comments } => {
+            let binders = binders.into_iter().map(rewrite_binder).collect();
             let guarded = match guarded {
                 GuardedExpr::Unconditional(e) => {
                     GuardedExpr::Unconditional(Box::new(rewrite_expr(*e, fixity)))
@@ -139,7 +140,7 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                                         GuardPattern::Boolean(Box::new(rewrite_expr(*e, fixity)))
                                     }
                                     GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
-                                        b,
+                                        rewrite_binder(b),
                                         Box::new(rewrite_expr(*e, fixity)),
                                     ),
                                 })
@@ -152,9 +153,11 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
             let where_clause: Vec<LetBinding> = where_clause
                 .into_iter()
                 .map(|b| match b {
-                    LetBinding::Value { span, binder, expr } => {
-                        LetBinding::Value { span, binder, expr: rewrite_expr(expr, fixity) }
-                    }
+                    LetBinding::Value { span, binder, expr } => LetBinding::Value {
+                        span,
+                        binder: rewrite_binder(binder),
+                        expr: rewrite_expr(expr, fixity),
+                    },
                     LetBinding::Signature { span, name, ty } => {
                         LetBinding::Signature { span, name, ty }
                     }
@@ -162,7 +165,94 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                 .collect();
             Decl::Value { name, binders, guarded, where_clause, span, doc_comments }
         }
+        // Instance and Derive declarations hold `Decl::Value`
+        // members. Without recursing, `append f g x = f x <> g x`
+        // inside `instance semigroupFn` keeps its `Op` node and
+        // trips the IR lowering's residual-operator guard.
+        Decl::Instance {
+            span,
+            name,
+            constraints,
+            class_name,
+            types,
+            members,
+            chain,
+            doc_comments,
+        } => Decl::Instance {
+            span,
+            name,
+            constraints,
+            class_name,
+            types,
+            members: members.into_iter().map(|m| desugar_decl(m, fixity)).collect(),
+            chain,
+            doc_comments,
+        },
         other => other,
+    }
+}
+
+/// Lower every `Binder::Op` (e.g. `x : xs`) into a
+/// `Binder::Constructor` whose head is the operator's target.
+/// Treats symbolic operator binders as constructor patterns
+/// (PureScript's convention — only constructors can be used in
+/// pattern position) and recurses into every nested binder slot
+/// so the output contains no `Binder::Op` anywhere. The IR
+/// lowering assumes this invariant and returns
+/// `LoweringError::ResidualBinderOperator` if it sees one.
+fn rewrite_binder(b: crate::cst::Binder) -> crate::cst::Binder {
+    use crate::cst::Binder;
+    use crate::names::{ConstructorName, Qualified};
+    match b {
+        Binder::Op { span, left, op, right } => {
+            let left = rewrite_binder(*left);
+            let right = rewrite_binder(*right);
+            let op_sym = op.value.name.symbol();
+            let op_str = resolve_sym(op_sym);
+            let cn = ConstructorName::new(crate::interner::intern(&op_str));
+            let name = match op.value.module {
+                Some(m) => Qualified::qualified(m, cn),
+                None => Qualified::unqualified(cn),
+            };
+            Binder::Constructor { span, name, args: vec![left, right] }
+        }
+        Binder::Constructor { span, name, args } => Binder::Constructor {
+            span,
+            name,
+            args: args.into_iter().map(rewrite_binder).collect(),
+        },
+        Binder::Record { span, fields } => Binder::Record {
+            span,
+            fields: fields
+                .into_iter()
+                .map(|f| crate::cst::RecordBinderField {
+                    span: f.span,
+                    label: f.label,
+                    binder: f.binder.map(rewrite_binder),
+                })
+                .collect(),
+        },
+        Binder::As { span, name, binder } => Binder::As {
+            span,
+            name,
+            binder: Box::new(rewrite_binder(*binder)),
+        },
+        Binder::Parens { span, binder } => Binder::Parens {
+            span,
+            binder: Box::new(rewrite_binder(*binder)),
+        },
+        Binder::Array { span, elements } => Binder::Array {
+            span,
+            elements: elements.into_iter().map(rewrite_binder).collect(),
+        },
+        Binder::Typed { span, binder, ty } => Binder::Typed {
+            span,
+            binder: Box::new(rewrite_binder(*binder)),
+            ty,
+        },
+        leaf @ (Binder::Wildcard { .. }
+        | Binder::Var { .. }
+        | Binder::Literal { .. }) => leaf,
     }
 }
 
@@ -199,13 +289,21 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
                 span,
                 name: target_var(info, span),
             },
-            // Preserved by design: at the desugar stage we can't tell
-            // whether a missing fixity entry means "imported module's
-            // fixity decls aren't loaded yet", "user forgot to declare
-            // the operator", or "typo". Leave the node as-is so the
-            // later name-resolution / typecheck passes can surface a
-            // precise error with the original span.
-            None => Expr::OpParens { span, op },
+            // Unknown fixity: fall back to the raw operator name as
+            // an unqualified (or qualified) value reference. Keeps
+            // the output operator-free so the IR lowering can assume
+            // `Op`/`OpParens`/`BacktickApp` are structurally
+            // impossible downstream; bad operator names surface as
+            // `UnboundVar` at inference time.
+            None => {
+                let sym = op.value.name.symbol();
+                let vn = value_name(&resolve_sym(sym));
+                let qualified = match op.value.module {
+                    Some(m) => Qualified::qualified(m, vn),
+                    None => Qualified::unqualified(vn),
+                };
+                Expr::Var { span, name: qualified }
+            }
         },
         other => recurse_children(other, fixity),
     }
@@ -294,9 +392,10 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
                             .into_iter()
                             .map(|p| match p {
                                 GuardPattern::Boolean(e) => GuardPattern::Boolean(rec_box(e, fixity)),
-                                GuardPattern::Pattern(b, e) => {
-                                    GuardPattern::Pattern(b, rec_box(e, fixity))
-                                }
+                                GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
+                                    rewrite_binder(b),
+                                    rec_box(e, fixity),
+                                ),
                             })
                             .collect(),
                         expr: rec_box(guard.expr, fixity),
@@ -307,24 +406,28 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
     }
     fn rec_let(b: LetBinding, fixity: &FixityTable) -> LetBinding {
         match b {
-            LetBinding::Value { span, binder, expr } => {
-                LetBinding::Value { span, binder, expr: rec(expr, fixity) }
-            }
+            LetBinding::Value { span, binder, expr } => LetBinding::Value {
+                span,
+                binder: rewrite_binder(binder),
+                expr: rec(expr, fixity),
+            },
             LetBinding::Signature { span, name, ty } => LetBinding::Signature { span, name, ty },
         }
     }
     fn rec_alt(a: CaseAlternative, fixity: &FixityTable) -> CaseAlternative {
         CaseAlternative {
             span: a.span,
-            binders: a.binders,
+            binders: a.binders.into_iter().map(rewrite_binder).collect(),
             result: rec_guarded(a.result, fixity),
         }
     }
     fn rec_do(s: DoStatement, fixity: &FixityTable) -> DoStatement {
         match s {
-            DoStatement::Bind { span, binder, expr } => {
-                DoStatement::Bind { span, binder, expr: rec(expr, fixity) }
-            }
+            DoStatement::Bind { span, binder, expr } => DoStatement::Bind {
+                span,
+                binder: rewrite_binder(binder),
+                expr: rec(expr, fixity),
+            },
             DoStatement::Let { span, bindings } => DoStatement::Let {
                 span,
                 bindings: bindings.into_iter().map(|b| rec_let(b, fixity)).collect(),
@@ -358,7 +461,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
         },
         Expr::Lambda { span, binders, body } => Expr::Lambda {
             span,
-            binders,
+            binders: binders.into_iter().map(rewrite_binder).collect(),
             body: rec_box(body, fixity),
         },
         Expr::Op { .. } | Expr::BacktickApp { .. } => rewrite_expr(e, fixity),
@@ -493,34 +596,27 @@ fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: S
                     span,
                     name: target_var(*info, span),
                 },
-                None if is_identifier_op(sym) => {
-                    // Backtick-style `a `f` b`: the parser stored `f`
-                    // as an OpName, but it's really the function value
-                    // to call. Lower to `App(App(Var(f), a), b)`.
+                None => {
+                    // No fixity decl in scope. Two flavors:
+                    //   * Identifier-shaped name (`a `f` b` parsed as
+                    //     an Op with `f`'s identifier as the op):
+                    //     lower to `App(App(Var(f), a), b)`.
+                    //   * Symbolic operator (e.g. `??` with no fixity
+                    //     in scope): lower to `App(App(Var("??"), a),
+                    //     b)` using the raw operator name. Downstream
+                    //     name resolution / typecheck surfaces the
+                    //     "unbound var" error if the operator was a
+                    //     typo; passing a real import that hasn't
+                    //     loaded yet produces the expected resolved
+                    //     `Var`. In both cases the output is fully
+                    //     operator-free, which is the invariant the
+                    //     IR lowering depends on.
                     let vn = value_name(&resolve_sym(sym));
                     let qualified = match n.value.module {
                         Some(m) => Qualified::qualified(m, vn),
                         None => Qualified::unqualified(vn),
                     };
                     Expr::Var { span, name: qualified }
-                }
-                None => {
-                    // Preserved by design: a symbolic operator whose
-                    // fixity decl isn't in the table today might be
-                    // (a) defined in an import whose metadata hasn't
-                    // loaded yet during an incremental build, (b)
-                    // genuinely undeclared, or (c) a typo. We can't
-                    // distinguish at the desugar stage — panicking
-                    // would break case (a), and silently fabricating
-                    // a target would hide cases (b)/(c). Leave the Op
-                    // node intact; the downstream typechecker has the
-                    // right context to surface a precise error.
-                    return Expr::Op {
-                        span,
-                        left: Box::new(left),
-                        op: n.clone(),
-                        right: Box::new(right),
-                    };
                 }
             }
         }
@@ -679,16 +775,22 @@ foo a b c = a + b * c
     }
 
     #[test]
-    fn unknown_op_preserves_op_node() {
-        // No fixity for `??`, so we keep the Op intact rather than
-        // fabricating an App.
+    fn unknown_op_lowers_to_app_of_raw_name() {
+        // Even without a fixity decl in scope, an operator must
+        // lower to `App(App(Var(op_name), lhs), rhs)`. The IR
+        // pass relies on every `Op` / `OpParens` / `BacktickApp`
+        // being gone after desugar — leaving an unknown op as
+        // `Expr::Op` would force a fallback lowering elsewhere
+        // and break that invariant. Typos / missing imports
+        // surface as `UnboundVar` during inference, which is
+        // precise enough.
         let table = FixityTable::new();
         let d = first_value("\
 module M where
 foo a b = a ?? b
 ");
         let out = desugar_decl(d, &table);
-        assert_eq!(count_op(&out), 1, "unknown op must stay as Op");
+        assert_eq!(count_op(&out), 0, "unknown op must still be lowered");
     }
 
     #[test]

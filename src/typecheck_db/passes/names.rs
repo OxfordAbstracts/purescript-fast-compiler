@@ -1000,10 +1000,32 @@ mod tests {
     use super::*;
     use crate::parser::parse;
 
+    // IR lowering is strict: any `Op` / `OpParens` / `BacktickApp`
+    // / `Binder::Op` that survives desugar produces a
+    // `LoweringError`. Test helpers must run the full desugar
+    // pipeline before handing the CST to `lower_module`.
+    fn lower_after_desugar(module: crate::cst::Module) -> crate::typecheck_db::ir::Module {
+        use crate::typecheck_db::desugar::{
+            desugar_module, fixity_table_from_decls, DesugarContext,
+        };
+        let (fixity_table, module_fixity_hash) = fixity_table_from_decls(&module.decls);
+        let ctx = DesugarContext { module_fixity_hash, fixity_table };
+        let decls = desugar_module(module.decls.clone(), &ctx);
+        let desugared = crate::cst::Module {
+            span: module.span,
+            name: module.name,
+            exports: module.exports,
+            imports: module.imports,
+            decls,
+            comments: module.comments,
+            doc_comments: module.doc_comments,
+        };
+        crate::typecheck_db::ir::lower_module(desugared).expect("cst → ir lowering")
+    }
+
     fn parse_single_decl(src: &str) -> Decl {
         let module = parse(src).expect("parse");
-        let ir_module = crate::typecheck_db::ir::lower_module(module)
-            .expect("cst → ir lowering");
+        let ir_module = lower_after_desugar(module);
         ir_module
             .decls
             .into_iter()
@@ -1013,8 +1035,7 @@ mod tests {
 
     fn parse_decl_by_index(src: &str, i: usize) -> Decl {
         let module = parse(src).expect("parse");
-        let ir_module = crate::typecheck_db::ir::lower_module(module)
-            .expect("cst → ir lowering");
+        let ir_module = lower_after_desugar(module);
         ir_module.decls.into_iter().nth(i).expect("decl at index")
     }
 

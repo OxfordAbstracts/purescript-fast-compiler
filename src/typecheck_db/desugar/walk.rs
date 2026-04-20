@@ -234,6 +234,31 @@ pub fn fold_decl_exprs<F: FnMut(Expr) -> Expr>(
                 doc_comments,
             }
         }
+        // Instance method bodies are `Decl::Value` entries nested
+        // inside `Decl::Instance.members` — fold into each one so
+        // every sub-transform (sections, records, signed,
+        // do-notation) applies to instance methods too. Without
+        // this, `append f g x = f x <> g x` inside
+        // `instance semigroupFn …` would skip every pass.
+        Decl::Instance {
+            span,
+            name,
+            constraints,
+            class_name,
+            types,
+            members,
+            chain,
+            doc_comments,
+        } => Decl::Instance {
+            span,
+            name,
+            constraints,
+            class_name,
+            types,
+            members: members.into_iter().map(|m| fold_decl_exprs(m, f)).collect(),
+            chain,
+            doc_comments,
+        },
         other => other,
     }
 }

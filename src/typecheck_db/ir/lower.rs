@@ -21,6 +21,12 @@ use super::decl::{
 };
 use super::expr::{Expr, Literal, RecordField, RecordUpdate};
 
+fn op_name_string(
+    op: &crate::cst::Spanned<crate::names::Qualified<crate::names::OpName>>,
+) -> String {
+    crate::interner::resolve(op.value.name.symbol()).unwrap_or_default()
+}
+
 fn lower_literal(lit: cst::Literal) -> Result<Literal, LoweringError> {
     Ok(match lit {
         cst::Literal::Int(i) => Literal::Int(i),
@@ -47,25 +53,6 @@ pub enum LoweringError {
     /// it shouldn't be — surfaces a parser invariant violation
     /// cleanly instead of panicking downstream.
     MalformedDataMembers { span: Span },
-}
-
-/// Turn an operator reference into a value-level `Var`. The
-/// operator's *name* (`+`, `<>`, …) becomes the value-name;
-/// downstream name resolution still needs to point that at the
-/// fixity's target (`add`, `append`, …). Used as a fallback when
-/// desugar didn't fully rebracket.
-fn op_as_value_var(
-    op: &crate::cst::Spanned<crate::names::Qualified<crate::names::OpName>>,
-) -> Expr {
-    use crate::names::{value_name, Qualified};
-    let op_sym = op.value.name.symbol();
-    let op_str = crate::interner::resolve(op_sym).unwrap_or_default();
-    let vn = value_name(&op_str);
-    let qn = match op.value.module {
-        Some(m) => Qualified::qualified(m, vn),
-        None => Qualified::unqualified(vn),
-    };
-    Expr::Var { span: op.span, name: qn }
 }
 
 pub fn lower_module(module: cst::Module) -> Result<Module, LoweringError> {
@@ -223,24 +210,17 @@ pub fn lower_binder(binder: cst::Binder) -> Result<Binder, LoweringError> {
             span,
             elements: lower_binders(elements)?,
         },
-        cst::Binder::Op { span, left, op, right } => {
-            // Fallback: a residual `Binder::Op` (usually a ctor
-            // operator like `x : xs`) lowers to
-            // `Constructor(op_ctor, [left, right])`. Downstream
-            // name resolution decides whether it's a real ctor.
-            use crate::names::{ConstructorName, Qualified};
-            let op_sym = op.value.name.symbol();
-            let op_str = crate::interner::resolve(op_sym).unwrap_or_default();
-            let cn = ConstructorName::new(crate::interner::intern(&op_str));
-            let qn = match op.value.module {
-                Some(m) => Qualified::qualified(m, cn),
-                None => Qualified::unqualified(cn),
-            };
-            Binder::Constructor {
+        cst::Binder::Op { span, op, .. } => {
+            // Desugar is responsible for converting every
+            // `Binder::Op` into a `Binder::Constructor` via
+            // `rebracket::rewrite_binder`. Reaching here means
+            // that pass was skipped or the parser emitted a
+            // shape it doesn't handle.
+            return Err(LoweringError::ResidualBinderOperator {
                 span,
-                name: qn,
-                args: vec![lower_binder(*left)?, lower_binder(*right)?],
-            }
+                op: crate::interner::resolve(op.value.name.symbol())
+                    .unwrap_or_default(),
+            });
         }
         cst::Binder::Typed { span, binder, ty } => Binder::Typed {
             span,
@@ -270,43 +250,32 @@ pub fn lower_expr(expr: cst::Expr) -> Result<Expr, LoweringError> {
             binders: lower_binders(binders)?,
             body: Box::new(lower_expr(*body)?),
         },
-        cst::Expr::Op { span, left, op, right } => {
-            // Fallback: desugar's rebracketer normally rewrites
-            // `x + y` into `App(App(Var(add), x), y)`. If one slips
-            // through (unknown fixity, tests that skip desugar,
-            // etc.), produce the analogous `App(App(Var(op_name),
-            // lhs), rhs)` lowering ourselves. Matches
-            // `desugar::rebracket`'s unknown-operator fallback and
-            // keeps the IR construction total.
-            let op_var = op_as_value_var(&op);
-            Expr::App {
-                span,
-                func: Box::new(Expr::App {
-                    span,
-                    func: Box::new(op_var),
-                    arg: Box::new(lower_expr(*left)?),
-                }),
-                arg: Box::new(lower_expr(*right)?),
-            }
+        cst::Expr::Op { span, op, .. } => {
+            // Desugar is responsible for rewriting every `Op`
+            // chain to `App`s via `rebracket::rewrite_expr`. If
+            // one survived, the pipeline is mis-configured —
+            // surface a clear error instead of silently synth'ing
+            // a `Var` lookup that would shadow the real problem.
+            return Err(LoweringError::ResidualOperator { span, op: op_name_string(&op) });
         }
-        cst::Expr::OpParens { span: _, op } => op_as_value_var(&op),
-        cst::Expr::BacktickApp { span, func, left, right } => {
-            // `x `f` y` should be `App(App(f, x), y)`. If it's still
-            // a BacktickApp after desugar, convert it here — this is
-            // semantics-preserving (backticks are left-associative
-            // infixl-1 applications).
-            let func = lower_expr(*func)?;
-            let left = lower_expr(*left)?;
-            let right = lower_expr(*right)?;
-            Expr::App {
+        cst::Expr::OpParens { span, op } => {
+            return Err(LoweringError::ResidualOperator { span, op: op_name_string(&op) });
+        }
+        cst::Expr::BacktickApp { span, func, .. } => {
+            // Backticks are also the rebracketer's responsibility
+            // — they flatten into the same operator chain as
+            // named operators. Seeing one here means we skipped
+            // desugar or the rebracket walker missed a branch.
+            return Err(LoweringError::ResidualOperator {
                 span,
-                func: Box::new(Expr::App {
-                    span,
-                    func: Box::new(func),
-                    arg: Box::new(left),
-                }),
-                arg: Box::new(right),
-            }
+                op: match &*func {
+                    cst::Expr::Var { name, .. } => {
+                        crate::interner::resolve(name.name.symbol())
+                            .unwrap_or_default()
+                    }
+                    _ => "<backtick>".to_string(),
+                },
+            });
         }
         cst::Expr::If { span, cond, then_expr, else_expr } => Expr::If {
             span,
@@ -504,11 +473,13 @@ f x = case x of
     }
 
     #[test]
-    fn residual_op_falls_back_to_app_of_var() {
-        // If an `Expr::Op` slips past desugar, lowering produces a
-        // plain application with the operator name as the function.
-        // Matches `desugar::rebracket`'s unknown-operator fallback
-        // so the IR stays total and operator-free.
+    fn residual_op_is_a_hard_error() {
+        // Desugar owns operator elimination end-to-end. Reaching
+        // the IR lowering with a surviving `Expr::Op` means the
+        // pipeline is mis-configured — surface it as
+        // `LoweringError::ResidualOperator` so callers can see the
+        // exact span and operator name rather than silently
+        // fabricating a `Var` lookup.
         use crate::cst::Spanned;
         use crate::interner::intern;
         use crate::names::Qualified;
@@ -522,16 +493,9 @@ f x = case x of
             op,
             right: Box::new(cst::Expr::Wildcard { span }),
         };
-        let out = lower_expr(input).expect("lowering should not fail");
-        match out {
-            Expr::App { func, .. } => match *func {
-                Expr::App { func: inner, .. } => match *inner {
-                    Expr::Var { .. } => { /* good */ }
-                    other => panic!("expected inner Var, got {other:?}"),
-                },
-                other => panic!("expected inner App, got {other:?}"),
-            },
-            other => panic!("expected App, got {other:?}"),
+        match lower_expr(input) {
+            Err(LoweringError::ResidualOperator { op, .. }) => assert_eq!(op, "+"),
+            other => panic!("expected ResidualOperator, got {other:?}"),
         }
     }
 }

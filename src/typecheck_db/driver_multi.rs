@@ -172,7 +172,9 @@ fn check_one_module(
         .into_iter()
         .map(crate::typecheck_db::ir::lower_decl)
         .collect::<Result<_, _>>()
-        .expect("cst → ir lowering");
+        .unwrap_or_else(|e| {
+            panic!("cst → ir lowering failed in {}: {e:?}", name)
+        });
 
     let type_ops = TypeOpMap::default();
 

@@ -384,8 +384,15 @@ mod tests {
     }
 
     fn parse_module(src: &str) -> Vec<Decl> {
+        use crate::typecheck_db::desugar::{
+            desugar_module, fixity_table_from_decls, DesugarContext,
+        };
         let cst_mod = parse(src).unwrap();
-        crate::typecheck_db::ir::lower_module(cst_mod)
+        let (fixity_table, module_fixity_hash) = fixity_table_from_decls(&cst_mod.decls);
+        let ctx = DesugarContext { module_fixity_hash, fixity_table };
+        let decls = desugar_module(cst_mod.decls.clone(), &ctx);
+        let desugared = crate::cst::Module { decls, ..cst_mod };
+        crate::typecheck_db::ir::lower_module(desugared)
             .expect("cst → ir lowering")
             .decls
     }
