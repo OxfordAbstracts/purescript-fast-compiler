@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 10:7 - 10:12
+INFERRED_TYPE:
+  Array a0 -> a0
+SUGGESTIONS:
+  Main.snd       :: forall a. Partial => Array a -> a
+  Partial.crash  :: forall a. Partial => a

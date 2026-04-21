@@ -1,0 +1,51 @@
+HOLE: test
+POSITION: 137:5498 - 137:5503
+INFERRED_TYPE:
+  Int
+SUGGESTIONS:
+  x                :: Int
+  xx               :: Int
+  xxx              :: Int
+  xxxx             :: Int
+  xxxxx            :: Int
+  xxxxxx           :: Int
+  xxxxxxx          :: Int
+  xxxxxxxx         :: Int
+  xxxxxxxxx        :: Int
+  xxxxxxxxxx       :: Int
+  xxxxxxxxxxx      :: Int
+  xxxxxxxxxxxx     :: Int
+  xxxxxxxxxxxxx    :: Int
+  xxxxxxxxxxxxxx   :: Int
+  xxxxxxxxxxxxxxx  :: Int
+CONTEXT:
+  m :: Array Int
+  mm :: Array Int
+  mmm :: Array Int
+  mmmm :: Array Int
+  mmmmm :: Array Int
+  mmmmmm :: Array Int
+  mmmmmmm :: Array Int
+  mmmmmmmm :: Array Int
+  mmmmmmmmm :: Array Int
+  mmmmmmmmmm :: Array Int
+  mmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmmmmmmm :: Array Int
+  mmmmmmmmmmmmmmmmmmmmmmmmmmmmmm :: Array Int

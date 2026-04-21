@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 14:8 - 14:13
+INFERRED_TYPE:
+  PProxy Proxy
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Main.test    :: PProxy' Proxy
+  Main.PProxy  :: forall @p. PProxy p

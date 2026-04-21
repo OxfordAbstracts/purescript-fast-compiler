@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 10:11 - 10:16
+INFERRED_TYPE:
+  b0 -> b0 -> Ordering
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  Data.Ord.compare    :: forall @a. Ord a => a -> a -> Ordering
+CONTEXT:
+  a1 :: a1
+  b1 :: b0
+  a2 :: a1
+  b2 :: b0

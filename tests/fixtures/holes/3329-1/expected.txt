@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 27:8 - 27:13
+INFERRED_TYPE:
+  f0 -> Either f0 g1
+SUGGESTIONS:
+  Main.inj                    :: forall @f @g. Inject f g => f -> g
+  Main.injL                   :: forall f g. f -> Either f g
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+  Data.Either.Left            :: forall @a @b. a -> Either a b

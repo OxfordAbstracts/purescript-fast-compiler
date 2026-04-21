@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 43:12 - 43:17
+INFERRED_TYPE:
+  Boolean
+SUGGESTIONS:
+  Data.Boolean.otherwise  :: Boolean
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a

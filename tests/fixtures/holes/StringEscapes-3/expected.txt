@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 9:17 - 9:22
+INFERRED_TYPE:
+  t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.liftA1          :: forall f a b. Applicative f => (a -> b) -> f a -> f b
+  Control.Applicative.pure            :: forall @f a. Applicative f => a -> f a
+  Control.Applicative.unless          :: forall m. Applicative m => Boolean -> m Unit -> m Unit
+  Control.Applicative.when            :: forall m. Applicative m => Boolean -> m Unit -> m Unit
+  Control.Apply.apply                 :: forall @f a b. Apply f => f (a -> b) -> f a -> f b
+  Control.Apply.applyFirst            :: forall a b f. Apply f => f a -> f b -> f a
+  Control.Apply.applySecond           :: forall a b f. Apply f => f a -> f b -> f b
+  Control.Apply.lift2                 :: forall a b c f. Apply f => (a -> b -> c) -> f a -> ... -> ...
+  Control.Apply.lift3                 :: forall a b c d f. Apply f => (a -> b -> ...) -> f a -> ... -> ...
+  Control.Apply.lift4                 :: forall a b c d e f. Apply f => (a -> b -> ...) -> f a -> ... -> ...
+  Control.Apply.lift5                 :: forall a b c d e f g. Apply f => (a -> b -> ...) -> f a -> ... -> ...
+  Control.Bind.bind                   :: forall @m a b. Bind m => m a -> (a -> ...) -> m b
+  Control.Bind.bindFlipped            :: forall m a b. Bind m => (a -> m b) -> m a -> m b
+  Control.Bind.composeKleisli         :: forall a b c m. Bind m => (a -> m b) -> (b -> ...) -> a -> ...
+  Control.Bind.composeKleisliFlipped  :: forall a b c m. Bind m => (b -> m c) -> (a -> ...) -> a -> ...

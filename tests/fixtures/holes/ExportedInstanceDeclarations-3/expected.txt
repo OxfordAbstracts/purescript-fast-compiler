@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 39:9 - 39:14
+INFERRED_TYPE:
+  a0
+SUGGESTIONS:
+  Main.notExported  :: forall @a. NonexportedClass a => a

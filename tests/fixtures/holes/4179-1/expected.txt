@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 45:17 - 45:22
+INFERRED_TYPE:
+  String -> (Maybe String -> Effect a0) -> Effect a0
+SUGGESTIONS:
+  Main.runtimeImport          :: forall a. String -> (... -> ...) -> Effect a
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

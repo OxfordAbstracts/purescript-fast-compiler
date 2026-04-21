@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 17:11 - 17:16
+INFERRED_TYPE:
+  { name :: t0 | t1 } -> t0
+CONSTRAINTS:
+  where t0 is an unknown type

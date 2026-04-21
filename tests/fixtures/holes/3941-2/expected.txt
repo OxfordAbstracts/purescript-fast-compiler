@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 18:11 - 18:16
+INFERRED_TYPE:
+  Int -> Boolean
+SUGGESTIONS:
+  Data.HeytingAlgebra.ff      :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt      :: forall @a. HeytingAlgebra a => a
+  Main.func                   :: forall @a @b. TwoParams a b => a -> b
+  Main.testAny                :: Int -> Boolean
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

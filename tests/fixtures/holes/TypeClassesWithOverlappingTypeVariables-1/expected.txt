@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 10:21 - 10:26
+INFERRED_TYPE:
+  Either a0 b1
+CONTEXT:
+  f :: a2 -> b1
+  y :: a2

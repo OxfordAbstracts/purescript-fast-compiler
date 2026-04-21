@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 19:14 - 19:19
+INFERRED_TYPE:
+  a0
+SUGGESTIONS:
+  a  :: a0
+CONTEXT:
+  a :: a0

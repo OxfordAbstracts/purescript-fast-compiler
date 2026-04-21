@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 18:6 - 18:11
+INFERRED_TYPE:
+  f0 a1 -> f0 a1
+SUGGESTIONS:
+  Control.Category.identity  :: forall @a t. Category a => a t t

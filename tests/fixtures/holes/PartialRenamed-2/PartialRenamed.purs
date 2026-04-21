@@ -1,0 +1,21 @@
+module Main where
+
+import Prelude
+import Effect.Console (log)
+
+partial ∷ Partial ⇒ Int → Int
+partial n = case n of
+  0 -> 0
+
+unsafeOp ∷ Int → Int
+unsafeOp = otherDischargePartial partial
+
+foreign import _otherDischargePartial :: forall a b. a -> b
+
+otherDischargePartial :: forall a. (Partial => a) -> a
+otherDischargePartial = _otherDischargePartial
+
+
+main = do
+  let _ = ?test 0
+  log "Done"

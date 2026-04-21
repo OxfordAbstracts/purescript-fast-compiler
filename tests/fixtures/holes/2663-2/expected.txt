@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 10:30 - 10:35
+INFERRED_TYPE:
+  String -> t0 Unit
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.Function.applyFlipped     :: forall a b. a -> (a -> b) -> b
+  Data.Symbol.reifySymbol        :: forall r. String -> (forall sym. ...) -> r
+  Effect.Console.debug           :: String -> Effect Unit
+  Effect.Console.debugShow       :: forall a. Show a => a -> Effect Unit
+  Effect.Console.error           :: String -> Effect Unit
+  Effect.Console.errorShow       :: forall a. Show a => a -> Effect Unit
+  Effect.Console.group           :: String -> Effect Unit
+  Effect.Console.groupCollapsed  :: String -> Effect Unit
+  Effect.Console.info            :: String -> Effect Unit
+  Effect.Console.infoShow        :: forall a. Show a => a -> Effect Unit
+  Effect.Console.log             :: String -> Effect Unit
+  Effect.Console.logShow         :: forall a. Show a => a -> Effect Unit
+  Effect.Console.time            :: String -> Effect Unit
+  Effect.Console.timeEnd         :: String -> Effect Unit
+  Effect.Console.timeLog         :: String -> Effect Unit

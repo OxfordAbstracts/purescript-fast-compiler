@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 7:9 - 7:14
+INFERRED_TYPE:
+  { b :: Number | t0 }
+SUGGESTIONS:
+  f  :: { b :: Number
+  | a1
+  }
+CONTEXT:
+  f :: { b :: Number
+  | a1
+  }

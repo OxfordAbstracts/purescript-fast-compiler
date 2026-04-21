@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 10:5 - 10:10
+INFERRED_TYPE:
+  Number
+SUGGESTIONS:
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+  Main.z               :: Number

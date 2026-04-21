@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 14:12 - 14:17
+INFERRED_TYPE:
+  a0 -> b1
+SUGGESTIONS:
+  Main.myCoerce               :: forall a b. Coercible a b => a -> b
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

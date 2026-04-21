@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 9:39 - 9:44
+INFERRED_TYPE:
+  t0
+CONSTRAINTS:
+  where t0 is an unknown type

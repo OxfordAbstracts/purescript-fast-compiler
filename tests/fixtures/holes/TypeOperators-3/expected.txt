@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 12:21 - 12:26
+INFERRED_TYPE:
+  Compose f2 g3 a4
+SUGGESTIONS:
+  x  :: Compose f2 g3 a4
+CONTEXT:
+  x :: Compose @t0 @t1 f2 g3 a4

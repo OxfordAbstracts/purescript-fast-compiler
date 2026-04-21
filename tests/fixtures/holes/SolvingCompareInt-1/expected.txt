@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 50:13 - 50:18
+INFERRED_TYPE:
+  Proxy ( left :: m0 , right :: p1 )
+SUGGESTIONS:
+  Main.assertEqual  :: forall l r.
+  Compare l r EQ => Proxy
+  ( left :: l
+  , right :: r
+  )
+  Main.symmEq       :: forall m n.
+  Compare m n EQ => Proxy
+  ( left :: n
+  , right :: m
+  )
+  Main.Proxy        :: forall @n. Proxy n

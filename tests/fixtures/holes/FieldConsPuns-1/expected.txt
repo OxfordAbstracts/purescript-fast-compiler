@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 13:10 - 13:15
+INFERRED_TYPE:
+  String
+SUGGESTIONS:
+  greeting            :: String
+  name                :: String
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+CONTEXT:
+  greeting :: String

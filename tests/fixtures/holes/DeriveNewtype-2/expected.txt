@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 27:5 - 27:10
+INFERRED_TYPE:
+  First Int -> Int
+SUGGESTIONS:
+  Data.Newtype.unwrap         :: forall t a. Newtype t a => t -> a
+  Data.Semiring.one           :: forall @a. Semiring a => a
+  Data.Semiring.zero          :: forall @a. Semiring a => a
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

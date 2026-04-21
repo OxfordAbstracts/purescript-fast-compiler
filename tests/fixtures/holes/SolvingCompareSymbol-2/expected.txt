@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 32:9 - 32:14
+INFERRED_TYPE:
+  Boolean -> Boolean
+SUGGESTIONS:
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.HeytingAlgebra.ff     :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.not    :: forall @a. HeytingAlgebra a => a -> a
+  Data.HeytingAlgebra.tt     :: forall @a. HeytingAlgebra a => a
+CONTEXT:
+  gotLT :: Boolean
+  gotEQ :: Boolean
+  gotGT :: Boolean

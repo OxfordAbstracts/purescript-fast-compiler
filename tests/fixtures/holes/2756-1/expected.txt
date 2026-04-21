@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 8:8 - 8:13
+INFERRED_TYPE:
+  Effect Unit
+SUGGESTIONS:
+  Data.Monoid.mempty       :: forall @m. Monoid m => m
+  Effect.Console.clear     :: Effect Unit
+  Effect.Console.groupEnd  :: Effect Unit
+  Main.main                :: Effect Unit

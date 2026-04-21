@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 37:8 - 37:13
+INFERRED_TYPE:
+  m0 s1
+SUGGESTIONS:
+  Main.get  :: forall @s @m. MonadState s m => m s
+CONTEXT:
+  f :: s1 -> s1

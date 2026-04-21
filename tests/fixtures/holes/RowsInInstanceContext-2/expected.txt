@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 25:32 - 25:37
+INFERRED_TYPE:
+  { x :: String } -> inner0
+SUGGESTIONS:
+  Main.coerceBack  :: forall @a @b. TypeEquals a b => b -> a
+CONTEXT:
+  rec :: { x :: String
+  }

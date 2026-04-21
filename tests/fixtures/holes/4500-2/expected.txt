@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 10:11 - 10:16
+INFERRED_TYPE:
+  Proxy t1 -> v2
+SUGGESTIONS:
+  Data.Reflectable.reflectType  :: forall @v @t. Reflectable v t => Proxy v -> t

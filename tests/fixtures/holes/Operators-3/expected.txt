@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 62:21 - 62:26
+INFERRED_TYPE:
+  Number

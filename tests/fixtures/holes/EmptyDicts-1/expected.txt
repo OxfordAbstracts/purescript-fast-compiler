@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 48:24 - 48:29
+INFERRED_TYPE:
+  Check
+SUGGESTIONS:
+  Main.hasEmptySuper           :: HasEmptySuper => Check
+  Main.whenAccessingSuperDict  :: Check
+  Main.whenAliasEmptyClass     :: Check
+  Main.whenEmpty               :: Check
+  Main.whenHasEmptySuper       :: Check
+  Main.whenHasNonEmptySuper    :: Check
+  Main.withArgHasEmptySuper    :: forall @t. WithArgHasEmptySuper t => t
+  Main.Check                   :: Check

@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 28:12 - 28:17
+INFERRED_TYPE:
+  Z -> Z -> Boolean
+SUGGESTIONS:
+  Data.Eq.eq                 :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq              :: forall a. Eq a => a -> a -> Boolean
+  Data.Eq.Generic.genericEq  :: forall a rep. Generic a rep => GenericEq rep => a -> a -> Boolean
+  Data.HeytingAlgebra.ff     :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt     :: forall @a. HeytingAlgebra a => a
+CONTEXT:
+  x :: Z
+  y :: Z

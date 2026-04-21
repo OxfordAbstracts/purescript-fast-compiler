@@ -1,0 +1,23 @@
+HOLE: test
+POSITION: 48:13 - 48:18
+INFERRED_TYPE:
+  Number
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  x                    :: t0
+  y                    :: t0
+  sum                  :: t0
+  z                    :: Number
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+CONTEXT:
+  mx :: Maybe t0
+  my :: Maybe t0
+  mz :: Maybe Number
+  x :: t0
+  y :: t0
+  sum :: t0
+  z :: Number

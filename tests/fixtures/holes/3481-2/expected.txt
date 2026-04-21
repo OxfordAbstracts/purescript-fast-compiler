@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 7:12 - 7:17
+INFERRED_TYPE:
+  { "0" :: { "1" :: String | t0 } | t1 }
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.message            :: { "0" :: { "1" :: String
+  }
+  }

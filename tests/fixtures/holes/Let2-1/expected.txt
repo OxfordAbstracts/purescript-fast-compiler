@@ -1,0 +1,26 @@
+HOLE: test
+POSITION: 16:6 - 16:11
+INFERRED_TYPE:
+  Boolean -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure     :: forall @f a. Applicative f => a -> f a
+  Control.Applicative.unless   :: forall m. Applicative m => Boolean -> m Unit -> m Unit
+  Control.Applicative.when     :: forall m. Applicative m => Boolean -> m Unit -> m Unit
+  Control.Category.identity    :: forall @a t. Category a => a t t
+  Data.Eq.eq                   :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq                :: forall a. Eq a => a -> a -> Boolean
+  Data.Function.applyFlipped   :: forall a b. a -> (a -> b) -> b
+  Data.Function.const          :: forall a b. a -> b -> a
+  Data.Functor.voidRight       :: forall f a b. Functor f => a -> f b -> f a
+  Data.HeytingAlgebra.conj     :: forall @a. HeytingAlgebra a => a -> a -> a
+  Data.HeytingAlgebra.disj     :: forall @a. HeytingAlgebra a => a -> a -> a
+  Data.HeytingAlgebra.ff       :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.implies  :: forall @a. HeytingAlgebra a => a -> a -> a
+  Data.HeytingAlgebra.not      :: forall @a. HeytingAlgebra a => a -> a
+  Data.HeytingAlgebra.tt       :: forall @a. HeytingAlgebra a => a
+CONTEXT:
+  f :: Number -> Boolean
+  g :: Number -> Boolean
+  x :: Boolean

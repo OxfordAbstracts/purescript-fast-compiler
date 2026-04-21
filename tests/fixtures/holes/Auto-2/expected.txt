@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 11:57 - 11:62
+INFERRED_TYPE:
+  s0 -> i1 -> o2
+SUGGESTIONS:
+  step  :: s0 -> i1 -> o2
+CONTEXT:
+  state :: s0
+  step :: s0 -> i1 -> o2
+  f :: forall (s :: Type). Auto s i1 o2 -> r3

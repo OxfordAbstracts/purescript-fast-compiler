@@ -1,0 +1,28 @@
+HOLE: test
+POSITION: 11:13 - 11:18
+INFERRED_TYPE:
+  Number -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  g                           :: Number -> t0
+  go1                         :: Number -> t0
+  Control.Applicative.pure    :: forall @f a. Applicative f => a -> f a
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Data.DivisionRing.leftDiv   :: forall a. DivisionRing a => a -> a -> a
+  Data.DivisionRing.recip     :: forall @a. DivisionRing a => a -> a
+  Data.DivisionRing.rightDiv  :: forall a. DivisionRing a => a -> a -> a
+  Data.Eq.eq                  :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq               :: forall a. Eq a => a -> a -> Boolean
+  Data.EuclideanRing.degree   :: forall @a. EuclideanRing a => a -> Int
+  Data.EuclideanRing.div      :: forall @a. EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.gcd      :: forall a. Eq a => EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.lcm      :: forall a. Eq a => EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.mod      :: forall @a. EuclideanRing a => a -> a -> a
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+CONTEXT:
+  x :: Number
+  g :: Number -> t0
+  x :: Number
+  go1 :: Number -> t0
+  x :: Number

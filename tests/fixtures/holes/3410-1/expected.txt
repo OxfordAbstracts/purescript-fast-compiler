@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 11:8 - 11:13
+INFERRED_TYPE:
+  String -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure   :: forall @f a. Applicative f => a -> f a
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.Either.fromLeft       :: forall a b. a -> Either a b -> a
+  Data.Either.fromRight      :: forall a b. b -> Either a b -> b
+  Data.Either.note           :: forall a b. a -> Maybe b -> Either a b
+  Data.Either.Nested.at1     :: forall r a z. r -> (a -> r) -> ... -> r
+  Data.Either.Nested.at10    :: forall r a b c d e f g h i j z. r -> (j -> r) -> ... -> r
+  Data.Either.Nested.at2     :: forall r a b z. r -> (b -> r) -> ... -> r
+  Data.Either.Nested.at3     :: forall r a b c z. r -> (c -> r) -> ... -> r
+  Data.Either.Nested.at4     :: forall r a b c d z. r -> (d -> r) -> ... -> r
+  Data.Either.Nested.at5     :: forall r a b c d e z. r -> (e -> r) -> ... -> r
+  Data.Either.Nested.at6     :: forall r a b c d e f z. r -> (f -> r) -> ... -> r
+  Data.Either.Nested.at7     :: forall r a b c d e f g z. r -> (g -> r) -> ... -> r
+  Data.Either.Nested.at8     :: forall r a b c d e f g h z. r -> (h -> r) -> ... -> r
+  Data.Either.Nested.at9     :: forall r a b c d e f g h i z. r -> (i -> r) -> ... -> r

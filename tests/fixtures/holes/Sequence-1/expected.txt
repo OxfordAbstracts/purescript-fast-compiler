@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 14:50 - 14:55
+INFERRED_TYPE:
+  List (m0 a1)
+SUGGESTIONS:
+  xs        :: List (m0 a1)
+  Main.Nil  :: forall @a. List a
+CONTEXT:
+  x :: m0 a1
+  xs :: List (m0 a1)

@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 15:16 - 15:21
+INFERRED_TYPE:
+  List Number -> Number
+SUGGESTIONS:
+  Data.Semiring.one   :: forall @a. Semiring a => a
+  Data.Semiring.zero  :: forall @a. Semiring a => a
+  Main.match2         :: List Number -> Number

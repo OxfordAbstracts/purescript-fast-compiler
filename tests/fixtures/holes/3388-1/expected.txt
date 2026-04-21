@@ -1,0 +1,18 @@
+HOLE: test
+POSITION: 8:9 - 8:14
+INFERRED_TYPE:
+  { a :: t0 , b :: t1 | t2 }
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  x                       :: { a :: t0
+  , b :: t1
+  | t2
+  }
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a

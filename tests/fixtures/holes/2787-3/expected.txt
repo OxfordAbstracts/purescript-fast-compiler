@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 7:5 - 7:10
+INFERRED_TYPE:
+  Int -> Int -> Int -> Boolean
+SUGGESTIONS:
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Ord.between        :: forall a. Ord a => a -> a -> a -> Boolean

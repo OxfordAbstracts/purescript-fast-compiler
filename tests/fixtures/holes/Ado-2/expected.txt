@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 76:10 - 76:15
+INFERRED_TYPE:
+  String -> Effect String
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.Monoid.mempty        :: forall @m. Monoid m => m
+  Main.test1                :: forall t142 f144. Applicative f144 => t142 -> f144 String
+  Main.test11               :: forall t103 f105. Apply f105 => Applicative f105 => t103 -> f105 String
+CONTEXT:
+  r :: Ref String

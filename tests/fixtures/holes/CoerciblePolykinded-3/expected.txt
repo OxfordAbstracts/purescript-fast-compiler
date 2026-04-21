@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 20:11 - 20:16
+INFERRED_TYPE:
+  Name -> String
+SUGGESTIONS:
+  Data.Monoid.mempty          :: forall @m. Monoid m => m
+  Main.getName                :: Name -> String
+  Main.myCoerce               :: forall a b. Coercible a b => a -> b
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

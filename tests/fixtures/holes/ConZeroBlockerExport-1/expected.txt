@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 13:8 - 13:13
+INFERRED_TYPE:
+  T
+SUGGESTIONS:
+  Main.test  :: T

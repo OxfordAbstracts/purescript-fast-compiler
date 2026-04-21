@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 7:27 - 7:32
+INFERRED_TYPE:
+  Succ (Succ (Succ Zero))

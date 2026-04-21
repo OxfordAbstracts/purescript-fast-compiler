@@ -1,0 +1,18 @@
+HOLE: test
+POSITION: 102:30 - 102:35
+INFERRED_TYPE:
+  { a :: String , arrayIgnore :: Array Int , empty :: Record () , fIgnore :: Array Int , fa :: Array String , ignore :: Int , recursiveA :: Array (Tuple Int (Array String)) , zArrayA :: Array String }
+SUGGESTIONS:
+  Main.recordValueR  :: { a :: String
+  , arrayIgnore :: Array Int
+  , empty :: Record ()
+  , fIgnore :: Array Int
+  , fa :: Array String
+  , ignore :: Int
+  , recursiveA :: Array (Tuple Int (Array String))
+  , zArrayA :: Array String
+  }
+  Partial.crash      :: forall a. Partial => a
+CONTEXT:
+  left :: Unit -> Array (Array (Array ...))
+  right :: Unit -> Array (Array (Array ...))

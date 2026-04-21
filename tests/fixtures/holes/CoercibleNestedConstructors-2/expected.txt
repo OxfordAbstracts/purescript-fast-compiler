@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 22:14 - 22:19
+INFERRED_TYPE:
+  Pair (Id Int) (Array N) -> Pair Int (Array String)
+SUGGESTIONS:
+  Main.convert                :: Pair (Id Int) (Array N) -> Pair Int (Array String)
+  Main.unwrapPair             :: Pair (Id Int) (Array N) -> Pair Int (Array String)
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

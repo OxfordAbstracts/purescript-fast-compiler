@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 25:13 - 25:18
+INFERRED_TYPE:
+  a0 -> a0
+SUGGESTIONS:
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+CONTEXT:
+  go :: (a0 -> a0) -> Int -> (a0 -> a0) -> a0 -> a0

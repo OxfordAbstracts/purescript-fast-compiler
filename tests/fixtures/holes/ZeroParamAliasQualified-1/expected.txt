@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 12:8 - 12:13
+INFERRED_TYPE:
+  T Int String Boolean
+SUGGESTIONS:
+  Main.test  :: T

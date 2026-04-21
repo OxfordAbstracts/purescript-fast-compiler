@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 12:5 - 12:10
+INFERRED_TYPE:
+  { x :: Int , y :: String }
+SUGGESTIONS:
+  Main.y  :: Rec

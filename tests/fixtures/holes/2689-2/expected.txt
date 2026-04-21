@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 24:27 - 24:32
+INFERRED_TYPE:
+  Array a0 -> a0
+SUGGESTIONS:
+  Data.Array.Partial.head     :: forall a. Partial => Array a -> a
+  Data.Array.Partial.last     :: forall a. Partial => Array a -> a
+  Partial.crash               :: forall a. Partial => a
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+CONTEXT:
+  p :: a0 -> Boolean
+  count' :: Int -> Array a0 -> Int
+  acc :: Int
+  xs :: Array a0
+  h :: a0

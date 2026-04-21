@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 38:12 - 38:17
+INFERRED_TYPE:
+  Tree Int -> Tree Int -> Tree Int
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.Function.const       :: forall a b. a -> b -> a
+  Main.constClass           :: forall @a @b. ConstClass a => a -> b -> a
+  Main.treeInt'             :: Tree Int -> Tree Int -> Tree Int
+  Main.Branch               :: forall @a. Tree a -> Tree a -> Tree a

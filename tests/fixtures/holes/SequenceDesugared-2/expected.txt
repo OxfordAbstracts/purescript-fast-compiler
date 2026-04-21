@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 19:26 - 19:31
+INFERRED_TYPE:
+  List (m0 a1) -> m0 (List a1)
+SUGGESTIONS:
+  Main.sequenceListSeq  :: forall m a. Monad m => List (m a) -> m (List a)

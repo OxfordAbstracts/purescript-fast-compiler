@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 12:33 - 12:38
+INFERRED_TYPE:
+  a0
+SUGGESTIONS:
+  x  :: a0
+CONTEXT:
+  xs :: Stream a0
+  x :: a0

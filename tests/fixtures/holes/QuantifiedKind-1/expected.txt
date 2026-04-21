@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 8:8 - 8:13
+INFERRED_TYPE:
+  Proxy a1
+SUGGESTIONS:
+  Main.test   :: forall a. Proxy a
+  Main.Proxy  :: forall @a. Proxy a

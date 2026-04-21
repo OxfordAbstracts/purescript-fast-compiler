@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 66:12 - 66:17
+INFERRED_TYPE:
+  String -> Y String
+SUGGESTIONS:
+  Main.singleton              :: forall @a @b. Singleton a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

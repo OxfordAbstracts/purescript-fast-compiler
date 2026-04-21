@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 13:11 - 13:16
+INFERRED_TYPE:
+  A
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  b       :: t0
+  Main.A  :: A
+  Main.B  :: A
+  Main.C  :: A
+CONTEXT:
+  b :: t0

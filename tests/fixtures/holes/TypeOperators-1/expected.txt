@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 21:17 - 21:22
+INFERRED_TYPE:
+  Tuple b0 a1
+CONTEXT:
+  a :: a1
+  b :: b0

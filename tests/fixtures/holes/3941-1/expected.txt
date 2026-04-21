@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 23:24 - 23:29
+INFERRED_TYPE:
+  a0 -> m1 a0
+SUGGESTIONS:
+  Main.func                   :: forall @a @b. TwoParams a b => a -> b
+  Main.thisShouldBeCompiled   :: forall m a. a -> m a
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

@@ -1,0 +1,20 @@
+HOLE: test
+POSITION: 74:9 - 74:14
+INFERRED_TYPE:
+  Proxy ( left :: 0 , right :: 1 )
+SUGGESTIONS:
+  Main.assertLesser  :: forall l r.
+  Compare l r LT => Proxy
+  ( left :: l
+  , right :: r
+  )
+  Main.litLt         :: Proxy
+  ( left :: 0
+  , right :: 1
+  )
+  Main.symmLt        :: forall m n.
+  Compare m n GT => Proxy
+  ( left :: n
+  , right :: m
+  )
+  Main.Proxy         :: forall @n. Proxy n

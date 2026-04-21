@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 18:9 - 18:14
+INFERRED_TYPE:
+  m0 Unit
+SUGGESTIONS:
+  Main.test2  :: forall m r.
+  T
+  { foo :: String
+  | r
+  }
+  m
+  => m Unit

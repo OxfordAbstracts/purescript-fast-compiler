@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 18:6 - 18:11
+INFERRED_TYPE:
+  Proxy 21
+SUGGESTIONS:
+  Main.b      :: forall n. Add 21 n 42 => Proxy n
+  Main.b'     :: Proxy 21
+  Main.c      :: forall n. Add n 21 42 => Proxy n
+  Main.c'     :: Proxy 21
+  Main.Proxy  :: forall @k. Proxy k

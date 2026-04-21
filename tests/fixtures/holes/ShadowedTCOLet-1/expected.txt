@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 15:3 - 15:8
+INFERRED_TYPE:
+  String -> Effect t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure       :: forall @f a. Applicative f => a -> f a
+  Effect.Console.debug           :: String -> Effect Unit
+  Effect.Console.debugShow       :: forall a. Show a => a -> Effect Unit
+  Effect.Console.error           :: String -> Effect Unit
+  Effect.Console.errorShow       :: forall a. Show a => a -> Effect Unit
+  Effect.Console.group           :: String -> Effect Unit
+  Effect.Console.groupCollapsed  :: String -> Effect Unit
+  Effect.Console.info            :: String -> Effect Unit
+  Effect.Console.infoShow        :: forall a. Show a => a -> Effect Unit
+  Effect.Console.log             :: String -> Effect Unit
+  Effect.Console.logShow         :: forall a. Show a => a -> Effect Unit
+  Effect.Console.time            :: String -> Effect Unit
+  Effect.Console.timeEnd         :: String -> Effect Unit
+  Effect.Console.timeLog         :: String -> Effect Unit
+  Effect.Console.warn            :: String -> Effect Unit

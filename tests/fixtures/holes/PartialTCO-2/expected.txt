@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 8:11 - 8:16
+INFERRED_TYPE:
+  (Boolean -> Int -> Int) -> Boolean -> Int -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.Function.apply        :: forall a b. (a -> b) -> a -> b
+  Data.HeytingAlgebra.ff     :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt     :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty         :: forall @m. Monoid m => m
+  Data.Ring.negate           :: forall a. Ring a => a -> a
+  Data.Semiring.one          :: forall @a. Semiring a => a
+  Data.Semiring.zero         :: forall @a. Semiring a => a
+  Partial.crash              :: forall a. Partial => a

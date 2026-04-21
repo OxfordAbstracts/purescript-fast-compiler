@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 34:39 - 34:44
+INFERRED_TYPE:
+  MTrace b0 -> Effect b0
+SUGGESTIONS:
+  Main.runMTrace  :: forall a. MTrace a -> Effect a
+CONTEXT:
+  f :: a1 -> MTrace b0
+  m :: MTrace a1

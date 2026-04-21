@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 109:13 - 109:18
+INFERRED_TYPE:
+  t0
+CONSTRAINTS:
+  where t2 is an unknown type
+CONTEXT:
+  left :: forall (@b :: t1). MultiWithBidiFDs @t2 @t1 Int b => Int

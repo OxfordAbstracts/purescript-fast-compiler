@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 17:11 - 17:16
+INFERRED_TYPE:
+  a0 -> Wrapper a0
+SUGGESTIONS:
+  MethodConstraintGiven.Lib.ipure  :: forall @f a. IxMonad f => a -> f a
+  Main.Wrapper                     :: forall @a. a -> Wrapper a

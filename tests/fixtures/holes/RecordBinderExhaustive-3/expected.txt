@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 10:9 - 10:14
+INFERRED_TYPE:
+  { x :: Int | t0 }
+CONSTRAINTS:
+  where t0 is an unknown type

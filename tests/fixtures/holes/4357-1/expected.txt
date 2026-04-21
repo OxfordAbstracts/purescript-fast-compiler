@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 27:25 - 27:30
+INFERRED_TYPE:
+  Array t0 -> Additive Int
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.Foldable.fold          :: forall f m. Foldable f => Monoid m => f m -> m
+  Data.Monoid.mempty          :: forall @m. Monoid m => m
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+CONTEXT:
+  m :: Maybe Int

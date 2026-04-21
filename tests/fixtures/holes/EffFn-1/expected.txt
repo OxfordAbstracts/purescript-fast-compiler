@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 10:11 - 10:16
+INFERRED_TYPE:
+  EffectFn7 t0 t1 t2 t3 t4 t5 t6 Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int -> Effect Int
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Effect.Uncurried.runEffectFn7  :: forall a b c d e f g r. EffectFn7 a b c d e f g r -> a -> b -> ...

@@ -1,0 +1,19 @@
+HOLE: test
+POSITION: 22:11 - 22:16
+INFERRED_TYPE:
+  Proxy Int
+SUGGESTIONS:
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Type.Proxy.Proxy        :: forall @a. Proxy a
+CONTEXT:
+  x :: Proxy @(Row Type)
+  ( x :: a0
+  , x :: b1
+  , x :: Int
+  | r2
+  )

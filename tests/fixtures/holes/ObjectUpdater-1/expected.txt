@@ -1,0 +1,30 @@
+HOLE: test
+POSITION: 18:16 - 18:21
+INFERRED_TYPE:
+  { x :: Number , y :: Number | t0 }
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  point                   :: { x :: Number
+  , y :: Number
+  }
+  point'                  :: { x :: Number
+  , y :: Number
+  | t0
+  }
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+CONTEXT:
+  record :: { value :: Boolean
+  }
+  record' :: { value :: Boolean
+  }
+  point :: { x :: Number
+  , y :: Number
+  }
+  x :: Number

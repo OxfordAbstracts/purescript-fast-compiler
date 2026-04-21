@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 11:12 - 11:17
+INFERRED_TYPE:
+  { bar :: { baz :: Int , qux :: { lhs :: Int , rhs :: Int } } , foo :: Int }

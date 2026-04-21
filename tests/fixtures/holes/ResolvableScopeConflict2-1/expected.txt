@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 12:13 - 12:18
+INFERRED_TYPE:
+  Int
+SUGGESTIONS:
+  A.thing              :: Int
+  A.zing               :: Int
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+  Main.thing           :: Int

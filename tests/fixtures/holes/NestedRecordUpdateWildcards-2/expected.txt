@@ -1,0 +1,29 @@
+HOLE: test
+POSITION: 20:21 - 20:26
+INFERRED_TYPE:
+  { bar :: { baz :: Int , qux :: Int | t0 } , foo :: Int | t1 }
+CONSTRAINTS:
+  where t1 is an unknown type
+SUGGESTIONS:
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.after              :: { bar :: { baz :: Int
+  , qux :: Int
+  }
+  , foo :: Int
+  }
+  Main.expected           :: { bar :: { baz :: Int
+  , qux :: Int
+  }
+  , foo :: Int
+  }
+  Main.init               :: { bar :: { baz :: Int
+  , qux :: Int
+  }
+  , foo :: Int
+  }

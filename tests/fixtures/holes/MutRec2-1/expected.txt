@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 18:11 - 18:16
+INFERRED_TYPE:
+  S
+CONTEXT:
+  a :: A

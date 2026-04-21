@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 10:19 - 10:24
+INFERRED_TYPE:
+  Number -> L Number -> Number
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.Function.const       :: forall a b. a -> b -> a
+  Data.Semiring.one         :: forall @a. Semiring a => a
+  Data.Semiring.zero        :: forall @a. Semiring a => a
+  Main.loop                 :: forall a. Number -> a
+  Main.test                 :: Number -> L Number -> Number
+CONTEXT:
+  n :: Number
+  x :: Number
+  xs :: L Number

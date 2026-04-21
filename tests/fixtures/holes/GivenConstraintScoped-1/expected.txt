@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 11:15 - 11:20
+INFERRED_TYPE:
+  m0 String
+CONTEXT:
+  key :: String

@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 11:12 - 11:17
+INFERRED_TYPE:
+  ProgramType -> String
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  DataModule.showPT   :: ProgramType -> String
+  Main.usePT          :: ProgramType -> String
+CONTEXT:
+  pt :: ProgramType

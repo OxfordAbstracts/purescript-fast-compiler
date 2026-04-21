@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 15:5 - 15:10
+INFERRED_TYPE:
+  Proxy 42
+SUGGESTIONS:
+  Main.a      :: Proxy 42
+  Main.c      :: Proxy 42
+  Main.d      :: Proxy 42
+  Main.Proxy  :: forall @n. Proxy n

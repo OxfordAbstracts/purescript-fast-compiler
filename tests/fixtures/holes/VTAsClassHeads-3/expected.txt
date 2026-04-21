@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 145:27 - 145:32
+INFERRED_TYPE:
+  Maybe

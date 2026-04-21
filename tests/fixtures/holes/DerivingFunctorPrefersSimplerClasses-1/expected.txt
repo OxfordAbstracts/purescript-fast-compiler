@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 14:17 - 14:22
+INFERRED_TYPE:
+  MonoAndBi b0 d1

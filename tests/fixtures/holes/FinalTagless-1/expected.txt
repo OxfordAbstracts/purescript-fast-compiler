@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 21:9 - 21:14
+INFERRED_TYPE:
+  e0 Number
+SUGGESTIONS:
+  Main.three  :: Expr Number

@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 10:55 - 10:60
+INFERRED_TYPE:
+  m0 a1 -> (a1 -> m0 b2) -> m0 b2
+SUGGESTIONS:
+  bind  :: forall a b. m0 a -> (a -> ...) -> m0 b
+CONTEXT:
+  bind :: forall (a :: Type) (b :: Type). m0 a -> (a -> ...) -> m0 b
+  action :: m0 a3

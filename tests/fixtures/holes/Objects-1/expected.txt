@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 17:9 - 17:14
+INFERRED_TYPE:
+  { foo :: Number }
+SUGGESTIONS:
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+  Main.typed           :: { foo :: Number
+  }

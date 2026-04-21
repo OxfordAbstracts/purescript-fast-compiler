@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 15:36 - 15:41
+INFERRED_TYPE:
+  STRef r0 Number
+SUGGESTIONS:
+  n1  :: STRef r0 Number
+  n2  :: STRef r0 Number
+CONTEXT:
+  n1 :: STRef r0 Number
+  n2 :: STRef r0 Number
+  n1' :: Number
+  n2' :: Number

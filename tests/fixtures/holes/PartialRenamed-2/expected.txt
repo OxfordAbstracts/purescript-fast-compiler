@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 20:11 - 20:16
+INFERRED_TYPE:
+  Int -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure    :: forall @f a. Applicative f => a -> f a
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Data.Eq.eq                  :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq               :: forall a. Eq a => a -> a -> Boolean
+  Data.EuclideanRing.degree   :: forall @a. EuclideanRing a => a -> Int
+  Data.EuclideanRing.div      :: forall @a. EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.gcd      :: forall a. Eq a => EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.lcm      :: forall a. Eq a => EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.mod      :: forall @a. EuclideanRing a => a -> a -> a
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+  Data.Function.const         :: forall a b. a -> b -> a
+  Data.Functor.voidRight      :: forall f a b. Functor f => a -> f b -> f a
+  Data.HeytingAlgebra.ff      :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt      :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty          :: forall @m. Monoid m => m

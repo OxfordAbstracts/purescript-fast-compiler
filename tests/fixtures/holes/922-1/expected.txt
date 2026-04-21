@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 16:9 - 16:14
+INFERRED_TYPE:
+  I a0
+SUGGESTIONS:
+  Main.def  :: forall @a. Default a => a

@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 59:10 - 59:15
+INFERRED_TYPE:
+  b0 -> { foo :: a1 | r2 } -> { foo :: b0 | r2 }
+SUGGESTIONS:
+  Main.setFoo  :: forall a b r.
+  b
+  -> { foo :: a
+  | r
+  }
+  -> { foo :: b
+  | r
+  }

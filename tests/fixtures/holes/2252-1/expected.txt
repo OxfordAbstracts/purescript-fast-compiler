@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 11:5 - 11:10
+INFERRED_TYPE:
+  T a1
+SUGGESTIONS:
+  Main.t  :: forall a. T a
+  Main.T  :: forall @a. T a

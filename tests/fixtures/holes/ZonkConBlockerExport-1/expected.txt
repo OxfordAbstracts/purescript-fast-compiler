@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 14:10 - 14:15
+INFERRED_TYPE:
+  ProgramType
+SUGGESTIONS:
+  Main.mkTalk          :: ProgramType
+  DataModule.Poster    :: ProgramType
+  DataModule.Talk      :: ProgramType
+  DataModule.Workshop  :: ProgramType

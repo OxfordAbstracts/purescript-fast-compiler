@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 7:7 - 7:12
+INFERRED_TYPE:
+  String
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  Main.foo            :: String

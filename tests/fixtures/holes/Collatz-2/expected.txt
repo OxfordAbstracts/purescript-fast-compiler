@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 17:14 - 17:19
+INFERRED_TYPE:
+  STRef r0 Int
+SUGGESTIONS:
+  r      :: STRef r0 Int
+  count  :: STRef r0 Int
+CONTEXT:
+  n :: Int
+  r :: STRef r0 Int
+  count :: STRef r0 Int

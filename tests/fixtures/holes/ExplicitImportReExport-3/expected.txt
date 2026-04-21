@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 8:8 - 8:13
+INFERRED_TYPE:
+  Int

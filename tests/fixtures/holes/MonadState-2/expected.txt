@@ -1,0 +1,19 @@
+HOLE: test
+POSITION: 55:10 - 55:15
+INFERRED_TYPE:
+  t0 t1
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  f                        :: t1 -> t1
+  Data.DivisionRing.recip  :: forall @a. DivisionRing a => a -> a
+  Data.HeytingAlgebra.not  :: forall @a. HeytingAlgebra a => a -> a
+  Data.Ord.abs             :: forall a. Ord a => Ring a => a -> a
+  Data.Ord.signum          :: forall a. Ord a => Ring a => a -> a
+  Data.Ring.negate         :: forall a. Ring a => a -> a
+  Data.Void.absurd         :: forall a. Void -> a
+  Main.get                 :: forall @s @m. MonadState s m => m s
+  Type.Proxy.Proxy         :: forall @a. Proxy a
+CONTEXT:
+  f :: t1 -> t1
+  same :: forall (a :: Type). (a -> a) -> a -> a

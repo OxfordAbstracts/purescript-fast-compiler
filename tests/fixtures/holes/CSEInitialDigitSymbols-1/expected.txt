@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 8:18 - 8:23
+INFERRED_TYPE:
+  Proxy s0 -> String
+SUGGESTIONS:
+  Data.Monoid.mempty         :: forall @m. Monoid m => m
+  Data.Show.show             :: forall @a. Show a => a -> String
+  Data.Symbol.reflectSymbol  :: forall @sym. IsSymbol sym => Proxy sym -> String
+  Main.reflectSymbol'        :: forall s. IsSymbol s => Proxy s -> String

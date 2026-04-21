@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 13:7 - 13:12
+INFERRED_TYPE:
+  T t1
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Main.t   :: forall a. T a
+  Main.ti  :: T Int
+  Main.T   :: forall @a. T a

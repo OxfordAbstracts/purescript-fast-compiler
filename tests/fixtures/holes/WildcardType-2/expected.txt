@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 12:14 - 12:19
+INFERRED_TYPE:
+  (t0 -> String) -> String
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  Main.f1             :: forall t14. (Int -> t14) -> t14
+  Main.f2             :: forall t3. t3 -> String

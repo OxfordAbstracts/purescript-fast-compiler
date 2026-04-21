@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 41:14 - 41:19
+INFERRED_TYPE:
+  Proxy i30
+SUGGESTIONS:
+  Main.Proxy  :: forall @a. Proxy a

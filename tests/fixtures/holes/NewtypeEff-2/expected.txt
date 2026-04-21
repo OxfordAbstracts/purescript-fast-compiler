@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 22:33 - 22:38
+INFERRED_TYPE:
+  T b0 -> Effect b0
+SUGGESTIONS:
+  Main.runT  :: forall a. T a -> Effect a
+CONTEXT:
+  t :: Effect a1
+  f :: a1 -> T b0
+  x :: a1

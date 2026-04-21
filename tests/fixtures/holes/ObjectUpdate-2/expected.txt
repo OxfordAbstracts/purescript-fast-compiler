@@ -1,0 +1,41 @@
+HOLE: test
+POSITION: 22:9 - 22:14
+INFERRED_TYPE:
+  { foo :: String } -> { foo :: String | t0 }
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.HeytingAlgebra.ff     :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt     :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty         :: forall @m. Monoid m => m
+  Data.Semiring.one          :: forall @a. Semiring a => a
+  Data.Semiring.zero         :: forall @a. Semiring a => a
+  Main.inferPolyUpdate       :: forall t36 t37.
+  { foo :: t37
+  | t36
+  }
+  -> { foo :: String
+  | t36
+  }
+  Main.polyUpdate            :: forall a r.
+  { foo :: a
+  | r
+  }
+  -> { foo :: String
+  | r
+  }
+  Main.update1               :: forall t8 t9.
+  { foo :: t9
+  | t8
+  }
+  -> { foo :: String
+  | t8
+  }
+  Main.update2               :: forall r.
+  { foo :: String
+  | r
+  }
+  -> { foo :: String
+  | r
+  }

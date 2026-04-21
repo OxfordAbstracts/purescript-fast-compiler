@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 29:9 - 29:14
+INFERRED_TYPE:
+  Effect

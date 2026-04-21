@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 19:11 - 19:16
+INFERRED_TYPE:
+  Proxy Int -> String
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  Main.showP          :: forall @a. ShowP a => a -> String

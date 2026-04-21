@@ -1,0 +1,24 @@
+HOLE: test
+POSITION: 7:18 - 7:23
+INFERRED_TYPE:
+  t0
+CONSTRAINTS:
+  where t1 is an unknown type
+SUGGESTIONS:
+  n                           :: t1
+  Data.Boolean.otherwise      :: Boolean
+  Data.Function.apply         :: forall a b. (a -> b) -> a -> b
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+  Data.Function.applyN        :: forall a. (a -> a) -> Int -> a -> a
+  Data.Function.const         :: forall a b. a -> b -> a
+  Data.Function.flip          :: forall a b c. (a -> b -> c) -> b -> a -> c
+  Data.Function.on            :: forall a b c. (b -> b -> c) -> (a -> b) -> a -> ...
+  Data.Ordering.invert        :: Ordering -> Ordering
+  Data.Symbol.reifySymbol     :: forall r. String -> (forall sym. ...) -> r
+  Data.Unit.unit              :: Unit
+  Data.Void.absurd            :: forall a. Void -> a
+  Effect.forE                 :: Int -> Int -> (Int -> ...) -> Effect Unit
+  Effect.foreachE             :: forall a. Array a -> (a -> ...) -> Effect Unit
+  Effect.untilE               :: Effect Boolean -> Effect Unit
+CONTEXT:
+  n :: t1

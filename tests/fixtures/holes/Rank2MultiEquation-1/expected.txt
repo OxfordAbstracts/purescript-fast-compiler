@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 14:26 - 14:31
+INFERRED_TYPE:
+  Tree a0
+SUGGESTIONS:
+  l  :: Tree a0
+  r  :: Tree a0
+CONTEXT:
+  f :: forall (x :: Type). x -> x
+  l :: Tree a0
+  r :: Tree a0

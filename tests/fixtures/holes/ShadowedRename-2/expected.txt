@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 9:23 - 9:28
+INFERRED_TYPE:
+  Unit -> Number
+CONSTRAINTS:
+  where t1 is an unknown type
+SUGGESTIONS:
+  foo                 :: t0
+  foo_1               :: t1 -> t0
+  Data.Semiring.one   :: forall @a. Semiring a => a
+  Data.Semiring.zero  :: forall @a. Semiring a => a
+  Main.foo            :: t0 -> Number
+CONTEXT:
+  foo :: t0
+  foo_1 :: t1 -> t0

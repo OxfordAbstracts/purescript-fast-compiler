@@ -1,0 +1,19 @@
+HOLE: test
+POSITION: 11:5 - 11:10
+INFERRED_TYPE:
+  Proxy Proxy -> t1
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure    :: forall @f a. Applicative f => a -> f a
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+  Data.Function.const         :: forall a b. a -> b -> a
+  Data.Functor.voidRight      :: forall f a b. Functor f => a -> f b -> f a
+  Data.HeytingAlgebra.ff      :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt      :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty          :: forall @m. Monoid m => m
+  Data.Semiring.one           :: forall @a. Semiring a => a
+  Data.Semiring.zero          :: forall @a. Semiring a => a
+  Main.fproxy                 :: forall f a. Proxy f -> Proxy a -> Proxy ...
+  Main.F                      :: forall @f @a. f a -> F f a

@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 11:9 - 11:14
+INFERRED_TYPE:
+  b0
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+CONTEXT:
+  l :: a1 -> b0
+  r :: a1 -> b0

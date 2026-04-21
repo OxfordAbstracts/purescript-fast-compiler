@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 49:21 - 49:26
+INFERRED_TYPE:
+  { a :: String , arrayIgnore :: Array Int , fIgnore :: Array Int , fa :: Array String , ignore :: Int , zArrayA :: Array String }
+SUGGESTIONS:
+  Main.recordValue  :: { a :: String
+  , arrayIgnore :: Array Int
+  , fIgnore :: Array Int
+  , fa :: Array String
+  , ignore :: Int
+  , zArrayA :: Array String
+  }

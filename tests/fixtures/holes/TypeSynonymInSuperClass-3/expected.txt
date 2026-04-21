@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 13:38 - 13:43
+INFERRED_TYPE:
+  Boolean

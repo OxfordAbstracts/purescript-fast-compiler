@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 13:11 - 13:16
+INFERRED_TYPE:
+  Free TestF a0 -> Boolean
+SUGGESTIONS:
+  go                      :: forall b. Free TestF b -> Boolean
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Main.hasOnly            :: forall a. Free TestF a -> Boolean
+CONTEXT:
+  go :: forall (b :: Type). Free TestF b -> Boolean

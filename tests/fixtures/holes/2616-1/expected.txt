@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 9:13 - 9:18
+INFERRED_TYPE:
+  { x :: a0 | r1 }
+SUGGESTIONS:
+  x  :: { x :: a0
+  | r1
+  }
+CONTEXT:
+  x :: { x :: a0
+  | r1
+  }

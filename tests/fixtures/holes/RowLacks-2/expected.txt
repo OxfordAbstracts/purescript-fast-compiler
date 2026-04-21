@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 31:9 - 31:14
+INFERRED_TYPE:
+  Proxy sym1 -> Proxy ()
+SUGGESTIONS:
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.lacksSym           :: forall sym to. Lacks sym to => Proxy sym -> Proxy to
+  Main.test4              :: forall sym. Proxy sym -> Proxy ()

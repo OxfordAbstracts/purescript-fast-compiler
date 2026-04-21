@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 47:17 - 47:22
+INFERRED_TYPE:
+  r20

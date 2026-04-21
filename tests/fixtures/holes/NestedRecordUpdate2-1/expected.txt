@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 31:19 - 31:24
+INFERRED_TYPE:
+  { inner :: { x :: Int | r0 } | r0 }
+SUGGESTIONS:
+  rec  :: { inner :: { x :: Int
+  | r0
+  }
+  | r0
+  }
+CONTEXT:
+  rec :: { inner :: { x :: Int
+  | r0
+  }
+  | r0
+  }

@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 9:8 - 9:13
+INFERRED_TYPE:
+  Effect Boolean
+SUGGESTIONS:
+  Main.doIt  :: Effect Boolean

@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 216:22 - 216:27
+INFERRED_TYPE:
+  Foreign1 NTString1 (Phantom2 Int) -> Foreign1 String (Phantom2 Boolean)
+SUGGESTIONS:
+  Main.foreign1ToForeign1     :: Foreign1 NTString1 (Phantom2 Int) -> Foreign1 String (Phantom2 Boolean)
+  Main.symm                   :: forall a b. Coercible a b => b -> a
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

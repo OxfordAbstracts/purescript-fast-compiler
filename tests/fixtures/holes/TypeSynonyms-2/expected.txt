@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 14:36 - 14:41
+INFERRED_TYPE:
+  { get :: a0 -> b1 | t2 }
+SUGGESTIONS:
+  l1  :: { get :: a0 -> b1
+  , set :: a0 -> b1 -> a0
+  }
+CONTEXT:
+  l1 :: { get :: a0 -> b1
+  , set :: a0 -> b1 -> a0
+  }
+  l2 :: { get :: b1 -> c3
+  , set :: b1 -> c3 -> b1
+  }
+  a :: a0
+  c :: c3

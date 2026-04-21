@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 16:25 - 16:30
+INFERRED_TYPE:
+  (Partial => a0) -> a0
+SUGGESTIONS:
+  Main._otherDischargePartial  :: forall a b. a -> b
+  Main.otherDischargePartial   :: forall a. (Partial => a) -> a

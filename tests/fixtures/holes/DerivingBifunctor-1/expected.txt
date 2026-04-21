@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 26:8 - 26:13
+INFERRED_TYPE:
+  String -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure      :: forall @f a. Applicative f => a -> f a
+  Control.Biapplicative.bipure  :: forall @w a b. Biapplicative w => a -> b -> w a b
+  Control.Category.identity     :: forall @a t. Category a => a t t
+  Data.Either.fromLeft          :: forall a b. a -> Either a b -> a
+  Data.Either.fromRight         :: forall a b. b -> Either a b -> b
+  Data.Either.note              :: forall a b. a -> Maybe b -> Either a b
+  Data.Eq.eq                    :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq                 :: forall a. Eq a => a -> a -> Boolean
+  Data.Foldable.elem            :: forall a f. Foldable f => Eq a => a -> f a -> Boolean
+  Data.Foldable.intercalate     :: forall f m. Foldable f => Monoid m => m -> f m -> m
+  Data.Foldable.lookup          :: forall a b f. Foldable f => Eq a => a -> f ... -> Maybe b
+  Data.Foldable.notElem         :: forall a f. Foldable f => Eq a => a -> f a -> Boolean
+  Data.Foldable.surround        :: forall f m. Foldable f => Semigroup m => m -> f m -> m
+  Data.Foldable.surroundMap     :: forall f a m. Foldable f => Semigroup m => m -> (a -> m) -> ... -> m
+  Data.Function.applyFlipped    :: forall a b. a -> (a -> b) -> b

@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 12:10 - 12:15
+INFERRED_TYPE:
+  m0 a1 -> ListT m0 a1
+SUGGESTIONS:
+  OverlapLocalTypeShadow.Dep.lift  :: forall @t m a. MyTrans t => m a -> t m a
+  Main.ListT                       :: forall @m @a. m a -> ListT m a

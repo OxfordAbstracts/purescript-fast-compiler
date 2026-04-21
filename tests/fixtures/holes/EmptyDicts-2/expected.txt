@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 67:11 - 67:16
+INFERRED_TYPE:
+  t0 -> t0
+SUGGESTIONS:
+  bar                        :: forall t. WithArgEmpty t => t -> t
+  foo                        :: forall t. WithArgHasEmptySuper t => t -> t
+  Control.Category.identity  :: forall @a t. Category a => a t t
+CONTEXT:
+  bar :: forall (t :: Type). WithArgEmpty @Type t => t -> t
+  foo :: forall (t :: Type). WithArgHasEmptySuper t => t -> t
+  x :: t0

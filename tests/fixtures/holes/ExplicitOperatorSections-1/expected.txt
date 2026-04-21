@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 10:10 - 10:15
+INFERRED_TYPE:
+  Int -> Int
+SUGGESTIONS:
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.EuclideanRing.degree  :: forall @a. EuclideanRing a => a -> Int
+  Data.Ord.abs               :: forall a. Ord a => Ring a => a -> a
+  Data.Ord.signum            :: forall a. Ord a => Ring a => a -> a
+  Data.Ring.negate           :: forall a. Ring a => a -> a
+  Data.Semiring.one          :: forall @a. Semiring a => a
+  Data.Semiring.zero         :: forall @a. Semiring a => a
+  Main.addOne                :: Int -> Int
+  Main.named                 :: Int -> Int
+  Main.subtractOne           :: Int -> Int

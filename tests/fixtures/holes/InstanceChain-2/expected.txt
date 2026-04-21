@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 20:10 - 20:15
+INFERRED_TYPE:
+  Proxy (Array Int) -> Proxy Int
+SUGGESTIONS:
+  Main.arg  :: forall i o. Arg i o => Proxy i -> Proxy o

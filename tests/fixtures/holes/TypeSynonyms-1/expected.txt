@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 26:9 - 26:14
+INFERRED_TYPE:
+  { get :: { fst :: { fst :: a0 , snd :: b1 } , snd :: c2 } -> a0 , set :: { fst :: { fst :: a0 , snd :: b1 } , snd :: c2 } -> a0 -> { fst :: { fst :: a0 , snd :: b1 } , snd :: c2 } }
+SUGGESTIONS:
+  Main.test1  :: forall a b c. Lens (Pair (Pair a b) c) a

@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 14:19 - 14:24
+INFERRED_TYPE:
+  Unit
+SUGGESTIONS:
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Data.Unit.unit          :: Unit
+CONTEXT:
+  action :: Effect (Identity a0)
+  x :: a0

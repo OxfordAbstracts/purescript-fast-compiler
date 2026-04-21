@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 28:17 - 28:22
+INFERRED_TYPE:
+  MonoAndPro a0 d1

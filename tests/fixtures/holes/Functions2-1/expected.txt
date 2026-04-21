@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 11:15 - 11:20
+INFERRED_TYPE:
+  String -> Record () -> String
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.Function.const       :: forall a b. a -> b -> a
+  Data.Monoid.mempty        :: forall @m. Monoid m => m
+  Main.test                 :: forall a b. a -> b -> a
+  Record.Unsafe.unsafeGet   :: forall r a. String -> Record r -> a

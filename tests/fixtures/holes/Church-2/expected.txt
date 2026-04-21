@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 14:24 - 14:29
+INFERRED_TYPE:
+  r0 -> (a1 -> r0 -> r0) -> r0
+SUGGESTIONS:
+  l1                        :: forall r. r -> (a1 -> ...) -> r
+  l2                        :: forall r. r -> (a1 -> ...) -> r
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.Function.const       :: forall a b. a -> b -> a
+  Main.empty                :: forall a r. r -> (a -> ...) -> r
+CONTEXT:
+  l1 :: forall (r :: Type). r -> (a1 -> ...) -> r
+  l2 :: forall (r :: Type). r -> (a1 -> ...) -> r
+  r :: r0
+  f :: a1 -> r0 -> r0

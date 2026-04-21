@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 14:10 - 14:15
+INFERRED_TYPE:
+  Effect Boolean
+SUGGESTIONS:
+  Main.doIt      :: Effect Boolean
+  Main.set       :: Effect Boolean
+  Partial.crash  :: forall a. Partial => a

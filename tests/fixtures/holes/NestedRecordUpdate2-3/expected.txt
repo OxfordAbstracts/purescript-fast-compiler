@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 30:93 - 30:98
+INFERRED_TYPE:
+  r0

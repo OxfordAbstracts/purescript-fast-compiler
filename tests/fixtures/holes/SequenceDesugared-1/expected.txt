@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 27:18 - 27:23
+INFERRED_TYPE:
+  Sequence List
+SUGGESTIONS:
+  Main.sequenceList     :: Sequence List
+  Main.sequenceList'    :: Sequence List
+  Main.sequenceList''   :: Sequence List
+  Main.sequenceList'''  :: Sequence List

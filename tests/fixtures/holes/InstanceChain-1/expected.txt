@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 65:15 - 65:20
+INFERRED_TYPE:
+  Proxy True
+SUGGESTIONS:
+  Main.isEqEg0      :: Proxy True
+  Main.isEqEg1      :: Proxy True
+  Main.isStringEg0  :: Proxy True
+  Main.Proxy        :: forall @p. Proxy p

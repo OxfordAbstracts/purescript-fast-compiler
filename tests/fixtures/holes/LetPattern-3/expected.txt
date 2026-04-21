@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 53:24 - 53:29
+INFERRED_TYPE:
+  Effect Boolean
+SUGGESTIONS:
+  Main.patternDoArray               :: Effect Boolean
+  Main.patternDoData                :: Effect Boolean
+  Main.patternDoDataIgnored         :: Effect Boolean
+  Main.patternDoMultiple            :: Effect Boolean
+  Main.patternDoMultipleWithNormal  :: Effect Boolean
+  Main.patternDoNewtype             :: Effect Boolean
+  Main.patternDoSimple              :: Effect Boolean
+  Main.patternDoWithInfixOp         :: Effect Boolean
+  Main.patternDoWithNamedBinder     :: Effect Boolean
+  Main.patternDoWithParens          :: Effect Boolean

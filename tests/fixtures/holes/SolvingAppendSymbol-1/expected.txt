@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 19:8 - 19:13
+INFERRED_TYPE:
+  Proxy "AB"
+SUGGESTIONS:
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.egAB               :: Proxy "AB"
+  Type.Proxy.Proxy        :: forall @a. Proxy a

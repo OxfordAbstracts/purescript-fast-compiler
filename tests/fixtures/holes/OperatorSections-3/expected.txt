@@ -1,0 +1,24 @@
+HOLE: test
+POSITION: 16:21 - 16:26
+INFERRED_TYPE:
+  { x :: t0 }
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  foo                     :: { x :: Number
+  }
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+CONTEXT:
+  foo :: { x :: Number
+  }
+  div :: { x :: Number
+  }
+  -> { x :: Number
+  }
+  -> Number

@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 8:6 - 8:11
+INFERRED_TYPE:
+  Record

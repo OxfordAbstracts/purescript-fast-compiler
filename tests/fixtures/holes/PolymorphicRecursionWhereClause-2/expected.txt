@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 18:47 - 18:52
+INFERRED_TYPE:
+  Free TestF t0
+SUGGESTIONS:
+  inner  :: Free TestF Int
+  rest   :: Free TestF b1
+CONTEXT:
+  go :: forall (b :: Type). Free TestF b -> Boolean
+  inner :: Free TestF Int
+  rest :: Free TestF b1

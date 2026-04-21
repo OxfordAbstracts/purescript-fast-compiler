@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 17:13 - 17:18
+INFERRED_TYPE:
+  Foo -> Int -> Boolean -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Main.what  :: Foo -> Int -> Boolean -> Foo

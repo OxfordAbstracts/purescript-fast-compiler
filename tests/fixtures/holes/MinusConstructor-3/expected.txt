@@ -1,0 +1,21 @@
+HOLE: test
+POSITION: 21:25 - 21:30
+INFERRED_TYPE:
+  Int
+CONSTRAINTS:
+  where t2 is an unknown type
+SUGGESTIONS:
+  a                    :: t0
+  b                    :: t1
+  c                    :: t2
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+  Main.test2           :: Int
+  Main.test4           :: Int
+  Main.test5           :: Int
+CONTEXT:
+  a :: t0
+  b :: t1
+  c :: t2

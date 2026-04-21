@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 41:54 - 41:59
+INFERRED_TYPE:
+  FVect (S (S (S (S (S Z))))) Int
+SUGGESTIONS:
+  Main.fexample  :: FVect (S (S (S ...))) Int

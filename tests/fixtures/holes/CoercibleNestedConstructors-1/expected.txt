@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 29:3 - 29:8
+INFERRED_TYPE:
+  Pair Int (Array String)
+CONTEXT:
+  x :: Pair (Id Int) (Array N)

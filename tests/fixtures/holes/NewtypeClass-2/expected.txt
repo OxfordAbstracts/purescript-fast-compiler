@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 12:8 - 12:13
+INFERRED_TYPE:
+  a0 -> t1
+SUGGESTIONS:
+  Main.wrap                   :: forall t a. Newtype t a => a -> t
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b

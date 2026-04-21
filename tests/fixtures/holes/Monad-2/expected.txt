@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 26:18 - 26:23
+INFERRED_TYPE:
+  Number
+SUGGESTIONS:
+  n1                   :: Number
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+CONTEXT:
+  m :: { bind :: forall (a :: Type) (b :: Type). m0 a -> ... -> ...
+  , return :: forall (a :: Type). a -> m0 a
+  }
+  n1 :: Number
+  n2 :: String

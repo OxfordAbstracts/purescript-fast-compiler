@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 14:16 - 14:21
+INFERRED_TYPE:
+  (a0 -> m1) -> Array a0 -> m1
+SUGGESTIONS:
+  Main.foldMap  :: forall a m. Semigroup m => (a -> m) -> Array a -> m
+CONTEXT:
+  f :: a0 -> m1
+  xs :: Array a0

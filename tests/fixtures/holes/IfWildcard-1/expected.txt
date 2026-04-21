@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 18:14 - 18:19
+INFERRED_TYPE:
+  Boolean -> Int -> Int -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Main.cond  :: forall a. Boolean -> a -> a -> a
+CONTEXT:
+  tmp1 :: Foo

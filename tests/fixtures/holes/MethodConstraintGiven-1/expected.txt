@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 20:36 - 20:41
+INFERRED_TYPE:
+  Wrapper b0
+CONTEXT:
+  f :: a1 -> b0
+  a :: a1

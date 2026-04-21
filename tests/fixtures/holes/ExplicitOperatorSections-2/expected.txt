@@ -1,0 +1,18 @@
+HOLE: test
+POSITION: 13:9 - 13:22
+INFERRED_TYPE:
+  Int -> Int -> Int
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.EuclideanRing.div    :: forall @a. EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.gcd    :: forall a. Eq a => EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.lcm    :: forall a. Eq a => EuclideanRing a => a -> a -> a
+  Data.EuclideanRing.mod    :: forall @a. EuclideanRing a => a -> a -> a
+  Data.Function.const       :: forall a b. a -> b -> a
+  Data.Ord.max              :: forall a. Ord a => a -> a -> a
+  Data.Ord.min              :: forall a. Ord a => a -> a -> a
+  Data.Ring.sub             :: forall @a. Ring a => a -> a -> a
+  Data.Semiring.add         :: forall @a. Semiring a => a -> a -> a
+  Data.Semiring.mul         :: forall @a. Semiring a => a -> a -> a
+  Data.Semiring.one         :: forall @a. Semiring a => a
+  Data.Semiring.zero        :: forall @a. Semiring a => a

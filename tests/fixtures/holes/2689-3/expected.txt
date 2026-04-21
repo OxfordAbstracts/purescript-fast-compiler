@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 8:16 - 8:21
+INFERRED_TYPE:
+  Int -> Int
+SUGGESTIONS:
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Data.EuclideanRing.degree   :: forall @a. EuclideanRing a => a -> Int
+  Data.Ord.abs                :: forall a. Ord a => Ring a => a -> a
+  Data.Ord.signum             :: forall a. Ord a => Ring a => a -> a
+  Data.Ring.negate            :: forall a. Ring a => a -> a
+  Data.Semiring.one           :: forall @a. Semiring a => a
+  Data.Semiring.zero          :: forall @a. Semiring a => a
+  Partial.crash               :: forall a. Partial => a
+  Safe.Coerce.coerce          :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+CONTEXT:
+  go :: (Int -> Int) -> Int -> Int -> Int

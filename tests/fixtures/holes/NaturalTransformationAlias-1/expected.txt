@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 18:22 - 18:27
+INFERRED_TYPE:
+  Box (b0 Int)
+CONTEXT:
+  nat :: forall (a0 :: Type). a1 a0 -> b0 a0
+  x :: a1 Int

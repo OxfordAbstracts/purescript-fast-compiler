@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 8:17 - 8:22
+INFERRED_TYPE:
+  NatProxy (Succ (Succ (Succ Zero)))
+SUGGESTIONS:
+  Main.proxy1Add2Is3         :: NatProxy N3
+  ForeignKinds.Lib.NatProxy  :: forall @t. NatProxy t

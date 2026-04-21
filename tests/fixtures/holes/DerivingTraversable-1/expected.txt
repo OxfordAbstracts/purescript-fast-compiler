@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 49:15 - 49:20
+INFERRED_TYPE:
+  f0 (Array String) -> Array (f0 String)
+SUGGESTIONS:
+  Data.Monoid.mempty                :: forall @m. Monoid m => m
+  Data.Traversable.sequence         :: forall @t a m. Traversable t => Applicative m => t (m a) -> m (t a)
+  Data.Traversable.sequenceDefault  :: forall t a m. Traversable t => Applicative m => t (m a) -> m (t a)
+  Main.sequenceStr                  :: forall f. Traversable f => f (Array String) -> Array (f String)
+  Unsafe.Coerce.unsafeCoerce        :: forall a b. a -> b

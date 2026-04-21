@@ -1,0 +1,18 @@
+HOLE: test
+POSITION: 35:11 - 35:16
+INFERRED_TYPE:
+  Number -> Number
+SUGGESTIONS:
+  go                         :: Number -> Number
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.DivisionRing.recip    :: forall @a. DivisionRing a => a -> a
+  Data.Ord.abs               :: forall a. Ord a => Ring a => a -> a
+  Data.Ord.signum            :: forall a. Ord a => Ring a => a -> a
+  Data.Ring.negate           :: forall a. Ring a => a -> a
+  Data.Semiring.one          :: forall @a. Semiring a => a
+  Data.Semiring.zero         :: forall @a. Semiring a => a
+  Main.test1                 :: Number -> Number
+  Main.test7                 :: Number -> Number
+CONTEXT:
+  x :: Number
+  go :: Number -> Number

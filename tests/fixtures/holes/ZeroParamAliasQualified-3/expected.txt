@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 11:9 - 11:14
+INFERRED_TYPE:
+  T Int t0 Boolean
+CONSTRAINTS:
+  where t0 is an unknown type

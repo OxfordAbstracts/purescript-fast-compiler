@@ -1,0 +1,20 @@
+HOLE: test
+POSITION: 95:3 - 95:8
+INFERRED_TYPE:
+  String -> Effect Unit
+SUGGESTIONS:
+  Data.Monoid.mempty             :: forall @m. Monoid m => m
+  Effect.Console.debug           :: String -> Effect Unit
+  Effect.Console.debugShow       :: forall a. Show a => a -> Effect Unit
+  Effect.Console.error           :: String -> Effect Unit
+  Effect.Console.errorShow       :: forall a. Show a => a -> Effect Unit
+  Effect.Console.group           :: String -> Effect Unit
+  Effect.Console.groupCollapsed  :: String -> Effect Unit
+  Effect.Console.info            :: String -> Effect Unit
+  Effect.Console.infoShow        :: forall a. Show a => a -> Effect Unit
+  Effect.Console.log             :: String -> Effect Unit
+  Effect.Console.logShow         :: forall a. Show a => a -> Effect Unit
+  Effect.Console.time            :: String -> Effect Unit
+  Effect.Console.timeEnd         :: String -> Effect Unit
+  Effect.Console.timeLog         :: String -> Effect Unit
+  Effect.Console.warn            :: String -> Effect Unit

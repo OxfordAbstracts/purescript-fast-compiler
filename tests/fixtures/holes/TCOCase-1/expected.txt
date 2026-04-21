@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 11:12 - 11:17
+INFERRED_TYPE:
+  Number -> Data -> Data
+SUGGESTIONS:
+  to  :: Number -> Data -> Data
+CONTEXT:
+  to :: Number -> Data -> Data
+  n :: Number
+  a :: Data
+  from :: Data -> String

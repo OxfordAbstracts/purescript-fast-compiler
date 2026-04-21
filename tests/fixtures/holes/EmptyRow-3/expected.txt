@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 8:9 - 8:14
+INFERRED_TYPE:
+  Foo

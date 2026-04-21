@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 19:8 - 19:13
+INFERRED_TYPE:
+  I String
+SUGGESTIONS:
+  Main.def  :: forall @a. Default a => a

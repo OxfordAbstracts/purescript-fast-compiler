@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 11:3 - 11:8
+INFERRED_TYPE:
+  String -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure    :: forall @f a. Applicative f => a -> f a
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Data.Eq.eq                  :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq               :: forall a. Eq a => a -> a -> Boolean
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+  Data.Function.const         :: forall a b. a -> b -> a
+  Data.Functor.voidRight      :: forall f a b. Functor f => a -> f b -> f a
+  Data.HeytingAlgebra.ff      :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt      :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty          :: forall @m. Monoid m => m
+  Data.Monoid.power           :: forall m. Monoid m => m -> Int -> m
+  Data.Ord.between            :: forall a. Ord a => a -> a -> a -> Boolean
+  Data.Ord.clamp              :: forall a. Ord a => a -> a -> a -> a
+  Data.Ord.compare            :: forall @a. Ord a => a -> a -> Ordering
+  Data.Ord.greaterThan        :: forall a. Ord a => a -> a -> Boolean

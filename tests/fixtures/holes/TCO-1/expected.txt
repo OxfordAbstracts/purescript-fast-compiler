@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 18:38 - 18:43
+INFERRED_TYPE:
+  Array t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  largeArray            :: Array Int
+  Control.Plus.empty    :: forall @f a. Plus f => f a
+  Data.Monoid.mempty    :: forall @m. Monoid m => m
+  Data.Unfoldable.none  :: forall f a. Unfoldable f => f a
+  Partial.crash         :: forall a. Partial => a
+CONTEXT:
+  f :: Int -> Int
+  v :: Int
+  largeArray :: Array Int

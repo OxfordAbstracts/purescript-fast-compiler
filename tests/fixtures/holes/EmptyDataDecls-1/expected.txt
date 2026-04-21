@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 16:25 - 16:30
+INFERRED_TYPE:
+  ArrayBox (S n1) a2
+CONTEXT:
+  x :: a2
+  xs :: Array a2

@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 15:8 - 15:13
+INFERRED_TYPE:
+  String -> f0 String
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a

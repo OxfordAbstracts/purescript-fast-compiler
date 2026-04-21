@@ -1,0 +1,26 @@
+HOLE: test
+POSITION: 20:8 - 20:13
+INFERRED_TYPE:
+  Number -> String -> { bar :: String | t0 }
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty      :: forall @m. Monoid m => m
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.mkRecord           :: forall t1 t2.
+  t1
+  -> t2
+  -> { bar :: t2
+  , baz :: String
+  , foo :: t1
+  }
+CONTEXT:
+  obj :: { value :: Boolean
+  }
+  x :: Number
+  point :: { x :: Number
+  , y :: Number
+  }

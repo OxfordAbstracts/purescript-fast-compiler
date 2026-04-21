@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 13:10 - 13:15
+INFERRED_TYPE:
+  Baz
+CONTEXT:
+  x :: a0

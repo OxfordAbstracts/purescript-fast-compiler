@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 14:15 - 14:20
+INFERRED_TYPE:
+  Maybe b0
+SUGGESTIONS:
+  Main.Nothing  :: forall @a. Maybe a

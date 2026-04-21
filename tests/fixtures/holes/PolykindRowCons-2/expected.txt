@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 45:9 - 45:14
+INFERRED_TYPE:
+  Proxy Identity
+SUGGESTIONS:
+  Main.lookup5  :: Proxy Identity
+  Main.test5    :: Proxy Identity
+  Main.Proxy    :: forall @a. Proxy a

@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 14:5 - 14:10
+INFERRED_TYPE:
+  Data_Unit
+SUGGESTIONS:
+  Main.n  :: Data_Unit

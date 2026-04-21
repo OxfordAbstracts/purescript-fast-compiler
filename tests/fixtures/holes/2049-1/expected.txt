@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 11:20 - 11:25
+INFERRED_TYPE:
+  Int
+SUGGESTIONS:
+  x                    :: Int
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+CONTEXT:
+  r :: { x :: Int
+  , y :: Int
+  }
+  x :: Int

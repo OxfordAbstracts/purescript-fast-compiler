@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 18:19 - 18:24
+INFERRED_TYPE:
+  ( x :: String )

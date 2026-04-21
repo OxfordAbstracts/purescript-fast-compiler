@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 16:25 - 16:30
+INFERRED_TYPE:
+  Odd -> Number
+SUGGESTIONS:
+  Data.Semiring.one   :: forall @a. Semiring a => a
+  Data.Semiring.zero  :: forall @a. Semiring a => a
+CONTEXT:
+  n :: Odd

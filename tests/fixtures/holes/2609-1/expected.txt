@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 9:8 - 9:13
+INFERRED_TYPE:
+  Foo'
+SUGGESTIONS:
+  Main.bar'  :: Foo'

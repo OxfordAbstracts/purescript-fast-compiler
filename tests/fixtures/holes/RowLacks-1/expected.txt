@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 28:9 - 28:14
+INFERRED_TYPE:
+  Proxy ()
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.Bounded.bottom     :: forall @a. Bounded a => a
+  Data.Bounded.top        :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff  :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt  :: forall @a. HeytingAlgebra a => a
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.test1              :: Proxy ()
+  Main.test3              :: Proxy ()
+  Type.Proxy.Proxy        :: forall @a. Proxy a

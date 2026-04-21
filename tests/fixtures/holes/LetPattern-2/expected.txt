@@ -1,0 +1,20 @@
+HOLE: test
+POSITION: 180:40 - 180:45
+INFERRED_TYPE:
+  Boolean
+SUGGESTIONS:
+  Data.Boolean.otherwise          :: Boolean
+  Data.Bounded.bottom             :: forall @a. Bounded a => a
+  Data.Bounded.top                :: forall @a. Bounded a => a
+  Data.HeytingAlgebra.ff          :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt          :: forall @a. HeytingAlgebra a => a
+  Main.patternArray               :: Boolean
+  Main.patternData                :: Boolean
+  Main.patternDataIgnored         :: Boolean
+  Main.patternMultiple            :: Boolean
+  Main.patternMultipleWithNormal  :: Boolean
+  Main.patternNewtype             :: Boolean
+  Main.patternSimple              :: Boolean
+  Main.patternWithInfixOp         :: Boolean
+  Main.patternWithNamedBinder     :: Boolean
+  Main.patternWithParens          :: Boolean

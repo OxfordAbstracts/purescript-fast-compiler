@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 18:8 - 18:13
+INFERRED_TYPE:
+  m0 Int
+CONTEXT:
+  n :: Int

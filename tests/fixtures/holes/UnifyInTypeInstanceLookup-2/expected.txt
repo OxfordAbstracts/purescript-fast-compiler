@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 19:10 - 19:15
+INFERRED_TYPE:
+  a0 -> b1
+SUGGESTIONS:
+  Main.spin  :: forall a b. a -> b
+CONTEXT:
+  a :: a0

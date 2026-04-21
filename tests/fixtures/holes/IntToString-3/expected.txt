@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 17:16 - 17:21
+INFERRED_TYPE:
+  Proxy

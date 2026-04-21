@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 31:59 - 31:64
+INFERRED_TYPE:
+  Proxy
+CONSTRAINTS:
+  where t0 is an unknown type

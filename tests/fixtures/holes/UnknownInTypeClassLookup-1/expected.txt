@@ -1,0 +1,6 @@
+HOLE: test
+POSITION: 11:12 - 11:17
+INFERRED_TYPE:
+  String
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m

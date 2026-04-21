@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 12:10 - 12:15
+INFERRED_TYPE:
+  a0 -> Maybe a0
+SUGGESTIONS:
+  Main.pure  :: forall @f a. Applicative f => a -> f a
+  Main.Just  :: forall @a. a -> Maybe a

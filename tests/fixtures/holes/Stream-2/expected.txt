@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 25:15 - 25:20
+INFERRED_TYPE:
+  String -> (t0 -> Stream String) -> Stream String
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+  Main.cons                   :: forall @el @s. IsStream el s => el -> (Unit -> s) -> s
+  Main.Stream                 :: forall @a. a -> (Unit -> ...) -> Stream a

@@ -1,0 +1,13 @@
+HOLE: test
+POSITION: 30:11 - 30:16
+INFERRED_TYPE:
+  (Int -> Boolean) -> Array Int -> Int
+SUGGESTIONS:
+  Data.Semiring.one           :: forall @a. Semiring a => a
+  Data.Semiring.zero          :: forall @a. Semiring a => a
+  Main.count                  :: forall a. (a -> Boolean) -> Array a -> Int
+  Partial.crash               :: forall a. Partial => a
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+CONTEXT:
+  x :: Int
+  y :: Int

@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 45:11 - 45:16
+INFERRED_TYPE:
+  Maybe (a0 -> b1) -> Maybe a0 -> Maybe b1
+SUGGESTIONS:
+  Control.Apply.apply  :: forall @f a b. Apply f => f (a -> b) -> f a -> f b
+  Control.Monad.ap     :: forall m a b. Monad m => m (a -> b) -> m a -> m b

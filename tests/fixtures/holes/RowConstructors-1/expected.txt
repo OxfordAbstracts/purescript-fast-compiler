@@ -1,0 +1,22 @@
+HOLE: test
+POSITION: 20:8 - 20:13
+INFERRED_TYPE:
+  { x :: Number , y :: Number , z :: Number }
+SUGGESTIONS:
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+  Main.bar             :: { x :: Number
+  , y :: Number
+  , z :: Number
+  }
+  Main.bar'            :: { x :: Number
+  , y :: Number
+  , z :: Number
+  }
+  Main.foo             :: { x :: Number
+  , y :: Number
+  , z :: Number
+  }
+  Main.foo'            :: Record Foo

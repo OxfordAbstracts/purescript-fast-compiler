@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 7:8 - 7:13
+INFERRED_TYPE:
+  Array

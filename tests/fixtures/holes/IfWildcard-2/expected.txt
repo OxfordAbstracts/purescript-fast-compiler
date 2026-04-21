@@ -1,0 +1,24 @@
+HOLE: test
+POSITION: 17:14 - 17:19
+INFERRED_TYPE:
+  Boolean -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Category.identity    :: forall @a t. Category a => a t t
+  Data.Eq.eq                   :: forall @a. Eq a => a -> a -> Boolean
+  Data.Eq.notEq                :: forall a. Eq a => a -> a -> Boolean
+  Data.Function.applyFlipped   :: forall a b. a -> (a -> b) -> b
+  Data.Function.const          :: forall a b. a -> b -> a
+  Data.HeytingAlgebra.conj     :: forall @a. HeytingAlgebra a => a -> a -> a
+  Data.HeytingAlgebra.disj     :: forall @a. HeytingAlgebra a => a -> a -> a
+  Data.HeytingAlgebra.implies  :: forall @a. HeytingAlgebra a => a -> a -> a
+  Data.HeytingAlgebra.not      :: forall @a. HeytingAlgebra a => a -> a
+  Data.Ord.between             :: forall a. Ord a => a -> a -> a -> Boolean
+  Data.Ord.clamp               :: forall a. Ord a => a -> a -> a -> a
+  Data.Ord.compare             :: forall @a. Ord a => a -> a -> Ordering
+  Data.Ord.greaterThan         :: forall a. Ord a => a -> a -> Boolean
+  Data.Ord.greaterThanOrEq     :: forall a. Ord a => a -> a -> Boolean
+  Data.Ord.lessThan            :: forall a. Ord a => a -> a -> Boolean
+CONTEXT:
+  tmp2 :: Int

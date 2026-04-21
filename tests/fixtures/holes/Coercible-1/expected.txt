@@ -1,0 +1,9 @@
+HOLE: test
+POSITION: 288:37 - 288:42
+INFERRED_TYPE:
+  MutuallyRecursiveRepresentational1 a0 -> MutuallyRecursiveRepresentational1 (Id1 a0)
+SUGGESTIONS:
+  Main.mutuallyRecursiveRepresentational  :: forall a. MutuallyRecursiveRepresentational1 a -> MutuallyRecursiveRepresentational1 (Id1 a)
+  Main.symm                               :: forall a b. Coercible a b => b -> a
+  Safe.Coerce.coerce                      :: forall a b. Coercible a b => a -> b
+  Unsafe.Coerce.unsafeCoerce              :: forall a b. a -> b

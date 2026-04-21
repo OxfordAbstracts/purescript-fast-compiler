@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 16:8 - 16:13
+INFERRED_TYPE:
+  m0 Int
+SUGGESTIONS:
+  Main.ask   :: forall @r @m. MonadAsk r m => m r
+  Main.test  :: forall m. MonadAsk t1 m => m Int

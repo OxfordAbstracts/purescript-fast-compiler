@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 10:12 - 10:17
+INFERRED_TYPE:
+  ( x :: Number , y :: Number , z :: Number )

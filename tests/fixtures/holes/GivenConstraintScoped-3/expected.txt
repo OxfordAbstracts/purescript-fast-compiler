@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 10:42 - 10:47
+INFERRED_TYPE:
+  String

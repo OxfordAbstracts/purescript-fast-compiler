@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 13:25 - 13:30
+INFERRED_TYPE:
+  (Array t0 -> Boolean) -> Array Number -> Array Number -> t1
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure  :: forall @f a. Applicative f => a -> f a
+  Data.Function.const       :: forall a b. a -> b -> a
+  Data.Functor.voidLeft     :: forall f a b. Functor f => f a -> b -> f b
+  Data.HeytingAlgebra.ff    :: forall @a. HeytingAlgebra a => a
+  Data.HeytingAlgebra.tt    :: forall @a. HeytingAlgebra a => a
+  Data.Monoid.mempty        :: forall @m. Monoid m => m
+  Data.Ord.comparing        :: forall a b. Ord b => (a -> b) -> a -> a -> Ordering
+  Data.Semiring.one         :: forall @a. Semiring a => a
+  Data.Semiring.zero        :: forall @a. Semiring a => a
+  Main.comparing            :: forall a b. Ord b => (a -> b) -> a -> a -> Ordering

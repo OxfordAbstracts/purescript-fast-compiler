@@ -1,0 +1,4 @@
+HOLE: test
+POSITION: 9:44 - 9:49
+INFERRED_TYPE:
+  a0

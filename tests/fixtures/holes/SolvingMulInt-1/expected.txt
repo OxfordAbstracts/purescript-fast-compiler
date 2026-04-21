@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 12:6 - 12:11
+INFERRED_TYPE:
+  Proxy 16
+SUGGESTIONS:
+  Main.a      :: forall n. Mul 4 4 n => Proxy n
+  Main.a'     :: Proxy 16
+  Main.Proxy  :: forall @k. Proxy k

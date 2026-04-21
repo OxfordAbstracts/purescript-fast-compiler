@@ -1,0 +1,15 @@
+HOLE: test
+POSITION: 24:24 - 24:29
+INFERRED_TYPE:
+  Int -> (Int -> Maybe Int) -> Int -> Int
+SUGGESTIONS:
+  Data.Functor.voidRight  :: forall f a b. Functor f => a -> f b -> f a
+  Data.Semiring.one       :: forall @a. Semiring a => a
+  Data.Semiring.zero      :: forall @a. Semiring a => a
+  Main.weirdsum           :: Int -> (Int -> Maybe Int) -> Int -> Int
+CONTEXT:
+  accum :: Int
+  f :: Int -> Maybe Int
+  n :: Int
+  x :: Int
+  y :: Int

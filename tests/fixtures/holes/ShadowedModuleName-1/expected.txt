@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 8:13 - 8:18
+INFERRED_TYPE:
+  Z -> String
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  Test.runZ           :: Z -> String

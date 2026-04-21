@@ -1,0 +1,12 @@
+HOLE: test
+POSITION: 10:9 - 10:14
+INFERRED_TYPE:
+  String -> String
+SUGGESTIONS:
+  go                         :: String -> String
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Data.Monoid.mempty         :: forall @m. Monoid m => m
+  Data.Show.show             :: forall @a. Show a => a -> String
+  Main.foo                   :: forall @a. Foo a => a -> String
+CONTEXT:
+  go :: String -> String

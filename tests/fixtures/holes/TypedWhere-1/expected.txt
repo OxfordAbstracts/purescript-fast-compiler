@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 16:28 - 16:33
+INFERRED_TYPE:
+  L (E a0 t1)
+SUGGESTIONS:
+  rest    :: L (E a0 b2)
+  Main.N  :: forall @a. L a
+CONTEXT:
+  go :: forall (a :: Type) (b :: Type). L a -> L ... -> L a
+  ls :: L a0
+  rest :: L (E a0 b2)

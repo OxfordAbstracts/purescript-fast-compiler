@@ -1,0 +1,11 @@
+HOLE: test
+POSITION: 11:13 - 11:18
+INFERRED_TYPE:
+  Foo -> t0
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  A.foo                       :: Foo -> Foo
+  Control.Category.identity   :: forall @a t. Category a => a t t
+  Data.Function.applyFlipped  :: forall a b. a -> (a -> b) -> b
+  Data.Function.const         :: forall a b. a -> b -> a

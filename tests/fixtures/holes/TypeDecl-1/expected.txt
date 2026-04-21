@@ -1,0 +1,10 @@
+HOLE: test
+POSITION: 11:17 - 11:22
+INFERRED_TYPE:
+  a0
+SUGGESTIONS:
+  a  :: a0
+CONTEXT:
+  n :: Number
+  f :: a0 -> a0
+  a :: a0

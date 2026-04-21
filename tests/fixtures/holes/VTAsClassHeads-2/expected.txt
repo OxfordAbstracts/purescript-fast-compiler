@@ -1,0 +1,16 @@
+HOLE: test
+POSITION: 179:3 - 179:8
+INFERRED_TYPE:
+  Maybe String -> Effect (Maybe String)
+SUGGESTIONS:
+  Control.Applicative.pure    :: forall @f a. Applicative f => a -> f a
+  Data.Monoid.mempty          :: forall @m. Monoid m => m
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+CONTEXT:
+  test1a :: Boolean
+  test1b :: Boolean
+  test1c :: Boolean
+  test2a :: Boolean
+  test2b :: Boolean
+  test2c :: Boolean
+  passes :: Boolean

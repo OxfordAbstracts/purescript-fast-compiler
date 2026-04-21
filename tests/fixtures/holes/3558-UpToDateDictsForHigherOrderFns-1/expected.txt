@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 18:16 - 18:21
+INFERRED_TYPE:
+  LBox row1 a2 -> LBox row1 a2
+SUGGESTIONS:
+  Control.Category.identity  :: forall @a t. Category a => a t t
+  Main.lboxIdentity          :: forall row a. LBox row a -> LBox row a

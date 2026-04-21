@@ -1,0 +1,8 @@
+HOLE: test
+POSITION: 52:20 - 52:25
+INFERRED_TYPE:
+  Maybe
+CONSTRAINTS:
+  where t0 is an unknown type
+CONTEXT:
+  mx :: Maybe t0

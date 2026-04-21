@@ -1,0 +1,7 @@
+HOLE: test
+POSITION: 9:31 - 9:36
+INFERRED_TYPE:
+  c0
+CONTEXT:
+  g :: b1 -> c0
+  y :: b1

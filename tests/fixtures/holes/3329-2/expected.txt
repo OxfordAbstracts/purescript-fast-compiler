@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 32:33 - 32:38
+INFERRED_TYPE:
+  t0 -> Either t0 t1
+CONSTRAINTS:
+  where t0 is an unknown type
+SUGGESTIONS:
+  Control.Applicative.pure    :: forall @f a. Applicative f => a -> f a
+  Data.Void.absurd            :: forall a. Void -> a
+  Main.inj                    :: forall @f @g. Inject f g => f -> g
+  Main.injL                   :: forall f g. f -> Either f g
+  Unsafe.Coerce.unsafeCoerce  :: forall a b. a -> b
+  Data.Either.Left            :: forall @a @b. a -> Either a b
+  Data.Either.Right           :: forall @a @b. b -> Either a b
+CONTEXT:
+  a :: t0
+  testInjLWithUnknowns :: t0 -> t0

@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 9:8 - 9:13
+INFERRED_TYPE:
+  { bar :: { baz :: Int , qux :: { lhs :: Int , rhs :: Int } } , foo :: Int }
+SUGGESTIONS:
+  Data.Bounded.bottom  :: forall @a. Bounded a => a
+  Data.Bounded.top     :: forall @a. Bounded a => a
+  Data.Semiring.one    :: forall @a. Semiring a => a
+  Data.Semiring.zero   :: forall @a. Semiring a => a
+  Main.expected        :: { bar :: { baz :: Int
+  , qux :: { lhs :: Int
+  , rhs :: Int
+  }
+  }
+  , foo :: Int
+  }
+  Main.init            :: T

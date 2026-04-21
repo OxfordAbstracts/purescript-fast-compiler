@@ -1,0 +1,17 @@
+HOLE: test
+POSITION: 24:47 - 24:52
+INFERRED_TYPE:
+  Array Number -> String
+SUGGESTIONS:
+  Data.Monoid.mempty  :: forall @m. Monoid m => m
+  Data.Show.show      :: forall @a. Show a => a -> String
+CONTEXT:
+  a :: Number
+  b :: Number
+  c :: Number
+  d :: Number
+  e :: Number
+  f :: Number
+  g :: Number
+  h :: Number
+  i :: Number
