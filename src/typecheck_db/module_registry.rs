@@ -863,6 +863,7 @@ mod tests {
             resolved_dicts: vec![],
             constraint_errors: vec![],
             constraint_dicts: HashMap::new(),
+            hole_diagnostics: vec![],
         }
     }
 
@@ -1104,6 +1105,7 @@ class Eq a where
             resolved_dicts: vec![],
             constraint_errors: vec![],
             constraint_dicts: HashMap::new(),
+            hole_diagnostics: vec![],
         }];
         let exports = distill_exports(&m, &schemes, &[], &classes, &HashMap::new());
         assert!(exports.classes.contains_key("Eq"));
@@ -1177,6 +1179,7 @@ infixl 6 add as +
             resolved_dicts: vec![],
             constraint_errors: vec![],
             constraint_dicts: HashMap::new(),
+            hole_diagnostics: vec![],
         }];
         let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new());
         assert!(exports.values.contains_key("add"));

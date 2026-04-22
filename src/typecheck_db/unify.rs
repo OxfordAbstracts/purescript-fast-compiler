@@ -41,6 +41,11 @@ pub struct UnifyState {
     // drained by the SCC driver into the matching `InferredScheme`.
     pending_constraints:
         Vec<crate::typecheck_db::passes::constraints::PendingConstraint>,
+    // Typed-hole records. Same routing story as the other `pending_*`
+    // vectors: stamped with `current_decl` on record, drained and
+    // zonked at SCC end, routed into the matching `InferredScheme`.
+    pending_holes:
+        Vec<crate::typecheck_db::passes::infer_value::HoleDiagnostic>,
     // Name of the decl currently being inferred; read by
     // `record_pending_exhaust` so each entry is attributed to the
     // right decl, routed into the matching `InferredScheme`.
@@ -53,6 +58,7 @@ impl UnifyState {
             bindings: Vec::new(),
             pending_exhaust: Vec::new(),
             pending_constraints: Vec::new(),
+            pending_holes: Vec::new(),
             current_decl: None,
         }
     }
@@ -73,6 +79,39 @@ impl UnifyState {
         &mut self,
     ) -> Vec<crate::typecheck_db::passes::constraints::PendingConstraint> {
         std::mem::take(&mut self.pending_constraints)
+    }
+
+    /// Number of pending constraints currently recorded. Callers use
+    /// this as a bookmark — constraints born _after_ the bookmark are
+    /// the ones to associate with a hole seen at that point.
+    pub fn pending_constraints_len(&self) -> usize {
+        self.pending_constraints.len()
+    }
+
+    /// Push one typed-hole diagnostic, stamping it with the current
+    /// decl name so the draining caller can route it to the right
+    /// [`InferredScheme`].
+    pub fn record_pending_hole(
+        &mut self,
+        mut hole: crate::typecheck_db::passes::infer_value::HoleDiagnostic,
+    ) {
+        hole.decl_name = self.current_decl.clone();
+        self.pending_holes.push(hole);
+    }
+
+    /// Drain every recorded pending hole.
+    pub fn take_pending_holes(
+        &mut self,
+    ) -> Vec<crate::typecheck_db::passes::infer_value::HoleDiagnostic> {
+        std::mem::take(&mut self.pending_holes)
+    }
+
+    /// Set of decl names that have at least one pending hole.
+    pub fn decls_with_holes(&self) -> std::collections::HashSet<String> {
+        self.pending_holes
+            .iter()
+            .filter_map(|h| h.decl_name.clone())
+            .collect()
     }
 
     /// Capture the current union-find bindings so a later

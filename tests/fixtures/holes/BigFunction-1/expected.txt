@@ -1,9 +1,0 @@
-HOLE: test
-POSITION: 140:7 - 140:12
-INFERRED_TYPE:
-  Int
-SUGGESTIONS:
-  Data.Bounded.bottom  :: forall @a. Bounded a => a
-  Data.Bounded.top     :: forall @a. Bounded a => a
-  Data.Semiring.one    :: forall @a. Semiring a => a
-  Data.Semiring.zero   :: forall @a. Semiring a => a

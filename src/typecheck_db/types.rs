@@ -46,31 +46,68 @@ impl fmt::Display for QName {
     }
 }
 
-impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Type {
+    /// Format with explicit precedence context.
+    ///
+    /// Precedence levels (match PureScript notation):
+    ///   0 = outermost — no wrapping needed for `->` or App
+    ///   1 = left of `->` — wrap `->` in parens, App is fine
+    ///   2 = argument of App — wrap both `->` and App in parens
+    fn fmt_prec(&self, f: &mut fmt::Formatter<'_>, prec: u8) -> fmt::Result {
         match self {
             Type::Var(n) => write!(f, "{}", n),
             Type::Con(q) => write!(f, "{}", q),
-            Type::App(g, a) => write!(f, "({} {})", g, a),
-            Type::Fun(a, b) => write!(f, "({} -> {})", a, b),
+            Type::App(g, a) => {
+                if prec > 1 {
+                    write!(f, "(")?;
+                    g.fmt_prec(f, 1)?;
+                    write!(f, " ")?;
+                    a.fmt_prec(f, 2)?;
+                    write!(f, ")")
+                } else {
+                    g.fmt_prec(f, 1)?;
+                    write!(f, " ")?;
+                    a.fmt_prec(f, 2)
+                }
+            }
+            Type::Fun(a, b) => {
+                if prec > 0 {
+                    write!(f, "(")?;
+                    a.fmt_prec(f, 1)?;
+                    write!(f, " -> ")?;
+                    b.fmt_prec(f, 0)?;
+                    write!(f, ")")
+                } else {
+                    a.fmt_prec(f, 1)?;
+                    write!(f, " -> ")?;
+                    b.fmt_prec(f, 0)
+                }
+            }
             Type::Forall(vars, body) => {
                 write!(f, "forall")?;
                 for (n, _, _) in vars {
                     write!(f, " {}", n)?;
                 }
-                write!(f, ". {}", body)
+                write!(f, ". ")?;
+                body.fmt_prec(f, 0)
             }
             Type::Constrained(cs, body) => {
+                let do_parens = prec > 0;
+                if do_parens { write!(f, "(")?; }
                 for (i, c) in cs.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}", c.class)?;
                     for a in &c.args {
-                        write!(f, " {}", a)?;
+                        write!(f, " ")?;
+                        a.fmt_prec(f, 2)?;
                     }
                 }
-                write!(f, " => {}", body)
+                write!(f, " => ")?;
+                body.fmt_prec(f, 0)?;
+                if do_parens { write!(f, ")")?; }
+                Ok(())
             }
             Type::Record(fields, tail) => {
                 write!(f, "{{ ")?;
@@ -78,10 +115,12 @@ impl fmt::Display for Type {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{} :: {}", l, t)?;
+                    write!(f, "{} :: ", l)?;
+                    t.fmt_prec(f, 0)?;
                 }
                 if let Some(t) = tail {
-                    write!(f, " | {}", t)?;
+                    write!(f, " | ")?;
+                    t.fmt_prec(f, 0)?;
                 }
                 write!(f, " }}")
             }
@@ -91,10 +130,12 @@ impl fmt::Display for Type {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{} :: {}", l, t)?;
+                    write!(f, "{} :: ", l)?;
+                    t.fmt_prec(f, 0)?;
                 }
                 if let Some(t) = tail {
-                    write!(f, " | {}", t)?;
+                    write!(f, " | ")?;
+                    t.fmt_prec(f, 0)?;
                 }
                 write!(f, ")")
             }
@@ -105,6 +146,12 @@ impl fmt::Display for Type {
             Type::Kinded(t, k) => write!(f, "({} :: {})", t, k),
             Type::Unif(id) => write!(f, "?u{}", id),
         }
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_prec(f, 0)
     }
 }
 

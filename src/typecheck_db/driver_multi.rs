@@ -65,6 +65,10 @@ pub struct ModuleCheckResult {
     /// invoked through [`check_many_modules_with_db`]; on a fresh
     /// in-memory DB every decl is a [`CacheOutcome::Miss`].
     pub decl_outcomes: HashMap<String, CacheOutcome>,
+    /// Typed-hole diagnostics encountered anywhere in this module,
+    /// aggregated across every decl's `hole_diagnostics`.
+    pub hole_diagnostics:
+        Vec<crate::typecheck_db::passes::infer_value::HoleDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -804,11 +808,13 @@ fn check_one_module(
     let mut constraint_errors = Vec::new();
     let mut deferred_constraints = Vec::new();
     let mut resolved_dicts = Vec::new();
+    let mut hole_diagnostics = Vec::new();
     for s in &all_schemes {
         exhaustiveness_errors.extend(s.exhaustiveness_errors.iter().cloned());
         constraint_errors.extend(s.constraint_errors.iter().cloned());
         deferred_constraints.extend(s.pending_constraints.iter().cloned());
         resolved_dicts.extend(s.resolved_dicts.iter().cloned());
+        hole_diagnostics.extend(s.hole_diagnostics.iter().cloned());
     }
 
     // 6) Distill exports + register. `module X` re-export clauses
@@ -957,6 +963,7 @@ fn check_one_module(
         resolved_dicts,
         inference_error,
         decl_outcomes,
+        hole_diagnostics,
     }
 }
 

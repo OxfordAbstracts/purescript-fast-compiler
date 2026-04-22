@@ -26,7 +26,7 @@ use crate::typecheck_db::env::{Env, Lookup};
 use crate::typecheck_db::generalize::{generalize, instantiate};
 use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::store::DepEdge;
-use crate::typecheck_db::types::{convert_type_expr, QName, Scheme, Type, TypeOpMap};
+use crate::typecheck_db::types::{convert_type_expr, Constraint, QName, Scheme, Type, TypeOpMap};
 use crate::typecheck_db::unify::{UnifyError, UnifyState};
 
 pub const PASS_NAME: &str = "infer_value_scc";
@@ -93,6 +93,33 @@ pub struct InferredScheme {
         crate::span::Span,
         crate::typecheck_db::passes::constraints::ResolvedDict,
     >,
+    /// Typed-hole diagnostics recorded during this decl's body. Each
+    /// entry captures the hole's source name, inferred type (zonked),
+    /// constraints born downstream of the hole that reference its
+    /// unification variables, and a snapshot of the local bindings
+    /// visible at the hole site.
+    #[serde(default)]
+    pub hole_diagnostics: Vec<HoleDiagnostic>,
+}
+
+/// A typed-hole diagnostic surfaced from inference. Mirrors the
+/// old `TypeError::HoleInferredType` variant's shape, adapted to the
+/// typecheck_db type world.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoleDiagnostic {
+    pub decl_name: Option<String>,
+    pub span: crate::span::Span,
+    pub hole_name: String,
+    pub inferred_type: Type,
+    pub constraints: Vec<Constraint>,
+    pub local_bindings: Vec<(String, Type)>,
+    /// Internal bookkeeping: how many `pending_constraints` had been
+    /// recorded on `UnifyState` when this hole was seen. At drain time,
+    /// constraints with index >= this value are the candidates for
+    /// "constraints related to this hole". Zeroed out in serialized
+    /// form; callers should treat it as opaque.
+    #[serde(skip)]
+    pub constraint_start: usize,
 }
 
 /// Case / multi-equation pattern match recorded during inference so
@@ -113,6 +140,31 @@ pub struct PendingExhaust {
 pub struct PendingAlt {
     pub binders: Vec<Binder>,
     pub guarded: ir::GuardedExpr,
+}
+
+/// Snapshot the monomorphic + scheme-typed local bindings visible at a
+/// point inside a decl body, walking inner-to-outer and dropping outer
+/// bindings shadowed by inner ones. Used by typed-hole reporting to
+/// capture the `CONTEXT:` set for the emitted diagnostic.
+fn snapshot_env_locals(env: &Env, state: &UnifyState) -> Vec<(String, Type)> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<(String, Type)> = Vec::new();
+    for scope in env.locals.iter().rev() {
+        for (name, ty) in scope {
+            if seen.insert(name.clone()) {
+                out.push((name.clone(), state.zonk(&ty.clone())));
+            }
+        }
+    }
+    for scope in env.local_schemes.iter().rev() {
+        for (name, scheme) in scope {
+            if seen.insert(name.clone()) {
+                out.push((name.clone(), state.zonk(&scheme.ty.clone())));
+            }
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -152,7 +204,23 @@ pub fn infer_expr(
             check_expr(state, env, type_ops, expr, &monotype)?;
             Ok(monotype)
         }
-        Expr::Wildcard { .. } | Expr::Hole { .. } => Ok(state.fresh()),
+        Expr::Wildcard { .. } => Ok(state.fresh()),
+        Expr::Hole { span, name } => {
+            let ty = state.fresh();
+            let hole_name = name.resolve().unwrap_or_default();
+            let local_bindings = snapshot_env_locals(env, state);
+            let constraint_start = state.pending_constraints_len();
+            state.record_pending_hole(HoleDiagnostic {
+                decl_name: None,
+                span: *span,
+                hole_name,
+                inferred_type: ty.clone(),
+                constraints: Vec::new(),
+                local_bindings,
+                constraint_start,
+            });
+            Ok(ty)
+        }
         Expr::Negate { expr, .. } => infer_expr(state, env, type_ops, expr),
 
         Expr::If { cond, then_expr, else_expr, .. } => {
@@ -293,14 +361,6 @@ pub fn infer_value_scc_with_all(
         if let Decl::Value { binders, guarded, where_clause, .. } = decl {
             let expected = slot_of.get(name).cloned().unwrap();
             state.set_current_decl(Some(name.clone()));
-            // If the decl has a signature, instantiate it and
-            // pre-unify the parameter binders against the sig's
-            // argument types. This threads polymorphic field
-            // types into the body so expressions like
-            // `m.return 1` on a parameter `m :: {
-            //   return :: forall a. a -> m a }` see the
-            //  per-use `forall a.` quantification instead of
-            //  inferring `m` as a bare unif.
             let _ = sig_param_types; // retained for future sig-aware work
             // Wrap the body with any where-clause bindings so
             // declarations like `foo = bar where bar = 1` see `bar`
@@ -339,6 +399,131 @@ pub fn infer_value_scc_with_all(
     // and zonk each constraint's type arguments so the solver sees
     // final forms (Phase A collects only; Phase B adds the solver).
     let pending_constraints_raw = state.take_pending_constraints();
+
+    // Drain typed-hole records. For each hole, zonk its inferred type
+    // and local-binding types, then scan the constraints born after
+    // the hole for any whose args reference the hole's free unif vars
+    // — those are the constraints we surface as "relevant to this
+    // hole" in the diagnostic. This mirrors the old typechecker's
+    // drain_pending_holes.
+    //
+    // Build a map from decl name → instantiated declared return type
+    // (no constraints recorded). For a decl with `k` binders, we strip
+    // the first `k` argument types from the sig so we get the return
+    // type — what the hole in the body is expected to produce.
+    let decl_binder_count: HashMap<String, usize> = decl_refs
+        .iter()
+        .filter_map(|(decl, name)| {
+            if let Decl::Value { binders, .. } = decl {
+                Some((name.clone(), binders.len()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Full sig map (not binder-stripped): used for slot-sig unification so
+    // that free unif vars inside partially-inferred types (e.g. `String -> u0`)
+    // get resolved via the declared sig (e.g. `String -> Effect Unit`).
+    let full_sig_map: HashMap<String, Type> = slot_of
+        .keys()
+        .filter_map(|n| {
+            let scheme = env
+                .top_level
+                .get(&crate::typecheck_db::types::QName {
+                    module: None,
+                    name: n.clone(),
+                })?
+                .clone();
+            let ty = instantiate_scheme_no_constraints(&mut state, &scheme);
+            Some((n.clone(), ty))
+        })
+        .collect();
+    // Unify each slot with its full declared sig — but only for decls that
+    // actually contain a typed hole. Without the guard every decl's slot gets
+    // unified with its sig, which corrupts state for `Partial`-constrained or
+    // wildcard-typed decls that don't have holes.
+    let hole_decls = state.decls_with_holes();
+    for (n, sig_ty) in &full_sig_map {
+        if !hole_decls.contains(n) {
+            continue;
+        }
+        if let Some(slot) = slot_of.get(n) {
+            let _ = state.unify(slot, sig_ty);
+        }
+    }
+    // Binder-stripped sig map: used for direct hole-type annotation when the
+    // hole is still a bare unif var (fallback path after slot-sig unification).
+    let decl_sig_map: HashMap<String, Type> = slot_of
+        .keys()
+        .filter_map(|n| {
+            let scheme = env
+                .top_level
+                .get(&crate::typecheck_db::types::QName {
+                    module: None,
+                    name: n.clone(),
+                })?
+                .clone();
+            let mut ty = instantiate_scheme_no_constraints(&mut state, &scheme);
+            // Strip argument types for each binder so the remaining
+            // type is the return type (what the hole body must be).
+            let binders = decl_binder_count.get(n).copied().unwrap_or(0);
+            for _ in 0..binders {
+                match ty {
+                    Type::Fun(_, ret) => ty = *ret,
+                    other => { ty = other; break; }
+                }
+            }
+            Some((n.clone(), ty))
+        })
+        .collect();
+
+    let pending_holes_raw = state.take_pending_holes();
+    let mut holes_by_decl: HashMap<String, Vec<HoleDiagnostic>> = HashMap::new();
+    for mut hole in pending_holes_raw {
+        hole.inferred_type = state.zonk(&hole.inferred_type);
+        // If the hole type is still a fully-free unif var (no
+        // structural info), try to annotate it from the declared sig
+        // of the owning decl.
+        if let (Type::Unif(_), Some(owner)) =
+            (&hole.inferred_type, &hole.decl_name)
+        {
+            if let Some(sig_ty) = decl_sig_map.get(owner) {
+                // Unify the hole var with the declared sig type —
+                // purely for diagnostic annotation, errors silently
+                // ignored (body-inferred type takes precedence).
+                let _ = state.unify(&hole.inferred_type, sig_ty);
+                hole.inferred_type = state.zonk(&hole.inferred_type);
+            }
+        }
+        for (_, ty) in hole.local_bindings.iter_mut() {
+            *ty = state.zonk(ty);
+        }
+        let hole_vars = state.free_unif_vars(&hole.inferred_type);
+        if !hole_vars.is_empty() && hole.constraint_start <= pending_constraints_raw.len() {
+            for pc in &pending_constraints_raw[hole.constraint_start..] {
+                let zonked_args: Vec<Type> = pc
+                    .constraint
+                    .args
+                    .iter()
+                    .map(|a| state.zonk(a))
+                    .collect();
+                let arg_vars: std::collections::HashSet<u32> = zonked_args
+                    .iter()
+                    .flat_map(|a| state.free_unif_vars(a))
+                    .collect();
+                if hole_vars.iter().any(|v| arg_vars.contains(v)) {
+                    hole.constraints.push(Constraint {
+                        class: pc.constraint.class.clone(),
+                        args: zonked_args,
+                    });
+                }
+            }
+        }
+        if let Some(owner) = hole.decl_name.clone() {
+            holes_by_decl.entry(owner).or_default().push(hole);
+        }
+    }
+
     let mut constraints_by_decl: HashMap<
         String,
         Vec<crate::typecheck_db::passes::constraints::PendingConstraint>,
@@ -452,6 +637,7 @@ pub fn infer_value_scc_with_all(
         let constraint_errors = errors.remove(name).unwrap_or_default();
         let pending_constraints = deferred_by_decl.remove(name).unwrap_or_default();
         let constraint_dicts = dicts_by_span.remove(name).unwrap_or_default();
+        let hole_diagnostics = holes_by_decl.remove(name).unwrap_or_default();
         // Fold deferred constraints into the scheme using a single
         // shared unif→typevar substitution. Importers see the
         // constraints in the bound scheme and re-instantiate them at
@@ -476,6 +662,7 @@ pub fn infer_value_scc_with_all(
             resolved_dicts,
             constraint_errors,
             constraint_dicts,
+            hole_diagnostics,
         });
     }
 
@@ -1370,6 +1557,32 @@ fn sig_to_scheme(sig_ty: Type) -> Scheme {
 /// `instantiate_and_record_constraints` does at reference sites
 /// so the body's constraints and the signature's constraints
 /// share the same unif identities.
+/// Instantiate a scheme with fresh unif vars for its forall-bound vars,
+/// stripping any `Constrained` or nested `Forall` wrappers. Does NOT
+/// record pending constraints — safe to call for diagnostic annotation
+/// without affecting inference.
+fn instantiate_scheme_no_constraints(
+    state: &mut UnifyState,
+    scheme: &crate::typecheck_db::types::Scheme,
+) -> Type {
+    use crate::typecheck_db::generalize::apply_var_subst;
+    let fresh: Vec<Type> = scheme.vars.iter().map(|_| state.fresh()).collect();
+    let subst: std::collections::HashMap<String, Type> = scheme
+        .vars
+        .iter()
+        .cloned()
+        .zip(fresh.into_iter())
+        .collect();
+    let mut ty = apply_var_subst(&scheme.ty, &subst);
+    loop {
+        match ty {
+            Type::Constrained(_, body) => ty = *body,
+            Type::Forall(_, body) => ty = *body,
+            other => break other,
+        }
+    }
+}
+
 fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
     use crate::typecheck_db::generalize::instantiate;
     use crate::typecheck_db::passes::constraints::{
@@ -1560,7 +1773,7 @@ mod tests {
         let mut env = Env::new();
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
         assert_eq!(schemes.len(), 1);
-        assert_eq!(scheme_display(&schemes[0].scheme), "forall a. (a -> a)");
+        assert_eq!(scheme_display(&schemes[0].scheme), "forall a. a -> a");
     }
 
     #[test]
@@ -1574,7 +1787,7 @@ mod tests {
         assert_eq!(schemes.len(), 1);
         assert_eq!(
             scheme_display(&schemes[0].scheme),
-            "forall a b. (a -> (b -> a))",
+            "forall a b. a -> b -> a",
         );
     }
 
@@ -1631,7 +1844,7 @@ mod tests {
         let ops = TypeOpMap::default();
         let mut env = Env::new();
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
-        assert_eq!(scheme_display(&schemes[0].scheme), "(Int -> Int)");
+        assert_eq!(scheme_display(&schemes[0].scheme), "Int -> Int");
     }
 
     #[test]
@@ -1860,7 +2073,7 @@ foo x = case x of
         let ops = TypeOpMap::default();
         let mut env = Env::new();
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
-        assert_eq!(scheme_display(&schemes[0].scheme), "(Int -> String)");
+        assert_eq!(scheme_display(&schemes[0].scheme), "Int -> String");
     }
 
     #[test]
@@ -1879,7 +2092,7 @@ foo m = case m of
         let mut env = Env::new();
         seed_maybe(&mut env);
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
-        assert_eq!(scheme_display(&schemes[0].scheme), "((Maybe Int) -> Int)");
+        assert_eq!(scheme_display(&schemes[0].scheme), "Maybe Int -> Int");
     }
 
     #[test]
@@ -1900,7 +2113,7 @@ foo m = case m of
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
         assert_eq!(
             scheme_display(&schemes[0].scheme),
-            "((Maybe (Maybe Int)) -> Int)",
+            "Maybe (Maybe Int) -> Int",
         );
     }
 
@@ -1969,7 +2182,7 @@ foo m n = case m, n of
         // fallthrough branch.
         assert_eq!(
             scheme_display(&schemes[0].scheme),
-            "forall a. ((Maybe Int) -> ((Maybe a) -> Int))",
+            "forall a. Maybe Int -> Maybe a -> Int",
         );
     }
 
@@ -1998,7 +2211,7 @@ foo x | isOk x = 1
         // foo :: forall a. a -> Int (first guard ignores result of isOk,
         // returns Int; second guard returns Int).
         let disp = scheme_display(&schemes[0].scheme);
-        assert!(disp.ends_with("Int)"), "got: {disp}");
+        assert!(disp.ends_with("Int"), "got: {disp}");
     }
 
     #[test]
@@ -2016,7 +2229,7 @@ foo x | x = 1
         // x :: Int.
         // Instead, test by requiring the scheme to end with "Boolean -> Int".
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
-        assert_eq!(scheme_display(&schemes[0].scheme), "(Boolean -> Int)");
+        assert_eq!(scheme_display(&schemes[0].scheme), "Boolean -> Int");
     }
 
     // ------------------------------------------------------------------
@@ -2228,7 +2441,7 @@ foo x | x = 1
         let ops = TypeOpMap::default();
         let mut env = Env::new();
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
-        assert_eq!(scheme_display(&schemes[0].scheme), "forall a. (Array a)");
+        assert_eq!(scheme_display(&schemes[0].scheme), "forall a. Array a");
     }
 
     #[test]
@@ -2242,7 +2455,7 @@ foo x | x = 1
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
         assert_eq!(
             scheme_display(&schemes[0].scheme),
-            "forall a. ((Array a) -> a)",
+            "forall a. Array a -> a",
         );
     }
 
@@ -2259,7 +2472,7 @@ foo x | x = 1
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
         assert_eq!(
             scheme_display(&schemes[0].scheme),
-            "((Array Int) -> (Array Int))",
+            "Array Int -> Array Int",
         );
     }
 

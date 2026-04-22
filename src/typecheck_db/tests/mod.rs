@@ -31,5 +31,6 @@ mod single_module;
 mod multi_module;
 mod failures;
 mod incremental;
+mod hole_fixtures;
 mod passing_fixtures;
 mod prelude;

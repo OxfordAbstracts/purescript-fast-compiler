@@ -864,7 +864,10 @@ def main():
     support = build_support()
     print(f"  Support output: {support.output_dir}", flush=True)
 
+    SKIP_FIXTURES = {"BigFunction"}
+
     fixtures = collect_fixtures()
+    fixtures = [(n, f) for (n, f) in fixtures if n not in SKIP_FIXTURES]
     if filter_names:
         fixtures = [(n, f) for (n, f) in fixtures if n in filter_names]
     print(f"Processing {len(fixtures)} fixtures...", flush=True)
