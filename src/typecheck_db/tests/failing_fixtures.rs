@@ -194,6 +194,9 @@ fn collect_error_codes(report: &ModuleCheckReport) -> Vec<String> {
         for _ke in &r.kind_errors {
             codes.push("KindsDoNotUnify".into());
         }
+        for ce in &r.coercible_errors {
+            codes.push(ce.kind.code().to_string());
+        }
         if let Some(err) = &r.inference_error {
             codes.push(infer_error_code(err));
         }

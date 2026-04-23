@@ -52,6 +52,11 @@ f_ClassHeadNoVTA6a
 f_ClassHeadNoVTA6b
 f_ClassHeadNoVTA6c
 f_ClassHeadNoVTA7
+f_CoercibleRoleMismatch1
+f_CoercibleRoleMismatch2
+f_CoercibleRoleMismatch3
+f_CoercibleRoleMismatch4
+f_CoercibleRoleMismatch5
 f_ConstraintFailure
 f_ConstraintInForeignImport
 f_CycleInForeignDataKinds
@@ -93,6 +98,7 @@ f_ImportModule
 f_InfiniteType
 f_InstanceNamedWithoutSeparator
 f_IntAsRecordLabel
+f_InvalidCoercibleInstanceDeclaration
 f_LeadingZeros1
 f_LeadingZeros2
 f_LetPatterns1

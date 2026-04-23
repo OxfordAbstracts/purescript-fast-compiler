@@ -78,6 +78,12 @@ pub struct ModuleCheckResult {
     /// CST walk; no kind unification.
     pub kind_errors:
         Vec<crate::typecheck_db::passes::kind_check::KindError>,
+    /// Coercible-related structural errors: RoleMismatch on `type
+    /// role` decls that are more permissive than inferred roles,
+    /// plus InvalidCoercibleInstanceDeclaration for user-written
+    /// Coercible instances (forbidden).
+    pub coercible_errors:
+        Vec<crate::typecheck_db::passes::coercible_check::CoercibleError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +193,12 @@ fn check_one_module(
     //     Reads the registry for imported types/classes.
     let kind_errors =
         crate::typecheck_db::passes::kind_check::check_module(module, registry);
+
+    // 1d) Coercible-related checks: role validation + forbidden
+    //     user-written Coercible instances. CST-only — doesn't need
+    //     the registry.
+    let coercible_errors =
+        crate::typecheck_db::passes::coercible_check::check_module(module);
 
     // 2) Desugar the module as a whole, then lower cst → ir so
     //    every downstream pass consumes an `ir::Decl` that has no
@@ -987,6 +999,7 @@ fn check_one_module(
         hole_diagnostics,
         validation_errors,
         kind_errors,
+        coercible_errors,
     }
 }
 

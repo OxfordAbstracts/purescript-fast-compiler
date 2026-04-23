@@ -304,6 +304,12 @@ fn run_inner(name: &str) -> Result<Vec<String>, String> {
                 result.name, ke.kind,
             ));
         }
+        if let Some(ce) = result.coercible_errors.first() {
+            return Err(format!(
+                "coercible error in {}: {:?}",
+                result.name, ce.kind,
+            ));
+        }
         if let Some(err) = &result.inference_error {
             return Err(format!(
                 "inference error in {}: {err:?}",

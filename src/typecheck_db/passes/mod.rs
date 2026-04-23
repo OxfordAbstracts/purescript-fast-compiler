@@ -18,3 +18,4 @@ pub mod imports;
 pub mod check_nonvalue;
 pub mod validate_decls;
 pub mod kind_check;
+pub mod coercible_check;
