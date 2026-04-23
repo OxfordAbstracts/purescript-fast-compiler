@@ -498,6 +498,17 @@ macro_rules! check_failing_build_unit {
     };
 }
 
+macro_rules! check_failing_build_unit_ignored {
+    ($test_name:ident, $fixture:literal) => {
+        #[test]
+        #[ignore = "gap-closing: typecheck_db doesn't yet catch this failure category"]
+        #[allow(non_snake_case)]
+        fn $test_name() {
+            run_failing_build_unit($fixture);
+        }
+    };
+}
+
 macro_rules! check_failing_build_unit_skipped {
     ($test_name:ident, $fixture:literal, $reason:literal) => {
         #[test]

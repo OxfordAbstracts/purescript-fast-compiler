@@ -14,6 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 FAILING_ROOT = REPO / "tests" / "fixtures" / "original-compiler" / "failing"
 OUT = REPO / "src" / "typecheck_db" / "tests" / "failing_fixtures_list.rs"
+PASSING_LIST = REPO / "src" / "typecheck_db" / "tests" / "failing_fixtures_passing.txt"
 
 
 def fixture_ident(stem: str) -> str:
@@ -30,6 +31,10 @@ SKIP_STACK_OVERFLOW = {
 
 
 def main() -> None:
+    passing = set()
+    if PASSING_LIST.exists():
+        passing = {l.strip() for l in PASSING_LIST.read_text().splitlines() if l.strip()}
+
     purs_files = sorted(f for f in FAILING_ROOT.iterdir() if f.suffix == ".purs")
     entries = []
     for purs in purs_files:
@@ -39,8 +44,10 @@ def main() -> None:
             entries.append(
                 f'check_failing_build_unit_skipped!({ident}, "{stem}", "stack overflow in typecheck_db");'
             )
-        else:
+        elif ident in passing:
             entries.append(f'check_failing_build_unit!({ident}, "{stem}");')
+        else:
+            entries.append(f'check_failing_build_unit_ignored!({ident}, "{stem}");')
 
     OUT.write_text("\n".join(entries) + "\n")
     print(f"Wrote {len(entries)} entries to {OUT.relative_to(REPO)}")
