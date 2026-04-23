@@ -44,6 +44,7 @@ pub enum ValidationErrorKind {
     CycleInTypeClassDeclaration(Vec<String>),
     CycleInKindDeclaration(Vec<String>),
     CycleInDeclaration(Vec<String>),
+    PartiallyAppliedSynonym(String),
 }
 
 impl ValidationErrorKind {
@@ -63,6 +64,7 @@ impl ValidationErrorKind {
             Self::CycleInTypeClassDeclaration(_) => "CycleInTypeClassDeclaration",
             Self::CycleInKindDeclaration(_) => "CycleInKindDeclaration",
             Self::CycleInDeclaration(_) => "CycleInDeclaration",
+            Self::PartiallyAppliedSynonym(_) => "PartiallyAppliedSynonym",
         }
     }
 }
@@ -307,7 +309,211 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // NOTE: Partially-applied type synonyms are detected conservatively
+    // via `detect_partially_applied_synonyms` below, but disabled here —
+    // without kind information we can't distinguish `type Identity a = a;
+    // type Patch = Template Identity` (valid HKT argument) from
+    // `newtype N = N S where type S a = D a` (actual partial). Enable
+    // once Bucket 3 (kind checker) lands kind-aware detection.
+    let _ = detect_partially_applied_synonyms;
+
     errors
+}
+
+/// Flag any use of a local type alias with fewer arguments than its
+/// declared parameter count. Only catches LOCAL aliases; imported
+/// aliases aren't accessible from this CST-only pass.
+fn detect_partially_applied_synonyms(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Collect arity of every local alias.
+    let mut alias_arity: HashMap<Symbol, usize> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { name, type_vars, .. } = d {
+            alias_arity.insert(name.value.symbol(), type_vars.len());
+        }
+    }
+    if alias_arity.is_empty() {
+        return;
+    }
+
+    // Helper used on every TypeExpr site.
+    let mut reported: HashSet<(Symbol, usize)> = HashSet::new();
+    let mut check = |te: &cst::TypeExpr, errors: &mut Vec<ValidationError>| {
+        walk_partial_apps(te, &alias_arity, errors, &mut reported);
+    };
+
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { ty, .. } => check(ty, errors),
+            cst::Decl::TypeSignature { ty, .. } => check(ty, errors),
+            cst::Decl::Foreign { ty, .. } => check(ty, errors),
+            cst::Decl::ForeignData { kind, .. } => check(kind, errors),
+            cst::Decl::Data { constructors, kind_type, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        check(f, errors);
+                    }
+                }
+                if let Some(k) = kind_type {
+                    check(k, errors);
+                }
+            }
+            cst::Decl::Newtype { ty, .. } => check(ty, errors),
+            cst::Decl::Class { members, constraints, kind_type, .. } => {
+                for c in constraints {
+                    for arg in &c.args {
+                        check(arg, errors);
+                    }
+                }
+                for m in members {
+                    check(&m.ty, errors);
+                }
+                if let Some(k) = kind_type {
+                    check(k, errors);
+                }
+            }
+            cst::Decl::Instance { constraints, types, .. }
+            | cst::Decl::Derive { constraints, types, .. } => {
+                for c in constraints {
+                    for arg in &c.args {
+                        check(arg, errors);
+                    }
+                }
+                for t in types {
+                    check(t, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_partial_apps(
+    te: &cst::TypeExpr,
+    alias_arity: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+    reported: &mut HashSet<(Symbol, usize)>,
+) {
+    match te {
+        cst::TypeExpr::Constructor { span, name } => {
+            if name.module.is_none() {
+                let sym = name.name.symbol();
+                if let Some(&n) = alias_arity.get(&sym) {
+                    if n > 0 {
+                        // Zero arguments applied.
+                        if reported.insert((sym, span.start)) {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::PartiallyAppliedSynonym(
+                                    resolve(sym),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        cst::TypeExpr::App { span, .. } => {
+            // Peel the App chain to find head + arg count.
+            let (head, args) = peel_app_chain(te);
+            if let cst::TypeExpr::Constructor { name, .. } = head {
+                if name.module.is_none() {
+                    let sym = name.name.symbol();
+                    if let Some(&n) = alias_arity.get(&sym) {
+                        if args.len() < n {
+                            if reported.insert((sym, span.start)) {
+                                errors.push(ValidationError {
+                                    span: *span,
+                                    kind: ValidationErrorKind::PartiallyAppliedSynonym(
+                                        resolve(sym),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into args regardless — nested apps may have their
+            // own partial alias applications.
+            for a in &args {
+                walk_partial_apps(a, alias_arity, errors, reported);
+            }
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_partial_apps(from, alias_arity, errors, reported);
+            walk_partial_apps(to, alias_arity, errors, reported);
+        }
+        cst::TypeExpr::Forall { ty, vars, .. } => {
+            for (_, _, k) in vars {
+                if let Some(k) = k {
+                    walk_partial_apps(k, alias_arity, errors, reported);
+                }
+            }
+            walk_partial_apps(ty, alias_arity, errors, reported);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for a in &c.args {
+                    walk_partial_apps(a, alias_arity, errors, reported);
+                }
+            }
+            walk_partial_apps(ty, alias_arity, errors, reported);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_partial_apps(&f.ty, alias_arity, errors, reported);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_partial_apps(&f.ty, alias_arity, errors, reported);
+            }
+            if let Some(t) = tail {
+                walk_partial_apps(t, alias_arity, errors, reported);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            walk_partial_apps(ty, alias_arity, errors, reported);
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_partial_apps(left, alias_arity, errors, reported);
+            walk_partial_apps(right, alias_arity, errors, reported);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_partial_apps(ty, alias_arity, errors, reported);
+            walk_partial_apps(kind, alias_arity, errors, reported);
+        }
+        cst::TypeExpr::ArrayPattern { elements, .. } => {
+            for e in elements {
+                walk_partial_apps(e, alias_arity, errors, reported);
+            }
+        }
+        cst::TypeExpr::AsPattern { ty, .. } => {
+            walk_partial_apps(ty, alias_arity, errors, reported);
+        }
+        _ => {}
+    }
+}
+
+fn peel_app_chain(te: &cst::TypeExpr) -> (&cst::TypeExpr, Vec<&cst::TypeExpr>) {
+    let mut args: Vec<&cst::TypeExpr> = Vec::new();
+    let mut cur = te;
+    loop {
+        match cur {
+            cst::TypeExpr::App { constructor, arg, .. } => {
+                args.push(arg);
+                cur = constructor;
+            }
+            cst::TypeExpr::Parens { ty, .. } => {
+                cur = ty;
+            }
+            _ => break,
+        }
+    }
+    args.reverse();
+    (cur, args)
 }
 
 /// Cycle through type synonyms only. `type A = B; type B = A` is cyclic;
