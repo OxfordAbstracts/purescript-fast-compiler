@@ -16,3 +16,4 @@ pub mod instance_index;
 pub mod constraints;
 pub mod imports;
 pub mod check_nonvalue;
+pub mod validate_decls;

@@ -47,6 +47,9 @@ f_ConstraintFailure
 f_DoNotSuggestComposition2
 f_DuplicateDeclarationsInLet
 f_DuplicateProperties
+f_DuplicateRoleDeclaration
+f_DuplicateTypeClass
+f_DuplicateTypeVars
 f_EmptyCase
 f_EmptyClass
 f_EmptyDo
@@ -77,6 +80,8 @@ f_LetPatterns3
 f_LetPatterns4
 f_MissingRecordField
 f_MultipleErrors2
+f_MultipleTypeOpFixities
+f_MultipleValueOpFixities
 f_NewtypeMultiArgs
 f_NewtypeMultiCtor
 f_NullaryAbs
@@ -84,6 +89,9 @@ f_Object
 f_OperatorAt
 f_OperatorBackslash
 f_OperatorSections
+f_OrphanKindDeclaration1
+f_OrphanRoleDeclaration1
+f_OrphanTypeDecl
 f_OverlappingVars
 f_ProgrammablePolykindedTypeErrorsTypeString
 f_ProgrammableTypeErrors

@@ -292,6 +292,12 @@ fn run_inner(name: &str) -> Result<Vec<String>, String> {
         }
     }
     for result in &report.results {
+        if let Some(ve) = result.validation_errors.first() {
+            return Err(format!(
+                "validation error in {}: {:?}",
+                result.name, ve.kind,
+            ));
+        }
         if let Some(err) = &result.inference_error {
             return Err(format!(
                 "inference error in {}: {err:?}",

@@ -69,6 +69,10 @@ pub struct ModuleCheckResult {
     /// aggregated across every decl's `hole_diagnostics`.
     pub hole_diagnostics:
         Vec<crate::typecheck_db::passes::infer_value::HoleDiagnostic>,
+    /// Structural validation errors (duplicates, orphans, fixity conflicts,
+    /// etc.) emitted before any type inference runs.
+    pub validation_errors:
+        Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +170,12 @@ fn check_one_module(
     // 1) Pull imports into an Env + InstanceIndex.
     let (mut env, mut instance_index, import_errors) =
         build_env_from_imports(module, registry);
+
+    // 1b) Structural validation (duplicates, orphans, fixity conflicts,
+    //     duplicate type arguments). Pure traversal over the CST — no
+    //     dependence on type/kind inference or the registry.
+    let validation_errors =
+        crate::typecheck_db::passes::validate_decls::validate_module(module);
 
     // 2) Desugar the module as a whole, then lower cst → ir so
     //    every downstream pass consumes an `ir::Decl` that has no
@@ -964,6 +974,7 @@ fn check_one_module(
         inference_error,
         decl_outcomes,
         hole_diagnostics,
+        validation_errors,
     }
 }
 
