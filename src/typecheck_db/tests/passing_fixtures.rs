@@ -298,6 +298,12 @@ fn run_inner(name: &str) -> Result<Vec<String>, String> {
                 result.name, ve.kind,
             ));
         }
+        if let Some(ke) = result.kind_errors.first() {
+            return Err(format!(
+                "kind error in {}: {:?}",
+                result.name, ke.kind,
+            ));
+        }
         if let Some(err) = &result.inference_error {
             return Err(format!(
                 "inference error in {}: {err:?}",

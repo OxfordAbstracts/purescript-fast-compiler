@@ -73,6 +73,11 @@ pub struct ModuleCheckResult {
     /// etc.) emitted before any type inference runs.
     pub validation_errors:
         Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
+    /// Kind-arity errors. Currently catches over-application of type
+    /// constructors and arity mismatches in class constraints. Pure
+    /// CST walk; no kind unification.
+    pub kind_errors:
+        Vec<crate::typecheck_db::passes::kind_check::KindError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +181,12 @@ fn check_one_module(
     //     dependence on type/kind inference or the registry.
     let validation_errors =
         crate::typecheck_db::passes::validate_decls::validate_module(module);
+
+    // 1c) Kind-arity check. Catches over-application of type
+    //     constructors and arity mismatches in class constraints.
+    //     Reads the registry for imported types/classes.
+    let kind_errors =
+        crate::typecheck_db::passes::kind_check::check_module(module, registry);
 
     // 2) Desugar the module as a whole, then lower cst → ir so
     //    every downstream pass consumes an `ir::Decl` that has no
@@ -975,6 +986,7 @@ fn check_one_module(
         decl_outcomes,
         hole_diagnostics,
         validation_errors,
+        kind_errors,
     }
 }
 

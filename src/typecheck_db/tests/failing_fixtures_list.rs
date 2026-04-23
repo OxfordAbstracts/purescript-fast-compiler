@@ -1,4 +1,4 @@
-check_failing_build_unit_ignored!(f_1071, "1071");
+check_failing_build_unit!(f_1071, "1071");
 check_failing_build_unit_ignored!(f_1169, "1169");
 check_failing_build_unit_ignored!(f_1175, "1175");
 check_failing_build_unit!(f_1310, "1310");
@@ -29,7 +29,7 @@ check_failing_build_unit!(f_2947, "2947");
 check_failing_build_unit_ignored!(f_3077, "3077");
 check_failing_build_unit_ignored!(f_3132, "3132");
 check_failing_build_unit_ignored!(f_3275_BindingGroupErrorPos, "3275-BindingGroupErrorPos");
-check_failing_build_unit_ignored!(f_3275_DataBindingGroupErrorPos, "3275-DataBindingGroupErrorPos");
+check_failing_build_unit!(f_3275_DataBindingGroupErrorPos, "3275-DataBindingGroupErrorPos");
 check_failing_build_unit!(f_3329, "3329");
 check_failing_build_unit_ignored!(f_3335_TypeOpAssociativityError, "3335-TypeOpAssociativityError");
 check_failing_build_unit!(f_3405, "3405");
