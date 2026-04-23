@@ -44,6 +44,12 @@ pub enum InferError {
     Unsupported(&'static str),
     #[error("unsupported binder form: {0}")]
     UnsupportedBinder(&'static str),
+    #[error("do-block may not end with `let`")]
+    InvalidDoLet,
+    #[error("do-block may not end with `<-` bind")]
+    InvalidDoBind,
+    #[error("empty do-block")]
+    EmptyDoBlock,
 }
 
 /// Output of `infer_value_scc` for one SCC of mutually-recursive value decls.
@@ -246,7 +252,10 @@ pub fn infer_expr(
         // exist in `ir::Expr` — they're eliminated at lowering
         // time, which is why this match doesn't need an arm for
         // them any more.
-        Expr::Do { .. } | Expr::Ado { .. } => Err(InferError::Unsupported("do/ado")),
+        Expr::Do { statements, .. } => infer_do(state, env, type_ops, statements),
+        Expr::Ado { statements, result, .. } => {
+            infer_ado(state, env, type_ops, statements, result)
+        }
         Expr::VisibleTypeApp { func, .. } => {
             // Visible type applications (`f @Int x`) pin the next
             // quantified type variable of `f` to the annotated
@@ -260,7 +269,15 @@ pub fn infer_expr(
             // annotation just echoes inference's result.
             infer_expr(state, env, type_ops, func)
         }
-        Expr::AsPattern { .. } => Err(InferError::Unsupported("as-pattern")),
+        Expr::AsPattern { name, .. } => {
+            // At expression level, `name@pattern` survives from parsing
+            // only when the rhs is a VTA annotation (`f@Type`). The
+            // pattern slot carries the annotation. We don't yet
+            // specialise f's scheme with the annotation — fall back to
+            // inferring the base expression, matching the
+            // VisibleTypeApp treatment above.
+            infer_expr(state, env, type_ops, name)
+        }
     }
 }
 
@@ -1054,13 +1071,15 @@ fn infer_record(
     type_ops: &TypeOpMap,
     fields: &[ir::RecordField],
 ) -> Result<Type, InferError> {
-    // A bare `Expr::Record` with `is_update` fields is an unusual
-    // but not impossible shape — some Prelude fixtures produce it.
-    // Surface as a soft "unsupported" error instead of panicking
-    // so the rest of the module can still finish checking.
-    if fields.iter().any(|f| f.is_update) {
-        return Err(InferError::Unsupported("bare record with update fields"));
-    }
+    // A bare `Expr::Record` with `is_update` fields is the nested
+    // record-update position: in `init { bar { baz = 1 } }`, the
+    // inner `{ baz = 1 }` arrives here with is_update=true on `baz`.
+    // We treat these fields as value fields — the field's contribution
+    // to the row is the inferred value type. The surrounding
+    // `infer_record_update` already models the "must contain at least
+    // these labels" shape via an open record, so structural soundness
+    // is preserved at the outer level.
+    let is_update_section = fields.iter().any(|f| f.is_update);
     let mut inferred: Vec<(String, Type)> = Vec::with_capacity(fields.len());
     for f in fields {
         let label = crate::typecheck_db::util::resolve_symbol(f.label.value.symbol());
@@ -1077,7 +1096,15 @@ fn infer_record(
         };
         inferred.push((label, field_ty));
     }
-    Ok(Type::Record(inferred, None))
+    // Update sections produce an OPEN row so nested updates
+    // (`init { bar { baz = 1 } }`) can unify with whatever extra
+    // fields the surrounding record already has.
+    let tail = if is_update_section {
+        Some(Box::new(state.fresh()))
+    } else {
+        None
+    };
+    Ok(Type::Record(inferred, tail))
 }
 
 fn infer_record_access(
@@ -1325,6 +1352,175 @@ fn infer_let(
     let body_ty = infer_expr(state, env, type_ops, body)?;
     env.pop_scope();
     Ok(body_ty)
+}
+
+/// Do-notation. Desugars semantically to `bind` / `discard` chaining
+/// without going through an actual desugar — we just unify each
+/// `<-` statement's RHS against `m a`, pull out the `a`, bind it,
+/// and require the last statement to be an expression whose type
+/// is `m r` for some result `r`.
+fn infer_do(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    statements: &[ir::DoStatement],
+) -> Result<Type, InferError> {
+    if statements.is_empty() {
+        return Err(InferError::EmptyDoBlock);
+    }
+    env.push_scope();
+
+    // A single monad constructor threads through the entire block.
+    let m = state.fresh();
+    let last_idx = statements.len() - 1;
+
+    let mut result_ty: Option<Type> = None;
+    for (i, stmt) in statements.iter().enumerate() {
+        let is_last = i == last_idx;
+        match stmt {
+            ir::DoStatement::Bind { binder, expr, .. } => {
+                if is_last {
+                    env.pop_scope();
+                    return Err(InferError::InvalidDoBind);
+                }
+                let expr_ty = infer_expr(state, env, type_ops, expr)?;
+                let a = state.fresh();
+                let expected = Type::App(Box::new(m.clone()), Box::new(a.clone()));
+                state.unify(&expr_ty, &expected)?;
+                let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+                state.unify(&pat_ty, &a)?;
+            }
+            ir::DoStatement::Let { bindings, .. } => {
+                if is_last {
+                    env.pop_scope();
+                    return Err(InferError::InvalidDoLet);
+                }
+                process_do_let_bindings(state, env, type_ops, bindings)?;
+            }
+            ir::DoStatement::Discard { expr, .. } => {
+                let expr_ty = infer_expr(state, env, type_ops, expr)?;
+                if is_last {
+                    // Last statement is the block's result. Its type
+                    // must be `m r` for some r — force-unify to pin the
+                    // shape and feed the surrounding context.
+                    let r = state.fresh();
+                    let expected = Type::App(Box::new(m.clone()), Box::new(r.clone()));
+                    state.unify(&expr_ty, &expected)?;
+                    result_ty = Some(expr_ty);
+                } else {
+                    let any = state.fresh();
+                    let expected = Type::App(Box::new(m.clone()), Box::new(any));
+                    state.unify(&expr_ty, &expected)?;
+                }
+            }
+        }
+    }
+
+    env.pop_scope();
+    result_ty.ok_or(InferError::EmptyDoBlock)
+}
+
+/// Ado-notation. Applicative variant of do: each `<-` statement's RHS
+/// has type `m a`, bindings introduced by `<-` are applicative-
+/// independent (can't see each other), and the `in <expr>` at the
+/// end runs in an environment that DOES see the binds.
+fn infer_ado(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    statements: &[ir::DoStatement],
+    result: &Expr,
+) -> Result<Type, InferError> {
+    // Two envs: `expr_env` is what each `<-` expression sees; it only
+    // accumulates `let` bindings. `result_env` sees everything (binds
+    // + lets) and is what the final `in <expr>` runs under. This
+    // matches PureScript semantics for applicative scoping.
+    let m = state.fresh();
+
+    // Clone env so we have a "frozen at entry" version for expressions.
+    env.push_scope();
+    let mut expr_env = env.clone();
+
+    for stmt in statements {
+        match stmt {
+            ir::DoStatement::Bind { binder, expr, .. } => {
+                let expr_ty = infer_expr(state, &mut expr_env, type_ops, expr)?;
+                let a = state.fresh();
+                let expected = Type::App(Box::new(m.clone()), Box::new(a.clone()));
+                state.unify(&expr_ty, &expected)?;
+                let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+                state.unify(&pat_ty, &a)?;
+            }
+            ir::DoStatement::Let { bindings, .. } => {
+                process_do_let_bindings(state, env, type_ops, bindings)?;
+                // Let bindings ARE visible to subsequent <- expressions,
+                // so also replay them into expr_env.
+                process_do_let_bindings(state, &mut expr_env, type_ops, bindings)?;
+            }
+            ir::DoStatement::Discard { expr, .. } => {
+                // In ado, bare expressions have the shape `m _` but
+                // don't contribute to the result; they behave like
+                // `_ <- expr`.
+                let expr_ty = infer_expr(state, &mut expr_env, type_ops, expr)?;
+                let a = state.fresh();
+                let expected = Type::App(Box::new(m.clone()), Box::new(a));
+                state.unify(&expr_ty, &expected)?;
+            }
+        }
+    }
+
+    let result_a = infer_expr(state, env, type_ops, result)?;
+    env.pop_scope();
+    // ado yields `m <result>`.
+    Ok(Type::App(Box::new(m), Box::new(result_a)))
+}
+
+/// Shared helper: add `LetBinding`s from a do/ado `let` statement into
+/// `env`. Monomorphic — no generalization. Signatures are honored for
+/// the bound scheme via `sig_to_scheme`, matching `infer_let`'s signed-
+/// binding path (which also doesn't re-generalize signatures).
+fn process_do_let_bindings(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    bindings: &[LetBinding],
+) -> Result<(), InferError> {
+    let mut sigs: HashMap<String, Type> = HashMap::new();
+    for b in bindings {
+        if let LetBinding::Signature { name, ty, .. } = b {
+            let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+            let converted = convert_type_expr(ty, type_ops);
+            sigs.insert(
+                n,
+                crate::typecheck_db::types::expand_aliases(converted, &env.aliases),
+            );
+        }
+    }
+    for b in bindings {
+        match b {
+            LetBinding::Value { binder: Binder::Var { name, .. }, expr, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                if let Some(sig_ty) = sigs.get(&n).cloned() {
+                    let scheme = sig_to_scheme(sig_ty.clone());
+                    env.bind_local_scheme(n.clone(), scheme);
+                    let monotype = instantiate_sig_as_monotype(state, sig_ty);
+                    check_expr(state, env, type_ops, expr, &monotype)?;
+                } else {
+                    let slot = state.fresh();
+                    env.bind_local(n.clone(), slot.clone());
+                    let actual = infer_expr(state, env, type_ops, expr)?;
+                    state.unify(&slot, &actual)?;
+                }
+            }
+            LetBinding::Value { binder, expr, .. } => {
+                let rhs = infer_expr(state, env, type_ops, expr)?;
+                let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+                state.unify(&pat_ty, &rhs)?;
+            }
+            LetBinding::Signature { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn infer_case(

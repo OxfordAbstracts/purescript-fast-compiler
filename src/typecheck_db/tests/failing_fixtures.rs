@@ -231,6 +231,9 @@ fn infer_error_code(e: &InferError) -> String {
         InferError::UnboundConstructor(_) => "UnboundConstructor".into(),
         InferError::Unsupported(_) => "Unsupported".into(),
         InferError::UnsupportedBinder(_) => "UnsupportedBinder".into(),
+        InferError::InvalidDoLet => "InvalidDoLet".into(),
+        InferError::InvalidDoBind => "InvalidDoBind".into(),
+        InferError::EmptyDoBlock => "EmptyDoBlock".into(),
     }
 }
 

@@ -98,6 +98,9 @@ f_MultipleTypeOpFixities
 f_MultipleValueOpFixities
 f_MutRec
 f_MutRec2
+f_NestedRecordUpdateFlatMismatch
+f_NestedRecordUpdateTypeMismatch
+f_NestedRecordUpdateWrongValueType
 f_NewtypeMultiArgs
 f_NewtypeMultiCtor
 f_NullaryAbs
