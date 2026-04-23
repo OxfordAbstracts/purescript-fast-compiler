@@ -66,35 +66,120 @@ fn build_param_kinds(
 ) -> HashMap<Symbol, Vec<ParamKind>> {
     let mut env: HashMap<Symbol, Vec<ParamKind>> = HashMap::new();
 
-    let collect = |anns: &[Option<Box<cst::TypeExpr>>]| -> Vec<ParamKind> {
-        anns.iter()
-            .map(|opt| ParamKind {
-                arrows: opt.as_deref().map(arrow_count),
+    // For nominal types (data/newtype/class), unannotated params
+    // default to Type (arrow_count = 0) — the var will be used in
+    // constructor fields which require Type-kind. For type aliases
+    // there's no such default (RHS may have any kind), so callers
+    // pass `default_to_type = false`.
+    //
+    // ALSO: when the var is used as a type constructor anywhere in
+    // the RHS (`newtype Ap f a = Ap (f a)` — `f` is used as a
+    // ctor), default-to-Type is suppressed. Would otherwise flag
+    // `Ap Id1 a` as a mismatch (Id1 is higher-kinded, f's inferred
+    // kind is `Type -> Type`).
+    let collect_with_default = |vars: &[Symbol],
+                                anns: &[Option<Box<cst::TypeExpr>>],
+                                default_to_type: bool,
+                                bodies: &[cst::TypeExpr]|
+     -> Vec<ParamKind> {
+        let (hkt_vars, poly_vars) = if default_to_type {
+            classify_var_usage(bodies, vars)
+        } else {
+            (std::collections::HashSet::new(), std::collections::HashSet::new())
+        };
+        vars.iter()
+            .zip(anns.iter())
+            .map(|(v, opt)| ParamKind {
+                arrows: match (opt.as_deref(), default_to_type) {
+                    (Some(te), _) => Some(arrow_count(te)),
+                    (None, true) if hkt_vars.contains(v) => None,
+                    (None, true) if poly_vars.contains(v) => None,
+                    (None, true) => Some(0),
+                    (None, false) => None,
+                },
             })
             .collect()
     };
+
+    // Types that have a sibling standalone kind signature (`data Foo
+    // :: Kind -> Kind`). Default-to-Type is suppressed for these
+    // because the standalone kind could declare higher-kinded
+    // params that we don't parse here.
+    let mut has_standalone_kind: std::collections::HashSet<Symbol> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Data { name, kind_sig, .. }
+                if !matches!(kind_sig, cst::KindSigSource::None) =>
+            {
+                has_standalone_kind.insert(name.value.symbol());
+            }
+            cst::Decl::Class { name, is_kind_sig: true, .. } => {
+                has_standalone_kind.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
 
     for d in &module.decls {
         match d {
             cst::Decl::Data {
                 name,
+                type_vars,
                 type_var_kind_anns,
+                constructors,
                 kind_sig: cst::KindSigSource::None,
                 is_role_decl: false,
+                kind_type: None,
                 ..
             } => {
-                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+                let default = !has_standalone_kind.contains(&name.value.symbol());
+                let vars: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                let bodies: Vec<cst::TypeExpr> = constructors
+                    .iter()
+                    .flat_map(|c| c.fields.iter().cloned())
+                    .collect();
+                env.insert(
+                    name.value.symbol(),
+                    collect_with_default(&vars, type_var_kind_anns, default, &bodies),
+                );
             }
-            cst::Decl::Newtype { name, type_var_kind_anns, .. } => {
-                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+            cst::Decl::Newtype { name, type_vars, type_var_kind_anns, ty, .. } => {
+                let default = !has_standalone_kind.contains(&name.value.symbol());
+                let vars: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                env.insert(
+                    name.value.symbol(),
+                    collect_with_default(&vars, type_var_kind_anns, default, std::slice::from_ref(ty)),
+                );
             }
-            cst::Decl::TypeAlias { name, type_var_kind_anns, .. } => {
-                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+            cst::Decl::TypeAlias { name, type_vars, type_var_kind_anns, .. } => {
+                let vars: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                env.insert(
+                    name.value.symbol(),
+                    collect_with_default(&vars, type_var_kind_anns, false, &[]),
+                );
             }
             cst::Decl::Class {
-                name, type_var_kind_anns, is_kind_sig: false, ..
+                name,
+                type_vars,
+                type_var_kind_anns,
+                members,
+                is_kind_sig: false,
+                kind_type: None,
+                ..
             } => {
-                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+                let default = !has_standalone_kind.contains(&name.value.symbol());
+                let vars: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                let bodies: Vec<cst::TypeExpr> =
+                    members.iter().map(|m| m.ty.clone()).collect();
+                env.insert(
+                    name.value.symbol(),
+                    collect_with_default(&vars, type_var_kind_anns, default, &bodies),
+                );
             }
             _ => {}
         }
@@ -512,6 +597,108 @@ fn peel_app(te: &cst::TypeExpr) -> (&cst::TypeExpr, Vec<&cst::TypeExpr>) {
     }
     args.reverse();
     (cur, args)
+}
+
+/// Walk `te` and classify each `vars` entry's usage. Result:
+/// `hkt` holds vars used as a type constructor (`f a` → `f`).
+/// `poly` holds vars whose kind can't be defaulted to `Type` — either
+/// they were used as the arg to a type variable (like `a` in `f a`),
+/// or they appear inside a kind annotation. The remainder have
+/// default kind `Type`.
+fn classify_var_usage(
+    bodies: &[cst::TypeExpr],
+    vars: &[Symbol],
+) -> (std::collections::HashSet<Symbol>, std::collections::HashSet<Symbol>) {
+    let mut hkt: std::collections::HashSet<Symbol> =
+        std::collections::HashSet::new();
+    let mut poly: std::collections::HashSet<Symbol> =
+        std::collections::HashSet::new();
+    for b in bodies {
+        walk_for_var_usage(b, vars, &mut hkt, &mut poly);
+    }
+    (hkt, poly)
+}
+
+fn walk_for_var_usage(
+    te: &cst::TypeExpr,
+    vars: &[Symbol],
+    hkt: &mut std::collections::HashSet<Symbol>,
+    poly: &mut std::collections::HashSet<Symbol>,
+) {
+    match te {
+        cst::TypeExpr::App { .. } => {
+            let (head, args) = peel_app(te);
+            let var_head = match head {
+                cst::TypeExpr::Var { name, .. } => {
+                    let sym = name.value.symbol();
+                    if vars.contains(&sym) {
+                        hkt.insert(sym);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if var_head {
+                // Args to a type-variable head have polymorphic kind.
+                for a in &args {
+                    if let cst::TypeExpr::Var { name, .. } = a {
+                        let sym = name.value.symbol();
+                        if vars.contains(&sym) {
+                            poly.insert(sym);
+                        }
+                    }
+                    walk_for_var_usage(a, vars, hkt, poly);
+                }
+            } else {
+                walk_for_var_usage(head, vars, hkt, poly);
+                for a in args {
+                    walk_for_var_usage(a, vars, hkt, poly);
+                }
+            }
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_for_var_usage(from, vars, hkt, poly);
+            walk_for_var_usage(to, vars, hkt, poly);
+        }
+        cst::TypeExpr::Forall { ty, vars: qvars, .. } => {
+            let shadowed: Vec<Symbol> =
+                qvars.iter().map(|(v, _, _)| v.value.symbol()).collect();
+            let sub_vars: Vec<Symbol> =
+                vars.iter().copied().filter(|v| !shadowed.contains(v)).collect();
+            walk_for_var_usage(ty, &sub_vars, hkt, poly);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for a in &c.args {
+                    walk_for_var_usage(a, vars, hkt, poly);
+                }
+            }
+            walk_for_var_usage(ty, vars, hkt, poly);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_for_var_usage(&f.ty, vars, hkt, poly);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_for_var_usage(&f.ty, vars, hkt, poly);
+            }
+            if let Some(t) = tail {
+                walk_for_var_usage(t, vars, hkt, poly);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } | cst::TypeExpr::Kinded { ty, .. } => {
+            walk_for_var_usage(ty, vars, hkt, poly);
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_for_var_usage(left, vars, hkt, poly);
+            walk_for_var_usage(right, vars, hkt, poly);
+        }
+        _ => {}
+    }
 }
 
 /// Approximate kind arity from a kind type expression. Counts the
