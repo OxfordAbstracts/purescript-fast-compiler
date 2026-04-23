@@ -13,6 +13,7 @@ f_2567
 f_2616
 f_2947
 f_3329
+f_3453
 f_3531_4
 f_3531_5
 f_3531_6
@@ -44,6 +45,8 @@ f_ClassHeadNoVTA6b
 f_ClassHeadNoVTA6c
 f_ClassHeadNoVTA7
 f_ConstraintFailure
+f_CycleInForeignDataKinds
+f_CycleInKindDeclaration
 f_DoNotSuggestComposition2
 f_DuplicateDeclarationsInLet
 f_DuplicateProperties
@@ -82,6 +85,8 @@ f_MissingRecordField
 f_MultipleErrors2
 f_MultipleTypeOpFixities
 f_MultipleValueOpFixities
+f_MutRec
+f_MutRec2
 f_NewtypeMultiArgs
 f_NewtypeMultiCtor
 f_NullaryAbs
@@ -101,12 +106,19 @@ f_QualifiedOperators2
 f_Rank2Types
 f_Reserved
 f_RowLacks
+f_SelfCycleInForeignDataKinds
+f_SelfCycleInKindDeclaration
+f_SelfCycleInTypeClassDeclaration
 f_SelfImport
 f_SuggestComposition
 f_Superclasses1
+f_Superclasses2
 f_Superclasses5
 f_TypeClasses2
 f_TypeError
+f_TypeSynonymCycle
+f_TypeSynonyms
+f_TypeSynonyms5
 f_TypedBinders
 f_TypedBinders2
 f_TypedBinders3

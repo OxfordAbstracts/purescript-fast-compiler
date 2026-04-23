@@ -40,6 +40,10 @@ pub enum ValidationErrorKind {
     OrphanRoleDeclaration(String),
     MultipleValueOpFixities(String),
     MultipleTypeOpFixities(String),
+    CycleInTypeSynonym(Vec<String>),
+    CycleInTypeClassDeclaration(Vec<String>),
+    CycleInKindDeclaration(Vec<String>),
+    CycleInDeclaration(Vec<String>),
 }
 
 impl ValidationErrorKind {
@@ -55,6 +59,10 @@ impl ValidationErrorKind {
             Self::OrphanRoleDeclaration(_) => "OrphanRoleDeclaration",
             Self::MultipleValueOpFixities(_) => "MultipleValueOpFixities",
             Self::MultipleTypeOpFixities(_) => "MultipleTypeOpFixities",
+            Self::CycleInTypeSynonym(_) => "CycleInTypeSynonym",
+            Self::CycleInTypeClassDeclaration(_) => "CycleInTypeClassDeclaration",
+            Self::CycleInKindDeclaration(_) => "CycleInKindDeclaration",
+            Self::CycleInDeclaration(_) => "CycleInDeclaration",
         }
     }
 }
@@ -293,7 +301,443 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
         }
     }
 
+    // Cycle detection --------------------------------------------------
+    detect_alias_cycles(&module.decls, &mut errors);
+    detect_class_cycles(&module.decls, &mut errors);
+    detect_kind_sig_cycles(&module.decls, &mut errors);
+    detect_value_cycles(&module.decls, &mut errors);
+
     errors
+}
+
+/// Cycle through type synonyms only. `type A = B; type B = A` is cyclic;
+/// `type A = Array A` is not (Array is a type constructor, not an alias).
+fn detect_alias_cycles(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+    // First pass: find alias names in this module.
+    let mut aliases: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { span, name, ty, .. } = d {
+            let refs = collect_type_cons(ty);
+            aliases.insert(name.value.symbol(), (*span, refs));
+        }
+    }
+    // Keep only edges that point to other aliases (the graph is alias-only).
+    let alias_keys: HashSet<Symbol> = aliases.keys().copied().collect();
+    for (_, (_span, refs)) in aliases.iter_mut() {
+        refs.retain(|r| alias_keys.contains(r));
+    }
+
+    let mut graph: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    for (n, (_s, refs)) in &aliases {
+        graph.insert(*n, refs.clone());
+    }
+
+    for cycle in find_cycles(&graph) {
+        // Primary span = first alias in the cycle's span.
+        let first = cycle[0];
+        let span = aliases.get(&first).map(|(s, _)| *s).unwrap_or(Span::new(0, 0));
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::CycleInTypeSynonym(
+                cycle.iter().map(|s| resolve(*s)).collect(),
+            ),
+        });
+    }
+}
+
+/// Cycle through class superclass constraints. `class Foo a <= Bar a; class Bar a <= Foo a`.
+fn detect_class_cycles(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+    let mut classes: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Class { span, name, constraints, is_kind_sig, .. } = d {
+            if *is_kind_sig {
+                continue;
+            }
+            // Unqualified superclass refs only — `class P.Show a <= Show a`
+            // is not a self-cycle because `P.Show` is an imported class.
+            let sup: Vec<Symbol> = constraints
+                .iter()
+                .filter(|c| c.class.module.is_none())
+                .map(|c| c.class.name.symbol())
+                .collect();
+            classes.insert(name.value.symbol(), (*span, sup));
+        }
+    }
+    let class_keys: HashSet<Symbol> = classes.keys().copied().collect();
+    for (_, (_s, refs)) in classes.iter_mut() {
+        refs.retain(|r| class_keys.contains(r));
+    }
+
+    let graph: HashMap<Symbol, Vec<Symbol>> = classes
+        .iter()
+        .map(|(k, (_, v))| (*k, v.clone()))
+        .collect();
+
+    for cycle in find_cycles(&graph) {
+        let first = cycle[0];
+        let span = classes.get(&first).map(|(s, _)| *s).unwrap_or(Span::new(0, 0));
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::CycleInTypeClassDeclaration(
+                cycle.iter().map(|s| resolve(*s)).collect(),
+            ),
+        });
+    }
+}
+
+/// Cycle through standalone kind signatures, including foreign-data kinds.
+/// `foreign import data Foo :: Bar; foreign import data Bar :: Foo` → cycle.
+/// `data Foo :: Foo -> Type; data Foo a = Foo` is a self-cycle on Foo's kind.
+fn detect_kind_sig_cycles(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+    // Collect every type-level name whose kind refers to other type-level names.
+    // This includes:
+    //   - `data Foo :: Kind` (standalone kind decl, is_kind_sig != None)
+    //   - `newtype Foo :: Kind`
+    //   - `class Foo :: Kind`  (is_kind_sig = true)
+    //   - `type Foo :: Kind`
+    //   - `foreign import data Foo :: Kind`
+    let mut kinded: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+
+    for d in decls {
+        match d {
+            cst::Decl::Data {
+                span,
+                name,
+                kind_sig,
+                kind_type: Some(kt),
+                ..
+            } if !matches!(kind_sig, cst::KindSigSource::None) => {
+                let refs = collect_type_cons(kt);
+                kinded
+                    .entry(name.value.symbol())
+                    .and_modify(|(_, r)| r.extend(refs.iter().copied()))
+                    .or_insert((*span, refs));
+            }
+            cst::Decl::Class { span, name, is_kind_sig: true, kind_type: Some(kt), .. } => {
+                let refs = collect_type_cons(kt);
+                kinded
+                    .entry(name.value.symbol())
+                    .and_modify(|(_, r)| r.extend(refs.iter().copied()))
+                    .or_insert((*span, refs));
+            }
+            cst::Decl::ForeignData { span, name, kind, .. } => {
+                let refs = collect_type_cons(kind);
+                kinded
+                    .entry(name.value.symbol())
+                    .and_modify(|(_, r)| r.extend(refs.iter().copied()))
+                    .or_insert((*span, refs));
+            }
+            _ => {}
+        }
+    }
+
+    // Restrict to edges pointing at other kinded decls (local).
+    let kinded_keys: HashSet<Symbol> = kinded.keys().copied().collect();
+    for (_, (_, refs)) in kinded.iter_mut() {
+        refs.retain(|r| kinded_keys.contains(r));
+    }
+
+    let graph: HashMap<Symbol, Vec<Symbol>> = kinded
+        .iter()
+        .map(|(k, (_, v))| (*k, v.clone()))
+        .collect();
+
+    for cycle in find_cycles(&graph) {
+        let first = cycle[0];
+        let span = kinded.get(&first).map(|(s, _)| *s).unwrap_or(Span::new(0, 0));
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::CycleInKindDeclaration(
+                cycle.iter().map(|s| resolve(*s)).collect(),
+            ),
+        });
+    }
+}
+
+/// Cycle through value declarations at the top level, where the cycle
+/// goes through bindings with NO function parameters (otherwise the
+/// decl is a lazy function body and the recursion is fine).
+///
+/// `x = x` → cycle. `x = y; y = x` → cycle. `f x = f x` → NOT cycle
+/// (function definition). `loop = loop + 1` → cycle (no binders).
+fn detect_value_cycles(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+    // First collect groups: merge adjacent equations as in the duplicate
+    // detection above. We only care about groups with ZERO binders on
+    // every equation. A group with mixed arities is handled by later
+    // passes; we conservatively skip those.
+    let mut zero_arity: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+    let mut last_name: Option<Symbol> = None;
+    let mut i = 0usize;
+    while i < decls.len() {
+        if let cst::Decl::Value { span, name, binders, guarded, .. } = &decls[i] {
+            let sym = name.value.symbol();
+            if last_name == Some(sym) {
+                // Part of a multi-equation group already recorded.
+                i += 1;
+                continue;
+            }
+            last_name = Some(sym);
+
+            // Walk adjacent equations with same name, checking that ALL
+            // have zero binders. If any has >=1 binder, this is a function
+            // group — skip.
+            let mut j = i;
+            let mut all_zero_arity = true;
+            let mut all_refs: Vec<Symbol> = Vec::new();
+            while j < decls.len() {
+                match &decls[j] {
+                    cst::Decl::Value { name: n2, binders: b2, guarded: g2, .. }
+                        if n2.value.symbol() == sym =>
+                    {
+                        if !b2.is_empty() {
+                            all_zero_arity = false;
+                        }
+                        collect_value_refs(g2, &mut all_refs);
+                        j += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let _ = guarded;
+            let _ = binders;
+            if all_zero_arity {
+                zero_arity.insert(sym, (*span, all_refs));
+            }
+            i = j;
+            continue;
+        } else {
+            last_name = None;
+        }
+        i += 1;
+    }
+
+    // Restrict to edges within the zero-arity set.
+    let za_keys: HashSet<Symbol> = zero_arity.keys().copied().collect();
+    for (_, (_, refs)) in zero_arity.iter_mut() {
+        refs.retain(|r| za_keys.contains(r));
+    }
+
+    let graph: HashMap<Symbol, Vec<Symbol>> = zero_arity
+        .iter()
+        .map(|(k, (_, v))| (*k, v.clone()))
+        .collect();
+
+    for cycle in find_cycles(&graph) {
+        let first = cycle[0];
+        let span = zero_arity.get(&first).map(|(s, _)| *s).unwrap_or(Span::new(0, 0));
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::CycleInDeclaration(
+                cycle.iter().map(|s| resolve(*s)).collect(),
+            ),
+        });
+    }
+}
+
+/// Collect every type-constructor symbol referenced inside a `TypeExpr`.
+/// The caller is responsible for filtering out non-local names (constructors
+/// that aren't defined in this module simply won't appear in the graph's
+/// key set).
+fn collect_type_cons(te: &cst::TypeExpr) -> Vec<Symbol> {
+    let mut out: Vec<Symbol> = Vec::new();
+    walk_type_expr(te, &mut out);
+    out
+}
+
+fn walk_type_expr(te: &cst::TypeExpr, out: &mut Vec<Symbol>) {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            // Only collect UNQUALIFIED references. `P.Number` is a different
+            // type from a local `type Number = …` even though the bare name
+            // matches after qualifier stripping. Cycle detection must respect
+            // module qualifiers or it will false-positive on fixtures like
+            // `type Number = P.Number`.
+            if name.module.is_none() {
+                out.push(name.name.symbol());
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_type_expr(constructor, out);
+            walk_type_expr(arg, out);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_type_expr(from, out);
+            walk_type_expr(to, out);
+        }
+        cst::TypeExpr::Forall { ty, vars, .. } => {
+            for (_, _, k) in vars {
+                if let Some(k) = k {
+                    walk_type_expr(k, out);
+                }
+            }
+            walk_type_expr(ty, out);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    walk_type_expr(arg, out);
+                }
+            }
+            walk_type_expr(ty, out);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_type_expr(&f.ty, out);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_type_expr(&f.ty, out);
+            }
+            if let Some(t) = tail {
+                walk_type_expr(t, out);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => walk_type_expr(ty, out),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_type_expr(left, out);
+            walk_type_expr(right, out);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_type_expr(ty, out);
+            walk_type_expr(kind, out);
+        }
+        cst::TypeExpr::ArrayPattern { elements, .. } => {
+            for e in elements {
+                walk_type_expr(e, out);
+            }
+        }
+        cst::TypeExpr::AsPattern { ty, .. } => walk_type_expr(ty, out),
+        cst::TypeExpr::Var { .. }
+        | cst::TypeExpr::Hole { .. }
+        | cst::TypeExpr::Wildcard { .. }
+        | cst::TypeExpr::StringLiteral { .. }
+        | cst::TypeExpr::IntLiteral { .. } => {}
+    }
+}
+
+/// Collect value-level references used by a guarded body, strictly for the
+/// zero-arity value-cycle detector. Shallow — follows the common forms;
+/// anything missed is a false-negative (no cycle reported), which is safe.
+fn collect_value_refs(ge: &cst::GuardedExpr, out: &mut Vec<Symbol>) {
+    match ge {
+        cst::GuardedExpr::Unconditional(e) => walk_expr(e, out),
+        cst::GuardedExpr::Guarded(guards) => {
+            for g in guards {
+                for p in &g.patterns {
+                    match p {
+                        cst::GuardPattern::Boolean(e) => walk_expr(e, out),
+                        cst::GuardPattern::Pattern(_, e) => walk_expr(e, out),
+                    }
+                }
+                walk_expr(&g.expr, out);
+            }
+        }
+    }
+}
+
+fn walk_expr(e: &cst::Expr, out: &mut Vec<Symbol>) {
+    use cst::Expr;
+    match e {
+        Expr::Var { name, .. } => {
+            // Unqualified references to module-local names only.
+            if name.module.is_none() {
+                out.push(name.name.symbol());
+            }
+        }
+        Expr::App { func, arg, .. } => {
+            walk_expr(func, out);
+            walk_expr(arg, out);
+        }
+        Expr::Op { left, right, .. } => {
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
+        Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr(func, out);
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr(cond, out);
+            walk_expr(then_expr, out);
+            walk_expr(else_expr, out);
+        }
+        Expr::Parens { expr, .. } => walk_expr(expr, out),
+        Expr::TypeAnnotation { expr, .. } => walk_expr(expr, out),
+        Expr::Negate { expr, .. } => walk_expr(expr, out),
+        Expr::VisibleTypeApp { func, .. } => walk_expr(func, out),
+        Expr::RecordAccess { expr, .. } => walk_expr(expr, out),
+        // Deliberately skip Let/Case/Do/Ado/Lambda/Record — these introduce
+        // new binders / scopes and a cycle detector over the whole module
+        // without scoping would produce false positives.
+        _ => {}
+    }
+}
+
+/// Simple cycle-finder. For each node, DFS and record all cycles containing
+/// it. Deduplicates so a k-cycle emits once. Self-loops (x → x) are included.
+fn find_cycles(graph: &HashMap<Symbol, Vec<Symbol>>) -> Vec<Vec<Symbol>> {
+    let mut reported: HashSet<Vec<Symbol>> = HashSet::new();
+    let mut cycles: Vec<Vec<Symbol>> = Vec::new();
+    let mut nodes: Vec<Symbol> = graph.keys().copied().collect();
+    nodes.sort_by_key(|s| (*s).to_string_rep());
+    for start in nodes {
+        let mut path: Vec<Symbol> = Vec::new();
+        let mut on_path: HashSet<Symbol> = HashSet::new();
+        dfs_cycle(start, graph, &mut path, &mut on_path, &mut cycles, &mut reported);
+    }
+    cycles
+}
+
+fn dfs_cycle(
+    node: Symbol,
+    graph: &HashMap<Symbol, Vec<Symbol>>,
+    path: &mut Vec<Symbol>,
+    on_path: &mut HashSet<Symbol>,
+    out: &mut Vec<Vec<Symbol>>,
+    reported: &mut HashSet<Vec<Symbol>>,
+) {
+    if on_path.contains(&node) {
+        // Extract the cycle by finding node in path.
+        let pos = path.iter().position(|&x| x == node).unwrap_or(0);
+        let mut cycle = path[pos..].to_vec();
+        // Canonicalise: rotate so smallest symbol comes first, for dedup.
+        if !cycle.is_empty() {
+            let min_pos = cycle
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.to_string_rep())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            cycle.rotate_left(min_pos);
+            if reported.insert(cycle.clone()) {
+                out.push(cycle);
+            }
+        }
+        return;
+    }
+    if path.contains(&node) {
+        return;
+    }
+    path.push(node);
+    on_path.insert(node);
+    if let Some(children) = graph.get(&node) {
+        for c in children {
+            dfs_cycle(*c, graph, path, on_path, out, reported);
+        }
+    }
+    on_path.remove(&node);
+    path.pop();
+}
+
+trait SymExt {
+    fn to_string_rep(self) -> String;
+}
+impl SymExt for Symbol {
+    fn to_string_rep(self) -> String {
+        crate::interner::resolve(self).unwrap_or_default()
+    }
 }
 
 fn check_duplicate_type_args(
