@@ -47,6 +47,7 @@ pub enum ValidationErrorKind {
     PartiallyAppliedSynonym(String),
     OrphanInstance(String),
     DeclConflict(String),
+    RoleDeclarationArityMismatch(String),
 }
 
 impl ValidationErrorKind {
@@ -69,6 +70,7 @@ impl ValidationErrorKind {
             Self::PartiallyAppliedSynonym(_) => "PartiallyAppliedSynonym",
             Self::OrphanInstance(_) => "OrphanInstance",
             Self::DeclConflict(_) => "DeclConflict",
+            Self::RoleDeclarationArityMismatch(_) => "RoleDeclarationArityMismatch",
         }
     }
 }
@@ -313,6 +315,10 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // RoleDeclarationArityMismatch: `type role Foo r1 r2 …` must match the
+    // arity of the matching data/newtype/foreign-data.
+    detect_role_arity_mismatches(&module.decls, &mut errors);
+
     // DeclConflict: cross-namespace name collisions at the type level
     // (e.g. `class Fail` + `data Fail`), plus duplicate data-constructor
     // names inside one decl or across data decls in the module.
@@ -331,6 +337,67 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     let _ = detect_partially_applied_synonyms;
 
     errors
+}
+
+/// Roles on a data/newtype/foreign-data must match its arity exactly.
+/// `data A = A` + `type role A nominal` = one role for a zero-arity
+/// data → mismatch. For foreign data, arity is the arrow-count in its
+/// declared kind (kind `Type` → arity 0, `Type -> Type` → 1, etc.).
+fn detect_role_arity_mismatches(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // First pass: record arity of every type-level name.
+    let mut arity: HashMap<Symbol, usize> = HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { name, type_vars, is_role_decl: false, kind_sig: cst::KindSigSource::None, .. } => {
+                arity.insert(name.value.symbol(), type_vars.len());
+            }
+            cst::Decl::Newtype { name, type_vars, .. } => {
+                arity.insert(name.value.symbol(), type_vars.len());
+            }
+            cst::Decl::ForeignData { name, kind, .. } => {
+                arity.insert(name.value.symbol(), count_kind_arrows(kind));
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: compare each role decl against the matching arity.
+    for d in decls {
+        if let cst::Decl::Data {
+            span,
+            name,
+            type_vars,
+            is_role_decl: true,
+            ..
+        } = d
+        {
+            let n = name.value.symbol();
+            if let Some(&expected) = arity.get(&n) {
+                if type_vars.len() != expected {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::RoleDeclarationArityMismatch(
+                            resolve(n),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Count the number of `a -> b -> c -> …` arrows in a kind expression.
+/// `Type` → 0, `Type -> Type` → 1, `Type -> (Type -> Type)` → 2.
+fn count_kind_arrows(te: &cst::TypeExpr) -> usize {
+    match te {
+        cst::TypeExpr::Function { to, .. } => 1 + count_kind_arrows(to),
+        cst::TypeExpr::Parens { ty, .. } => count_kind_arrows(ty),
+        cst::TypeExpr::Forall { ty, .. } => count_kind_arrows(ty),
+        _ => 0,
+    }
 }
 
 /// Cross-namespace name collisions at the type level: `class Foo` +

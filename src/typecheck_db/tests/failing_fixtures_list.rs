@@ -336,11 +336,11 @@ check_failing_build_unit_ignored!(f_RecordLabelOnTypeError, "RecordLabelOnTypeEr
 check_failing_build_unit_ignored!(f_RecordLabelOnTypeErrorImmediate, "RecordLabelOnTypeErrorImmediate");
 check_failing_build_unit_ignored!(f_RequiredHiddenType, "RequiredHiddenType");
 check_failing_build_unit!(f_Reserved, "Reserved");
-check_failing_build_unit_ignored!(f_RoleDeclarationArityMismatch, "RoleDeclarationArityMismatch");
-check_failing_build_unit_ignored!(f_RoleDeclarationArityMismatchForeign, "RoleDeclarationArityMismatchForeign");
-check_failing_build_unit_ignored!(f_RoleDeclarationArityMismatchForeign2, "RoleDeclarationArityMismatchForeign2");
-check_failing_build_unit_ignored!(f_RoleDeclarationArityMismatchForeign3, "RoleDeclarationArityMismatchForeign3");
-check_failing_build_unit_ignored!(f_RoleDeclarationArityMismatchForeign4, "RoleDeclarationArityMismatchForeign4");
+check_failing_build_unit!(f_RoleDeclarationArityMismatch, "RoleDeclarationArityMismatch");
+check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign, "RoleDeclarationArityMismatchForeign");
+check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign2, "RoleDeclarationArityMismatchForeign2");
+check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign3, "RoleDeclarationArityMismatchForeign3");
+check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign4, "RoleDeclarationArityMismatchForeign4");
 check_failing_build_unit_ignored!(f_RowConstructors1, "RowConstructors1");
 check_failing_build_unit_ignored!(f_RowConstructors2, "RowConstructors2");
 check_failing_build_unit_ignored!(f_RowConstructors3, "RowConstructors3");
