@@ -337,7 +337,9 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
         "ClassInstanceArityMismatch" => has("ClassInstanceArityMismatch"),
         "InvalidInstanceHead" => has("InvalidInstanceHead"),
         "PartiallyAppliedSynonym" => has("PartiallyAppliedSynonym"),
-        "TransitiveExportError" | "TransitiveDctorExportError" => has("TransitiveExportError"),
+        "TransitiveExportError" | "TransitiveDctorExportError" => {
+            has("TransitiveExportError") || has("TransitiveDctorExportError")
+        }
         "OverlappingInstances" => has("OverlappingInstances"),
         "ExportConflict" => has("ExportConflict"),
         "ScopeConflict" => has("ScopeConflict"),

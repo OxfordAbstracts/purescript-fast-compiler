@@ -52,6 +52,8 @@ pub enum ValidationErrorKind {
     WildcardInTypeDefinition,
     ConstraintInForeignImport,
     InvalidConstraintArgument,
+    TransitiveDctorExportError(String),
+    TransitiveExportError(String),
 }
 
 impl ValidationErrorKind {
@@ -79,6 +81,8 @@ impl ValidationErrorKind {
             Self::WildcardInTypeDefinition => "WildcardInTypeDefinition",
             Self::ConstraintInForeignImport => "ConstraintInForeignImport",
             Self::InvalidConstraintArgument => "InvalidConstraintArgument",
+            Self::TransitiveDctorExportError(_) => "TransitiveDctorExportError",
+            Self::TransitiveExportError(_) => "TransitiveExportError",
         }
     }
 }
@@ -323,6 +327,14 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // Transitive export errors (subset — only catches the cases
+    // decidable purely from the CST):
+    //   - TransitiveDctorExportError: `T(A)` names fewer constructors
+    //     than `data T = A | B | …` has.
+    //   - TransitiveExportError: an exported value-operator alias
+    //     whose fixity target isn't also exported.
+    detect_transitive_export_errors(module, &mut errors);
+
     // Parse-level structural rejections that our grammar lets through:
     //   - Wildcards in type definitions (type/data/newtype RHS).
     //   - `=>` in foreign-import signatures.
@@ -356,6 +368,167 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     let _ = detect_partially_applied_synonyms;
 
     errors
+}
+
+/// Transitive export error subset detectable from the CST alone.
+fn detect_transitive_export_errors(
+    module: &cst::Module,
+    errors: &mut Vec<ValidationError>,
+) {
+    let export_list = match &module.exports {
+        Some(e) => &e.value.exports,
+        None => return,
+    };
+
+    // Collect per-data-type constructor sets.
+    let mut data_ctors: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+    for d in &module.decls {
+        if let cst::Decl::Data {
+            span,
+            name,
+            constructors,
+            is_role_decl: false,
+            kind_sig: cst::KindSigSource::None,
+            ..
+        } = d
+        {
+            let ctors: Vec<Symbol> = constructors
+                .iter()
+                .map(|c| c.name.value.symbol())
+                .collect();
+            data_ctors.insert(name.value.symbol(), (*span, ctors));
+        }
+    }
+
+    // Local value names (for checking whether a fixity target is
+    // actually defined in this module).
+    let mut local_values: HashSet<Symbol> = HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Value { name, .. } => {
+                local_values.insert(name.value.symbol());
+            }
+            cst::Decl::Foreign { name, .. } => {
+                local_values.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    let mut local_ctors: HashSet<Symbol> = HashSet::new();
+    for (_, ctors) in data_ctors.values() {
+        for c in ctors {
+            local_ctors.insert(*c);
+        }
+    }
+    for d in &module.decls {
+        if let cst::Decl::Newtype { constructor, .. } = d {
+            local_ctors.insert(constructor.value.symbol());
+        }
+    }
+
+    // Collect value fixities so we can map exported operator aliases
+    // back to their target. Only track fixities whose target is
+    // locally defined — if the target is imported, the reference
+    // compiler treats the alias as its own export and doesn't require
+    // separate re-export of the underlying name.
+    let mut value_op_target: HashMap<Symbol, (Span, Symbol)> = HashMap::new();
+    for d in &module.decls {
+        if let cst::Decl::Fixity { span, operator, is_type: false, target, .. } = d {
+            if target.module.is_none()
+                && (local_values.contains(&target.name)
+                    || local_ctors.contains(&target.name))
+            {
+                value_op_target
+                    .insert(operator.value.symbol(), (*span, target.name));
+            }
+        }
+    }
+
+    // Build "is this name reachable from the export list?" lookups.
+    // Values, constructors (via `T(..)` or `T(C1, C2)`), and types are
+    // tracked separately. A fixity target may be a value OR a
+    // constructor — `infix 4 Bar' as :->` targets the `Bar'` ctor.
+    let mut exported_values: HashSet<Symbol> = HashSet::new();
+    let mut exported_ctors: HashSet<Symbol> = HashSet::new();
+    let mut re_exports_wild = false;
+    for e in export_list {
+        match e {
+            cst::Export::Value(n) => {
+                exported_values.insert(n.symbol());
+            }
+            cst::Export::Type(t, members) => {
+                let tsym = t.symbol();
+                match members {
+                    Some(cst::DataMembers::All) => {
+                        if let Some((_, ctors)) = data_ctors.get(&tsym) {
+                            exported_ctors.extend(ctors.iter().copied());
+                        }
+                    }
+                    Some(cst::DataMembers::Explicit(cs)) => {
+                        for c in cs {
+                            exported_ctors.insert(c.value.symbol());
+                        }
+                    }
+                    None => {}
+                }
+            }
+            cst::Export::Module(_) => {
+                // `module X` re-exports everything from X. We don't
+                // track what X actually re-exports without the
+                // registry, so conservatively turn off operator-alias
+                // checking for this module.
+                re_exports_wild = true;
+            }
+            _ => {}
+        }
+    }
+
+    for e in export_list {
+        match e {
+            cst::Export::Type(type_name, Some(cst::DataMembers::Explicit(ctors))) => {
+                // Partial-ctor export: if the local data type has more
+                // ctors than this explicit list, the reference compiler
+                // rejects with TransitiveDctorExportError.
+                let tsym = type_name.symbol();
+                if let Some((span, all_ctors)) = data_ctors.get(&tsym) {
+                    let named: HashSet<Symbol> =
+                        ctors.iter().map(|c| c.value.symbol()).collect();
+                    let all: HashSet<Symbol> = all_ctors.iter().copied().collect();
+                    if named != all {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::TransitiveDctorExportError(
+                                resolve(tsym),
+                            ),
+                        });
+                    }
+                }
+            }
+            cst::Export::Value(opn) => {
+                // Operator alias in export list → its fixity target
+                // must also be exported (as a value or as a ctor).
+                // Skip if this module uses `module X` re-export: we
+                // can't see through that without the registry.
+                if re_exports_wild {
+                    continue;
+                }
+                let op = opn.symbol();
+                if let Some((span, target)) = value_op_target.get(&op) {
+                    if !exported_values.contains(target)
+                        && !exported_ctors.contains(target)
+                    {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::TransitiveExportError(
+                                resolve(op),
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Parser-level rejections the reference compiler makes at parse time

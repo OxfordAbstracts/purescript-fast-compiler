@@ -53,6 +53,7 @@ f_ConstraintFailure
 f_ConstraintInForeignImport
 f_CycleInForeignDataKinds
 f_CycleInKindDeclaration
+f_DctorOperatorAliasExport
 f_DeclConflictClassSynonym
 f_DeclConflictClassType
 f_DeclConflictCtorCtor
@@ -109,6 +110,7 @@ f_NewtypeMultiArgs
 f_NewtypeMultiCtor
 f_NullaryAbs
 f_Object
+f_OperatorAliasNoExport
 f_OperatorAt
 f_OperatorBackslash
 f_OperatorSections
@@ -142,6 +144,7 @@ f_Superclasses2
 f_Superclasses5
 f_TooFewClassInstanceArgs
 f_TooFewUnnamedClassInstanceArgs
+f_TransitiveDctorExportError
 f_TypeClasses2
 f_TypeError
 f_TypeSynonymCycle
