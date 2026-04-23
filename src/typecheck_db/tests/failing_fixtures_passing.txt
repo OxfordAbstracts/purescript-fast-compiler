@@ -91,6 +91,7 @@ f_LetPatterns1
 f_LetPatterns2
 f_LetPatterns3
 f_LetPatterns4
+f_MPTCs
 f_MissingRecordField
 f_MultipleErrors2
 f_MultipleTypeOpFixities
@@ -132,6 +133,8 @@ f_SuggestComposition
 f_Superclasses1
 f_Superclasses2
 f_Superclasses5
+f_TooFewClassInstanceArgs
+f_TooFewUnnamedClassInstanceArgs
 f_TypeClasses2
 f_TypeError
 f_TypeSynonymCycle

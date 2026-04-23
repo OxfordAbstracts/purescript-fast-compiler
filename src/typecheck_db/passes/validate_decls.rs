@@ -48,6 +48,7 @@ pub enum ValidationErrorKind {
     OrphanInstance(String),
     DeclConflict(String),
     RoleDeclarationArityMismatch(String),
+    ClassInstanceArityMismatch { class: String, expected: usize, got: usize },
 }
 
 impl ValidationErrorKind {
@@ -71,6 +72,7 @@ impl ValidationErrorKind {
             Self::OrphanInstance(_) => "OrphanInstance",
             Self::DeclConflict(_) => "DeclConflict",
             Self::RoleDeclarationArityMismatch(_) => "RoleDeclarationArityMismatch",
+            Self::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch",
         }
     }
 }
@@ -315,6 +317,11 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // ClassInstanceArityMismatch: instance head's type-arg count must
+    // match the class's parameter count (local classes only — imported
+    // classes aren't accessible from this CST-only pass).
+    detect_class_instance_arity(&module.decls, &mut errors);
+
     // RoleDeclarationArityMismatch: `type role Foo r1 r2 …` must match the
     // arity of the matching data/newtype/foreign-data.
     detect_role_arity_mismatches(&module.decls, &mut errors);
@@ -337,6 +344,47 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     let _ = detect_partially_applied_synonyms;
 
     errors
+}
+
+/// Local-class instance-arity mismatch. For imported classes the class
+/// arity isn't accessible here; those cases are left for later passes
+/// that hold the registry.
+fn detect_class_instance_arity(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut class_arity: HashMap<Symbol, usize> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Class { name, type_vars, is_kind_sig: false, .. } = d {
+            class_arity.insert(name.value.symbol(), type_vars.len());
+        }
+    }
+    if class_arity.is_empty() {
+        return;
+    }
+    for d in decls {
+        let (span, class_name, types) = match d {
+            cst::Decl::Instance { span, class_name, types, .. } => (*span, class_name, types),
+            cst::Decl::Derive { span, class_name, types, .. } => (*span, class_name, types),
+            _ => continue,
+        };
+        if class_name.module.is_some() {
+            continue;
+        }
+        let sym = class_name.name.symbol();
+        if let Some(&expected) = class_arity.get(&sym) {
+            if types.len() != expected {
+                errors.push(ValidationError {
+                    span,
+                    kind: ValidationErrorKind::ClassInstanceArityMismatch {
+                        class: resolve(sym),
+                        expected,
+                        got: types.len(),
+                    },
+                });
+            }
+        }
+    }
 }
 
 /// Roles on a data/newtype/foreign-data must match its arity exactly.
