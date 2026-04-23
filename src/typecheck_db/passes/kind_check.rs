@@ -46,6 +46,88 @@ pub enum KindErrorKind {
     },
 }
 
+/// Per-parameter expected kind structure. We approximate kinds by
+/// "arrow count" (number of `->` arrows at the top level): `Type` = 0,
+/// `Type -> Type` = 1, `(Type -> Type) -> Type` = 1, etc. Coarse but
+/// good enough to catch `Syn Int` when `Syn (a :: Type -> Type)` is
+/// the declared shape.
+#[derive(Debug, Clone, Copy)]
+struct ParamKind {
+    /// Number of arrows the param expects. None = no kind annotation
+    /// (treat as wildcard).
+    arrows: Option<usize>,
+}
+
+/// Build the param-kind environment for a module: every nominal type
+/// constructor's per-param expected kind structure, plus aliases'.
+fn build_param_kinds(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> HashMap<Symbol, Vec<ParamKind>> {
+    let mut env: HashMap<Symbol, Vec<ParamKind>> = HashMap::new();
+
+    let collect = |anns: &[Option<Box<cst::TypeExpr>>]| -> Vec<ParamKind> {
+        anns.iter()
+            .map(|opt| ParamKind {
+                arrows: opt.as_deref().map(arrow_count),
+            })
+            .collect()
+    };
+
+    for d in &module.decls {
+        match d {
+            cst::Decl::Data {
+                name,
+                type_var_kind_anns,
+                kind_sig: cst::KindSigSource::None,
+                is_role_decl: false,
+                ..
+            } => {
+                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+            }
+            cst::Decl::Newtype { name, type_var_kind_anns, .. } => {
+                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+            }
+            cst::Decl::TypeAlias { name, type_var_kind_anns, .. } => {
+                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+            }
+            cst::Decl::Class {
+                name, type_var_kind_anns, is_kind_sig: false, ..
+            } => {
+                env.insert(name.value.symbol(), collect(type_var_kind_anns));
+            }
+            _ => {}
+        }
+    }
+
+    // We don't have per-param kind annotations from the registry,
+    // only arities, so imported types contribute no annotations —
+    // their App-sites won't trigger an annotation-based check.
+    let _ = registry;
+    env
+}
+
+/// Hardcoded arities for the most common Prim type constructors.
+/// `Prim` is implicitly imported by every user module but doesn't
+/// flow through the registry path here.
+fn prim_arities() -> &'static [(&'static str, usize)] {
+    &[
+        ("Int", 0),
+        ("Number", 0),
+        ("String", 0),
+        ("Char", 0),
+        ("Boolean", 0),
+        ("Type", 0),
+        ("Constraint", 0),
+        ("Symbol", 0),
+        ("Array", 1),
+        ("Function", 2),
+        ("Record", 1),
+        ("Row", 1),
+        ("Partial", 0),
+    ]
+}
+
 /// Build the kind environment for a module. Only NOMINAL type-level
 /// names go in: data / newtype / foreign-data / class. Type aliases
 /// are deliberately excluded — their RHS may have higher kind, so a
@@ -67,6 +149,11 @@ fn build_arity_env(
             _ => None,
         })
         .collect();
+
+    // 0) Implicit Prim imports.
+    for (name, arity) in prim_arities() {
+        env.insert(crate::interner::intern(name), *arity);
+    }
 
     // 1) Imports — only direct imports contribute to scope.
     for imp in &module.imports {
@@ -174,8 +261,14 @@ pub fn check_module(
 ) -> Vec<KindError> {
     let arity_env = build_arity_env(module, registry);
     let class_env = build_class_arity_env(module, registry);
+    let param_kinds = build_param_kinds(module, registry);
     let mut errors: Vec<KindError> = Vec::new();
-    let mut ctx = Ctx { arity_env: &arity_env, class_env: &class_env, errors: &mut errors };
+    let mut ctx = Ctx {
+        arity_env: &arity_env,
+        class_env: &class_env,
+        param_kinds: &param_kinds,
+        errors: &mut errors,
+    };
 
     for d in &module.decls {
         match d {
@@ -229,6 +322,7 @@ pub fn check_module(
 struct Ctx<'a> {
     arity_env: &'a HashMap<Symbol, usize>,
     class_env: &'a HashMap<Symbol, usize>,
+    param_kinds: &'a HashMap<Symbol, Vec<ParamKind>>,
     errors: &'a mut Vec<KindError>,
 }
 
@@ -242,16 +336,40 @@ impl<'a> Ctx<'a> {
         if let cst::TypeExpr::Constructor { span, name } = head {
             // Only check unqualified or same-name lookups.
             if name.module.is_none() {
-                if let Some(&expected) = self.arity_env.get(&name.name.symbol()) {
+                let sym = name.name.symbol();
+                if let Some(&expected) = self.arity_env.get(&sym) {
                     if args.len() > expected {
                         self.errors.push(KindError {
                             span: *span,
                             kind: KindErrorKind::KindsDoNotUnify {
-                                head: resolve(name.name.symbol()),
+                                head: resolve(sym),
                                 expected,
                                 got: args.len(),
                             },
                         });
+                    }
+                }
+                // Per-parameter kind annotations: when the head's
+                // type vars carry explicit kinds, verify each
+                // supplied arg's structural kind matches.
+                if let Some(params) = self.param_kinds.get(&sym) {
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Some(p) = params.get(i) {
+                            if let Some(expected_arrows) = p.arrows {
+                                if let Some(actual_arrows) = self.infer_arg_arrows(arg) {
+                                    if actual_arrows != expected_arrows {
+                                        self.errors.push(KindError {
+                                            span: arg.span(),
+                                            kind: KindErrorKind::KindsDoNotUnify {
+                                                head: resolve(sym),
+                                                expected: expected_arrows,
+                                                got: actual_arrows,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -316,6 +434,40 @@ impl<'a> Ctx<'a> {
             | cst::TypeExpr::Wildcard { .. }
             | cst::TypeExpr::StringLiteral { .. }
             | cst::TypeExpr::IntLiteral { .. } => {}
+        }
+    }
+
+    /// Infer the arrow-count of an argument's kind. `Type` (a
+    /// fully-applied 0-arity ctor like Int) → 0 arrows. `Array` (1
+    /// param, fully unapplied) → 1 arrow. Returns None when we
+    /// can't tell (alias references, type variables, holes,
+    /// wildcards, qualified imports we don't have arities for).
+    fn infer_arg_arrows(&self, te: &cst::TypeExpr) -> Option<usize> {
+        let (head, args) = peel_app(te);
+        match head {
+            cst::TypeExpr::Constructor { name, .. } => {
+                if name.module.is_some() {
+                    // Imported, qualified ref — we don't have full
+                    // kinds. Skip.
+                    return None;
+                }
+                let sym = name.name.symbol();
+                let arity = self.arity_env.get(&sym).copied()?;
+                if args.len() > arity {
+                    // Over-applied; the over-application is reported
+                    // separately so don't double-flag here.
+                    return None;
+                }
+                Some(arity - args.len())
+            }
+            cst::TypeExpr::Function { .. }
+            | cst::TypeExpr::Forall { .. }
+            | cst::TypeExpr::Constrained { .. }
+            | cst::TypeExpr::Record { .. }
+            | cst::TypeExpr::Row { .. } => Some(0),
+            cst::TypeExpr::StringLiteral { .. }
+            | cst::TypeExpr::IntLiteral { .. } => Some(0),
+            _ => None,
         }
     }
 

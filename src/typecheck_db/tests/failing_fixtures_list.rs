@@ -19,7 +19,7 @@ check_failing_build_unit!(f_2434, "2434");
 check_failing_build_unit_ignored!(f_2534, "2534");
 check_failing_build_unit_ignored!(f_2542, "2542");
 check_failing_build_unit!(f_2567, "2567");
-check_failing_build_unit_ignored!(f_2601, "2601");
+check_failing_build_unit!(f_2601, "2601");
 check_failing_build_unit!(f_2616, "2616");
 check_failing_build_unit_ignored!(f_2806, "2806");
 check_failing_build_unit!(f_2874_forall, "2874-forall");
