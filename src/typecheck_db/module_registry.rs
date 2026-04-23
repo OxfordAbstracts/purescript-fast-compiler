@@ -629,7 +629,19 @@ pub fn distill_exports(
                                     })
                                     .collect(),
                             };
-                            out.data_constructors.insert(name.clone(), wanted.clone());
+                            // When the same type is exported more than
+                            // once (e.g. `module M (A(..), A) where`)
+                            // prefer the richer ctor list. A later
+                            // `A` (no ctors) shouldn't shadow a prior
+                            // `A(..)` (full list).
+                            out.data_constructors
+                                .entry(name.clone())
+                                .and_modify(|existing| {
+                                    if wanted.len() > existing.len() {
+                                        *existing = wanted.clone();
+                                    }
+                                })
+                                .or_insert_with(|| wanted.clone());
                             for ctor in wanted {
                                 if let Some(info) = ctor_info.get(&ctor) {
                                     out.ctors.insert(ctor, info.clone());
