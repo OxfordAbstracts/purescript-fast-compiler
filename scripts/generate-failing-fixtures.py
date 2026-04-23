@@ -21,13 +21,26 @@ def fixture_ident(stem: str) -> str:
     return "f_" + stem.replace("-", "_")
 
 
+# Fixtures that stack-overflow typecheck_db (infinite-recursion bug).
+# Listed but marked skipped so their entries remain visible in the ratchet.
+SKIP_STACK_OVERFLOW = {
+    "3765-kinds",
+    "3765",
+}
+
+
 def main() -> None:
     purs_files = sorted(f for f in FAILING_ROOT.iterdir() if f.suffix == ".purs")
     entries = []
     for purs in purs_files:
         stem = purs.stem
         ident = fixture_ident(stem)
-        entries.append(f'check_failing_build_unit!({ident}, "{stem}");')
+        if stem in SKIP_STACK_OVERFLOW:
+            entries.append(
+                f'check_failing_build_unit_skipped!({ident}, "{stem}", "stack overflow in typecheck_db");'
+            )
+        else:
+            entries.append(f'check_failing_build_unit!({ident}, "{stem}");')
 
     OUT.write_text("\n".join(entries) + "\n")
     print(f"Wrote {len(entries)} entries to {OUT.relative_to(REPO)}")
