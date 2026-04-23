@@ -11,6 +11,30 @@ use thiserror::Error;
 
 use crate::typecheck_db::types::{Constraint, Type};
 
+/// True when the Forall body's outermost App head is a `Con` that
+/// matches the other side's outermost App head. This lets us
+/// distinguish the rank-N instantiation case (`forall r. ST r a` vs
+/// `ST U1 U2` — both headed by `Con("ST")`) from the rank-2
+/// violation case (`forall a. a -> a` vs `Number -> Number` — the
+/// Forall body is `Fun(Var, Var)` while the other is `Fun(Con,
+/// Con)`, and we must NOT let this unification succeed by
+/// instantiating `a = Number`).
+fn forall_head_matches(body: &Type, other: &Type) -> bool {
+    fn app_head(ty: &Type) -> Option<&Type> {
+        let mut cur = ty;
+        loop {
+            match cur {
+                Type::App(f, _) => cur = f,
+                _ => return Some(cur),
+            }
+        }
+    }
+    match (app_head(body), app_head(other)) {
+        (Some(Type::Con(a)), Some(Type::Con(b))) => a == b,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum UnifyError {
     #[error("cannot unify {0} with {1}")]
@@ -354,6 +378,27 @@ impl UnifyState {
                     renamed = crate::typecheck_db::generalize::apply_var_subst(&renamed, &subst);
                 }
                 self.unify(&renamed, body2)
+            }
+            // `Forall` against a structurally-concrete head that
+            // shares the Forall body's shape: this is the rank-N
+            // instantiation-on-argument case. For `forall r. ST r a`
+            // unified with `ST U1 U2`, we instantiate `r` to a fresh
+            // unif and continue. We deliberately limit this to the
+            // case where both sides have the same App-head so we
+            // don't accept `(forall a. a -> a)` being "instantiated"
+            // against `Number -> Number` — that's a rank-2
+            // violation which legitimately fails to unify.
+            (Type::Forall(vs, body), other) | (other, Type::Forall(vs, body))
+                if forall_head_matches(body, other) =>
+            {
+                let mut subst: std::collections::HashMap<String, Type> =
+                    std::collections::HashMap::new();
+                for (n, _, _) in vs {
+                    subst.insert(n.clone(), self.fresh());
+                }
+                let inst =
+                    crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+                self.unify(&inst, other)
             }
             (Type::Record(f1, t1), Type::Record(f2, t2)) => unify_fields(self, f1, t1, f2, t2),
             (Type::Row(f1, t1), Type::Row(f2, t2)) => unify_fields(self, f1, t1, f2, t2),
