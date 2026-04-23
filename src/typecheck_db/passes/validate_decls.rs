@@ -49,6 +49,9 @@ pub enum ValidationErrorKind {
     DeclConflict(String),
     RoleDeclarationArityMismatch(String),
     ClassInstanceArityMismatch { class: String, expected: usize, got: usize },
+    WildcardInTypeDefinition,
+    ConstraintInForeignImport,
+    InvalidConstraintArgument,
 }
 
 impl ValidationErrorKind {
@@ -73,6 +76,9 @@ impl ValidationErrorKind {
             Self::DeclConflict(_) => "DeclConflict",
             Self::RoleDeclarationArityMismatch(_) => "RoleDeclarationArityMismatch",
             Self::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch",
+            Self::WildcardInTypeDefinition => "WildcardInTypeDefinition",
+            Self::ConstraintInForeignImport => "ConstraintInForeignImport",
+            Self::InvalidConstraintArgument => "InvalidConstraintArgument",
         }
     }
 }
@@ -317,6 +323,12 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // Parse-level structural rejections that our grammar lets through:
+    //   - Wildcards in type definitions (type/data/newtype RHS).
+    //   - `=>` in foreign-import signatures.
+    //   - Invalid constraint arguments (forall-quantified / wildcard).
+    detect_parse_level_rejections(&module.decls, &mut errors);
+
     // ClassInstanceArityMismatch: instance head's type-arg count must
     // match the class's parameter count (local classes only — imported
     // classes aren't accessible from this CST-only pass).
@@ -344,6 +356,198 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     let _ = detect_partially_applied_synonyms;
 
     errors
+}
+
+/// Parser-level rejections the reference compiler makes at parse time
+/// but our grammar doesn't. Caught structurally post-parse so we can
+/// still report ErrorParsingModule-class issues without grammar churn.
+fn detect_parse_level_rejections(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { ty, span, .. } => {
+                if contains_wildcard(ty) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::WildcardInTypeDefinition,
+                    });
+                }
+            }
+            cst::Decl::Data { constructors, span, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        if contains_wildcard(f) {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::WildcardInTypeDefinition,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            cst::Decl::Newtype { ty, span, .. } => {
+                if contains_wildcard(ty) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::WildcardInTypeDefinition,
+                    });
+                }
+            }
+            cst::Decl::Foreign { ty, span, .. } => {
+                if contains_constraint_arrow(ty) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::ConstraintInForeignImport,
+                    });
+                }
+            }
+            // InvalidConstraintArgument: a `Constraint` whose arg contains
+            // a forall-quantifier or a wildcard. Walk every type site
+            // that may carry constraints: instance/derive heads, class
+            // superclasses, value signatures.
+            cst::Decl::Instance { constraints, .. }
+            | cst::Decl::Derive { constraints, .. } => {
+                check_constraint_args(constraints, errors);
+            }
+            cst::Decl::Class { constraints, .. } => {
+                check_constraint_args(constraints, errors);
+                // Class-method bodies (the `members` field) are value
+                // type signatures semantically, and PureScript allows
+                // wildcards in value-sig constraint args as inference
+                // hints (`test :: MonadAsk _ m => …`), so we don't
+                // descend into them.
+            }
+            _ => {}
+        }
+    }
+}
+
+fn contains_wildcard(te: &cst::TypeExpr) -> bool {
+    let mut found = false;
+    walk_type_find(te, &mut |t| {
+        if matches!(t, cst::TypeExpr::Wildcard { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn contains_constraint_arrow(te: &cst::TypeExpr) -> bool {
+    let mut found = false;
+    walk_type_find(te, &mut |t| {
+        if matches!(t, cst::TypeExpr::Constrained { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn check_constraint_args(
+    constraints: &[cst::Constraint],
+    errors: &mut Vec<ValidationError>,
+) {
+    for c in constraints {
+        for a in &c.args {
+            if constraint_arg_invalid(a) {
+                errors.push(ValidationError {
+                    span: c.span,
+                    kind: ValidationErrorKind::InvalidConstraintArgument,
+                });
+                break;
+            }
+        }
+    }
+}
+
+fn check_constrained_type(te: &cst::TypeExpr, errors: &mut Vec<ValidationError>) {
+    if let cst::TypeExpr::Constrained { constraints, ty, .. } = te {
+        check_constraint_args(constraints, errors);
+        check_constrained_type(ty, errors);
+    } else if let cst::TypeExpr::Forall { ty, .. } = te {
+        check_constrained_type(ty, errors);
+    } else if let cst::TypeExpr::Parens { ty, .. } = te {
+        check_constrained_type(ty, errors);
+    }
+}
+
+/// A constraint arg is invalid if it contains a forall (rank-n type)
+/// or a wildcard. `Show a` is fine; `Show (forall t. t)` is not;
+/// `(Baz _) => …` is not.
+fn constraint_arg_invalid(te: &cst::TypeExpr) -> bool {
+    let mut bad = false;
+    walk_type_find(te, &mut |t| match t {
+        cst::TypeExpr::Forall { .. } | cst::TypeExpr::Wildcard { .. } => {
+            bad = true;
+        }
+        _ => {}
+    });
+    bad
+}
+
+/// Pre-order walker that applies `f` to every sub-TypeExpr.
+fn walk_type_find<F>(te: &cst::TypeExpr, f: &mut F)
+where
+    F: FnMut(&cst::TypeExpr),
+{
+    f(te);
+    match te {
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_type_find(constructor, f);
+            walk_type_find(arg, f);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_type_find(from, f);
+            walk_type_find(to, f);
+        }
+        cst::TypeExpr::Forall { ty, vars, .. } => {
+            for (_, _, k) in vars {
+                if let Some(k) = k {
+                    walk_type_find(k, f);
+                }
+            }
+            walk_type_find(ty, f);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for a in &c.args {
+                    walk_type_find(a, f);
+                }
+            }
+            walk_type_find(ty, f);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for fd in fields {
+                walk_type_find(&fd.ty, f);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for fd in fields {
+                walk_type_find(&fd.ty, f);
+            }
+            if let Some(t) = tail {
+                walk_type_find(t, f);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => walk_type_find(ty, f),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_type_find(left, f);
+            walk_type_find(right, f);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_type_find(ty, f);
+            walk_type_find(kind, f);
+        }
+        cst::TypeExpr::ArrayPattern { elements, .. } => {
+            for e in elements {
+                walk_type_find(e, f);
+            }
+        }
+        cst::TypeExpr::AsPattern { ty, .. } => walk_type_find(ty, f),
+        _ => {}
+    }
 }
 
 /// Local-class instance-arity mismatch. For imported classes the class

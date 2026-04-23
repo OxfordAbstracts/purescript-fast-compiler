@@ -259,7 +259,13 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
     match expected {
         "TypesDoNotUnify" => has("UnificationError") || has("RecordLabelMismatch"),
         "NoInstanceFound" => has("NoInstanceFound"),
-        "ErrorParsingModule" => has("LexError") || has("SyntaxError"),
+        "ErrorParsingModule" => {
+            has("LexError")
+                || has("SyntaxError")
+                || has("WildcardInTypeDefinition")
+                || has("ConstraintInForeignImport")
+                || has("InvalidConstraintArgument")
+        }
         "UnknownName" => {
             has("UnknownName")
                 || has("UndefinedVariable")

@@ -12,6 +12,9 @@ f_2379
 f_2434
 f_2567
 f_2616
+f_2874_forall
+f_2874_forall2
+f_2874_wildcard
 f_2947
 f_3329
 f_3405
@@ -47,6 +50,7 @@ f_ClassHeadNoVTA6b
 f_ClassHeadNoVTA6c
 f_ClassHeadNoVTA7
 f_ConstraintFailure
+f_ConstraintInForeignImport
 f_CycleInForeignDataKinds
 f_CycleInKindDeclaration
 f_DeclConflictClassSynonym
@@ -143,6 +147,9 @@ f_TypeError
 f_TypeSynonymCycle
 f_TypeSynonyms
 f_TypeSynonyms5
+f_TypeWildcards1
+f_TypeWildcards2
+f_TypeWildcards4
 f_TypedBinders
 f_TypedBinders2
 f_TypedBinders3
