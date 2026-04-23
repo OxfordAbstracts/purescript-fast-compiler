@@ -8,6 +8,63 @@ use crate::typecheck_db::driver_multi::MultiModuleError;
 use crate::typecheck_db::passes::imports::ImportErrorKind;
 
 #[test]
+fn imported_alias_in_constrained_higher_order_sig() {
+    // Mirrors `mapAccumL :: Traversable f => (s -> a -> Accum s b)
+    // -> s -> f a -> Accum s (f b)` — a cross-module alias used
+    // inside a constrained, higher-order signature, with a sibling
+    // decl (`scanl`) that passes a record literal where `Accum s b`
+    // is expected.
+    assert_typechecks_multi(&[
+        "\
+module AccumLib (Accum) where
+
+type Accum s a = { accum :: s, value :: a }
+",
+        "\
+module Main where
+
+import AccumLib (Accum)
+
+class Foldable f where
+  foldr :: forall a b. (a -> b -> b) -> b -> f a -> b
+
+mapAccumL
+  :: forall a b f s. Foldable f
+  => (s -> a -> Accum s b)
+  -> s
+  -> f a
+  -> Accum s Int
+mapAccumL _ s _ = { accum: s, value: 0 }
+
+scanl :: forall a b f. Foldable f => (b -> a -> b) -> b -> f a -> Int
+scanl f b0 xs = (mapAccumL (\\b a -> let b' = f b a in { accum: b', value: b' }) b0 xs).value
+",
+    ]);
+}
+
+#[test]
+fn imported_alias_expands_to_record_at_call_site() {
+    assert_typechecks_multi(&[
+        "\
+module AccumLib (Accum) where
+
+type Accum s a = { accum :: s, value :: a }
+",
+        "\
+module Main where
+
+import AccumLib (Accum)
+
+mk :: Int -> Accum Int Int
+mk x = { accum: x, value: x }
+
+useIt :: forall s. (Int -> Accum s Int) -> Int -> s
+useIt f x = (f x).accum
+",
+    ]);
+}
+
+#[test]
 fn prelude_style_generic_via_reexport_chain() {
     // Multi-module mirror of Prelude's failing path: `F` defines
     // `apply` + `$`, `Rep` defines the `Generic a rep | a -> rep`

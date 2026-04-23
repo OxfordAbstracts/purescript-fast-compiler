@@ -47,6 +47,14 @@ fn arrays() {
 }
 
 #[test]
+fn alias_to_record() {
+    // Type alias expanding to a record literal — used in sigs and
+    // returned as record literals at call sites (mimics
+    // `Data.Traversable.Accum`).
+    assert_typechecks(include_str!("fixtures/single_succeeds/alias_to_record.purs"));
+}
+
+#[test]
 fn class_and_instance() {
     // Single-class definition, one-constructor ADT, instance
     // discharged by the Phase B solver on call-site `show Happy`.

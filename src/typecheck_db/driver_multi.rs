@@ -321,7 +321,22 @@ fn check_one_module(
                 )
                 .expect("check_data");
                 let ctor_map = ctor_info_from_data_shape(&shape);
-                for (cname, info) in ctor_map {
+                for (cname, mut info) in ctor_map {
+                    // `check_data` stores field types via a bare
+                    // `convert_type_expr` — aliases are left
+                    // unexpanded. Expand them here so downstream
+                    // constructor-use sites (pattern matches,
+                    // `synth_ctor_scheme` for imports) see the
+                    // canonical form. Unblocks cases like
+                    // `newtype StateL s a = StateL (s -> Accum s a)`
+                    // where `Accum` must be the record row before
+                    // the call site can unify a record literal
+                    // against the constructor's arg.
+                    info.fields = info
+                        .fields
+                        .into_iter()
+                        .map(|f| crate::typecheck_db::types::expand_aliases(f, &alias_map))
+                        .collect();
                     ctor_details.insert(cname.clone(), info);
                     local_ctor_parent_hash.insert(cname, oh);
                 }
