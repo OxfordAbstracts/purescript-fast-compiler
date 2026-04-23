@@ -46,6 +46,7 @@ pub enum ValidationErrorKind {
     CycleInDeclaration(Vec<String>),
     PartiallyAppliedSynonym(String),
     OrphanInstance(String),
+    DeclConflict(String),
 }
 
 impl ValidationErrorKind {
@@ -67,6 +68,7 @@ impl ValidationErrorKind {
             Self::CycleInDeclaration(_) => "CycleInDeclaration",
             Self::PartiallyAppliedSynonym(_) => "PartiallyAppliedSynonym",
             Self::OrphanInstance(_) => "OrphanInstance",
+            Self::DeclConflict(_) => "DeclConflict",
         }
     }
 }
@@ -311,6 +313,11 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // DeclConflict: cross-namespace name collisions at the type level
+    // (e.g. `class Fail` + `data Fail`), plus duplicate data-constructor
+    // names inside one decl or across data decls in the module.
+    detect_decl_conflicts(&module.decls, &mut errors);
+
     // Orphan instances: declared where neither the class nor any type
     // constructor in the instance head is defined locally.
     detect_orphan_instances(&module.decls, &mut errors);
@@ -324,6 +331,79 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     let _ = detect_partially_applied_synonyms;
 
     errors
+}
+
+/// Cross-namespace name collisions at the type level: `class Foo` +
+/// `data Foo`, `type Foo` + `data Foo`, etc. Data constructors also
+/// share a namespace, so `data T = A | A` and `data T1 = X; data T2 = X`
+/// both count.
+fn detect_decl_conflicts(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+    // Track where each type-level name first appeared. Second and later
+    // collisions emit DeclConflict.
+    let mut type_level_names: HashMap<Symbol, &'static str> = HashMap::new();
+    let mut ctor_names: HashMap<Symbol, Span> = HashMap::new();
+
+    for d in decls {
+        match d {
+            cst::Decl::Data { span, name, is_role_decl: false, kind_sig: cst::KindSigSource::None, constructors, .. } => {
+                emit_conflict(&mut type_level_names, name.value.symbol(), "data", *span, errors);
+                for c in constructors {
+                    let csym = c.name.value.symbol();
+                    if ctor_names.contains_key(&csym) {
+                        errors.push(ValidationError {
+                            span: c.name.span,
+                            kind: ValidationErrorKind::DeclConflict(resolve(csym)),
+                        });
+                    } else {
+                        ctor_names.insert(csym, c.name.span);
+                    }
+                }
+            }
+            cst::Decl::Newtype { span, name, constructor, .. } => {
+                emit_conflict(&mut type_level_names, name.value.symbol(), "newtype", *span, errors);
+                let csym = constructor.value.symbol();
+                if ctor_names.contains_key(&csym) {
+                    errors.push(ValidationError {
+                        span: constructor.span,
+                        kind: ValidationErrorKind::DeclConflict(resolve(csym)),
+                    });
+                } else {
+                    ctor_names.insert(csym, constructor.span);
+                }
+            }
+            cst::Decl::TypeAlias { span, name, .. } => {
+                emit_conflict(&mut type_level_names, name.value.symbol(), "type", *span, errors);
+            }
+            cst::Decl::Class { span, name, is_kind_sig: false, .. } => {
+                emit_conflict(&mut type_level_names, name.value.symbol(), "class", *span, errors);
+            }
+            cst::Decl::ForeignData { span, name, .. } => {
+                emit_conflict(&mut type_level_names, name.value.symbol(), "foreign data", *span, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn emit_conflict(
+    seen: &mut HashMap<Symbol, &'static str>,
+    sym: Symbol,
+    kind: &'static str,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(prev_kind) = seen.get(&sym) {
+        // Don't emit when both are the same kind — DuplicateTypeClass /
+        // DuplicateTypeDeclaration already cover the homogeneous case.
+        if *prev_kind != kind {
+            errors.push(ValidationError {
+                span,
+                kind: ValidationErrorKind::DeclConflict(resolve(sym)),
+            });
+        }
+    } else {
+        seen.insert(sym, kind);
+    }
 }
 
 /// Orphan-instance detection.

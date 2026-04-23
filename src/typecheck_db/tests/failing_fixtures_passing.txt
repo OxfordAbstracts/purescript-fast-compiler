@@ -49,6 +49,14 @@ f_ClassHeadNoVTA7
 f_ConstraintFailure
 f_CycleInForeignDataKinds
 f_CycleInKindDeclaration
+f_DeclConflictClassSynonym
+f_DeclConflictClassType
+f_DeclConflictCtorCtor
+f_DeclConflictDuplicateCtor
+f_DeclConflictSynonymClass
+f_DeclConflictSynonymType
+f_DeclConflictTypeClass
+f_DeclConflictTypeSynonym
 f_DoNotSuggestComposition2
 f_DuplicateDeclarationsInLet
 f_DuplicateProperties
