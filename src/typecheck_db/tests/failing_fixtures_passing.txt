@@ -7,12 +7,14 @@ f_2109_discard
 f_2109_negate
 f_2128_class
 f_2128_instance
+f_2378
 f_2379
 f_2434
 f_2567
 f_2616
 f_2947
 f_3329
+f_3405
 f_3453
 f_3531_4
 f_3531_5
@@ -94,9 +96,12 @@ f_Object
 f_OperatorAt
 f_OperatorBackslash
 f_OperatorSections
+f_OrphanInstance
+f_OrphanInstanceNullary
 f_OrphanKindDeclaration1
 f_OrphanRoleDeclaration1
 f_OrphanTypeDecl
+f_OrphanUnnamedInstance
 f_OverlappingVars
 f_ProgrammablePolykindedTypeErrorsTypeString
 f_ProgrammableTypeErrors

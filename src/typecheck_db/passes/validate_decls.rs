@@ -45,6 +45,7 @@ pub enum ValidationErrorKind {
     CycleInKindDeclaration(Vec<String>),
     CycleInDeclaration(Vec<String>),
     PartiallyAppliedSynonym(String),
+    OrphanInstance(String),
 }
 
 impl ValidationErrorKind {
@@ -65,6 +66,7 @@ impl ValidationErrorKind {
             Self::CycleInKindDeclaration(_) => "CycleInKindDeclaration",
             Self::CycleInDeclaration(_) => "CycleInDeclaration",
             Self::PartiallyAppliedSynonym(_) => "PartiallyAppliedSynonym",
+            Self::OrphanInstance(_) => "OrphanInstance",
         }
     }
 }
@@ -309,6 +311,10 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     detect_kind_sig_cycles(&module.decls, &mut errors);
     detect_value_cycles(&module.decls, &mut errors);
 
+    // Orphan instances: declared where neither the class nor any type
+    // constructor in the instance head is defined locally.
+    detect_orphan_instances(&module.decls, &mut errors);
+
     // NOTE: Partially-applied type synonyms are detected conservatively
     // via `detect_partially_applied_synonyms` below, but disabled here —
     // without kind information we can't distinguish `type Identity a = a;
@@ -318,6 +324,162 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     let _ = detect_partially_applied_synonyms;
 
     errors
+}
+
+/// Orphan-instance detection.
+///
+/// An instance is orphan when it's declared in a module where none of
+/// the following are true:
+///   - The class is defined locally.
+///   - At least one type constructor in the instance head is defined
+///     locally (as `data`/`newtype`/`foreign import data`, NOT `type`).
+///
+/// Type aliases don't count — `type Something = Int` followed by
+/// `derive instance Eq Something` is still an orphan because `Something`
+/// is just an alias; PureScript's orphan check sees through it.
+fn detect_orphan_instances(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+    // Collect local class and data/newtype/foreign-data names.
+    let mut local_classes: HashSet<Symbol> = HashSet::new();
+    let mut local_data: HashSet<Symbol> = HashSet::new();
+    let mut local_aliases: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Class { name, is_kind_sig: false, .. } => {
+                local_classes.insert(name.value.symbol());
+            }
+            cst::Decl::Data { name, kind_sig: cst::KindSigSource::None, is_role_decl: false, .. } => {
+                local_data.insert(name.value.symbol());
+            }
+            cst::Decl::Newtype { name, .. } => {
+                local_data.insert(name.value.symbol());
+            }
+            cst::Decl::ForeignData { name, .. } => {
+                local_data.insert(name.value.symbol());
+            }
+            cst::Decl::TypeAlias { name, ty, .. } => {
+                // An alias "anchors locally" iff its expansion reaches a
+                // local data/newtype/foreign-data. Track body references
+                // so we can compute the closure below.
+                let refs = head_type_cons(ty);
+                local_aliases.insert(name.value.symbol(), refs);
+            }
+            _ => {}
+        }
+    }
+
+    // Propagate local-anchoring through aliases. `type T = Maybe Int`
+    // anchors T locally because Maybe is local data. Transitive:
+    // `type A = B; type B = Maybe Int` anchors both A and B.
+    let mut alias_anchors_locally: HashSet<Symbol> = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (alias, refs) in &local_aliases {
+            if alias_anchors_locally.contains(alias) {
+                continue;
+            }
+            if refs.iter().any(|r| {
+                local_data.contains(r) || alias_anchors_locally.contains(r)
+            }) {
+                alias_anchors_locally.insert(*alias);
+                changed = true;
+            }
+        }
+    }
+
+    for d in decls {
+        let (span, class_name, types, is_derive) = match d {
+            cst::Decl::Instance { span, class_name, types, .. } => {
+                (*span, class_name, types, false)
+            }
+            cst::Decl::Derive { span, class_name, types, .. } => {
+                (*span, class_name, types, true)
+            }
+            _ => continue,
+        };
+        let _ = is_derive;
+
+        // Class is local if referenced unqualified AND it's defined locally.
+        let class_local = class_name.module.is_none()
+            && local_classes.contains(&class_name.name.symbol());
+        if class_local {
+            continue;
+        }
+
+        // Walk each type in the head, extract constructor heads, check if any
+        // is locally defined as data/newtype/foreign-data — OR is a local
+        // alias whose expansion anchors locally.
+        let mut head_is_local = false;
+        for t in types {
+            for sym in head_type_cons(t) {
+                if local_data.contains(&sym) || alias_anchors_locally.contains(&sym) {
+                    head_is_local = true;
+                    break;
+                }
+            }
+            if head_is_local {
+                break;
+            }
+        }
+        if head_is_local {
+            continue;
+        }
+
+        // Neither the class nor any head type is local — orphan.
+        let class_display = resolve(class_name.name.symbol());
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::OrphanInstance(class_display),
+        });
+    }
+}
+
+/// Extract constructor names (unqualified) that appear in a type — both
+/// spine heads of applications and bare Constructor nodes. Used for
+/// orphan detection: any occurrence of a local data type in the instance
+/// head anchors the instance to this module.
+fn head_type_cons(te: &cst::TypeExpr) -> Vec<Symbol> {
+    let mut out: Vec<Symbol> = Vec::new();
+    collect_all_cons(te, &mut out);
+    out
+}
+
+fn collect_all_cons(te: &cst::TypeExpr, out: &mut Vec<Symbol>) {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            if name.module.is_none() {
+                out.push(name.name.symbol());
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            collect_all_cons(constructor, out);
+            collect_all_cons(arg, out);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            collect_all_cons(from, out);
+            collect_all_cons(to, out);
+        }
+        cst::TypeExpr::Parens { ty, .. } => collect_all_cons(ty, out),
+        cst::TypeExpr::Kinded { ty, .. } => collect_all_cons(ty, out),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            collect_all_cons(left, out);
+            collect_all_cons(right, out);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                collect_all_cons(&f.ty, out);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                collect_all_cons(&f.ty, out);
+            }
+            if let Some(t) = tail {
+                collect_all_cons(t, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Flag any use of a local type alias with fewer arguments than its
