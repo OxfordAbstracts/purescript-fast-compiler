@@ -232,6 +232,10 @@ fn infer_error_code(e: &InferError) -> String {
         InferError::Unify(u) => match u {
             UnifyError::Mismatch(_, _) => "UnificationError".into(),
             UnifyError::Infinite { .. } => "InfiniteType".into(),
+            // Skolem escape is a kind-1-vs-kind-N polymorphism
+            // violation — fits the same bucket as `EscapedSkolem`
+            // in the reference compiler.
+            UnifyError::SkolemEscape { .. } => "EscapedSkolem".into(),
         },
         InferError::UnboundVar(_) => "UnboundVar".into(),
         InferError::UnboundConstructor(_) => "UnboundConstructor".into(),

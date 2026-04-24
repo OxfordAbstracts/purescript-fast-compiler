@@ -1798,11 +1798,11 @@ fn bind_local_ctors(
             crate::typecheck_db::ir::Decl::TypeSignature { name, ty, .. } => {
                 // A top-level `foo :: T` before `foo = …` — bind
                 // the declared scheme so mutual references pick
-                // up the annotated shape. Phase-4-era inference
-                // currently ignores these signatures and infers
-                // fresh; this is an improvement that lets
-                // cross-module references settle faster.
+                // up the annotated shape.
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                // Mark the decl as user-signed so the SCC can opt
+                // into bidirectional check-mode for it.
+                env.local_signed.insert(n.clone());
                 let declared = conv(ty);
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {

@@ -145,6 +145,7 @@ impl Type {
             Type::TypeInt(n) => write!(f, "{}", n),
             Type::Kinded(t, k) => write!(f, "({} :: {})", t, k),
             Type::Unif(id) => write!(f, "?u{}", id),
+            Type::Skolem(id) => write!(f, "!s{}", id),
         }
     }
 }
@@ -182,6 +183,15 @@ pub enum Type {
     /// A mutable unification variable; resolved during inference.
     /// Must not appear in any serialized output.
     Unif(u32),
+    /// A rigid skolem variable introduced when checking against a
+    /// `Forall`. Two skolems are equal iff their ids match; a
+    /// skolem never unifies with anything else. Used to enforce
+    /// rank-2+ polymorphism: in `test :: (forall a. a -> a) ->
+    /// Number`, checking `\\n -> n + 1` against the argument type
+    /// introduces a skolem for `a`, then `+` demands `Semiring
+    /// skolem_a`, which has no instance — the correct rejection.
+    /// Must not appear in any serialized output.
+    Skolem(u32),
 }
 
 impl Type {

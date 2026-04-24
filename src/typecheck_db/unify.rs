@@ -41,11 +41,22 @@ pub enum UnifyError {
     Mismatch(Type, Type),
     #[error("infinite type: ?{var} occurs in {ty}")]
     Infinite { var: u32, ty: Type },
+    #[error("skolem !s{skolem} escapes its scope via ?{var}")]
+    SkolemEscape { var: u32, skolem: u32, ty: Type },
 }
 
 pub struct UnifyState {
     // bindings[i] = Some(ty) when ?i is solved, None when fresh.
     bindings: Vec<Option<Type>>,
+    // Skolem ids are monotonically allocated from `next_skolem`.
+    // Each unification variable records the skolem-counter value
+    // AT ITS ALLOCATION TIME (`unif_skolem_levels[i]`): the unif
+    // is only allowed to be bound to a type whose skolems all have
+    // id `< unif_skolem_levels[i]`. A skolem with id `>= level[i]`
+    // was introduced AFTER the unif existed and binding would leak
+    // the skolem past its scope — caught as `SkolemEscape`.
+    unif_skolem_levels: Vec<u32>,
+    next_skolem: u32,
     // Deferred diagnostics: case expressions / multi-equation groups
     // encountered during inference that need their scrutinee types
     // zonked before exhaustiveness can be decided. The caller
@@ -80,11 +91,29 @@ impl UnifyState {
     pub fn new() -> Self {
         Self {
             bindings: Vec::new(),
+            unif_skolem_levels: Vec::new(),
+            next_skolem: 0,
             pending_exhaust: Vec::new(),
             pending_constraints: Vec::new(),
             pending_holes: Vec::new(),
             current_decl: None,
         }
+    }
+
+    /// Allocate a fresh skolem. Returns its id; every subsequent
+    /// unification variable carries this id as its skolem boundary,
+    /// so attempting to bind an earlier variable to a type
+    /// containing this skolem will be rejected by `bind_var`.
+    pub fn fresh_skolem(&mut self) -> u32 {
+        let id = self.next_skolem;
+        self.next_skolem += 1;
+        id
+    }
+
+    /// Current skolem counter; used by `check_expr` to snapshot
+    /// the boundary before introducing a group of skolems.
+    pub fn skolem_level(&self) -> u32 {
+        self.next_skolem
     }
 
     /// Push one pending constraint, stamping it with the current decl
@@ -193,6 +222,7 @@ impl UnifyState {
     pub fn fresh(&mut self) -> Type {
         let id = self.bindings.len() as u32;
         self.bindings.push(None);
+        self.unif_skolem_levels.push(self.next_skolem);
         Type::Unif(id)
     }
 
@@ -210,6 +240,10 @@ impl UnifyState {
         let slot = id as usize;
         if slot >= self.bindings.len() {
             self.bindings.resize(slot + 1, None);
+            // Grow levels in parallel. Stray unifs (from cached
+            // schemes) get level 0 — conservative: they predate
+            // any skolem introduction.
+            self.unif_skolem_levels.resize(slot + 1, 0);
         }
         self.bindings[slot] = Some(ty);
     }
@@ -270,6 +304,14 @@ impl UnifyState {
             (Type::Unif(id), other) | (other, Type::Unif(id)) => self.bind_var(*id, other),
             (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
             (Type::Con(c1), Type::Con(c2)) if c1 == c2 => Ok(()),
+            // Skolems are rigid — they unify only with themselves.
+            // A skolem-vs-anything-else mismatch is exactly how
+            // rank-2 violations get rejected: a lambda `\\n -> n + 1`
+            // checked against `forall a. a -> a` introduces a skolem
+            // for `a`, then `+` needs `Semiring skolem` which can't
+            // be solved, or unification against `Number -> Number`
+            // fails because `Number` ≠ skolem.
+            (Type::Skolem(i), Type::Skolem(j)) if i == j => Ok(()),
             (Type::App(f1, a1), Type::App(f2, a2)) => {
                 self.unify(f1, f2)?;
                 self.unify(a1, a2)
@@ -432,6 +474,26 @@ impl UnifyState {
         if occurs_in(id, other) {
             return Err(UnifyError::Infinite { var: id, ty: other.clone() });
         }
+        // Escape check: `id`'s skolem boundary is the skolem
+        // counter value at its allocation time. `other` may only
+        // reference skolems introduced BEFORE that boundary. A
+        // skolem with id >= boundary was introduced AFTER the unif
+        // existed, so binding would leak the skolem out of its
+        // scope — exactly the rank-2 violation pattern.
+        let boundary = self
+            .unif_skolem_levels
+            .get(id as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+        if let Some(skolem) = max_skolem_in(other) {
+            if skolem >= boundary {
+                return Err(UnifyError::SkolemEscape {
+                    var: id,
+                    skolem,
+                    ty: other.clone(),
+                });
+            }
+        }
         self.assign(id, other.clone());
         Ok(())
     }
@@ -541,6 +603,45 @@ fn absorb_extras(
                 Some(r) => state.unify(&r, &Type::Record(vec![], None)),
             }
         }
+    }
+}
+
+/// Maximum skolem id appearing anywhere in `ty`, or `None` if the
+/// type contains no skolems. Used by `bind_var`'s escape check.
+fn max_skolem_in(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::Skolem(id) => Some(*id),
+        Type::App(f, a) | Type::Fun(f, a) | Type::Kinded(f, a) => {
+            match (max_skolem_in(f), max_skolem_in(a)) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+        Type::Forall(_, body) => max_skolem_in(body),
+        Type::Constrained(cs, b) => {
+            let cs_max = cs
+                .iter()
+                .flat_map(|c| c.args.iter())
+                .filter_map(max_skolem_in)
+                .max();
+            let b_max = max_skolem_in(b);
+            match (cs_max, b_max) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            let fs_max = fs.iter().filter_map(|(_, t)| max_skolem_in(t)).max();
+            let tail_max = tail.as_ref().and_then(|t| max_skolem_in(t));
+            match (fs_max, tail_max) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+        _ => None,
     }
 }
 

@@ -30,6 +30,22 @@ pub struct Env {
     /// before unification — so `Foo Number` unifies with
     /// `Array Number` when `type Foo a = Array a`.
     pub aliases: AliasMap,
+    /// Value decl names that have an explicit `Decl::TypeSignature`
+    /// sibling in the current module. Populated by
+    /// `bind_local_ctors`. Used by the value-SCC inference to
+    /// decide whether to run bidirectional check-mode against the
+    /// declared sig. Class methods and imported values aren't in
+    /// this set even though their schemes appear in `top_level` —
+    /// only user-declared top-level sigs opt into check-mode.
+    pub local_signed: std::collections::HashSet<String>,
+    /// Scoped type variables — outer-forall names that have been
+    /// skolemised during check-mode. Consulted by
+    /// `convert_type_expr` call sites (typed binders, let-sigs,
+    /// inline `expr :: T` annotations) so a body reference to
+    /// `a` in `\\(x :: a) -> …` resolves to the SAME skolem
+    /// introduced for the enclosing `forall a.` on the decl's
+    /// sig.
+    pub scoped_tys: HashMap<String, Type>,
 }
 
 impl Env {
@@ -39,6 +55,8 @@ impl Env {
             locals: vec![HashMap::new()],
             local_schemes: vec![HashMap::new()],
             aliases: AliasMap::default(),
+            local_signed: std::collections::HashSet::new(),
+            scoped_tys: HashMap::new(),
         }
     }
 

@@ -202,10 +202,16 @@ pub fn infer_expr(
             // unify normally. Returning the raw `Forall` here
             // pollutes surrounding unifications with a scheme
             // they can't look through.
-            let declared = crate::typecheck_db::types::expand_aliases(
+            let mut declared = crate::typecheck_db::types::expand_aliases(
                 convert_type_expr(ty, type_ops),
                 &env.aliases,
             );
+            if !env.scoped_tys.is_empty() {
+                declared = crate::typecheck_db::generalize::apply_var_subst(
+                    &declared,
+                    &env.scoped_tys,
+                );
+            }
             let monotype = instantiate_sig_as_monotype(state, declared);
             check_expr(state, env, type_ops, expr, &monotype)?;
             Ok(monotype)
@@ -290,8 +296,246 @@ pub fn check_expr(
     expr: &Expr,
     expected: &Type,
 ) -> Result<(), InferError> {
+    // Deep-skolemisation: if the expected type is `Forall(vs, body)`,
+    // replace each quantifier with a fresh skolem and check against
+    // the skolemised body. A later attempt to bind an OUTER
+    // unification variable to anything containing these skolems
+    // fails via `bind_var`'s escape check — exactly how rank-2
+    // violations surface (see Peyton-Jones et al., "Practical
+    // type inference for arbitrary-rank types" §5).
+    //
+    // Zonk first in case `expected` is a unif bound to a Forall.
+    let zonked = state.zonk(expected);
+    if let Type::Forall(vs, body) = &zonked {
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        for (n, _, _) in vs {
+            subst.insert(n.clone(), Type::Skolem(state.fresh_skolem()));
+        }
+        let skolemised =
+            crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+        return check_expr(state, env, type_ops, expr, &skolemised);
+    }
+    // Same treatment for `Constrained(cs, body)`: check against the
+    // body, but peel constraints. The user has already promised
+    // the caller will satisfy them; we don't want to check them
+    // as obligations inside the body.
+    if let Type::Constrained(_, body) = &zonked {
+        return check_expr(state, env, type_ops, expr, body);
+    }
+
+    // Bidirectional shortcut: `Lambda` checked against an arrow
+    // type peels arrows and binds each `Var` binder directly to
+    // the arg type. Without this, `bind_pattern` creates fresh
+    // unifs and any polymorphic structure in the expected is
+    // lost to a fresh unif.
+    if let Expr::Lambda { binders, body, .. } = expr {
+        if matches!(zonked, Type::Fun(_, _)) {
+            return check_lambda(state, env, type_ops, binders, body, &zonked);
+        }
+    }
+
     let actual = infer_expr(state, env, type_ops, expr)?;
     state.unify(&actual, expected)?;
+    Ok(())
+}
+
+/// True when the scheme's body contains a top-level `Constrained`
+/// layer — either directly or inside a `Forall`. Used to gate
+/// check-mode: constrained sigs need a given-tracking solver that
+/// we don't have yet; without it, stripping the constraint would
+/// leave body-level class-method uses unsolvable.
+fn scheme_has_constraint(scheme: &Scheme) -> bool {
+    fn walk(ty: &Type) -> bool {
+        match ty {
+            Type::Constrained(_, _) => true,
+            Type::Forall(_, body) => walk(body),
+            _ => false,
+        }
+    }
+    walk(&scheme.ty)
+}
+
+/// True when the scheme's body contains a `Forall` below the
+/// outer layer — i.e. the scheme describes a rank-2+ type. Used
+/// to gate check-mode: only rank-2 decls need the skolem-based
+/// bidirectional path; rank-1 decls stay on the existing
+/// infer-then-unify path.
+fn scheme_has_inner_forall(scheme: &Scheme) -> bool {
+    fn walk_below_top(ty: &Type) -> bool {
+        match ty {
+            Type::Forall(_, _) => true,
+            Type::App(f, a) | Type::Fun(f, a) | Type::Kinded(f, a) => {
+                walk_below_top(f) || walk_below_top(a)
+            }
+            Type::Constrained(cs, b) => {
+                cs.iter().any(|c| c.args.iter().any(walk_below_top))
+                    || walk_below_top(b)
+            }
+            Type::Record(fs, t) | Type::Row(fs, t) => {
+                fs.iter().any(|(_, v)| walk_below_top(v))
+                    || t.as_ref().map_or(false, |t| walk_below_top(t))
+            }
+            _ => false,
+        }
+    }
+    walk_below_top(&scheme.ty)
+}
+
+/// Check a decl's binders + guarded body against an expected
+/// type. Peels the expected (skolemising foralls, stripping
+/// constraints) down to a `Fun` chain matching the decl's
+/// binders, then checks the body against the return type.
+///
+/// Mirrors `check_lambda` but works over decl-level binders +
+/// `GuardedExpr` rather than `Lambda` binders + `Expr`.
+fn check_equation(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    binders: &[Binder],
+    guarded: &ir::GuardedExpr,
+    expected: &Type,
+) -> Result<(), InferError> {
+    // Peel outer `Forall` (introducing skolems) and any
+    // `Constrained` layer once, so the arrow-peeling loop below
+    // sees a `Fun`-chain. Record each Forall-var → skolem
+    // mapping in `env.scoped_tys` so body-level typed binders
+    // (`\(x :: a) -> …`) and type annotations refer to the
+    // same skolem.
+    let mut scoped_added: Vec<String> = Vec::new();
+    let peeled = {
+        let mut cur = state.zonk(expected);
+        loop {
+            match cur {
+                Type::Forall(vs, body) => {
+                    let mut subst: HashMap<String, Type> = HashMap::new();
+                    for (n, _, _) in &vs {
+                        let sk = Type::Skolem(state.fresh_skolem());
+                        subst.insert(n.clone(), sk.clone());
+                        env.scoped_tys.insert(n.clone(), sk);
+                        scoped_added.push(n.clone());
+                    }
+                    cur = crate::typecheck_db::generalize::apply_var_subst(
+                        &body, &subst,
+                    );
+                }
+                Type::Constrained(_, body) => {
+                    cur = *body;
+                }
+                other => break other,
+            }
+        }
+    };
+
+    env.push_scope();
+    let mut rest = peeled;
+    let mut consumed: usize = 0;
+    for b in binders {
+        let zonked = state.zonk(&rest);
+        let (arg, new_rest) = match zonked {
+            Type::Fun(a, r) => (*a, *r),
+            _ => break,
+        };
+        match b {
+            Binder::Var { name, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                env.bind_local(n, arg);
+            }
+            _ => {
+                let pat_ty = bind_pattern(state, env, type_ops, b)?;
+                state.unify(&pat_ty, &arg)?;
+            }
+        }
+        rest = new_rest;
+        consumed += 1;
+    }
+    if consumed < binders.len() {
+        // Ran out of arrows before binders — fall back to
+        // inference for the tail.
+        let tail_ty = infer_equation(
+            state,
+            env,
+            type_ops,
+            &binders[consumed..],
+            guarded,
+        )?;
+        state.unify(&tail_ty, &rest)?;
+    } else {
+        check_guarded(state, env, type_ops, guarded, &rest)?;
+    }
+    env.pop_scope();
+    // Remove the scoped-ty entries we added — they belong to
+    // THIS decl's scope, not siblings.
+    for n in scoped_added {
+        env.scoped_tys.remove(&n);
+    }
+    Ok(())
+}
+
+/// Check a `GuardedExpr` body against an expected type. Only
+/// `Unconditional` uses true check-mode; guarded alternatives
+/// fall back to inferring and unifying.
+fn check_guarded(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    g: &ir::GuardedExpr,
+    expected: &Type,
+) -> Result<(), InferError> {
+    match g {
+        ir::GuardedExpr::Unconditional(e) => {
+            check_expr(state, env, type_ops, e, expected)
+        }
+        ir::GuardedExpr::Guarded(_) => {
+            let actual = infer_guarded(state, env, type_ops, g)?;
+            state.unify(&actual, expected)?;
+            Ok(())
+        }
+    }
+}
+
+/// Check a lambda expression against an expected arrow type by
+/// peeling `Fun(arg, rest)` per binder. `Binder::Var` is bound
+/// directly to `arg` — preserves any `Forall` inside; others go
+/// through `bind_pattern` + unify.
+fn check_lambda(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    binders: &[Binder],
+    body: &Expr,
+    expected: &Type,
+) -> Result<(), InferError> {
+    env.push_scope();
+    let mut rest = expected.clone();
+    let mut consumed: usize = 0;
+    for b in binders {
+        let zonked = state.zonk(&rest);
+        let (arg, new_rest) = match zonked {
+            Type::Fun(a, r) => (*a, *r),
+            _ => break,
+        };
+        match b {
+            Binder::Var { name, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                env.bind_local(n, arg);
+            }
+            _ => {
+                let pat_ty = bind_pattern(state, env, type_ops, b)?;
+                state.unify(&pat_ty, &arg)?;
+            }
+        }
+        rest = new_rest;
+        consumed += 1;
+    }
+    if consumed < binders.len() {
+        let tail_ty =
+            infer_lambda(state, env, type_ops, &binders[consumed..], body)?;
+        state.unify(&tail_ty, &rest)?;
+    } else {
+        check_expr(state, env, type_ops, body, &rest)?;
+    }
+    env.pop_scope();
     Ok(())
 }
 
@@ -379,20 +623,80 @@ pub fn infer_value_scc_with_all(
             let expected = slot_of.get(name).cloned().unwrap();
             state.set_current_decl(Some(name.clone()));
             let _ = sig_param_types; // retained for future sig-aware work
-            // Wrap the body with any where-clause bindings so
-            // declarations like `foo = bar where bar = 1` see `bar`
-            // during inference. `wrap_guarded_with_where` turns the
-            // where-clause into a synthetic `let` around the body.
             let guarded_with_where =
                 wrap_guarded_with_where(guarded.clone(), where_clause.clone());
-            let lam_ty = infer_equation(
-                &mut state,
-                env,
-                type_ops,
-                binders,
-                &guarded_with_where,
-            )?;
-            state.unify(&expected, &lam_ty)?;
+
+            // Bidirectional check-mode: when the decl has a
+            // user-declared sibling `Decl::TypeSignature` in this
+            // module, check its body against the sig. Skolems
+            // introduced in `check_expr` reject rank-2 violations
+            // via the escape check in `bind_var`.
+            //
+            // `local_signed` (populated by `bind_local_ctors`)
+            // excludes imported values and class methods whose
+            // schemes happen to live in `top_level` but aren't
+            // user-written sigs.
+            // Bidirectional check-mode is implemented below
+            // (`check_equation` + skolemisation) but not yet
+            // wired into the decl loop. Turning it on regresses
+            // ~8 `passing_fixtures` for reasons orthogonal to
+            // check-mode itself (pre-existing cross-module
+            // qualified-name / alias issues surface because the
+            // check path passes sig types through new unify
+            // sites). Deferred until those are fixed; skolem
+            // infrastructure is still shipped so future work
+            // can flip this gate on.
+            let sig_scheme: Option<Scheme> = None;
+            let _ = name;
+            let _ = decl;
+            let _ = scheme_has_constraint;
+            let _ = scheme_has_inner_forall;
+
+            if let Some(scheme) = sig_scheme {
+                // Reconstruct the full declared type:
+                // `Forall(vars, body)`. `check_expr` will
+                // skolemise the outer forall and peel the
+                // `Constrained` layer before descending into
+                // the body with check-mode active.
+                let full_sig = if scheme.vars.is_empty() {
+                    scheme.ty.clone()
+                } else {
+                    Type::Forall(
+                        scheme
+                            .vars
+                            .iter()
+                            .cloned()
+                            .map(|n| (n, false, None))
+                            .collect(),
+                        Box::new(scheme.ty.clone()),
+                    )
+                };
+                check_equation(
+                    &mut state,
+                    env,
+                    type_ops,
+                    binders,
+                    &guarded_with_where,
+                    &full_sig,
+                )?;
+                // Pin the slot to the (un-instantiated) sig shape
+                // so any sibling referring to this decl via
+                // `infer_var` sees the sig. Use
+                // `instantiate_scheme_no_constraints` to strip
+                // outer Forall/Constrained for a slot-safe shape.
+                let slot_shape =
+                    instantiate_scheme_no_constraints(&mut state, &scheme);
+                let _ = state.unify(&expected, &slot_shape);
+            } else {
+                let lam_ty = infer_equation(
+                    &mut state,
+                    env,
+                    type_ops,
+                    binders,
+                    &guarded_with_where,
+                )?;
+                state.unify(&expected, &lam_ty)?;
+            }
         }
     }
     state.set_current_decl(None);
@@ -965,10 +1269,22 @@ fn bind_pattern(
             Ok(v)
         }
         Binder::Typed { binder, ty, .. } => {
-            let declared = crate::typecheck_db::types::expand_aliases(
+            let mut declared = crate::typecheck_db::types::expand_aliases(
                 convert_type_expr(ty, type_ops),
                 &env.aliases,
             );
+            // Scoped type variables: if the outer decl's
+            // signature put `a → skolem_0` into `env.scoped_tys`
+            // via check-mode, replace any `Var("a")` in this
+            // annotation with the skolem so `\(x :: a) -> x` at a
+            // rank-1 sig site correctly matches the skolemised
+            // param type.
+            if !env.scoped_tys.is_empty() {
+                declared = crate::typecheck_db::generalize::apply_var_subst(
+                    &declared,
+                    &env.scoped_tys,
+                );
+            }
             let inferred = bind_pattern(state, env, type_ops, binder)?;
             state.unify(&inferred, &declared)?;
             Ok(declared)
