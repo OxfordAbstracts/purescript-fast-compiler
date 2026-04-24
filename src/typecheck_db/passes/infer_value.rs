@@ -322,8 +322,11 @@ pub fn check_expr(
         Type::Forall(_, _) | Type::Constrained(_, _)
     );
     if needs_skolemise {
-        let (skolemised, _givens) = deep_skolemise_positive(state, zonked);
-        return check_expr(state, env, type_ops, expr, &skolemised);
+        let (skolemised, givens) = deep_skolemise_positive(state, zonked);
+        let snapshot = state.push_givens(givens);
+        let outcome = check_expr(state, env, type_ops, expr, &skolemised);
+        state.pop_givens_to(snapshot);
+        return outcome;
     }
 
     // Bidirectional shortcut: `Lambda` checked against an arrow
@@ -404,8 +407,13 @@ fn check_equation(
     // sees a `Fun`-chain. Record each Forall-var → skolem
     // mapping in `env.scoped_tys` so body-level typed binders
     // (`\(x :: a) -> …`) and type annotations refer to the
-    // same skolem.
+    // same skolem. Peeled constraints become givens: the solver
+    // treats them as known-true while checking the body, which
+    // is what lets a sig like `Semigroupoid a => …` call
+    // `compose` (itself `Semigroupoid a =>`) without tripping
+    // `NoInstanceFound` against a skolem.
     let mut scoped_added: Vec<String> = Vec::new();
+    let givens_snapshot = state.push_givens(Vec::new());
     let peeled = {
         let mut cur = state.zonk(expected);
         loop {
@@ -422,7 +430,8 @@ fn check_equation(
                         &body, &subst,
                     );
                 }
-                Type::Constrained(_, body) => {
+                Type::Constrained(cs, body) => {
+                    state.push_givens(cs);
                     cur = *body;
                 }
                 other => break other,
@@ -472,6 +481,7 @@ fn check_equation(
     for n in scoped_added {
         env.scoped_tys.remove(&n);
     }
+    state.pop_givens_to(givens_snapshot);
     Ok(())
 }
 
@@ -635,18 +645,12 @@ pub fn infer_value_scc_with_all(
             // introduced in `check_expr` reject rank-2 violations
             // via the escape check in `bind_var`.
             //
-            // `local_signed` (populated by `bind_local_ctors`)
-            // excludes imported values and class methods whose
-            // schemes happen to live in `top_level` but aren't
-            // user-written sigs.
-            // Bidirectional check-mode is implemented below
-            // (`check_equation` + skolemisation). Turning it on
-            // even gated at rank-2+ sigs introduces 8 passing-
-            // fixture regressions (Auto, Church, LiberalType-
-            // Synonyms — deep-skolemisation of nested Foralls
-            // isn't yet correct; Peyton-Jones §5 requires
-            // positive/negative position tracking). Gated off
-            // for now; infrastructure stays for future work.
+            // Gated OFF pending A2: `check_equation` peels a
+            // `Constrained` sig into skolems without pushing
+            // givens onto the solver, so any body-side call that
+            // re-raises those constraints (e.g. `composeFlipped`
+            // calling `compose`, which is `Semigroupoid a =>`)
+            // surfaces as `NoInstanceFound` against a skolem.
             let sig_scheme: Option<Scheme> = None;
             let _ = name;
             let _ = decl;

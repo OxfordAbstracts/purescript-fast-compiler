@@ -85,6 +85,20 @@ pub struct UnifyState {
     // `record_pending_exhaust` so each entry is attributed to the
     // right decl, routed into the matching `InferredScheme`.
     current_decl: Option<String>,
+    // Given-constraint stack. `check_equation` pushes constraints
+    // peeled off the expected sig's outer `Constrained` layer
+    // here; the solver consults this list BEFORE attempting
+    // instance lookup. A pending constraint whose zonked shape
+    // structurally matches any given is discharged as a local
+    // hypothesis — this is what lets `composeFlipped` call
+    // `compose` (which re-raises `Semigroupoid a =>`) inside a
+    // check-mode sig body without tripping `NoInstanceFound`
+    // against a skolem.
+    //
+    // Flat (not a stack-of-frames) because every push in
+    // check-mode is accompanied by a scope that ends with
+    // `clear_givens_to(snapshot_len)` on exit.
+    givens: Vec<Constraint>,
 }
 
 impl UnifyState {
@@ -97,6 +111,39 @@ impl UnifyState {
             pending_constraints: Vec::new(),
             pending_holes: Vec::new(),
             current_decl: None,
+            givens: Vec::new(),
+        }
+    }
+
+    /// Push a batch of givens onto the stack; returns the snapshot
+    /// length for a later `pop_givens_to`.
+    pub fn push_givens(&mut self, cs: Vec<Constraint>) -> usize {
+        let snapshot = self.givens.len();
+        self.givens.extend(cs);
+        snapshot
+    }
+
+    /// Restore the given stack to a prior snapshot length.
+    pub fn pop_givens_to(&mut self, snapshot: usize) {
+        self.givens.truncate(snapshot);
+    }
+
+    /// Does any given constraint structurally match `c` after
+    /// zonking both sides? Used by the solver as a discharge
+    /// shortcut for constraints that were promised by an enclosing
+    /// sig's `Constrained` layer.
+    pub fn given_discharges(&self, c: &Constraint) -> bool {
+        let zc = self.zonk_constraint(c);
+        self.givens.iter().any(|g| {
+            let zg = self.zonk_constraint(g);
+            constraints_structurally_eq(&zg, &zc)
+        })
+    }
+
+    fn zonk_constraint(&self, c: &Constraint) -> Constraint {
+        Constraint {
+            class: c.class.clone(),
+            args: c.args.iter().map(|a| self.zonk(a)).collect(),
         }
     }
 
@@ -698,6 +745,58 @@ fn collect_free(ty: &Type, out: &mut HashSet<u32>) {
             collect_free(k, out);
         }
         _ => {}
+    }
+}
+
+/// Structural equality of two zonked constraints — same class
+/// name (including module qualifier) and pair-wise structurally-
+/// equal args. Used by `given_discharges` to match a pending
+/// constraint against a peeled-from-sig hypothesis. Stricter than
+/// `unify` on purpose: givens are promises from the caller, so
+/// matching is syntactic over the zonked form — no fresh-unif
+/// binding allowed.
+fn constraints_structurally_eq(a: &Constraint, b: &Constraint) -> bool {
+    a.class == b.class
+        && a.args.len() == b.args.len()
+        && a.args.iter().zip(b.args.iter()).all(|(x, y)| type_eq(x, y))
+}
+
+fn type_eq(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Var(x), Type::Var(y)) => x == y,
+        (Type::Con(x), Type::Con(y)) => x == y,
+        (Type::Unif(x), Type::Unif(y)) => x == y,
+        (Type::Skolem(x), Type::Skolem(y)) => x == y,
+        (Type::TypeString(x), Type::TypeString(y)) => x == y,
+        (Type::TypeInt(x), Type::TypeInt(y)) => x == y,
+        (Type::App(f1, a1), Type::App(f2, a2))
+        | (Type::Fun(f1, a1), Type::Fun(f2, a2)) => type_eq(f1, f2) && type_eq(a1, a2),
+        (Type::Forall(vs1, b1), Type::Forall(vs2, b2)) => {
+            vs1.len() == vs2.len()
+                && vs1.iter().zip(vs2.iter()).all(|((n1, _, _), (n2, _, _))| n1 == n2)
+                && type_eq(b1, b2)
+        }
+        (Type::Constrained(c1, b1), Type::Constrained(c2, b2)) => {
+            c1.len() == c2.len()
+                && c1.iter().zip(c2.iter()).all(|(x, y)| constraints_structurally_eq(x, y))
+                && type_eq(b1, b2)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2))
+        | (Type::Row(f1, t1), Type::Row(f2, t2)) => {
+            f1.len() == f2.len()
+                && f1.iter().zip(f2.iter()).all(|((l1, t1), (l2, t2))| {
+                    l1 == l2 && type_eq(t1, t2)
+                })
+                && match (t1, t2) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => type_eq(a, b),
+                    _ => false,
+                }
+        }
+        (Type::Kinded(t1, k1), Type::Kinded(t2, k2)) => type_eq(t1, t2) && type_eq(k1, k2),
+        (Type::Hole(x), Type::Hole(y)) => x == y,
+        (Type::Wildcard, Type::Wildcard) => true,
+        _ => false,
     }
 }
 

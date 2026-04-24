@@ -188,6 +188,25 @@ pub fn solve_one(
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> SolveOutcome {
+    // Givens discharge before anything else: a constraint promised
+    // by an enclosing sig's `Constrained` layer (pushed onto
+    // `state.givens` by `check_equation` when skolemising a
+    // user-signed decl) is already known-true. Match structurally
+    // on zonked forms so a skolemised `Semigroupoid !sa` satisfies
+    // a pending `Semigroupoid ?ua` once `?ua := !sa` is bound.
+    if state.given_discharges(&pending.constraint) {
+        return SolveOutcome::Resolved(ResolvedDict {
+            class: pending.constraint.class.clone(),
+            instance_types: pending
+                .constraint
+                .args
+                .iter()
+                .map(|a| state.zonk(a))
+                .collect(),
+            instance_idx: usize::MAX,
+            context: Vec::new(),
+        });
+    }
     // Compiler-magic auto-dispatch: some Prim classes discharge
     // purely from the constraint's shape and don't rely on user
     // instance declarations. Handle them up-front so a fixture
