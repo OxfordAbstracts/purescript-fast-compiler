@@ -198,12 +198,12 @@ pub fn infer_expr(
         Expr::Parens { expr, .. } => infer_expr(state, env, type_ops, expr),
         Expr::TypeAnnotation { expr, ty, .. } => {
             // The declared type may be polymorphic (outer `Forall`
-            // and/or a `Constrained` layer). Check the inner
-            // expression against the instantiated monotype, and
-            // return that same monotype — leaving the caller to
-            // unify normally. Returning the raw `Forall` here
-            // pollutes surrounding unifications with a scheme
-            // they can't look through.
+            // and/or a `Constrained` layer). Deep-instantiate into
+            // every positive position so inner foralls on `Fun.ret`
+            // also collapse to unifs — keeping the result
+            // structurally compatible with a caller-side sig that
+            // was produced the same way. See
+            // `deep_instantiate_positive` for the PJ §5 rationale.
             let mut declared = crate::typecheck_db::types::expand_aliases(
                 convert_type_expr(ty, type_ops),
                 &env.aliases,
@@ -214,7 +214,8 @@ pub fn infer_expr(
                     &env.scoped_tys,
                 );
             }
-            let monotype = instantiate_sig_as_monotype(state, declared);
+            let monotype =
+                deep_instantiate_positive(state, declared, true);
             check_expr(state, env, type_ops, expr, &monotype)?;
             Ok(monotype)
         }
@@ -305,31 +306,24 @@ pub fn check_expr(
     expr: &Expr,
     expected: &Type,
 ) -> Result<(), InferError> {
-    // Deep-skolemisation: if the expected type is `Forall(vs, body)`,
-    // replace each quantifier with a fresh skolem and check against
-    // the skolemised body. A later attempt to bind an OUTER
-    // unification variable to anything containing these skolems
-    // fails via `bind_var`'s escape check — exactly how rank-2
-    // violations surface (see Peyton-Jones et al., "Practical
-    // type inference for arbitrary-rank types" §5).
-    //
     // Zonk first in case `expected` is a unif bound to a Forall.
     let zonked = state.zonk(expected);
-    if let Type::Forall(vs, body) = &zonked {
-        let mut subst: HashMap<String, Type> = HashMap::new();
-        for (n, _, _) in vs {
-            subst.insert(n.clone(), Type::Skolem(state.fresh_skolem()));
-        }
-        let skolemised =
-            crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+    // Deep-skolemisation: push fresh skolems through every
+    // outer `Forall`, `Constrained.body`, and `Fun.ret` layer.
+    // A later attempt to bind an OUTER unification variable to
+    // anything containing these skolems fails via `bind_var`'s
+    // escape check — exactly how rank-2 violations surface
+    // (see Peyton-Jones et al., "Practical type inference for
+    // arbitrary-rank types" §5). A1 discards the peeled
+    // constraint-givens; A2 will push them onto a given stack so
+    // the solver can discharge matching pending constraints.
+    let needs_skolemise = matches!(
+        &zonked,
+        Type::Forall(_, _) | Type::Constrained(_, _)
+    );
+    if needs_skolemise {
+        let (skolemised, _givens) = deep_skolemise_positive(state, zonked);
         return check_expr(state, env, type_ops, expr, &skolemised);
-    }
-    // Same treatment for `Constrained(cs, body)`: check against the
-    // body, but peel constraints. The user has already promised
-    // the caller will satisfy them; we don't want to check them
-    // as obligations inside the body.
-    if let Type::Constrained(_, body) = &zonked {
-        return check_expr(state, env, type_ops, expr, body);
     }
 
     // Bidirectional shortcut: `Lambda` checked against an arrow
@@ -1202,11 +1196,12 @@ fn infer_app(
     let raw_func_ty = infer_expr(state, env, type_ops, func)?;
     // If the function's type zonks to a `Forall` — typically
     // because it was pulled from a `Local` binding whose pattern
-    // match extracted a rank-2 constructor field — instantiate
-    // fresh at THIS call site.
+    // match extracted a rank-2 constructor field — deep-
+    // instantiate fresh at THIS call site so any inner foralls
+    // on `Fun.ret` also get fresh unifs.
     let func_ty_zonked = state.zonk(&raw_func_ty);
     let func_ty = if matches!(func_ty_zonked, Type::Forall(_, _)) {
-        instantiate_sig_as_monotype(state, func_ty_zonked)
+        deep_instantiate_positive(state, func_ty_zonked, true)
     } else {
         raw_func_ty
     };
@@ -1461,10 +1456,11 @@ fn infer_record_access(
     // access site should see a fresh instantiation, not the
     // `Forall` itself, so repeated uses (`m.return 1`, then
     // `m.return "x"`) don't accidentally unify their result
-    // types. Zonk the slot and instantiate any surfaced forall.
+    // types. Zonk the slot and deep-instantiate any surfaced
+    // Forall so inner foralls in `Fun.ret` are also fresh.
     let zonked = state.zonk(&field_ty);
     if matches!(&zonked, Type::Forall(_, _)) {
-        return Ok(instantiate_sig_as_monotype(state, zonked));
+        return Ok(deep_instantiate_positive(state, zonked, true));
     }
     Ok(field_ty)
 }
@@ -2129,6 +2125,100 @@ fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
         });
     }
     body
+}
+
+/// Deep-instantiate positive positions: replace outer `Forall` with
+/// fresh unif vars and recurse under every `Fun.ret` and
+/// `Constrained.body`. Negative positions (`Fun.arg`) keep their
+/// foralls intact so a sig like
+/// `forall x. Array x -> (forall a. Array a) -> Array x`
+/// round-trips against the same shape on the caller side.
+/// See Peyton-Jones et al. §5.
+///
+/// `record_constraints=true` registers `Constrained` layers as
+/// pending constraints on `state` (matches
+/// `instantiate_sig_as_monotype`'s existing behaviour); `false`
+/// drops them (safe for diagnostic-only uses).
+fn deep_instantiate_positive(
+    state: &mut UnifyState,
+    ty: Type,
+    record_constraints: bool,
+) -> Type {
+    use crate::typecheck_db::generalize::apply_var_subst;
+    use crate::typecheck_db::passes::constraints::{
+        ConstraintOrigin, PendingConstraint,
+    };
+    let mut cur = ty;
+    loop {
+        cur = match cur {
+            Type::Forall(vs, body) => {
+                let mut subst: HashMap<String, Type> = HashMap::new();
+                for (n, _, _) in &vs {
+                    subst.insert(n.clone(), state.fresh());
+                }
+                apply_var_subst(&body, &subst)
+            }
+            Type::Constrained(cs, body) => {
+                if record_constraints {
+                    for c in cs {
+                        state.record_pending_constraint(PendingConstraint {
+                            decl_name: None,
+                            span: crate::span::Span { start: 0, end: 0 },
+                            constraint: c,
+                            origin: ConstraintOrigin::Signature,
+                        });
+                    }
+                }
+                *body
+            }
+            Type::Fun(arg, ret) => {
+                let ret_inst = deep_instantiate_positive(
+                    state,
+                    *ret,
+                    record_constraints,
+                );
+                return Type::fun(*arg, ret_inst);
+            }
+            other => return other,
+        };
+    }
+}
+
+/// Deep-skolemise positive positions: replace outer `Forall` with
+/// fresh skolems, recurse under every `Fun.ret` and peel
+/// `Constrained` layers. Returns the skolemised type plus the
+/// flattened list of constraint-givens peeled along the way — A2
+/// will push those onto the solver's given stack; A1 callers just
+/// discard them (same as the pre-existing surface-only `Constrained`
+/// peeling in `check_expr`).
+fn deep_skolemise_positive(
+    state: &mut UnifyState,
+    ty: Type,
+) -> (Type, Vec<Constraint>) {
+    use crate::typecheck_db::generalize::apply_var_subst;
+    let mut cur = ty;
+    let mut givens: Vec<Constraint> = Vec::new();
+    loop {
+        cur = match cur {
+            Type::Forall(vs, body) => {
+                let mut subst: HashMap<String, Type> = HashMap::new();
+                for (n, _, _) in &vs {
+                    subst.insert(n.clone(), Type::Skolem(state.fresh_skolem()));
+                }
+                apply_var_subst(&body, &subst)
+            }
+            Type::Constrained(cs, body) => {
+                givens.extend(cs);
+                *body
+            }
+            Type::Fun(arg, ret) => {
+                let (ret_s, ret_g) = deep_skolemise_positive(state, *ret);
+                givens.extend(ret_g);
+                return (Type::fun(*arg, ret_s), givens);
+            }
+            other => return (other, givens),
+        };
+    }
 }
 
 /// If `name` has a declared signature in the env, instantiate it
