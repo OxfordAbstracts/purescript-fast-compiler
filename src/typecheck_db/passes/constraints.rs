@@ -57,6 +57,13 @@ pub struct PendingConstraint {
     /// a constraint is "given" (from a class method under its own
     /// instance) vs "wanted".
     pub origin: ConstraintOrigin,
+    /// Snapshot of the givens stack at the moment this constraint
+    /// was recorded. `check_equation` pushes a sig's `Constrained`
+    /// layer as givens while the body is inferred; by the time
+    /// `solve_all` runs those givens have been popped from the
+    /// `UnifyState`, so each pending must carry its own copy.
+    #[serde(default)]
+    pub givens: Vec<Constraint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -189,12 +196,13 @@ pub fn solve_one(
     pending: &PendingConstraint,
 ) -> SolveOutcome {
     // Givens discharge before anything else: a constraint promised
-    // by an enclosing sig's `Constrained` layer (pushed onto
-    // `state.givens` by `check_equation` when skolemising a
-    // user-signed decl) is already known-true. Match structurally
+    // by an enclosing sig's `Constrained` layer is already known-
+    // true. Each `PendingConstraint` carries a snapshot of the
+    // givens that were in scope when it was recorded (see
+    // `UnifyState::record_pending_constraint`). Match structurally
     // on zonked forms so a skolemised `Semigroupoid !sa` satisfies
     // a pending `Semigroupoid ?ua` once `?ua := !sa` is bound.
-    if state.given_discharges(&pending.constraint) {
+    if given_discharges_pending(state, pending) {
         return SolveOutcome::Resolved(ResolvedDict {
             class: pending.constraint.class.clone(),
             instance_types: pending
@@ -274,6 +282,60 @@ pub fn solve_one(
         return SolveOutcome::Deferred;
     }
     SolveOutcome::NoInstance
+}
+
+/// True when any given stamped on `pending` (or currently live on
+/// `state.givens`) structurally matches the pending's constraint
+/// after both sides are zonked. Strict match: same class, pairwise
+/// `type_eq` on zonked args — givens aren't subject to further
+/// unification.
+fn given_discharges_pending(
+    state: &crate::typecheck_db::unify::UnifyState,
+    pending: &PendingConstraint,
+) -> bool {
+    if state.given_discharges(&pending.constraint) {
+        return true;
+    }
+    // Fall back to the constraint's own captured givens (the stack
+    // at the moment of record has since been popped).
+    if pending.givens.is_empty() {
+        return false;
+    }
+    let zp = Constraint {
+        class: pending.constraint.class.clone(),
+        args: pending.constraint.args.iter().map(|a| state.zonk(a)).collect(),
+    };
+    pending.givens.iter().any(|g| {
+        let zg = Constraint {
+            class: g.class.clone(),
+            args: g.args.iter().map(|a| state.zonk(a)).collect(),
+        };
+        constraints_eq(&zg, &zp)
+    })
+}
+
+fn constraints_eq(a: &Constraint, b: &Constraint) -> bool {
+    a.class == b.class
+        && a.args.len() == b.args.len()
+        && a.args.iter().zip(b.args.iter()).all(|(x, y)| ty_eq(x, y))
+}
+
+fn ty_eq(a: &Type, b: &Type) -> bool {
+    use Type::*;
+    match (a, b) {
+        (Var(x), Var(y)) => x == y,
+        (TypeString(x), TypeString(y)) => x == y,
+        (Con(x), Con(y)) => x == y,
+        (Unif(x), Unif(y)) => x == y,
+        (Skolem(x), Skolem(y)) => x == y,
+        (TypeInt(x), TypeInt(y)) => x == y,
+        (App(f1, a1), App(f2, a2)) | (Fun(f1, a1), Fun(f2, a2)) => {
+            ty_eq(f1, f2) && ty_eq(a1, a2)
+        }
+        (Kinded(t1, _), other) => ty_eq(t1, other),
+        (other, Kinded(t2, _)) => ty_eq(other, t2),
+        _ => false,
+    }
 }
 
 /// True when the zonked form of `ty` mentions a rigid `Type::Var`
@@ -461,6 +523,7 @@ pub fn solve_all(
                                 args: ctx.args.iter().map(|a| state.zonk(a)).collect(),
                             },
                             origin: ConstraintOrigin::InstanceContext,
+                            givens: pc.givens.clone(),
                         });
                     }
                     // Record the outer dict at the call site's span
@@ -789,6 +852,7 @@ g c = eq c c
                 args,
             },
             origin: ConstraintOrigin::Signature,
+            givens: Vec::new(),
         }
     }
 
@@ -1186,6 +1250,7 @@ g c = eq c c
                 args,
             },
             origin: ConstraintOrigin::Signature,
+            givens: Vec::new(),
         }
     }
 

@@ -165,12 +165,17 @@ impl UnifyState {
 
     /// Push one pending constraint, stamping it with the current decl
     /// name so the draining caller can route it to the right
-    /// `InferredScheme`.
+    /// `InferredScheme`. Also snapshots the current givens stack so
+    /// the solver can consult it later, after the sig's Constrained
+    /// layer has been popped from `self.givens`.
     pub fn record_pending_constraint(
         &mut self,
         mut entry: crate::typecheck_db::passes::constraints::PendingConstraint,
     ) {
         entry.decl_name = self.current_decl.clone();
+        if entry.givens.is_empty() {
+            entry.givens = self.givens.clone();
+        }
         self.pending_constraints.push(entry);
     }
 

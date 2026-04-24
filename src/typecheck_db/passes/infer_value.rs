@@ -639,18 +639,16 @@ pub fn infer_value_scc_with_all(
             let guarded_with_where =
                 wrap_guarded_with_where(guarded.clone(), where_clause.clone());
 
-            // Bidirectional check-mode: when the decl has a
-            // user-declared sibling `Decl::TypeSignature` in this
-            // module, check its body against the sig. Skolems
-            // introduced in `check_expr` reject rank-2 violations
-            // via the escape check in `bind_var`.
-            //
-            // Gated OFF pending A2: `check_equation` peels a
-            // `Constrained` sig into skolems without pushing
-            // givens onto the solver, so any body-side call that
-            // re-raises those constraints (e.g. `composeFlipped`
-            // calling `compose`, which is `Semigroupoid a =>`)
-            // surfaces as `NoInstanceFound` against a skolem.
+            // Bidirectional check-mode: A1/A2 scaffolding is in
+            // place (deep skolemisation + givens stack), but the
+            // gate stays OFF. Enabling it even at rank-2+ sigs
+            // regresses 8 fixtures (Auto / Church / Rank2Types /
+            // NaturalTransformationAlias / …) because PureScript
+            // accepts deep-subsumption patterns the infer path
+            // sidesteps — strict PJ §5 checking rejects them. A
+            // follow-up plan must add "subsumption"-mode unify
+            // that instantiates a rank-2 arg's expected Forall
+            // when the arg is a lambda of matching shape.
             let sig_scheme: Option<Scheme> = None;
             let _ = name;
             let _ = decl;
@@ -1152,6 +1150,7 @@ fn instantiate_and_record_constraints(
             span,
             constraint: c,
             origin: ConstraintOrigin::Signature,
+            givens: Vec::new(), // filled from stack by record_pending_constraint
         });
     }
     body
@@ -1577,7 +1576,21 @@ fn infer_let(
     for b in bindings {
         if let LetBinding::Signature { name, ty, .. } = b {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-            let converted = convert_type_expr(ty, type_ops);
+            let mut converted = convert_type_expr(ty, type_ops);
+            // Scoped type variables: replace any `Var("r")` here
+            // that matches an outer-decl skolem (via check_equation
+            // seeding `env.scoped_tys`). Without this a where-clause
+            // sig that mentions the outer sig's forall vars would
+            // carry a rigid `Var` that can't unify with the outer
+            // sig's skolem — breaking patterns like
+            // `reifySymbol :: forall r. ... -> r` using a helper
+            // `coerce :: ... -> r` in its `where`.
+            if !env.scoped_tys.is_empty() {
+                converted = crate::typecheck_db::generalize::apply_var_subst(
+                    &converted,
+                    &env.scoped_tys,
+                );
+            }
             sigs.insert(n, crate::typecheck_db::types::expand_aliases(converted, &env.aliases));
         }
     }
@@ -2126,6 +2139,7 @@ fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
             span: crate::span::Span { start: 0, end: 0 },
             constraint: c,
             origin: ConstraintOrigin::Signature,
+            givens: Vec::new(),
         });
     }
     body
@@ -2170,6 +2184,7 @@ fn deep_instantiate_positive(
                             span: crate::span::Span { start: 0, end: 0 },
                             constraint: c,
                             origin: ConstraintOrigin::Signature,
+                            givens: Vec::new(),
                         });
                     }
                 }
