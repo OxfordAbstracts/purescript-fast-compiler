@@ -637,15 +637,13 @@ pub fn infer_value_scc_with_all(
             // schemes happen to live in `top_level` but aren't
             // user-written sigs.
             // Bidirectional check-mode is implemented below
-            // (`check_equation` + skolemisation) but not yet
-            // wired into the decl loop. Turning it on regresses
-            // ~8 `passing_fixtures` for reasons orthogonal to
-            // check-mode itself (pre-existing cross-module
-            // qualified-name / alias issues surface because the
-            // check path passes sig types through new unify
-            // sites). Deferred until those are fixed; skolem
-            // infrastructure is still shipped so future work
-            // can flip this gate on.
+            // (`check_equation` + skolemisation). Turning it on
+            // even gated at rank-2+ sigs introduces 8 passing-
+            // fixture regressions (Auto, Church, LiberalType-
+            // Synonyms — deep-skolemisation of nested Foralls
+            // isn't yet correct; Peyton-Jones §5 requires
+            // positive/negative position tracking). Gated off
+            // for now; infrastructure stays for future work.
             let sig_scheme: Option<Scheme> = None;
             let _ = name;
             let _ = decl;
