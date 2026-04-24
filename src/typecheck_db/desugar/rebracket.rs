@@ -277,7 +277,26 @@ fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Bi
 fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
     match e {
         Expr::Op { .. } | Expr::BacktickApp { .. } => {
-            let (operands_raw, ops_raw, root_span) = flatten_chain(e);
+            let (mut operands_raw, ops_raw, root_span) = flatten_chain(e);
+            // `::` has the lowest precedence in PureScript — lower
+            // than any user-declared operator. The parser attaches
+            // a trailing annotation to the rightmost chain operand,
+            // so `a <<< b :: T` arrives as
+            // `Op(a, <<<, TypeAnnotation(b, T))`. Extract the
+            // annotation here so it wraps the whole shunted chain
+            // rather than just `b`. Without this, the type
+            // annotation binds tighter than every operator.
+            let mut trailing_annotation: Option<(Span, crate::cst::TypeExpr)> = None;
+            if let Some(last) = operands_raw.last() {
+                if matches!(last, Expr::TypeAnnotation { .. }) {
+                    if let Some(Expr::TypeAnnotation { span, expr, ty }) =
+                        operands_raw.pop()
+                    {
+                        trailing_annotation = Some((span, ty));
+                        operands_raw.push(*expr);
+                    }
+                }
+            }
             let operands: Vec<Expr> = operands_raw
                 .into_iter()
                 .map(|x| rewrite_expr(x, fixity))
@@ -292,7 +311,15 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
                     },
                 })
                 .collect();
-            shunt(operands, ops, fixity, root_span)
+            let result = shunt(operands, ops, fixity, root_span);
+            match trailing_annotation {
+                Some((span, ty)) => Expr::TypeAnnotation {
+                    span,
+                    expr: Box::new(result),
+                    ty,
+                },
+                None => result,
+            }
         }
         Expr::OpParens { span, op } => match lookup_op(&op, fixity) {
             Some(info) if target_is_constructor(info) => Expr::Constructor {
