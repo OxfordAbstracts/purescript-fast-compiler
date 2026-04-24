@@ -135,6 +135,20 @@ fn swap_field_wildcard(
                 name: crate::names::Qualified::unqualified(name),
             })
         }
+        // Nested record update: `bar { baz = _, qux = _ }` parses
+        // as a `RecordField` whose value is a bare `Expr::Record`
+        // with `is_update` fields. Recurse into those fields so
+        // their wildcards also lift into the surrounding lambda's
+        // param list, in source order.
+        Some(Expr::Record { span: inner_span, fields })
+            if !fields.is_empty() && fields.iter().all(|ff| ff.is_update) =>
+        {
+            let new_fields: Vec<RecordField> = fields
+                .into_iter()
+                .map(|ff| swap_field_wildcard(ff, counter, params))
+                .collect();
+            Some(Expr::Record { span: inner_span, fields: new_fields })
+        }
         other => other,
     };
     RecordField { span, label, value: new_value, type_ann, is_update, is_nested }
