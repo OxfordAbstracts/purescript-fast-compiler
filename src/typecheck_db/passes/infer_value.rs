@@ -1190,7 +1190,21 @@ fn infer_app(
             return infer_record_update_from_fields(state, env, type_ops, func, fields);
         }
     }
-    let func_ty = infer_expr(state, env, type_ops, func)?;
+    let raw_func_ty = infer_expr(state, env, type_ops, func)?;
+    // If the function's type zonks to a `Forall` — typically
+    // because it was pulled from a `Local` binding whose pattern
+    // match extracted a rank-2 constructor field, OR because a
+    // check-mode param-binder bound it directly to a rank-2 arg
+    // type — instantiate it fresh at THIS call site. Without
+    // this, `case id of Id f -> f a` (where `f :: forall a. a ->
+    // a` is bound by pattern) would unify `Forall` with `Fun`
+    // and fail.
+    let func_ty_zonked = state.zonk(&raw_func_ty);
+    let func_ty = if matches!(func_ty_zonked, Type::Forall(_, _)) {
+        instantiate_sig_as_monotype(state, func_ty_zonked)
+    } else {
+        raw_func_ty
+    };
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
     let result = state.fresh();
     state.unify(&func_ty, &Type::fun(arg_ty, result.clone()))?;
