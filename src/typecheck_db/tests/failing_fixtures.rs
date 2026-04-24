@@ -525,9 +525,20 @@ macro_rules! check_failing_build_unit {
 }
 
 macro_rules! check_failing_build_unit_ignored {
+    // Legacy 2-arg form — falls back to the generic gap-closing
+    // reason. Preferred: the 3-arg form below with a specific
+    // reason category so future triage can filter by cause
+    // instead of scanning a 237-row opaque block.
     ($test_name:ident, $fixture:literal) => {
+        check_failing_build_unit_ignored!(
+            $test_name,
+            $fixture,
+            "gap-closing: typecheck_db doesn't yet catch this failure category"
+        );
+    };
+    ($test_name:ident, $fixture:literal, $reason:literal) => {
         #[test]
-        #[ignore = "gap-closing: typecheck_db doesn't yet catch this failure category"]
+        #[ignore = $reason]
         #[allow(non_snake_case)]
         fn $test_name() {
             run_failing_build_unit($fixture);

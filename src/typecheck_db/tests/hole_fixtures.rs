@@ -805,10 +805,20 @@ macro_rules! check_hole_variant {
 }
 
 macro_rules! check_hole_variant_ignored {
+    // Legacy 2-arg form — falls back to the generic gap-closing
+    // reason. 3-arg form lets specific variants carry a targeted
+    // reason category once triage has classified them.
     ($test_name:ident, $variant:literal) => {
+        check_hole_variant_ignored!(
+            $test_name,
+            $variant,
+            "gap-closing: typecheck_db hole reporting vs reference compiler"
+        );
+    };
+    ($test_name:ident, $variant:literal, $reason:literal) => {
         #[test]
         #[timeout(20000)]
-        #[ignore = "gap-closing: typecheck_db hole reporting vs reference compiler"]
+        #[ignore = $reason]
         #[allow(non_snake_case)]
         fn $test_name() {
             run_hole_variant($variant);
