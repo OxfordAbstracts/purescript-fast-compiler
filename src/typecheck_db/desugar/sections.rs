@@ -279,22 +279,9 @@ mod tests {
         n
     }
 
-    #[test]
-    fn op_section_becomes_lambda() {
-        let d = first_decl("module M where\nf = (_ + 1)\n");
-        assert_eq!(count_wildcards(&d), 1);
-        let d2 = desugar_decl(d);
-        assert_eq!(count_wildcards(&d2), 0);
-        assert!(count_lambdas(&d2) >= 1, "expected at least one lambda");
-    }
-
-    #[test]
-    fn backtick_section_becomes_lambda() {
-        let d = first_decl("module M where\nf = (_ `cmp` 1)\n");
-        assert_eq!(count_wildcards(&d), 1);
-        let d2 = desugar_decl(d);
-        assert_eq!(count_wildcards(&d2), 0);
-    }
+    // `op_section_becomes_lambda` / `backtick_section_becomes_lambda`
+    // live in `rebracket::tests` now — chain wildcards are lifted
+    // during rebracket flattening, not here.
 
     #[test]
     fn app_section_becomes_lambda() {
