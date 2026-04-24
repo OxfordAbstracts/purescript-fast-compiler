@@ -275,6 +275,16 @@ fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Bi
 /// at the outermost Op preserves precedence; we then recurse
 /// into each individual operand to handle nested expressions.
 fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
+    rewrite_expr_ctx(e, fixity, false)
+}
+
+/// `in_parens` is true when the expression being rewritten is
+/// the immediate body of an `Expr::Parens`. Only inside parens
+/// can a chain wildcard be lifted as an operator section — in
+/// bare position (e.g. `test = 1 + 2 * _`) the user must wrap
+/// the section explicitly, and leaving the wildcard unlifted
+/// surfaces as `IncorrectAnonymousArgument` downstream.
+fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, in_parens: bool) -> Expr {
     match e {
         Expr::Op { .. } | Expr::BacktickApp { .. } => {
             let (mut operands_raw, ops_raw, root_span) = flatten_chain(e);
@@ -297,10 +307,53 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
                     }
                 }
             }
-            let operands: Vec<Expr> = operands_raw
+            let mut operands: Vec<Expr> = operands_raw
                 .into_iter()
                 .map(|x| rewrite_expr(x, fixity))
                 .collect();
+            // Chain-level section lifting: any leaf wildcard in
+            // the flattened chain becomes a fresh lambda param,
+            // bound around the whole shunted result. This is the
+            // only place sections can be lifted from an *operator
+            // chain* correctly — doing it per-Op post-order (as
+            // `sections::desugar_decl` used to) wraps the inner
+            // chain-fragment in a lambda, breaking the parent
+            // operator's left-right structure. `(3 * 2 + _)`
+            // needs `\x -> 3 * 2 + x`, not `3 * (\x -> 2 + x)`.
+            //
+            // Only lift when the chain is directly inside parens —
+            // a bare `1 + _` must stay unlifted so the downstream
+            // `Wildcard` in expression position surfaces as
+            // `IncorrectAnonymousArgument` rather than silently
+            // becoming a valid lambda.
+            let mut section_params: Vec<crate::cst::Binder> = Vec::new();
+            let mut section_counter: u32 = 0;
+            if in_parens {
+                for slot in operands.iter_mut() {
+                    if matches!(slot, Expr::Wildcard { .. }) {
+                        let wspan = match slot {
+                            Expr::Wildcard { span } => *span,
+                            _ => unreachable!(),
+                        };
+                        let name = crate::names::value_name(&format!(
+                            "$secchain_{}",
+                            section_counter
+                        ));
+                        section_counter += 1;
+                        section_params.push(crate::cst::Binder::Var {
+                            span: wspan,
+                            name: crate::cst::Spanned {
+                                span: wspan,
+                                value: name.clone(),
+                            },
+                        });
+                        *slot = Expr::Var {
+                            span: wspan,
+                            name: crate::names::Qualified::unqualified(name),
+                        };
+                    }
+                }
+            }
             let ops: Vec<ChainOp> = ops_raw
                 .into_iter()
                 .map(|c| match c {
@@ -311,7 +364,16 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
                     },
                 })
                 .collect();
-            let result = shunt(operands, ops, fixity, root_span);
+            let shunted = shunt(operands, ops, fixity, root_span);
+            let result = if section_params.is_empty() {
+                shunted
+            } else {
+                Expr::Lambda {
+                    span: root_span,
+                    binders: section_params,
+                    body: Box::new(shunted),
+                }
+            };
             match trailing_annotation {
                 Some((span, ty)) => Expr::TypeAnnotation {
                     span,
@@ -345,6 +407,10 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
                 };
                 Expr::Var { span, name: qualified }
             }
+        },
+        Expr::Parens { span, expr } => Expr::Parens {
+            span,
+            expr: Box::new(rewrite_expr_ctx(*expr, fixity, true)),
         },
         other => recurse_children(other, fixity),
     }

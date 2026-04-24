@@ -28,7 +28,26 @@ use super::walk::fold_decl_exprs;
 
 pub fn desugar_decl(decl: crate::cst::Decl) -> crate::cst::Decl {
     let mut counter: u32 = 0;
+    // Pre-order pass: lift record-accessor sections (`_.x.y`) at
+    // the OUTERMOST `RecordAccess` of each chain. Post-order would
+    // wrap the innermost access in a lambda first and leave the
+    // outer accesses trying to `.y` a lambda.
+    let decl = lift_accessor_sections_decl(decl, &mut counter);
+    // Post-order pass: the rest of the section shapes.
     fold_decl_exprs(decl, &mut |node| rewrite_node(node, &mut counter))
+}
+
+fn lift_accessor_sections_decl(
+    decl: crate::cst::Decl,
+    counter: &mut u32,
+) -> crate::cst::Decl {
+    super::walk::fold_decl_exprs_preorder(decl, &mut |e| {
+        if is_accessor_section(&e) {
+            lift_accessor_section(e, counter)
+        } else {
+            e
+        }
+    })
 }
 
 fn is_wildcard(e: &Expr) -> bool {
@@ -54,7 +73,10 @@ fn is_record_update_section(func: &Expr, arg: &Expr) -> bool {
 /// transform's job).
 fn has_section_wildcard(e: &Expr) -> bool {
     match e {
-        Expr::Op { left, right, .. } => is_wildcard(left) || is_wildcard(right),
+        // `Op` / `BacktickApp` wildcards are lifted at CHAIN scope
+        // inside `rebracket::rewrite_expr`, not here — lifting per-
+        // Op post-order would break chains like `(3 * 2 + _)`.
+        Expr::Op { .. } | Expr::BacktickApp { .. } => false,
         Expr::App { func, arg, .. } => {
             if is_record_update_section(func, arg) {
                 false
@@ -62,7 +84,6 @@ fn has_section_wildcard(e: &Expr) -> bool {
                 is_wildcard(func) || is_wildcard(arg)
             }
         }
-        Expr::BacktickApp { left, right, .. } => is_wildcard(left) || is_wildcard(right),
         // `if _ then _ else _` sections: any direct wildcard in
         // cond/then/else slots produces a lambda of the
         // corresponding arity.
@@ -87,6 +108,59 @@ fn rewrite_node(e: Expr, counter: &mut u32) -> Expr {
     Expr::Lambda { span, binders: params, body: Box::new(body) }
 }
 
+/// True when `e` is a `RecordAccess` chain whose leftmost expr
+/// is `Wildcard` — i.e. `_.x`, `_.x.y`, ... — and NOT a chain
+/// whose leftmost expr is already a non-wildcard (those are
+/// plain accesses, not sections).
+fn is_accessor_section(e: &Expr) -> bool {
+    match e {
+        Expr::RecordAccess { expr, .. } => {
+            if is_wildcard(expr) {
+                true
+            } else {
+                is_accessor_section(expr)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn lift_accessor_section(e: Expr, counter: &mut u32) -> Expr {
+    let span = span_of(&e);
+    let name = fresh_param(counter);
+    let param_span = span;
+    let param_var = Expr::Var {
+        span: param_span,
+        name: crate::names::Qualified::unqualified(name.clone()),
+    };
+    // Rebuild the chain, replacing the leftmost Wildcard with
+    // the fresh param reference.
+    let body = replace_wildcard_at_root(e, &param_var);
+    Expr::Lambda {
+        span,
+        binders: vec![Binder::Var {
+            span: param_span,
+            name: Spanned { span: param_span, value: name },
+        }],
+        body: Box::new(body),
+    }
+}
+
+/// Walk down the `.field.field....` chain and substitute the
+/// leftmost `Wildcard` with `replacement`. The chain's shape is
+/// preserved — we only edit the leaf.
+fn replace_wildcard_at_root(e: Expr, replacement: &Expr) -> Expr {
+    match e {
+        Expr::RecordAccess { span, expr, field } => Expr::RecordAccess {
+            span,
+            expr: Box::new(replace_wildcard_at_root(*expr, replacement)),
+            field,
+        },
+        Expr::Wildcard { .. } => replacement.clone(),
+        other => other,
+    }
+}
+
 /// Walk the *direct* operand slots of one node and swap every `_` for a
 /// fresh `$arg_N` variable, appending a matching `Binder::Var` to
 /// `params`. Non-wildcard children are left alone (they've already been
@@ -97,22 +171,12 @@ fn replace_one_level_wildcards(
     params: &mut Vec<Binder>,
 ) -> Expr {
     match e {
-        Expr::Op { span, left, op, right } => Expr::Op {
-            span,
-            left: Box::new(swap_if_wildcard(*left, counter, params)),
-            op,
-            right: Box::new(swap_if_wildcard(*right, counter, params)),
-        },
+        // `Op` / `BacktickApp` are handled by rebracket — see
+        // the note on `has_section_wildcard`.
         Expr::App { span, func, arg } => Expr::App {
             span,
             func: Box::new(swap_if_wildcard(*func, counter, params)),
             arg: Box::new(swap_if_wildcard(*arg, counter, params)),
-        },
-        Expr::BacktickApp { span, func, left, right } => Expr::BacktickApp {
-            span,
-            func,
-            left: Box::new(swap_if_wildcard(*left, counter, params)),
-            right: Box::new(swap_if_wildcard(*right, counter, params)),
         },
         Expr::If { span, cond, then_expr, else_expr } => Expr::If {
             span,

@@ -20,6 +20,279 @@ pub fn fold_expr<F: FnMut(Expr) -> Expr>(e: Expr, f: &mut F) -> Expr {
     f(e)
 }
 
+/// Pre-order variant: visit the current node first, then recurse
+/// into whatever `f` returns. Useful for transforms where the
+/// outer node's shape decides how its children should be walked
+/// (e.g. lifting a RecordAccess chain as one unit rather than
+/// letting post-order wrap each inner access in its own lambda).
+pub fn fold_expr_preorder<F: FnMut(Expr) -> Expr>(e: Expr, f: &mut F) -> Expr {
+    let e = f(e);
+    recurse_children_preorder(e, f)
+}
+
+fn recurse_children_preorder<F: FnMut(Expr) -> Expr>(e: Expr, f: &mut F) -> Expr {
+    match e {
+        Expr::Var { .. }
+        | Expr::Constructor { .. }
+        | Expr::Wildcard { .. }
+        | Expr::Hole { .. }
+        | Expr::OpParens { .. } => e,
+        Expr::Literal { span, lit } => match lit {
+            Literal::Array(xs) => Expr::Literal {
+                span,
+                lit: Literal::Array(
+                    xs.into_iter().map(|x| fold_expr_preorder(x, f)).collect(),
+                ),
+            },
+            other => Expr::Literal { span, lit: other },
+        },
+        Expr::App { span, func, arg } => Expr::App {
+            span,
+            func: Box::new(fold_expr_preorder(*func, f)),
+            arg: Box::new(fold_expr_preorder(*arg, f)),
+        },
+        Expr::VisibleTypeApp { span, func, ty } => Expr::VisibleTypeApp {
+            span,
+            func: Box::new(fold_expr_preorder(*func, f)),
+            ty,
+        },
+        Expr::Lambda { span, binders, body } => Expr::Lambda {
+            span,
+            binders,
+            body: Box::new(fold_expr_preorder(*body, f)),
+        },
+        Expr::Op { span, left, op, right } => Expr::Op {
+            span,
+            left: Box::new(fold_expr_preorder(*left, f)),
+            op,
+            right: Box::new(fold_expr_preorder(*right, f)),
+        },
+        Expr::BacktickApp { span, func, left, right } => Expr::BacktickApp {
+            span,
+            func: Box::new(fold_expr_preorder(*func, f)),
+            left: Box::new(fold_expr_preorder(*left, f)),
+            right: Box::new(fold_expr_preorder(*right, f)),
+        },
+        Expr::If { span, cond, then_expr, else_expr } => Expr::If {
+            span,
+            cond: Box::new(fold_expr_preorder(*cond, f)),
+            then_expr: Box::new(fold_expr_preorder(*then_expr, f)),
+            else_expr: Box::new(fold_expr_preorder(*else_expr, f)),
+        },
+        Expr::Case { span, exprs, alts } => Expr::Case {
+            span,
+            exprs: exprs.into_iter().map(|x| fold_expr_preorder(x, f)).collect(),
+            alts: alts
+                .into_iter()
+                .map(|a| CaseAlternative {
+                    span: a.span,
+                    binders: a.binders,
+                    result: fold_guarded_preorder(a.result, f),
+                })
+                .collect(),
+        },
+        Expr::Let { span, bindings, body } => Expr::Let {
+            span,
+            bindings: bindings
+                .into_iter()
+                .map(|b| fold_let_binding_preorder(b, f))
+                .collect(),
+            body: Box::new(fold_expr_preorder(*body, f)),
+        },
+        Expr::Do { span, module, statements } => Expr::Do {
+            span,
+            module,
+            statements: statements
+                .into_iter()
+                .map(|s| fold_do_stmt_preorder(s, f))
+                .collect(),
+        },
+        Expr::Ado { span, module, statements, result } => Expr::Ado {
+            span,
+            module,
+            statements: statements
+                .into_iter()
+                .map(|s| fold_do_stmt_preorder(s, f))
+                .collect(),
+            result: Box::new(fold_expr_preorder(*result, f)),
+        },
+        Expr::Record { span, fields } => Expr::Record {
+            span,
+            fields: fields
+                .into_iter()
+                .map(|r| RecordField {
+                    span: r.span,
+                    label: r.label,
+                    value: r.value.map(|e| fold_expr_preorder(e, f)),
+                    type_ann: r.type_ann,
+                    is_update: r.is_update,
+                    is_nested: r.is_nested,
+                })
+                .collect(),
+        },
+        Expr::RecordAccess { span, expr, field } => Expr::RecordAccess {
+            span,
+            expr: Box::new(fold_expr_preorder(*expr, f)),
+            field,
+        },
+        Expr::RecordUpdate { span, expr, updates } => Expr::RecordUpdate {
+            span,
+            expr: Box::new(fold_expr_preorder(*expr, f)),
+            updates: updates
+                .into_iter()
+                .map(|u| RecordUpdate {
+                    span: u.span,
+                    label: u.label,
+                    value: fold_expr_preorder(u.value, f),
+                })
+                .collect(),
+        },
+        Expr::Parens { span, expr } => Expr::Parens {
+            span,
+            expr: Box::new(fold_expr_preorder(*expr, f)),
+        },
+        Expr::TypeAnnotation { span, expr, ty } => Expr::TypeAnnotation {
+            span,
+            expr: Box::new(fold_expr_preorder(*expr, f)),
+            ty,
+        },
+        Expr::Array { span, elements } => Expr::Array {
+            span,
+            elements: elements
+                .into_iter()
+                .map(|x| fold_expr_preorder(x, f))
+                .collect(),
+        },
+        Expr::Negate { span, expr } => Expr::Negate {
+            span,
+            expr: Box::new(fold_expr_preorder(*expr, f)),
+        },
+        Expr::AsPattern { span, name, pattern } => Expr::AsPattern {
+            span,
+            name: Box::new(fold_expr_preorder(*name, f)),
+            pattern: Box::new(fold_expr_preorder(*pattern, f)),
+        },
+    }
+}
+
+fn fold_guarded_preorder<F: FnMut(Expr) -> Expr>(
+    g: GuardedExpr,
+    f: &mut F,
+) -> GuardedExpr {
+    match g {
+        GuardedExpr::Unconditional(e) => {
+            GuardedExpr::Unconditional(Box::new(fold_expr_preorder(*e, f)))
+        }
+        GuardedExpr::Guarded(guards) => GuardedExpr::Guarded(
+            guards
+                .into_iter()
+                .map(|guard| Guard {
+                    span: guard.span,
+                    patterns: guard
+                        .patterns
+                        .into_iter()
+                        .map(|p| match p {
+                            GuardPattern::Boolean(e) => {
+                                GuardPattern::Boolean(Box::new(fold_expr_preorder(*e, f)))
+                            }
+                            GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
+                                b,
+                                Box::new(fold_expr_preorder(*e, f)),
+                            ),
+                        })
+                        .collect(),
+                    expr: Box::new(fold_expr_preorder(*guard.expr, f)),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn fold_let_binding_preorder<F: FnMut(Expr) -> Expr>(
+    b: LetBinding,
+    f: &mut F,
+) -> LetBinding {
+    match b {
+        LetBinding::Value { span, binder, expr } => LetBinding::Value {
+            span,
+            binder,
+            expr: fold_expr_preorder(expr, f),
+        },
+        LetBinding::Signature { span, name, ty } => {
+            LetBinding::Signature { span, name, ty }
+        }
+    }
+}
+
+fn fold_do_stmt_preorder<F: FnMut(Expr) -> Expr>(
+    s: DoStatement,
+    f: &mut F,
+) -> DoStatement {
+    match s {
+        DoStatement::Bind { span, binder, expr } => DoStatement::Bind {
+            span,
+            binder,
+            expr: fold_expr_preorder(expr, f),
+        },
+        DoStatement::Let { span, bindings } => DoStatement::Let {
+            span,
+            bindings: bindings
+                .into_iter()
+                .map(|b| fold_let_binding_preorder(b, f))
+                .collect(),
+        },
+        DoStatement::Discard { span, expr } => DoStatement::Discard {
+            span,
+            expr: fold_expr_preorder(expr, f),
+        },
+    }
+}
+
+pub fn fold_decl_exprs_preorder<F: FnMut(Expr) -> Expr>(
+    d: crate::cst::Decl,
+    f: &mut F,
+) -> crate::cst::Decl {
+    use crate::cst::Decl;
+    match d {
+        Decl::Value { name, binders, guarded, where_clause, span, doc_comments } => {
+            Decl::Value {
+                name,
+                binders,
+                guarded: fold_guarded_preorder(guarded, f),
+                where_clause: where_clause
+                    .into_iter()
+                    .map(|b| fold_let_binding_preorder(b, f))
+                    .collect(),
+                span,
+                doc_comments,
+            }
+        }
+        Decl::Instance {
+            span,
+            name,
+            constraints,
+            class_name,
+            types,
+            members,
+            chain,
+            doc_comments,
+        } => Decl::Instance {
+            span,
+            name,
+            constraints,
+            class_name,
+            types,
+            members: members
+                .into_iter()
+                .map(|m| fold_decl_exprs_preorder(m, f))
+                .collect(),
+            chain,
+            doc_comments,
+        },
+        other => other,
+    }
+}
+
 fn recurse_children<F: FnMut(Expr) -> Expr>(e: Expr, f: &mut F) -> Expr {
     match e {
         Expr::Var { .. }

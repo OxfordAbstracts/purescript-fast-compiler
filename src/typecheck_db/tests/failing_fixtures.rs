@@ -244,6 +244,7 @@ fn infer_error_code(e: &InferError) -> String {
         InferError::InvalidDoLet => "InvalidDoLet".into(),
         InferError::InvalidDoBind => "InvalidDoBind".into(),
         InferError::EmptyDoBlock => "EmptyDoBlock".into(),
+        InferError::IncorrectAnonymousArgument => "IncorrectAnonymousArgument".into(),
     }
 }
 

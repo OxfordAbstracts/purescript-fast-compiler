@@ -50,6 +50,8 @@ pub enum InferError {
     InvalidDoBind,
     #[error("empty do-block")]
     EmptyDoBlock,
+    #[error("anonymous function argument in invalid context")]
+    IncorrectAnonymousArgument,
 }
 
 /// Output of `infer_value_scc` for one SCC of mutually-recursive value decls.
@@ -216,7 +218,14 @@ pub fn infer_expr(
             check_expr(state, env, type_ops, expr, &monotype)?;
             Ok(monotype)
         }
-        Expr::Wildcard { .. } => Ok(state.fresh()),
+        // A bare `_` in expression position is only valid if the
+        // desugar pipeline has already lifted it into a lambda
+        // param (operator sections, record-update sections, ...).
+        // Any residual `Expr::Wildcard` at inference time means the
+        // user wrote `_` outside a section context, which is the
+        // `IncorrectAnonymousArgument` case in the reference
+        // compiler.
+        Expr::Wildcard { .. } => Err(InferError::IncorrectAnonymousArgument),
         Expr::Hole { span, name } => {
             let ty = state.fresh();
             let hole_name = name.resolve().unwrap_or_default();
