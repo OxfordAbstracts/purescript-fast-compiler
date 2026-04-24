@@ -170,11 +170,19 @@ fn import_all_except(
     // `Var("Data.Function.apply")` would not resolve when the
     // module was imported unqualified through a re-exporter.
     for (name, scheme) in &target.values {
-        if hidden.values.contains(name.as_str()) {
-            continue;
+        let is_hidden = hidden.values.contains(name.as_str());
+        // Hiding removes the unqualified-in-this-module binding
+        // (`(None|alias, name)`) but NOT the origin-qualified
+        // binding (`(Some("Data.Semiring"), name)`). The
+        // origin-qualified key is what rebracket-time operator
+        // lowering looks up when `+` has been canonicalized to
+        // `Data.Semiring.add`; without it, `import Prelude
+        // hiding (add)` would cascade into every use of `+`
+        // failing to resolve.
+        if !is_hidden {
+            let key = QName { module: qualifier.clone(), name: name.clone() };
+            env.bind_scheme(key, scheme.clone());
         }
-        let key = QName { module: qualifier.clone(), name: name.clone() };
-        env.bind_scheme(key, scheme.clone());
         let origin = target
             .value_origins
             .get(name)
@@ -188,11 +196,9 @@ fn import_all_except(
     // Also bind every extra origin-qualified scheme the
     // re-exporter surfaced — e.g. `Prelude.qualified_values`
     // holds `Data.Function.apply` even when its primary `values`
-    // entry was won by `Control.Apply.apply`.
+    // entry was won by `Control.Apply.apply`. Origin-qualified
+    // bindings ignore `hidden` for the same reason as above.
     for ((origin, name), scheme) in &target.qualified_values {
-        if hidden.values.contains(name.as_str()) {
-            continue;
-        }
         env.bind_scheme(
             QName { module: Some(origin.clone()), name: name.clone() },
             scheme.clone(),
