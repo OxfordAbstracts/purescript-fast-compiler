@@ -963,7 +963,7 @@ instance Eq Int where
         let mut classes: HashMap<String, ClassInfo> = HashMap::new();
         classes.insert(
             "Eq".into(),
-            ClassInfo { type_vars: vec!["a".into()], fundeps: vec![] },
+            ClassInfo { type_vars: vec!["a".into()], fundeps: vec![], superclasses: vec![] },
         );
         let instance = Instance {
             class: QName::unqualified("Eq"),
@@ -1098,7 +1098,7 @@ class Eq a where
         let mut classes: HashMap<String, ClassInfo> = HashMap::new();
         classes.insert(
             "Eq".into(),
-            ClassInfo { type_vars: vec!["a".into()], fundeps: vec![] },
+            ClassInfo { type_vars: vec!["a".into()], fundeps: vec![], superclasses: vec![] },
         );
         // Method scheme as it would appear after inference.
         let a = Type::Var("a".into());

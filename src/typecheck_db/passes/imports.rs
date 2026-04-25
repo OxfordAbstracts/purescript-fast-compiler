@@ -686,7 +686,7 @@ mod tests {
         let mut exp = ModuleExports::default();
         exp.classes.insert(
             "Eq".into(),
-            ClassInfo { type_vars: vec!["a".into()], fundeps: vec![] },
+            ClassInfo { type_vars: vec!["a".into()], fundeps: vec![], superclasses: vec![] },
         );
         exp.instances.push(Instance {
             class: QName::unqualified("Eq"),

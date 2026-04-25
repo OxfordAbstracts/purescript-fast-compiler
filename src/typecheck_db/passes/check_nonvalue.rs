@@ -671,6 +671,7 @@ pub fn class_info_from_class_shape(shape: &ClassShape) -> ClassInfo {
     ClassInfo {
         type_vars: shape.type_vars.clone(),
         fundeps: shape.fundeps.clone(),
+        superclasses: shape.superclasses.clone(),
     }
 }
 

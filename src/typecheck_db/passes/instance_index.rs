@@ -67,6 +67,13 @@ pub struct ClassInfo {
     /// Functional dependencies. Each entry `(determiners, determined)`
     /// is a list of *positions* into `type_vars`.
     pub fundeps: Vec<FunDep>,
+    /// Declared superclass constraints — `class Eq a => Ord a`
+    /// becomes `superclasses = [Eq a]`. Args are `Type::Var`
+    /// references to `type_vars`; consumers substitute when the
+    /// class is matched against concrete args. Used by the
+    /// solver's given-discharge path to expand givens transitively.
+    #[serde(default)]
+    pub superclasses: Vec<Constraint>,
 }
 
 /// One functional dependency, stored positionally so solver
@@ -210,7 +217,7 @@ pub fn from_decls(decls: &[Decl], type_ops: &TypeOpMap) -> InstanceIndex {
     // Pass 1: classes. Fundeps live here; instance coverage in
     // Pass 2 queries them by name.
     for d in decls {
-        if let Decl::Class { name, type_vars, fundeps, .. } = d {
+        if let Decl::Class { name, type_vars, fundeps, constraints, .. } = d {
             let class_name =
                 crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             let vars: Vec<String> = type_vars
@@ -232,9 +239,20 @@ pub fn from_decls(decls: &[Decl], type_ops: &TypeOpMap) -> InstanceIndex {
                         .collect(),
                 })
                 .collect();
+            let superclasses: Vec<Constraint> = constraints
+                .iter()
+                .map(|c| Constraint {
+                    class: cst_constraint_qname(&c.class),
+                    args: c.args.iter().map(|a| convert_type_expr(a, type_ops)).collect(),
+                })
+                .collect();
             ix.insert_class(
                 class_name,
-                ClassInfo { type_vars: vars, fundeps: fundeps_pos },
+                ClassInfo {
+                    type_vars: vars,
+                    fundeps: fundeps_pos,
+                    superclasses,
+                },
             );
         }
     }

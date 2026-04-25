@@ -82,11 +82,11 @@ fn prim_main() -> ModuleExports {
     // Magic classes.
     e.classes.insert(
         "Partial".into(),
-        ClassInfo { type_vars: vec![], fundeps: vec![] },
+        ClassInfo { type_vars: vec![], fundeps: vec![], superclasses: vec![] },
     );
     e.classes.insert(
         "IsSymbol".into(),
-        ClassInfo { type_vars: vec!["sym".into()], fundeps: vec![] },
+        ClassInfo { type_vars: vec!["sym".into()], fundeps: vec![], superclasses: vec![] },
     );
 
     e
@@ -112,6 +112,7 @@ fn prim_coerce() -> ModuleExports {
         ClassInfo {
             type_vars: vec!["a".into(), "b".into()],
             fundeps: vec![],
+            superclasses: vec![],
         },
     );
     e
@@ -152,6 +153,7 @@ fn prim_int() -> ModuleExports {
                     .into_iter()
                     .map(|(d, dd)| FunDep { determiners: d, determined: dd })
                     .collect(),
+                superclasses: vec![],
             },
         );
     }
@@ -160,6 +162,7 @@ fn prim_int() -> ModuleExports {
         ClassInfo {
             type_vars: vec!["i".into(), "sym".into()],
             fundeps: vec![FunDep { determiners: vec![0], determined: vec![1] }],
+            superclasses: vec![],
         },
     );
     e
@@ -202,6 +205,7 @@ fn prim_row() -> ModuleExports {
         ClassInfo {
             type_vars: vec!["label".into(), "row".into()],
             fundeps: vec![],
+            superclasses: vec![],
         },
     );
     // class Cons label a tail row
@@ -214,6 +218,7 @@ fn prim_row() -> ModuleExports {
                 FunDep { determiners: vec![0, 1, 2], determined: vec![3] },
                 FunDep { determiners: vec![0, 3], determined: vec![1, 2] },
             ],
+            superclasses: vec![],
         },
     );
     // class Nub orig nubbed | orig -> nubbed
@@ -222,6 +227,7 @@ fn prim_row() -> ModuleExports {
         ClassInfo {
             type_vars: vec!["original".into(), "nubbed".into()],
             fundeps: vec![FunDep { determiners: vec![0], determined: vec![1] }],
+            superclasses: vec![],
         },
     );
     // class Union left right union
@@ -235,6 +241,7 @@ fn prim_row() -> ModuleExports {
                 FunDep { determiners: vec![0, 2], determined: vec![1] },
                 FunDep { determiners: vec![1, 2], determined: vec![0] },
             ],
+            superclasses: vec![],
         },
     );
     e
@@ -267,6 +274,7 @@ fn prim_rowlist() -> ModuleExports {
         ClassInfo {
             type_vars: vec!["row".into(), "list".into()],
             fundeps: vec![FunDep { determiners: vec![0], determined: vec![1] }],
+            superclasses: vec![],
         },
     );
     e
@@ -284,6 +292,7 @@ fn prim_symbol() -> ModuleExports {
                 FunDep { determiners: vec![1, 2], determined: vec![0] },
                 FunDep { determiners: vec![0, 2], determined: vec![1] },
             ],
+            superclasses: vec![],
         },
     );
     // class Compare l r ordering | l r -> ordering
@@ -292,6 +301,7 @@ fn prim_symbol() -> ModuleExports {
         ClassInfo {
             type_vars: vec!["left".into(), "right".into(), "ordering".into()],
             fundeps: vec![FunDep { determiners: vec![0, 1], determined: vec![2] }],
+            superclasses: vec![],
         },
     );
     // class Cons head tail sym | head tail -> sym, sym -> head tail
@@ -303,6 +313,7 @@ fn prim_symbol() -> ModuleExports {
                 FunDep { determiners: vec![0, 1], determined: vec![2] },
                 FunDep { determiners: vec![2], determined: vec![0, 1] },
             ],
+            superclasses: vec![],
         },
     );
     e
@@ -313,12 +324,12 @@ fn prim_typeerror() -> ModuleExports {
     // class Fail (doc :: Doc) — fails compilation with a doc.
     e.classes.insert(
         "Fail".into(),
-        ClassInfo { type_vars: vec!["doc".into()], fundeps: vec![] },
+        ClassInfo { type_vars: vec!["doc".into()], fundeps: vec![], superclasses: vec![] },
     );
     // class Warn (doc :: Doc) — compiles but warns.
     e.classes.insert(
         "Warn".into(),
-        ClassInfo { type_vars: vec!["doc".into()], fundeps: vec![] },
+        ClassInfo { type_vars: vec!["doc".into()], fundeps: vec![], superclasses: vec![] },
     );
     // Doc type + constructors. No fields — these are used at
     // type level and never constructed at value level.

@@ -1084,6 +1084,7 @@ g c = eq c c
             // determined=[0].
             type_vars: vec!["s".into(), "m".into()],
             fundeps: vec![FunDep { determiners: vec![1], determined: vec![0] }],
+            superclasses: vec![],
         }
     }
 
@@ -1161,6 +1162,7 @@ g c = eq c c
                     FunDep { determiners: vec![0, 1], determined: vec![2] },
                     FunDep { determiners: vec![0, 1], determined: vec![3] },
                 ],
+                superclasses: vec![],
             },
         );
         // instance Cons "x" Int R1 R2
@@ -1207,6 +1209,7 @@ g c = eq c c
             crate::typecheck_db::passes::instance_index::ClassInfo {
                 type_vars: vec!["a".into()],
                 fundeps: vec![],
+            superclasses: vec![],
             },
         );
         ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
@@ -1370,6 +1373,7 @@ g c = eq c c
             crate::typecheck_db::passes::instance_index::ClassInfo {
                 type_vars: vec!["a".into()],
                 fundeps: vec![],
+            superclasses: vec![],
             },
         );
         ix.insert(mk_instance("Eq", vec![int_ty()], vec![]));
@@ -1562,6 +1566,7 @@ g (y :: Int) = eq y y
             ClassInfo {
                 type_vars: vec!["a".into(), "b".into(), "c".into()],
                 fundeps: vec![FunDep { determiners: vec![0], determined: vec![1] }],
+                superclasses: vec![],
             },
         );
         ix.insert(mk_instance(
