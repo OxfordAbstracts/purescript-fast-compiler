@@ -340,8 +340,25 @@ pub fn check_expr(
         }
     }
 
+    // Subsumption (sigma-vs-rho per Peyton-Jones §5): the
+    // expected has already been deep-skolemised above, so when
+    // the inferred actual zonks to a `Forall` or a `Constrained`
+    // we deep-instantiate it before unifying. Without this a
+    // polymorphic local — e.g. a check-mode binder that
+    // preserved its rank-2 sig — wouldn't unify against the
+    // skolemised expected because `forall_head_matches` rejects
+    // non-`Con`-headed foralls.
     let actual = infer_expr(state, env, type_ops, expr)?;
-    state.unify(&actual, expected)?;
+    let actual_zonked = state.zonk(&actual);
+    let actual_inst = if matches!(
+        &actual_zonked,
+        Type::Forall(_, _) | Type::Constrained(_, _)
+    ) {
+        deep_instantiate_positive(state, actual_zonked, true)
+    } else {
+        actual
+    };
+    state.unify(&actual_inst, expected)?;
     Ok(())
 }
 
