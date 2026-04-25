@@ -99,6 +99,13 @@ pub struct UnifyState {
     // check-mode is accompanied by a scope that ends with
     // `clear_givens_to(snapshot_len)` on exit.
     givens: Vec<Constraint>,
+    /// Maps skolem id → the `forall` var name it stood in for.
+    /// Populated by `fresh_named_skolem` during check-mode
+    /// skolemisation. Consumed by `deskolemise` when hole
+    /// diagnostics need to present types in their source-level
+    /// shape (the reference compiler reports holes with rigid
+    /// `Var("r")`, not `!s0`).
+    skolem_names: std::collections::HashMap<u32, String>,
 }
 
 impl UnifyState {
@@ -112,6 +119,61 @@ impl UnifyState {
             pending_holes: Vec::new(),
             current_decl: None,
             givens: Vec::new(),
+            skolem_names: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Allocate a fresh skolem AND record its source-level name.
+    /// The name is later used by `deskolemise` to present hole
+    /// diagnostics in the reference compiler's `Var("r")` style
+    /// instead of the internal `!s0` notation.
+    pub fn fresh_named_skolem(&mut self, name: &str) -> u32 {
+        let id = self.fresh_skolem();
+        self.skolem_names.insert(id, name.to_string());
+        id
+    }
+
+    /// Replace every `Type::Skolem(id)` whose name was captured
+    /// via `fresh_named_skolem` with `Type::Var(name)`. Used at
+    /// hole drain time so the reference-compiler hole format
+    /// (rigid `Var`) is preserved.
+    pub fn deskolemise(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Skolem(id) => match self.skolem_names.get(id) {
+                Some(n) => Type::Var(n.clone()),
+                None => Type::Skolem(*id),
+            },
+            Type::App(f, a) => Type::app(self.deskolemise(f), self.deskolemise(a)),
+            Type::Fun(a, b) => Type::fun(self.deskolemise(a), self.deskolemise(b)),
+            Type::Forall(vs, body) => {
+                Type::Forall(vs.clone(), Box::new(self.deskolemise(body)))
+            }
+            Type::Constrained(cs, body) => Type::Constrained(
+                cs.iter()
+                    .map(|c| Constraint {
+                        class: c.class.clone(),
+                        args: c.args.iter().map(|a| self.deskolemise(a)).collect(),
+                    })
+                    .collect(),
+                Box::new(self.deskolemise(body)),
+            ),
+            Type::Record(fs, tail) => Type::Record(
+                fs.iter()
+                    .map(|(l, t)| (l.clone(), self.deskolemise(t)))
+                    .collect(),
+                tail.as_ref().map(|t| Box::new(self.deskolemise(t))),
+            ),
+            Type::Row(fs, tail) => Type::Row(
+                fs.iter()
+                    .map(|(l, t)| (l.clone(), self.deskolemise(t)))
+                    .collect(),
+                tail.as_ref().map(|t| Box::new(self.deskolemise(t))),
+            ),
+            Type::Kinded(t, k) => Type::Kinded(
+                Box::new(self.deskolemise(t)),
+                Box::new(self.deskolemise(k)),
+            ),
+            other => other.clone(),
         }
     }
 

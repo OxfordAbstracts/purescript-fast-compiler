@@ -421,7 +421,7 @@ fn check_equation(
                 Type::Forall(vs, body) => {
                     let mut subst: HashMap<String, Type> = HashMap::new();
                     for (n, _, _) in &vs {
-                        let sk = Type::Skolem(state.fresh_skolem());
+                        let sk = Type::Skolem(state.fresh_named_skolem(n));
                         subst.insert(n.clone(), sk.clone());
                         env.scoped_tys.insert(n.clone(), sk);
                         scoped_added.push(n.clone());
@@ -819,8 +819,13 @@ pub fn infer_value_scc_with_all(
                 hole.inferred_type = state.zonk(&hole.inferred_type);
             }
         }
+        // Deskolemise so hole diagnostics report types in the
+        // reference compiler's `Var(name)` shape rather than our
+        // internal `!sN`. Only applies when check-mode has
+        // captured a name for the skolem via `fresh_named_skolem`.
+        hole.inferred_type = state.deskolemise(&hole.inferred_type);
         for (_, ty) in hole.local_bindings.iter_mut() {
-            *ty = state.zonk(ty);
+            *ty = state.deskolemise(&state.zonk(ty));
         }
         let hole_vars = state.free_unif_vars(&hole.inferred_type);
         if !hole_vars.is_empty() && hole.constraint_start <= pending_constraints_raw.len() {
@@ -2222,7 +2227,7 @@ fn deep_skolemise_positive(
             Type::Forall(vs, body) => {
                 let mut subst: HashMap<String, Type> = HashMap::new();
                 for (n, _, _) in &vs {
-                    subst.insert(n.clone(), Type::Skolem(state.fresh_skolem()));
+                    subst.insert(n.clone(), Type::Skolem(state.fresh_named_skolem(n)));
                 }
                 apply_var_subst(&body, &subst)
             }
