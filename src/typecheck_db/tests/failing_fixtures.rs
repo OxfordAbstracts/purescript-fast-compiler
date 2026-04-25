@@ -322,7 +322,14 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
             has("AdditionalProperty") || has("UnificationError") || has("RecordLabelMismatch")
         }
         "PropertyIsMissing" => {
-            has("PropertyIsMissing") || has("UnificationError") || has("RecordLabelMismatch")
+            has("PropertyIsMissing")
+                || has("UnificationError")
+                || has("RecordLabelMismatch")
+                // Row.Cons / Row.Lacks solving for a record
+                // update can surface a missing-label as
+                // `NoInstanceFound` on the row class — same
+                // semantic failure, different routing.
+                || has("NoInstanceFound")
         }
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
         "IncorrectAnonymousArgument" => has("IncorrectAnonymousArgument") || has("UnificationError"),

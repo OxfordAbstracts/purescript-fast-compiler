@@ -460,6 +460,36 @@ fn check_equation(
     let mut rest = peeled;
     let mut consumed: usize = 0;
     for b in binders {
+        // Before each arrow peel, also peel any `Forall` /
+        // `Constrained` layer that sits in the return position.
+        // Sigs like
+        // `forall s i o. s -> (s -> i -> o) -> forall r. (...) -> r`
+        // (after alias expansion of `SomeAuto`) need their inner
+        // `forall r` skolemised once we're past the first two
+        // arrows so the third binder can see the now-skolemised
+        // arrow chain.
+        loop {
+            let zonked = state.zonk(&rest);
+            match zonked {
+                Type::Forall(vs, body) => {
+                    let mut subst: HashMap<String, Type> = HashMap::new();
+                    for (n, _, _) in &vs {
+                        let sk = Type::Skolem(state.fresh_named_skolem(n));
+                        subst.insert(n.clone(), sk.clone());
+                        env.scoped_tys.insert(n.clone(), sk);
+                        scoped_added.push(n.clone());
+                    }
+                    rest = crate::typecheck_db::generalize::apply_var_subst(
+                        &body, &subst,
+                    );
+                }
+                Type::Constrained(cs, body) => {
+                    state.push_givens(cs);
+                    rest = *body;
+                }
+                _ => break,
+            }
+        }
         let zonked = state.zonk(&rest);
         let (arg, new_rest) = match zonked {
             Type::Fun(a, r) => (*a, *r),
@@ -540,6 +570,34 @@ fn check_lambda(
     let mut rest = expected.clone();
     let mut consumed: usize = 0;
     for b in binders {
+        // Pre-peel any `Forall` / `Constrained` that sits in
+        // return position before the next arrow — same trick as
+        // `check_equation`. Without this a sig like
+        // `... -> forall r. (...) -> r` (after alias expansion of
+        // `SomeAuto`) breaks the binder chain at the inner
+        // forall instead of skolemising it.
+        loop {
+            let zonked = state.zonk(&rest);
+            match zonked {
+                Type::Forall(vs, body) => {
+                    let mut subst: HashMap<String, Type> = HashMap::new();
+                    for (n, _, _) in &vs {
+                        subst.insert(
+                            n.clone(),
+                            Type::Skolem(state.fresh_named_skolem(n)),
+                        );
+                    }
+                    rest = crate::typecheck_db::generalize::apply_var_subst(
+                        &body, &subst,
+                    );
+                }
+                Type::Constrained(cs, body) => {
+                    state.push_givens(cs);
+                    rest = *body;
+                }
+                _ => break,
+            }
+        }
         let zonked = state.zonk(&rest);
         let (arg, new_rest) = match zonked {
             Type::Fun(a, r) => (*a, *r),
@@ -639,7 +697,26 @@ pub fn infer_value_scc_with_all(
                 partial_decls.insert(n.clone());
             }
             let v = state.fresh();
-            env.bind_local(n.clone(), v.clone());
+            // For rank-2+ user-signed decls — those that will go
+            // through check-mode below — skip the local-slot
+            // shadow. The slot's unif is allocated BEFORE
+            // `check_equation` introduces skolems, so any later
+            // self-reference that tries to bind the slot to a
+            // skolem-containing type would fail the escape
+            // check. Leaving the name in `env.top_level` only
+            // means self-ref goes through scheme instantiation
+            // each time — fresh unifs at each call site.
+            let is_signed_for_check_mode = env
+                .local_signed
+                .contains(&n)
+                && env
+                    .top_level
+                    .get(&QName { module: None, name: n.clone() })
+                    .map(|s| scheme_has_inner_forall(s))
+                    .unwrap_or(false);
+            if !is_signed_for_check_mode {
+                env.bind_local(n.clone(), v.clone());
+            }
             slot_of.insert(n.clone(), v);
             decl_refs.push((*decl, n));
         }
@@ -656,21 +733,26 @@ pub fn infer_value_scc_with_all(
             let guarded_with_where =
                 wrap_guarded_with_where(guarded.clone(), where_clause.clone());
 
-            // Bidirectional check-mode: A1/A2 scaffolding is in
-            // place (deep skolemisation + givens stack), but the
-            // gate stays OFF. Enabling it even at rank-2+ sigs
-            // regresses 8 fixtures (Auto / Church / Rank2Types /
-            // NaturalTransformationAlias / …) because PureScript
-            // accepts deep-subsumption patterns the infer path
-            // sidesteps — strict PJ §5 checking rejects them. A
-            // follow-up plan must add "subsumption"-mode unify
-            // that instantiates a rank-2 arg's expected Forall
-            // when the arg is a lambda of matching shape.
-            let sig_scheme: Option<Scheme> = None;
-            let _ = name;
+            // Bidirectional check-mode: enabled for rank-2+
+            // user-signed decls only (those whose body has a
+            // `Forall` below the outer layer). Rank-1 sigs stay
+            // on the infer path because turning check-mode on
+            // for them is currently noisy (module-qualifier
+            // mismatches, constraint-discharge edge cases).
+            let sig_scheme: Option<Scheme> = if env.local_signed.contains(name) {
+                let candidate = env
+                    .top_level
+                    .get(&QName { module: None, name: name.clone() })
+                    .cloned();
+                match candidate {
+                    Some(s) if scheme_has_inner_forall(&s) => Some(s),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let _ = decl;
             let _ = scheme_has_constraint;
-            let _ = scheme_has_inner_forall;
 
             if let Some(scheme) = sig_scheme {
                 // Reconstruct the full declared type:
@@ -699,13 +781,20 @@ pub fn infer_value_scc_with_all(
                     &guarded_with_where,
                     &full_sig,
                 )?;
-                // Pin the slot to the (un-instantiated) sig shape
-                // so any sibling referring to this decl via
-                // `infer_var` sees the sig. Use
-                // `instantiate_scheme_no_constraints` to strip
-                // outer Forall/Constrained for a slot-safe shape.
+                // Pin the slot to a deep-instantiated monotype of
+                // the sig so the final generalize step
+                // reconstructs the same scheme. `deep_instantiate_
+                // positive` replaces every positive-position
+                // `Forall` var with a fresh unif (so generalize
+                // can quantify them back) and registers any
+                // `Constrained` layer's constraints as pending
+                // (so the inferred scheme carries them).
+                // `instantiate_scheme_no_constraints` was wrong
+                // here because it stripped inner `Forall`s
+                // without substituting their vars — leaving rigid
+                // `Var` ids leaking into the final scheme.
                 let slot_shape =
-                    instantiate_scheme_no_constraints(&mut state, &scheme);
+                    deep_instantiate_positive(&mut state, full_sig.clone(), true);
                 let _ = state.unify(&expected, &slot_shape);
             } else {
                 let lam_ty = infer_equation(
@@ -1230,6 +1319,21 @@ fn infer_app(
     } else {
         raw_func_ty
     };
+    // Subsumption on the arg: when the function's expected arg
+    // type is a `Forall` (rank-2 arg), route through
+    // `check_expr` so `deep_skolemise_positive` peels the
+    // Forall and the arg gets checked against the skolemised
+    // body. Constrained-only args stay on the regular unify
+    // path — `unify`'s `Constrained(cs, body) | other if
+    // cs.is_empty()` rule handles those after instance solving.
+    let zonked_func = state.zonk(&func_ty);
+    if let Type::Fun(expected_arg, ret) = zonked_func {
+        let expected_arg_zonked = state.zonk(&expected_arg);
+        if matches!(&expected_arg_zonked, Type::Forall(_, _)) {
+            check_expr(state, env, type_ops, arg, &expected_arg_zonked)?;
+            return Ok(*ret);
+        }
+    }
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
     let result = state.fresh();
     state.unify(&func_ty, &Type::fun(arg_ty, result.clone()))?;
