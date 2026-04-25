@@ -588,10 +588,39 @@ fn unify_fields(
     let m1: HashMap<&str, &Type> = f1.iter().map(|(l, t)| (l.as_str(), t)).collect();
     let m2: HashMap<&str, &Type> = f2.iter().map(|(l, t)| (l.as_str(), t)).collect();
 
-    // Step 1: unify common labels.
+    // Step 1: unify common labels. Field-level subsumption: when
+    // exactly one side is `Forall(vs, body)`, instantiate the
+    // polymorphic side with fresh unifs before unifying — this is
+    // the record/row analogue of Peyton-Jones §5's sigma-vs-rho
+    // subsumption. The escape check in `bind_var` still protects
+    // against rank-2 violations whose skolems would leak. We don't
+    // touch the top-level App case (`forall_head_matches`) because
+    // a function-arg shape mismatch like `(forall a. a -> a) -> N`
+    // applied to `\n -> n + 1` must keep failing — the subsumption
+    // there belongs to a check-mode lambda check, not to plain
+    // unification.
     for (l, t1v) in &m1 {
         if let Some(t2v) = m2.get(l) {
-            state.unify(t1v, t2v)?;
+            let z1 = state.zonk(t1v);
+            let z2 = state.zonk(t2v);
+            match (&z1, &z2) {
+                (Type::Forall(vs, body), other)
+                | (other, Type::Forall(vs, body))
+                    if !matches!(other, Type::Forall(_, _)) =>
+                {
+                    use crate::typecheck_db::generalize::apply_var_subst;
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::new();
+                    for (n, _, _) in vs {
+                        subst.insert(n.clone(), state.fresh());
+                    }
+                    let inst = apply_var_subst(body, &subst);
+                    state.unify(&inst, other)?;
+                }
+                _ => {
+                    state.unify(t1v, t2v)?;
+                }
+            }
         }
     }
 
