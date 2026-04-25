@@ -31,6 +31,12 @@ fn forall_head_matches(body: &Type, other: &Type) -> bool {
     }
     match (app_head(body), app_head(other)) {
         (Some(Type::Con(a)), Some(Type::Con(b))) => a == b,
+        // The other side's head is a unification variable —
+        // we don't know its identity yet, but instantiating the
+        // Forall and recursing lets the unif bind to whatever
+        // the Forall's body resolves to. Skolem-escape catches
+        // rank-2 violations downstream.
+        (Some(_), Some(Type::Unif(_))) => true,
         _ => false,
     }
 }
