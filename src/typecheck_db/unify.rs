@@ -140,6 +140,14 @@ impl UnifyState {
         })
     }
 
+    /// Snapshot of the live givens stack. Combined by the solver
+    /// with each `PendingConstraint`'s stamped givens — they may
+    /// differ since a pending recorded in an inner scope keeps
+    /// its givens after the scope is popped.
+    pub fn givens_snapshot(&self) -> Vec<Constraint> {
+        self.givens.clone()
+    }
+
     fn zonk_constraint(&self, c: &Constraint) -> Constraint {
         Constraint {
             class: c.class.clone(),

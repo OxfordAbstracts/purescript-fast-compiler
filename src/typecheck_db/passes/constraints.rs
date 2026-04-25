@@ -202,7 +202,7 @@ pub fn solve_one(
     // `UnifyState::record_pending_constraint`). Match structurally
     // on zonked forms so a skolemised `Semigroupoid !sa` satisfies
     // a pending `Semigroupoid ?ua` once `?ua := !sa` is bound.
-    if given_discharges_pending(state, pending) {
+    if given_discharges_pending(state, instances, pending) {
         return SolveOutcome::Resolved(ResolvedDict {
             class: pending.constraint.class.clone(),
             instance_types: pending
@@ -284,34 +284,87 @@ pub fn solve_one(
     SolveOutcome::NoInstance
 }
 
-/// True when any given stamped on `pending` (or currently live on
+/// True when any given (stamped on `pending` or live on
 /// `state.givens`) structurally matches the pending's constraint
-/// after both sides are zonked. Strict match: same class, pairwise
-/// `type_eq` on zonked args — givens aren't subject to further
-/// unification.
+/// after both sides are zonked, either directly or by walking
+/// the given's superclass chain. Strict match: same class,
+/// pairwise `ty_eq` on zonked args — givens aren't subject to
+/// further unification.
 fn given_discharges_pending(
     state: &crate::typecheck_db::unify::UnifyState,
+    instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> bool {
-    if state.given_discharges(&pending.constraint) {
-        return true;
-    }
-    // Fall back to the constraint's own captured givens (the stack
-    // at the moment of record has since been popped).
-    if pending.givens.is_empty() {
-        return false;
-    }
     let zp = Constraint {
         class: pending.constraint.class.clone(),
         args: pending.constraint.args.iter().map(|a| state.zonk(a)).collect(),
     };
-    pending.givens.iter().any(|g| {
+    let live = state.givens_snapshot();
+    for g in pending.givens.iter().chain(live.iter()) {
         let zg = Constraint {
             class: g.class.clone(),
             args: g.args.iter().map(|a| state.zonk(a)).collect(),
         };
-        constraints_eq(&zg, &zp)
-    })
+        if constraints_eq(&zg, &zp) || superclass_matches(instances, &zg, &zp) {
+            return true;
+        }
+    }
+    false
+}
+
+/// BFS over `given`'s superclass chain. Each superclass's args
+/// are expressed in terms of the given's class's `type_vars`; we
+/// substitute with `given.args` to produce a concrete superclass
+/// instance, then compare to `target` structurally. Recursive so
+/// `Foo a <= Bar a <= Baz a` discharges `Baz` from a `Foo a`
+/// given.
+fn superclass_matches(
+    instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    given: &Constraint,
+    target: &Constraint,
+) -> bool {
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut queue: Vec<Constraint> = vec![given.clone()];
+    while let Some(cur) = queue.pop() {
+        let key = (
+            cur.class.name.clone(),
+            cur.args.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join("|"),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let info = match instances.class_info(&cur.class.name) {
+            Some(i) => i,
+            None => continue,
+        };
+        if info.superclasses.is_empty() {
+            continue;
+        }
+        let subst: std::collections::HashMap<String, Type> = info
+            .type_vars
+            .iter()
+            .cloned()
+            .zip(cur.args.iter().cloned())
+            .collect();
+        for sc in &info.superclasses {
+            let substituted = Constraint {
+                class: sc.class.clone(),
+                args: sc
+                    .args
+                    .iter()
+                    .map(|a| {
+                        crate::typecheck_db::generalize::apply_var_subst(a, &subst)
+                    })
+                    .collect(),
+            };
+            if constraints_eq(&substituted, target) {
+                return true;
+            }
+            queue.push(substituted);
+        }
+    }
+    false
 }
 
 fn constraints_eq(a: &Constraint, b: &Constraint) -> bool {
