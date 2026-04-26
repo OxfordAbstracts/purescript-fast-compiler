@@ -171,6 +171,45 @@ fn collect_stray_unif(ty: &Type, out: &mut std::collections::HashSet<u32>) {
     }
 }
 
+/// Collect every `Type::Var(name)` reference anywhere inside
+/// `ty`. Used by `apply_var_subst` to detect potential capture
+/// when an outer Forall var's substitution-value contains a
+/// name that an inner Forall already binds.
+fn collect_var_names(ty: &Type, out: &mut std::collections::HashSet<String>) {
+    match ty {
+        Type::Var(n) => {
+            out.insert(n.clone());
+        }
+        Type::App(f, a) | Type::Fun(f, a) | Type::Kinded(f, a) => {
+            collect_var_names(f, out);
+            collect_var_names(a, out);
+        }
+        Type::Forall(vs, body) => {
+            for (n, _, _) in vs {
+                out.insert(n.clone());
+            }
+            collect_var_names(body, out);
+        }
+        Type::Constrained(cs, body) => {
+            for c in cs {
+                for a in &c.args {
+                    collect_var_names(a, out);
+                }
+            }
+            collect_var_names(body, out);
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            for (_, t) in fs {
+                collect_var_names(t, out);
+            }
+            if let Some(t) = tail {
+                collect_var_names(t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Collect every type-var name bound by a `Forall` anywhere
 /// inside `ty`. Used by `generalize_with_constraints` to pick
 /// outer-quantifier names that don't capture inner Foralls.
@@ -294,12 +333,62 @@ pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         ),
         Type::Forall(vars, body) => {
             // Quantified vars *shadow* outer bindings — strip them from
-            // the substitution while traversing the body.
+            // the substitution while traversing the body. Capture-
+            // avoiding rename: if the inner forall binds a name that
+            // appears free in any of `subst`'s values (e.g. when an
+            // outer sig's `a` gets substituted into an alias body
+            // that itself binds `a`), alpha-rename the inner forall
+            // to a fresh name so the substitution doesn't capture
+            // the outer Var into the inner binding.
             let mut inner = subst.clone();
             for (n, _, _) in vars {
                 inner.remove(n);
             }
-            Type::Forall(vars.clone(), Box::new(apply_var_subst(body, &inner)))
+            let mut subst_free: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (_, v) in subst.iter() {
+                collect_var_names(v, &mut subst_free);
+            }
+            let mut rename: HashMap<String, Type> = HashMap::new();
+            let mut new_vars: Vec<(String, bool, Option<Box<Type>>)> =
+                Vec::with_capacity(vars.len());
+            let mut taken: std::collections::HashSet<String> = subst_free;
+            // Body's other forall vars also need to stay disjoint
+            // from new chosen names so we don't collide with
+            // sibling-Forall scopes.
+            let mut body_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            collect_var_names(body, &mut body_vars);
+            taken.extend(body_vars);
+            for (n, vis, k) in vars {
+                if taken.contains(n) {
+                    let mut idx = 0usize;
+                    let fresh = loop {
+                        let candidate = format!("{}{}", n, idx);
+                        idx += 1;
+                        if !taken.contains(&candidate) {
+                            break candidate;
+                        }
+                    };
+                    taken.insert(fresh.clone());
+                    rename.insert(n.clone(), Type::Var(fresh.clone()));
+                    new_vars.push((fresh, *vis, k.clone()));
+                } else {
+                    taken.insert(n.clone());
+                    new_vars.push((n.clone(), *vis, k.clone()));
+                }
+            }
+            // Apply rename to body first (within the inner-shadowed
+            // scope), then apply the outer subst.
+            let renamed_body = if rename.is_empty() {
+                (**body).clone()
+            } else {
+                apply_var_subst(body, &rename)
+            };
+            Type::Forall(
+                new_vars,
+                Box::new(apply_var_subst(&renamed_body, &inner)),
+            )
         }
         Type::Constrained(cs, body) => {
             let cs = cs
