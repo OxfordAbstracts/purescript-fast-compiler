@@ -37,6 +37,33 @@ fn forall_head_matches(body: &Type, other: &Type) -> bool {
         // the Forall's body resolves to. Skolem-escape catches
         // rank-2 violations downstream.
         (Some(_), Some(Type::Unif(_))) => true,
+        // Both sides have `Fun` heads AND the other side's leaf
+        // positions are entirely unifs (no concrete `Con` or
+        // `Var`). This handles the mutual-recursion / inferred-
+        // lam_ty case where a polymorphic sig is being unified
+        // against a freshly-inferred function body that hasn't
+        // been pinned to anything concrete yet — instantiating
+        // the Forall lets the unifs bind compatibly. Concrete-
+        // headed `other` (like `Int -> Int`) keeps failing,
+        // preserving rank-2 violation rejection.
+        (Some(Type::Fun(_, _)), Some(Type::Fun(_, _)))
+            if leaves_all_unif(other) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// True when every leaf type inside `ty` (walking through
+/// `Fun`, `App`) is a `Type::Unif` — no concrete `Con`s, `Var`s,
+/// or other heads. Used to gate Fun-Fun forall-head instantiation
+/// to the safe "still polymorphic" case.
+fn leaves_all_unif(ty: &Type) -> bool {
+    match ty {
+        Type::Unif(_) => true,
+        Type::Fun(a, b) => leaves_all_unif(a) && leaves_all_unif(b),
+        Type::App(f, a) => leaves_all_unif(f) && leaves_all_unif(a),
         _ => false,
     }
 }
