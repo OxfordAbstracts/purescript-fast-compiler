@@ -213,7 +213,37 @@ fn check_one_module(
             panic!("cst → ir lowering failed in {}: {e:?}", name)
         });
 
-    let type_ops = TypeOpMap::default();
+    // Type-level operator map: every `infixr N type Target as op`
+    // decl in this module (and every imported module) becomes an
+    // entry mapping `(module, op)` → `Target`'s QName so
+    // `convert_type_expr` can rewrite `a /\ b` to `App(App(Tuple,
+    // a), b)` at conversion time. Without this, instance heads
+    // declared as `Test (a /\ b)` end up keyed on `Type::Con("/\")`
+    // and never match a use-site `Test (Tuple Int Int)`.
+    let mut type_ops: TypeOpMap = TypeOpMap::default();
+    for d in &module.decls {
+        if let cst::Decl::Fixity { operator, target, is_type, .. } = d {
+            if !*is_type {
+                continue;
+            }
+            // Local fixity decls are unqualified at the site of
+            // declaration — no module prefix on the op.
+            let op_name = crate::typecheck_db::util::resolve_symbol(
+                operator.value.symbol(),
+            );
+            let target_module = target
+                .module
+                .map(crate::typecheck_db::util::resolve_symbol);
+            let target_name = crate::typecheck_db::util::resolve_symbol(target.name);
+            type_ops.insert(
+                (None, op_name),
+                crate::typecheck_db::types::QName {
+                    module: target_module,
+                    name: target_name,
+                },
+            );
+        }
+    }
 
     // Build a consolidated alias map: local `type Foo = …` decls
     // plus every imported module's exported aliases. Passed into
