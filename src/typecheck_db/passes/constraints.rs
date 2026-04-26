@@ -281,7 +281,72 @@ pub fn solve_one(
     if pending.constraint.args.iter().any(|a| contains_rigid_var(a, state)) {
         return SolveOutcome::Deferred;
     }
+    // Kind-mismatch / wrong-head defer: if any arg's App-spine
+    // head zonks to `Con(X)` AND no instance candidate has the
+    // same `Con(X)` head at that position (allowing for arity
+    // mismatch — `Apply Tuple` vs instance `Apply (Tuple a)`),
+    // the constraint can never be solved by the in-scope
+    // instances. Defer rather than emit `NoInstanceFound`: the
+    // constraint propagates into the inferred scheme and the
+    // downstream importer either resolves it concretely or
+    // surfaces a clearer error at a use-site.
+    //
+    // This is the typical case where a polymorphic body has a
+    // unif `?u` that's been pinned to a wrong-arity Con via
+    // App-decomposition — `Apply Tuple` (Tuple has kind
+    // `Type → Type → Type` but Apply expects `Type → Type`),
+    // or `Unfoldable1 (Tuple a)` (only `Unfoldable1 Array` /
+    // `Maybe` instances exist; Tuple doesn't fit).
+    let zonked_args: Vec<Type> = pending
+        .constraint
+        .args
+        .iter()
+        .map(|a| state.zonk(a))
+        .collect();
+    let candidates = instances.candidates(&pending.constraint.class.name);
+    // Kind-mismatch / wrong-shape defer: if any arg's App-spine
+    // head + arity doesn't match any instance's head + arity,
+    // the constraint can never be solved. Match on (head_qn,
+    // app_spine_arity) — `Apply Tuple` has arity 0 (no apps),
+    // `Apply (Tuple a)` instance has arity 1. Different keys
+    // → no candidate fits → defer.
+    let head_shape_mismatch = zonked_args.iter().enumerate().any(|(i, arg)| {
+        if let Some((arg_qn, arg_arity)) = app_spine_head_arity(arg) {
+            !candidates.iter().any(|cand| {
+                cand.types
+                    .get(i)
+                    .and_then(app_spine_head_arity)
+                    .map_or(false, |(h, a)| h == arg_qn && a == arg_arity)
+            })
+        } else {
+            false
+        }
+    });
+    if head_shape_mismatch {
+        return SolveOutcome::Deferred;
+    }
     SolveOutcome::NoInstance
+}
+
+/// Walk an App-spine and return `(head_con_qname, arity)` where
+/// arity is the number of `App` applications above the head.
+/// Bare `Con(X)` returns `(X, 0)`; `Tuple a` returns `(Tuple, 1)`;
+/// `Tuple a b` returns `(Tuple, 2)`. Non-Con heads → `None`.
+fn app_spine_head_arity(
+    ty: &Type,
+) -> Option<(&crate::typecheck_db::types::QName, usize)> {
+    let mut cur = ty;
+    let mut arity: usize = 0;
+    loop {
+        match cur {
+            Type::App(f, _) => {
+                arity += 1;
+                cur = f;
+            }
+            Type::Con(qn) => return Some((qn, arity)),
+            _ => return None,
+        }
+    }
 }
 
 /// True when any given (stamped on `pending` or live on
