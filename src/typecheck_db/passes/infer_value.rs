@@ -412,6 +412,28 @@ fn scheme_has_constraint(scheme: &Scheme) -> bool {
 /// to gate check-mode: only rank-2 decls need the skolem-based
 /// bidirectional path; rank-1 decls stay on the existing
 /// infer-then-unify path.
+/// True when `ty` contains a `Forall` anywhere — including
+/// inside `Fun.arg` positions. Used to gate the lambda-arg
+/// routing in `infer_app`: even a `Fun(Forall(..), Int)` arg
+/// type needs check-mode so the binder gets the Forall.
+fn type_contains_forall(ty: &Type) -> bool {
+    match ty {
+        Type::Forall(_, _) => true,
+        Type::App(f, a) | Type::Fun(f, a) | Type::Kinded(f, a) => {
+            type_contains_forall(f) || type_contains_forall(a)
+        }
+        Type::Constrained(cs, b) => {
+            cs.iter().any(|c| c.args.iter().any(type_contains_forall))
+                || type_contains_forall(b)
+        }
+        Type::Record(fs, t) | Type::Row(fs, t) => {
+            fs.iter().any(|(_, v)| type_contains_forall(v))
+                || t.as_ref().map_or(false, |t| type_contains_forall(t))
+        }
+        _ => false,
+    }
+}
+
 fn scheme_has_inner_forall(scheme: &Scheme) -> bool {
     fn walk_below_top(ty: &Type) -> bool {
         match ty {
@@ -1349,15 +1371,40 @@ fn infer_app(
         raw_func_ty
     };
     // Subsumption on the arg: when the function's expected arg
-    // type is a `Forall` (rank-2 arg), route through
-    // `check_expr` so `deep_skolemise_positive` peels the
-    // Forall and the arg gets checked against the skolemised
-    // body. Constrained-only args stay on the regular unify
-    // path — `unify`'s `Constrained(cs, body) | other if
-    // cs.is_empty()` rule handles those after instance solving.
+    // type is a `Forall` (rank-2 arg), we need PJ §5
+    // subsumption.
+    //
+    // Two sub-cases:
+    //
+    // 1. The arg is a `Lambda` whose first binder is a plain
+    //    `Var` — bind that binder DIRECTLY to the polymorphic
+    //    arg type so body-level uses of the binder retain the
+    //    Forall. This is what `g (\\f -> if f true then f 0
+    //    else f 1)` requires when `g :: (forall a. a -> a) ->
+    //    Int`: f must be polymorphic in the body.
+    //
+    // 2. Anything else: route through `check_expr` so
+    //    `deep_skolemise_positive` peels the Forall and rejects
+    //    rank-2 violations via skolem escape. This is what
+    //    catches `test (\\n -> n + 1)` against
+    //    `(forall a. a -> a) -> Number`.
     let zonked_func = state.zonk(&func_ty);
     if let Type::Fun(expected_arg, ret) = zonked_func {
         let expected_arg_zonked = state.zonk(&expected_arg);
+        // Lambda + Forall-anywhere expected_arg: route through
+        // check_expr so check_lambda peels arrows and binds
+        // each binder to its expected type — preserving any
+        // inner `Forall`s as polymorphic binder types. Without
+        // this `g (\\f -> if f true then f 0 else f 1)` against
+        // `((forall a. a -> a) -> Int) -> Int` infers f as a
+        // monomorphic unif and the second use at a different
+        // type is rejected.
+        if matches!(arg, Expr::Lambda { .. })
+            && type_contains_forall(&expected_arg_zonked)
+        {
+            check_expr(state, env, type_ops, arg, &expected_arg_zonked)?;
+            return Ok(*ret);
+        }
         if matches!(&expected_arg_zonked, Type::Forall(_, _)) {
             check_expr(state, env, type_ops, arg, &expected_arg_zonked)?;
             return Ok(*ret);
