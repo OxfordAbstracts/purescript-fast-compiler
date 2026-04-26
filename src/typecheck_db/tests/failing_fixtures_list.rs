@@ -354,8 +354,8 @@ check_failing_build_unit!(f_SelfCycleInForeignDataKinds, "SelfCycleInForeignData
 check_failing_build_unit!(f_SelfCycleInKindDeclaration, "SelfCycleInKindDeclaration");
 check_failing_build_unit!(f_SelfCycleInTypeClassDeclaration, "SelfCycleInTypeClassDeclaration");
 check_failing_build_unit!(f_SelfImport, "SelfImport");
-check_failing_build_unit_ignored!(f_SkolemEscape, "SkolemEscape", "expected: EscapedSkolem");
-check_failing_build_unit_ignored!(f_SkolemEscape2, "SkolemEscape2", "expected: EscapedSkolem");
+check_failing_build_unit!(f_SkolemEscape, "SkolemEscape");
+check_failing_build_unit!(f_SkolemEscape2, "SkolemEscape2");
 check_failing_build_unit_ignored!(f_SkolemEscapeKinds, "SkolemEscapeKinds", "expected: EscapedSkolem");
 check_failing_build_unit_ignored!(f_StandaloneKindSignatures1, "StandaloneKindSignatures1", "expected: KindsDoNotUnify");
 check_failing_build_unit_ignored!(f_StandaloneKindSignatures2, "StandaloneKindSignatures2", "expected: KindsDoNotUnify");
