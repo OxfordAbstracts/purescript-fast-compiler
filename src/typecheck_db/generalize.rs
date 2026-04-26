@@ -53,10 +53,33 @@ pub fn generalize_with_constraints(
         all_free.difference(&env_free).copied().collect();
     to_generalize.sort();
 
+    // Collect every type-var name already bound inside the body
+    // (by an inner `Forall`) so the names we coin for the outer
+    // quantifier don't accidentally capture them. Without this,
+    // a slot for `forall m. … forall a. a -> m a …` ends up with
+    // `m → Var("a")` (the next free var name) and the inner
+    // `forall a. a -> Var(a) Var(a)` has its `a` aliased to the
+    // outer "m" — which then surfaces as `Var(a)`-vs-`Con(Id)`
+    // mismatches at use-sites.
+    let mut taken_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    collect_forall_var_names(&zonked_ty, &mut taken_names);
+    for c in &zonked_constraints {
+        for a in &c.args {
+            collect_forall_var_names(a, &mut taken_names);
+        }
+    }
     let mut subst: HashMap<u32, Type> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
-    for (i, id) in to_generalize.iter().enumerate() {
-        let name = var_name(i);
+    let mut idx: usize = 0;
+    for id in &to_generalize {
+        let name = loop {
+            let candidate = var_name(idx);
+            idx += 1;
+            if !taken_names.contains(&candidate) {
+                break candidate;
+            }
+        };
         names.push(name.clone());
         subst.insert(*id, Type::Var(name));
     }
@@ -143,6 +166,48 @@ fn collect_stray_unif(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         Type::Kinded(t, k) => {
             collect_stray_unif(t, out);
             collect_stray_unif(k, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect every type-var name bound by a `Forall` anywhere
+/// inside `ty`. Used by `generalize_with_constraints` to pick
+/// outer-quantifier names that don't capture inner Foralls.
+fn collect_forall_var_names(
+    ty: &Type,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match ty {
+        Type::Forall(vs, body) => {
+            for (n, _, _) in vs {
+                out.insert(n.clone());
+            }
+            collect_forall_var_names(body, out);
+        }
+        Type::App(f, a) | Type::Fun(f, a) => {
+            collect_forall_var_names(f, out);
+            collect_forall_var_names(a, out);
+        }
+        Type::Constrained(cs, body) => {
+            for c in cs {
+                for a in &c.args {
+                    collect_forall_var_names(a, out);
+                }
+            }
+            collect_forall_var_names(body, out);
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            for (_, t) in fs {
+                collect_forall_var_names(t, out);
+            }
+            if let Some(t) = tail {
+                collect_forall_var_names(t, out);
+            }
+        }
+        Type::Kinded(t, k) => {
+            collect_forall_var_names(t, out);
+            collect_forall_var_names(k, out);
         }
         _ => {}
     }
