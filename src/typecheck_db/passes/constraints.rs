@@ -457,12 +457,14 @@ fn ty_eq(a: &Type, b: &Type) -> bool {
 }
 
 /// True when the zonked form of `ty` mentions a rigid `Type::Var`
-/// anywhere. Used by `solve_one` to defer constraints that can
-/// only be discharged via a caller-supplied given.
+/// or `Type::Skolem` anywhere. Used by `solve_one` to defer
+/// constraints that can only be discharged via a caller-
+/// supplied given (rigid Var for un-skolemised polymorphic
+/// scope; Skolem for inside check-mode bodies).
 fn contains_rigid_var(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
     fn walk(t: &Type) -> bool {
         match t {
-            Type::Var(_) => true,
+            Type::Var(_) | Type::Skolem(_) => true,
             Type::App(f, a) | Type::Fun(f, a) => walk(f) || walk(a),
             Type::Forall(_, body) => walk(body),
             Type::Constrained(cs, body) => {
