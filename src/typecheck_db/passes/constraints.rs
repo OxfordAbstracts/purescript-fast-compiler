@@ -594,13 +594,22 @@ pub fn solve_all(
                 }
                 SolveOutcome::NoInstance => {
                     made_progress = true;
+                    let zonked = Constraint {
+                        class: pc.constraint.class.clone(),
+                        args: pc
+                            .constraint
+                            .args
+                            .iter()
+                            .map(|a| state.zonk(a))
+                            .collect(),
+                    };
                     report
                         .errors
                         .entry(owner)
                         .or_default()
                         .push(ConstraintError {
                             span: pc.span,
-                            constraint: pc.constraint.clone(),
+                            constraint: zonked,
                             kind: ConstraintErrorKind::NoInstanceFound,
                         });
                 }

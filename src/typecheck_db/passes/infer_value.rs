@@ -1409,6 +1409,24 @@ fn infer_app(
             check_expr(state, env, type_ops, arg, &expected_arg_zonked)?;
             return Ok(*ret);
         }
+        // Constrained-in-arg-position: a ctor field like
+        // `data X a = X (Y a => Proxy a)` produces a func type
+        // `Fun(Constrained([Y ?u], Proxy ?u), X ?u)`. Push the
+        // constraints as givens for the duration of the arg's
+        // inference so any sub-expression that needs `Y ?u`
+        // discharges from the given. The givens are popped on
+        // exit; constraints that couldn't be discharged stay
+        // pending and bubble up into the surrounding scheme,
+        // which is how `test1 = X (Proxy :: _ Int)` typechecks
+        // even without an `instance Y Int` in scope.
+        if let Type::Constrained(cs, body) = &expected_arg_zonked {
+            let snapshot = state.push_givens(cs.clone());
+            let arg_ty_res = infer_expr(state, env, type_ops, arg);
+            state.pop_givens_to(snapshot);
+            let arg_ty = arg_ty_res?;
+            state.unify(body, &arg_ty)?;
+            return Ok(*ret);
+        }
     }
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
     let result = state.fresh();
