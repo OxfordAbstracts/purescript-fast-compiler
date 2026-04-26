@@ -214,9 +214,38 @@ pub fn infer_expr(
                     &env.scoped_tys,
                 );
             }
+            // Scoped type variables for the inner expression: if the
+            // annotation has an outer `Forall`, register each
+            // forall-bound name in `env.scoped_tys` (mapping to the
+            // fresh unif `deep_instantiate_positive` is about to
+            // produce) so a nested annotation like
+            // `(\b -> b :: b) :: forall b. b -> b` resolves the
+            // inner `b` to the same unif as the outer one.
+            let mut scoped_added: Vec<String> = Vec::new();
+            if let Type::Forall(vs, _) = &declared {
+                for (n, _, _) in vs {
+                    if !env.scoped_tys.contains_key(n) {
+                        let u = state.fresh();
+                        env.scoped_tys.insert(n.clone(), u);
+                        scoped_added.push(n.clone());
+                    }
+                }
+            }
+            // Now apply scoped_tys substitution again so the outer
+            // forall vars map to those same unifs throughout.
+            if !env.scoped_tys.is_empty() {
+                declared = crate::typecheck_db::generalize::apply_var_subst(
+                    &declared,
+                    &env.scoped_tys,
+                );
+            }
             let monotype =
                 deep_instantiate_positive(state, declared, true);
-            check_expr(state, env, type_ops, expr, &monotype)?;
+            let outcome = check_expr(state, env, type_ops, expr, &monotype);
+            for n in scoped_added {
+                env.scoped_tys.remove(&n);
+            }
+            outcome?;
             Ok(monotype)
         }
         // A bare `_` in expression position is only valid if the
