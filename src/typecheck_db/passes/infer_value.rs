@@ -848,6 +848,30 @@ pub fn infer_value_scc_with_all(
                     deep_instantiate_positive(&mut state, full_sig.clone(), true);
                 let _ = state.unify(&expected, &slot_shape);
             } else {
+                // Scoped type variables (rank-1 path): when the
+                // decl is user-signed, populate `env.scoped_tys`
+                // with the sig's outer forall vars mapped to
+                // fresh unifs so any let-binding sig (in
+                // `where` / `let`) that references them resolves
+                // to the same unif. This is the standard
+                // PureScript ScopedTypeVariables behaviour for
+                // sig-bound names like `f` and `a` referenced in
+                // a `where`-clause helper's own sig.
+                let mut scoped_added: Vec<String> = Vec::new();
+                if env.local_signed.contains(name) {
+                    if let Some(scheme) = env
+                        .top_level
+                        .get(&QName { module: None, name: name.clone() })
+                    {
+                        for v in &scheme.vars {
+                            if !env.scoped_tys.contains_key(v) {
+                                let u = state.fresh();
+                                env.scoped_tys.insert(v.clone(), u);
+                                scoped_added.push(v.clone());
+                            }
+                        }
+                    }
+                }
                 let lam_ty = infer_equation(
                     &mut state,
                     env,
@@ -856,6 +880,9 @@ pub fn infer_value_scc_with_all(
                     &guarded_with_where,
                 )?;
                 state.unify(&expected, &lam_ty)?;
+                for n in scoped_added {
+                    env.scoped_tys.remove(&n);
+                }
             }
         }
     }
