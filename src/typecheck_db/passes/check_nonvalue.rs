@@ -511,6 +511,10 @@ pub mod check_instance {
                     collect_vars(t, out);
                 }
             }
+            Type::Kinded(t, k) => {
+                collect_vars(t, out);
+                collect_vars(k, out);
+            }
             _ => {}
         }
     }
