@@ -952,6 +952,28 @@ fn check_one_module(
             for (v, t) in class_info.type_vars.iter().zip(head_tys.iter()) {
                 subst.insert(v.clone(), t.clone());
             }
+            // Member-level type signatures (`foo :: ?test` inside an
+            // instance) — keyed by method name. When a method has its
+            // own sig we prefer it over the class-derived one for
+            // body inference; the user's holes are recorded against
+            // the member sig's spans.
+            let mut member_sigs: std::collections::HashMap<
+                String,
+                &crate::cst::TypeExpr,
+            > = std::collections::HashMap::new();
+            for m in members {
+                if let crate::typecheck_db::ir::Decl::TypeSignature {
+                    name: sig_name,
+                    ty: sig_ty,
+                    ..
+                } = m
+                {
+                    let n = crate::typecheck_db::util::resolve_symbol(
+                        sig_name.value.symbol(),
+                    );
+                    member_sigs.insert(n, sig_ty);
+                }
+            }
             for member in members {
                 let crate::typecheck_db::ir::Decl::Value { name: member_name, .. } = member
                 else {
@@ -1011,7 +1033,7 @@ fn check_one_module(
                     .filter(|v| !subst.contains_key(*v))
                     .cloned()
                     .collect();
-                let synthesized_sig = if method_vars.is_empty() {
+                let class_synthesized_sig = if method_vars.is_empty() {
                     crate::typecheck_db::types::Scheme {
                         vars: Vec::new(),
                         ty: peeled,
@@ -1022,6 +1044,38 @@ fn check_one_module(
                         ty: peeled,
                     }
                 };
+                // If the user wrote a member-level type signature for
+                // this method (e.g. `foo :: ?test` inside an instance),
+                // prefer it: convert the sig and record any type-level
+                // holes so the SCC's F2 sig-pin path can rewrite them
+                // to fresh unifs and emit `HoleDiagnostic`s. The class-
+                // synthesized sig is the fallback shape; it should be
+                // at least as specific as the member sig (the original
+                // compiler enforces that elsewhere — we trust it here).
+                let mut new_hole_sites: Option<Vec<(crate::span::Span, String)>> =
+                    None;
+                let synthesized_sig = if let Some(sig_te) =
+                    member_sigs.get(&method_name)
+                {
+                    let mut hs: Vec<(crate::span::Span, String)> = Vec::new();
+                    crate::typecheck_db::types::collect_type_holes(sig_te, &mut hs);
+                    let sig_ty =
+                        crate::typecheck_db::types::convert_type_expr(sig_te, &type_ops);
+                    let (vars, body) = match sig_ty {
+                        crate::typecheck_db::types::Type::Forall(qs, body) => {
+                            let names: Vec<String> =
+                                qs.into_iter().map(|(n, _, _)| n).collect();
+                            (names, *body)
+                        }
+                        other => (Vec::new(), other),
+                    };
+                    if !hs.is_empty() {
+                        new_hole_sites = Some(hs);
+                    }
+                    crate::typecheck_db::types::Scheme { vars, ty: body }
+                } else {
+                    class_synthesized_sig
+                };
                 // Swap the class-method scheme for the synthesized
                 // instance-specialised one for the duration of body
                 // inference.
@@ -1030,6 +1084,10 @@ fn check_one_module(
                 let was_signed = env.local_signed.insert(method_name.clone());
                 let saved_hole_sites =
                     env.local_signed_hole_sites.remove(&method_name);
+                if let Some(hs) = new_hole_sites {
+                    env.local_signed_hole_sites
+                        .insert(method_name.clone(), hs);
+                }
                 // Drop any stale local slot binding for this method
                 // name from earlier value SCCs so lookup hits the
                 // synthesised top-level scheme.
