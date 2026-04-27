@@ -431,6 +431,24 @@ fn detect_transitive_export_errors(
             local_ctors.insert(constructor.value.symbol());
         }
     }
+    // Class → its method names. Used by the class/value export
+    // coupling check below.
+    let mut class_methods: HashMap<Symbol, (Span, Vec<(Span, Symbol)>)> =
+        HashMap::new();
+    let mut value_to_class: HashMap<Symbol, Symbol> = HashMap::new();
+    for d in &module.decls {
+        if let cst::Decl::Class { span, name, members, .. } = d {
+            let cname = name.value.symbol();
+            let mems: Vec<(Span, Symbol)> = members
+                .iter()
+                .map(|m| (m.span, m.name.value.symbol()))
+                .collect();
+            for (_, msym) in &mems {
+                value_to_class.insert(*msym, cname);
+            }
+            class_methods.insert(cname, (*span, mems));
+        }
+    }
 
     // Collect value fixities so we can map exported operator aliases
     // back to their target. Only track fixities whose target is
@@ -449,6 +467,33 @@ fn detect_transitive_export_errors(
             }
         }
     }
+    // Same for type-level fixity: `infixl 6 type Tuple as ×` makes
+    // `(×)` an alias for the local `Tuple` data type. Exporting
+    // `(×)` without exporting `Tuple` is a TransitiveExportError.
+    // Skip when the target isn't locally defined — `infixr 6 type
+    // Either as \/` in `Data.Either.Nested` aliases an imported
+    // `Either`, which is a legitimate re-export.
+    let mut local_types: HashSet<Symbol> = HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Data { name, .. }
+            | cst::Decl::Newtype { name, .. }
+            | cst::Decl::TypeAlias { name, .. }
+            | cst::Decl::ForeignData { name, .. } => {
+                local_types.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    let mut type_op_target: HashMap<Symbol, (Span, Symbol)> = HashMap::new();
+    for d in &module.decls {
+        if let cst::Decl::Fixity { span, operator, is_type: true, target, .. } = d {
+            if target.module.is_none() && local_types.contains(&target.name) {
+                type_op_target
+                    .insert(operator.value.symbol(), (*span, target.name));
+            }
+        }
+    }
 
     // Build "is this name reachable from the export list?" lookups.
     // Values, constructors (via `T(..)` or `T(C1, C2)`), and types are
@@ -456,6 +501,8 @@ fn detect_transitive_export_errors(
     // constructor — `infix 4 Bar' as :->` targets the `Bar'` ctor.
     let mut exported_values: HashSet<Symbol> = HashSet::new();
     let mut exported_ctors: HashSet<Symbol> = HashSet::new();
+    let mut exported_types: HashSet<Symbol> = HashSet::new();
+    let mut exported_classes: HashSet<Symbol> = HashSet::new();
     let mut re_exports_wild = false;
     for e in export_list {
         match e {
@@ -464,6 +511,7 @@ fn detect_transitive_export_errors(
             }
             cst::Export::Type(t, members) => {
                 let tsym = t.symbol();
+                exported_types.insert(tsym);
                 match members {
                     Some(cst::DataMembers::All) => {
                         if let Some((_, ctors)) = data_ctors.get(&tsym) {
@@ -477,6 +525,9 @@ fn detect_transitive_export_errors(
                     }
                     None => {}
                 }
+            }
+            cst::Export::Class(c) => {
+                exported_classes.insert(c.symbol());
             }
             cst::Export::Module(_) => {
                 // `module X` re-exports everything from X. We don't
@@ -532,7 +583,63 @@ fn detect_transitive_export_errors(
                     }
                 }
             }
+            cst::Export::TypeOp(opn) => {
+                // Type-operator alias in export list → its fixity
+                // target type must also be exported.
+                if re_exports_wild {
+                    continue;
+                }
+                let op = opn.symbol();
+                if let Some((span, target)) = type_op_target.get(&op) {
+                    if !exported_types.contains(target) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::TransitiveExportError(
+                                resolve(op),
+                            ),
+                        });
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    // Class/method export coupling. Reference compiler:
+    // - Exporting a class method without exporting its class →
+    //   TransitiveExportError on the value name.
+    // - Exporting a class without also exporting all its methods →
+    //   TransitiveExportError on the class.
+    if !re_exports_wild {
+        for v in &exported_values {
+            if let Some(parent_class) = value_to_class.get(v) {
+                if !exported_classes.contains(parent_class) {
+                    let span = class_methods
+                        .get(parent_class)
+                        .and_then(|(_, mems)| mems.iter().find(|(_, m)| m == v))
+                        .map(|(s, _)| *s)
+                        .unwrap_or(crate::span::Span::new(0, 0));
+                    errors.push(ValidationError {
+                        span,
+                        kind: ValidationErrorKind::TransitiveExportError(resolve(*v)),
+                    });
+                }
+            }
+        }
+        for c in &exported_classes {
+            if let Some((cspan, mems)) = class_methods.get(c) {
+                for (_, msym) in mems {
+                    if !exported_values.contains(msym) {
+                        errors.push(ValidationError {
+                            span: *cspan,
+                            kind: ValidationErrorKind::TransitiveExportError(
+                                resolve(*c),
+                            ),
+                        });
+                        break;
+                    }
+                }
+            }
         }
     }
 }

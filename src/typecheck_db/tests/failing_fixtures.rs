@@ -212,6 +212,9 @@ fn collect_error_codes(report: &ModuleCheckReport) -> Vec<String> {
                 ConstraintErrorKind::SolverDepthExceeded => {
                     codes.push("PossiblyInfiniteInstance".into())
                 }
+                ConstraintErrorKind::OverlappingInstances => {
+                    codes.push("OverlappingInstances".into())
+                }
             }
         }
         if !r.hole_diagnostics.is_empty() {

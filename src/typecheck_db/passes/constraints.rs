@@ -121,6 +121,9 @@ pub enum SolveOutcome {
     Resolved(ResolvedDict),
     /// No instance in scope has a compatible head.
     NoInstance,
+    /// Two or more non-chain-continued instances both match the
+    /// constraint — `OverlappingInstances` in reference-compiler terms.
+    Overlap,
     /// The constraint still depends on unification variables; try
     /// again after more inference. Phase B emits `Deferred` and
     /// lets the caller decide what to do; Phase D's fundep-driven
@@ -169,6 +172,10 @@ pub enum ConstraintErrorKind {
     /// whose context re-demands the same constraint (`instance
     /// Foo a => Foo a`). Diagnostic, not a crash.
     SolverDepthExceeded,
+    /// At a use-site, two or more independent (non-chain-continued)
+    /// instances both match the constraint. Reference compiler
+    /// reports this as `OverlappingInstances`.
+    OverlappingInstances,
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +685,29 @@ pub fn solve_all(
                             span: pc.span,
                             constraint: zonked,
                             kind: ConstraintErrorKind::NoInstanceFound,
+                        });
+                }
+                SolveOutcome::Overlap => {
+                    // Reserved for future use — overlap detection is not
+                    // yet wired into solve_one.
+                    made_progress = true;
+                    let zonked = Constraint {
+                        class: pc.constraint.class.clone(),
+                        args: pc
+                            .constraint
+                            .args
+                            .iter()
+                            .map(|a| state.zonk(a))
+                            .collect(),
+                    };
+                    report
+                        .errors
+                        .entry(owner)
+                        .or_default()
+                        .push(ConstraintError {
+                            span: pc.span,
+                            constraint: zonked,
+                            kind: ConstraintErrorKind::OverlappingInstances,
                         });
                 }
                 SolveOutcome::Deferred => {
