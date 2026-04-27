@@ -34,7 +34,7 @@ check_failing_build_unit!(f_3329, "3329");
 check_failing_build_unit_ignored!(f_3335_TypeOpAssociativityError, "3335-TypeOpAssociativityError", "expected: NonAssociativeError");
 check_failing_build_unit!(f_3405, "3405");
 check_failing_build_unit!(f_3453, "3453");
-check_failing_build_unit_ignored!(f_3510, "3510", "expected: InvalidInstanceHead");
+check_failing_build_unit!(f_3510, "3510");
 check_failing_build_unit_ignored!(f_3531_2, "3531-2", "expected: NoInstanceFound");
 check_failing_build_unit_ignored!(f_3531_3, "3531-3", "expected: NoInstanceFound");
 check_failing_build_unit!(f_3531_4, "3531-4");
@@ -238,7 +238,7 @@ check_failing_build_unit_ignored!(f_IntToString2, "IntToString2", "expected: Typ
 check_failing_build_unit_ignored!(f_IntToString3, "IntToString3", "expected: TypesDoNotUnify");
 check_failing_build_unit!(f_InvalidCoercibleInstanceDeclaration, "InvalidCoercibleInstanceDeclaration");
 check_failing_build_unit_ignored!(f_InvalidDerivedInstance, "InvalidDerivedInstance", "expected: ClassInstanceArityMismatch");
-check_failing_build_unit_ignored!(f_InvalidDerivedInstance2, "InvalidDerivedInstance2", "expected: InvalidInstanceHead");
+check_failing_build_unit!(f_InvalidDerivedInstance2, "InvalidDerivedInstance2");
 check_failing_build_unit!(f_InvalidDerivedInstance3, "InvalidDerivedInstance3");
 check_failing_build_unit_ignored!(f_InvalidOperatorInBinder, "InvalidOperatorInBinder", "expected: InvalidOperatorInBinder");
 check_failing_build_unit_ignored!(f_KindError, "KindError", "expected: KindsDoNotUnify");
@@ -348,7 +348,7 @@ check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign4, "RoleDeclarati
 check_failing_build_unit_ignored!(f_RowConstructors1, "RowConstructors1", "expected: KindsDoNotUnify");
 check_failing_build_unit!(f_RowConstructors2, "RowConstructors2");
 check_failing_build_unit_ignored!(f_RowConstructors3, "RowConstructors3", "expected: KindsDoNotUnify");
-check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined0, "RowInInstanceNotDetermined0", "expected: InvalidInstanceHead");
+check_failing_build_unit!(f_RowInInstanceNotDetermined0, "RowInInstanceNotDetermined0");
 check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined1, "RowInInstanceNotDetermined1", "expected: InvalidInstanceHead");
 check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined2, "RowInInstanceNotDetermined2", "expected: InvalidInstanceHead");
 check_failing_build_unit!(f_RowLacks, "RowLacks");
@@ -392,7 +392,7 @@ check_failing_build_unit_ignored!(f_TypeSynonymsOverlappingInstance, "TypeSynony
 check_failing_build_unit_ignored!(f_TypeSynonymsOverlappingUnnamedInstance, "TypeSynonymsOverlappingUnnamedInstance", "expected: OverlappingInstances");
 check_failing_build_unit!(f_TypeWildcards1, "TypeWildcards1");
 check_failing_build_unit!(f_TypeWildcards2, "TypeWildcards2");
-check_failing_build_unit_ignored!(f_TypeWildcards3, "TypeWildcards3", "expected: InvalidInstanceHead");
+check_failing_build_unit!(f_TypeWildcards3, "TypeWildcards3");
 check_failing_build_unit!(f_TypeWildcards4, "TypeWildcards4");
 check_failing_build_unit!(f_TypedBinders, "TypedBinders");
 check_failing_build_unit!(f_TypedBinders2, "TypedBinders2");

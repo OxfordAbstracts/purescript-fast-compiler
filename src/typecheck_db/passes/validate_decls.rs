@@ -54,6 +54,7 @@ pub enum ValidationErrorKind {
     InvalidConstraintArgument,
     TransitiveDctorExportError(String),
     TransitiveExportError(String),
+    InvalidInstanceHead,
 }
 
 impl ValidationErrorKind {
@@ -83,6 +84,7 @@ impl ValidationErrorKind {
             Self::InvalidConstraintArgument => "InvalidConstraintArgument",
             Self::TransitiveDctorExportError(_) => "TransitiveDctorExportError",
             Self::TransitiveExportError(_) => "TransitiveExportError",
+            Self::InvalidInstanceHead => "InvalidInstanceHead",
         }
     }
 }
@@ -372,8 +374,164 @@ pub fn validate_module_with_imports(
     detect_orphan_instances(&module.decls, &mut errors);
 
     detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
+    detect_invalid_instance_heads(&module.decls, &mut errors);
 
     errors
+}
+
+/// Reject instance heads whose argument is structurally invalid:
+/// - A bare record literal `{}` or `{ … }` (`derive instance eqRecord :: Eq {}`).
+/// - A wildcard `_` (`instance showFoo :: Show (Foo _)`).
+/// - A reference to a *local* type-alias whose body is a record/row
+///   (`type T = {}; derive instance eqT :: Eq T`,
+///   `type X r = { x :: Int | r }; instance showX :: Show (X r)`).
+///
+/// Reference compiler reports these as `InvalidInstanceHead`. Imported
+/// aliases aren't accessible here so we conservatively skip them.
+fn detect_invalid_instance_heads(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Build a map of local type-alias name → body, so we can look
+    // through one level of aliasing for the record/row check.
+    let mut alias_body: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+    // Local classes that declare any fundep — these allow record/row
+    // literals in determined positions and we conservatively skip
+    // record-checking for any instance of such a class. (A precise
+    // "is position i determined" rule would be better but requires
+    // imported fundep visibility too; classes-with-fundeps is the
+    // common case.)
+    let mut classes_with_fundeps: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { name, ty, .. } => {
+                alias_body.insert(name.value.symbol(), ty);
+            }
+            cst::Decl::Class { name, fundeps, .. } if !fundeps.is_empty() => {
+                classes_with_fundeps.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_to_record_alias(
+        te: &cst::TypeExpr,
+        alias_body: &HashMap<Symbol, &cst::TypeExpr>,
+        seen: &mut HashSet<Symbol>,
+    ) -> bool {
+        match te {
+            cst::TypeExpr::Parens { ty, .. } => {
+                walk_to_record_alias(ty, alias_body, seen)
+            }
+            cst::TypeExpr::Constructor { name, .. } if name.module.is_none() => {
+                let sym = name.name.symbol();
+                if !seen.insert(sym) {
+                    return false;
+                }
+                if let Some(body) = alias_body.get(&sym) {
+                    // Alias body that's a bare Record literal (closed
+                    // record) is record-headed. We can't reliably
+                    // distinguish open from closed records when the
+                    // alias body is a Row (open records can be made
+                    // closed by row composition with `()` —
+                    // `type Env = { | EnvRow () }`), so we skip Row
+                    // here.
+                    matches!(peel_parens(body), cst::TypeExpr::Record { .. })
+                        || walk_to_record_alias(body, alias_body, seen)
+                } else {
+                    false
+                }
+            }
+            cst::TypeExpr::App { constructor, .. } => {
+                // App-headed alias: head must be the alias.
+                walk_to_record_alias(constructor, alias_body, seen)
+            }
+            _ => false,
+        }
+    }
+
+    fn head_is_invalid(
+        te: &cst::TypeExpr,
+        alias_body: &HashMap<Symbol, &cst::TypeExpr>,
+        allow_top_wildcard: bool,
+    ) -> bool {
+        match peel_parens(te) {
+            cst::TypeExpr::Wildcard { .. } => !allow_top_wildcard,
+            // Bare record literal `{}` / `{ x :: Int }` — not a named
+            // type. Empty row `()` is fine (it's Row { fields: [] }
+            // under our parser, distinct from Record), so we don't
+            // flag rows here.
+            cst::TypeExpr::Record { .. } => true,
+            other => {
+                if has_wildcard(other) {
+                    return true;
+                }
+                let mut seen: HashSet<Symbol> = HashSet::new();
+                walk_to_record_alias(other, alias_body, &mut seen)
+            }
+        }
+    }
+
+    for d in decls {
+        let (types, class_name, span, is_derive) = match d {
+            cst::Decl::Instance { types, class_name, span, .. } => {
+                (types, class_name, span, false)
+            }
+            cst::Decl::Derive { types, class_name, span, .. } => {
+                (types, class_name, span, true)
+            }
+            _ => continue,
+        };
+        // Skip classes with fundeps — records in determined
+        // positions are legitimate (`class Simple a b | a -> b;
+        // instance Simple Empty {}`). Imported classes whose
+        // fundeps we can't see are also skipped, since we can't
+        // distinguish `Foo Empty {}` from `Foo Unit {}` without
+        // them.
+        let cqi = class_name.to_qi();
+        if cqi.module.is_some() {
+            continue;
+        }
+        if classes_with_fundeps.contains(&cqi.name) {
+            continue;
+        }
+        for t in types {
+            // `derive instance Newtype (Min a) _` puts a top-level
+            // wildcard in the second arg as the canonical
+            // newtype-representation pattern; that's legitimate.
+            // Wildcards nested inside a constructor (`Show (Foo _)`)
+            // are still rejected.
+            if head_is_invalid(t, &alias_body, is_derive) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::InvalidInstanceHead,
+                });
+                break;
+            }
+        }
+    }
+}
+
+fn peel_parens(te: &cst::TypeExpr) -> &cst::TypeExpr {
+    let mut cur = te;
+    while let cst::TypeExpr::Parens { ty, .. } = cur {
+        cur = ty;
+    }
+    cur
+}
+
+fn has_wildcard(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Wildcard { .. } => true,
+        cst::TypeExpr::Parens { ty, .. } => has_wildcard(ty),
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            has_wildcard(constructor) || has_wildcard(arg)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            has_wildcard(from) || has_wildcard(to)
+        }
+        _ => false,
+    }
 }
 
 /// Transitive export error subset detectable from the CST alone.
