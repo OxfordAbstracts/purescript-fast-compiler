@@ -384,6 +384,78 @@ fn collect_app_spine(ty: &Type) -> Option<(Type, Vec<Type>)> {
 /// constructor — which is wrong semantically but keeps the structural
 /// conversion total. Real operator resolution happens in passes that
 /// thread the full scope.
+/// Walk a TypeExpr collecting every TE::Hole site as
+/// `(span, hole_name)` in source order. Used by inference paths to
+/// allocate unif vars + emit `HoleDiagnostic`s for type-level holes.
+pub fn collect_type_holes(
+    ty: &cst::TypeExpr,
+    out: &mut Vec<(crate::span::Span, String)>,
+) {
+    use cst::TypeExpr as TE;
+    match ty {
+        TE::Hole { span, name } => {
+            out.push((*span, resolve(name.symbol())));
+        }
+        TE::Var { .. }
+        | TE::Constructor { .. }
+        | TE::Wildcard { .. }
+        | TE::StringLiteral { .. }
+        | TE::IntLiteral { .. } => {}
+        TE::App { constructor, arg, .. } => {
+            collect_type_holes(constructor, out);
+            collect_type_holes(arg, out);
+        }
+        TE::Function { from, to, .. } => {
+            collect_type_holes(from, out);
+            collect_type_holes(to, out);
+        }
+        TE::Forall { vars, ty, .. } => {
+            for (_, _, k) in vars {
+                if let Some(k) = k {
+                    collect_type_holes(k, out);
+                }
+            }
+            collect_type_holes(ty, out);
+        }
+        TE::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for a in &c.args {
+                    collect_type_holes(a, out);
+                }
+            }
+            collect_type_holes(ty, out);
+        }
+        TE::Record { fields, .. } => {
+            for f in fields {
+                collect_type_holes(&f.ty, out);
+            }
+        }
+        TE::Row { fields, tail, .. } => {
+            for f in fields {
+                collect_type_holes(&f.ty, out);
+            }
+            if let Some(t) = tail {
+                collect_type_holes(t, out);
+            }
+        }
+        TE::Parens { ty, .. } => collect_type_holes(ty, out),
+        TE::TypeOp { left, right, .. } => {
+            collect_type_holes(left, out);
+            collect_type_holes(right, out);
+        }
+        TE::Kinded { ty, kind, .. } => {
+            collect_type_holes(ty, out);
+            collect_type_holes(kind, out);
+        }
+        TE::ArrayPattern { elements, .. } => {
+            for e in elements {
+                collect_type_holes(e, out);
+            }
+        }
+        TE::AsPattern { ty, .. } => collect_type_holes(ty, out),
+    }
+}
+
 pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
     use cst::TypeExpr as TE;
     match ty {

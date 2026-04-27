@@ -46,6 +46,14 @@ pub struct Env {
     /// introduced for the enclosing `forall a.` on the decl's
     /// sig.
     pub scoped_tys: HashMap<String, Type>,
+    /// Per-decl type-level hole sites collected from
+    /// `Decl::TypeSignature`'s body. Each entry is `(span,
+    /// hole_name)` in source order — `convert_type_expr` lowers
+    /// `?test` to `Type::Hole(name)` (no span), so the SCC inference
+    /// reads spans from here when emitting `HoleDiagnostic`s for
+    /// type-level holes.
+    pub local_signed_hole_sites:
+        HashMap<String, Vec<(crate::span::Span, String)>>,
 }
 
 impl Env {
@@ -57,6 +65,7 @@ impl Env {
             aliases: AliasMap::default(),
             local_signed: std::collections::HashSet::new(),
             scoped_tys: HashMap::new(),
+            local_signed_hole_sites: HashMap::new(),
         }
     }
 

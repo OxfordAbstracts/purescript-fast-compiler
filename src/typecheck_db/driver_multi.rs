@@ -1880,6 +1880,18 @@ fn bind_local_ctors(
                 // Mark the decl as user-signed so the SCC can opt
                 // into bidirectional check-mode for it.
                 env.local_signed.insert(n.clone());
+                // Capture type-level holes (`?h`) in the sig: spans
+                // are needed for `HoleDiagnostic` emission, but
+                // `convert_type_expr` lowers `TE::Hole` to a
+                // span-less `Type::Hole(name)`. Stash the per-decl
+                // (span, name) list now so the SCC inference can
+                // reattach spans when it allocates unifs for the
+                // holes.
+                let mut hole_sites: Vec<(crate::span::Span, String)> = Vec::new();
+                crate::typecheck_db::types::collect_type_holes(ty, &mut hole_sites);
+                if !hole_sites.is_empty() {
+                    env.local_signed_hole_sites.insert(n.clone(), hole_sites);
+                }
                 let declared = conv(ty);
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {

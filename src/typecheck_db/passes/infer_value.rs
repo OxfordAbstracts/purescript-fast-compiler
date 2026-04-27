@@ -152,6 +152,108 @@ pub struct PendingAlt {
 
 /// Snapshot the monomorphic + scheme-typed local bindings visible at a
 /// point inside a decl body, walking inner-to-outer and dropping outer
+/// Replace every `Type::Hole(name)` in `ty` with a fresh unification
+/// variable, allocating one unif per occurrence and consuming
+/// `(span, name)` entries from `holes` in source order. For each
+/// replacement, push a `HoleDiagnostic` onto `state` whose
+/// `inferred_type` is the freshly-allocated unif so post-inference
+/// zonking surfaces the type the hole resolved to.
+///
+/// Used by inference paths that handle TypeExpr — type-level holes
+/// (`x :: forall a. ?test a`, `expr :: Maybe ?h`) are converted up
+/// front to `Type::Hole(name)` by `convert_type_expr`; this rewriter
+/// turns them into the inference world's first-class unif vars.
+pub fn rewrite_type_holes(
+    state: &mut UnifyState,
+    ty: Type,
+    holes: &[(crate::span::Span, String)],
+    env: &Env,
+) -> Type {
+    if holes.is_empty() {
+        return ty;
+    }
+    let mut iter = holes.to_vec().into_iter();
+    walk_replace(state, ty, &mut iter, env)
+}
+
+fn walk_replace(
+    state: &mut UnifyState,
+    ty: Type,
+    iter: &mut std::vec::IntoIter<(crate::span::Span, String)>,
+    env: &Env,
+) -> Type {
+    use std::iter::Iterator;
+    match ty {
+        Type::Hole(_) => {
+            let (span, hole_name) = iter
+                .next()
+                .expect("rewrite_type_holes: hole queue exhausted");
+            let unif = state.fresh();
+            let constraint_start = state.pending_constraints_len();
+            let local_bindings = snapshot_env_locals(env, state);
+            state.record_pending_hole(HoleDiagnostic {
+                decl_name: None,
+                span,
+                hole_name,
+                inferred_type: unif.clone(),
+                constraints: Vec::new(),
+                local_bindings,
+                constraint_start,
+            });
+            unif
+        }
+        Type::App(f, a) => Type::app(
+            walk_replace(state, *f, iter, env),
+            walk_replace(state, *a, iter, env),
+        ),
+        Type::Fun(a, b) => Type::Fun(
+            Box::new(walk_replace(state, *a, iter, env)),
+            Box::new(walk_replace(state, *b, iter, env)),
+        ),
+        Type::Forall(vs, body) => {
+            let new_vs = vs
+                .into_iter()
+                .map(|(n, vis, k)| {
+                    let k = k.map(|k| Box::new(walk_replace(state, *k, iter, env)));
+                    (n, vis, k)
+                })
+                .collect();
+            Type::Forall(new_vs, Box::new(walk_replace(state, *body, iter, env)))
+        }
+        Type::Constrained(cs, body) => {
+            let new_cs = cs
+                .into_iter()
+                .map(|c| Constraint {
+                    class: c.class,
+                    args: c
+                        .args
+                        .into_iter()
+                        .map(|a| walk_replace(state, a, iter, env))
+                        .collect(),
+                })
+                .collect();
+            Type::Constrained(new_cs, Box::new(walk_replace(state, *body, iter, env)))
+        }
+        Type::Record(fs, tail) => Type::Record(
+            fs.into_iter()
+                .map(|(l, t)| (l, walk_replace(state, t, iter, env)))
+                .collect(),
+            tail.map(|t| Box::new(walk_replace(state, *t, iter, env))),
+        ),
+        Type::Row(fs, tail) => Type::Row(
+            fs.into_iter()
+                .map(|(l, t)| (l, walk_replace(state, t, iter, env)))
+                .collect(),
+            tail.map(|t| Box::new(walk_replace(state, *t, iter, env))),
+        ),
+        Type::Kinded(t, k) => Type::Kinded(
+            Box::new(walk_replace(state, *t, iter, env)),
+            Box::new(walk_replace(state, *k, iter, env)),
+        ),
+        other => other,
+    }
+}
+
 /// bindings shadowed by inner ones. Used by typed-hole reporting to
 /// capture the `CONTEXT:` set for the emitted diagnostic.
 fn snapshot_env_locals(env: &Env, state: &UnifyState) -> Vec<(String, Type)> {
@@ -204,10 +306,21 @@ pub fn infer_expr(
             // structurally compatible with a caller-side sig that
             // was produced the same way. See
             // `deep_instantiate_positive` for the PJ §5 rationale.
+            //
+            // If the annotation contains type-level holes (`?h`),
+            // collect their spans, then replace each `Type::Hole(name)`
+            // in the converted type with a fresh unif and emit a
+            // `HoleDiagnostic` per occurrence so the user gets the
+            // hole's inferred type back.
+            let mut hole_sites: Vec<(crate::span::Span, String)> = Vec::new();
+            crate::typecheck_db::types::collect_type_holes(ty, &mut hole_sites);
             let mut declared = crate::typecheck_db::types::expand_aliases(
                 convert_type_expr(ty, type_ops),
                 &env.aliases,
             );
+            if !hole_sites.is_empty() {
+                declared = rewrite_type_holes(state, declared, &hole_sites, env);
+            }
             if !env.scoped_tys.is_empty() {
                 declared = crate::typecheck_db::generalize::apply_var_subst(
                     &declared,
@@ -870,6 +983,44 @@ pub fn infer_value_scc_with_all(
                                 scoped_added.push(v.clone());
                             }
                         }
+                    }
+                }
+                // Type-level holes in the sig: rewrite the sig's
+                // `Type::Hole(name)` leaves into fresh unifs and
+                // record a `HoleDiagnostic` per occurrence. Pin the
+                // slot to the rewritten sig so body-inference's
+                // unification flows through the hole's unif and
+                // post-zonking surfaces the inferred type. Only
+                // fires when the sig actually has holes — preserves
+                // existing behaviour for hole-free rank-1 decls.
+                let hole_sites = env.local_signed_hole_sites.get(name).cloned();
+                if let Some(sites) = hole_sites {
+                    if let Some(scheme) = env
+                        .top_level
+                        .get(&QName { module: None, name: name.clone() })
+                        .cloned()
+                    {
+                        let full_sig = if scheme.vars.is_empty() {
+                            scheme.ty.clone()
+                        } else {
+                            Type::Forall(
+                                scheme
+                                    .vars
+                                    .iter()
+                                    .cloned()
+                                    .map(|n| (n, false, None))
+                                    .collect(),
+                                Box::new(scheme.ty.clone()),
+                            )
+                        };
+                        let with_unifs =
+                            rewrite_type_holes(&mut state, full_sig, &sites, env);
+                        let slot_shape = deep_instantiate_positive(
+                            &mut state,
+                            with_unifs,
+                            true,
+                        );
+                        let _ = state.unify(&expected, &slot_shape);
                     }
                 }
                 let lam_ty = infer_equation(
