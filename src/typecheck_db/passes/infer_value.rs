@@ -937,13 +937,27 @@ pub fn infer_value_scc_with_all(
                         Box::new(scheme.ty.clone()),
                     )
                 };
+                // Type-level holes in the sig: rewrite each
+                // `Type::Hole(name)` to a fresh unif and emit a
+                // `HoleDiagnostic` per occurrence. This must
+                // happen BEFORE `check_equation` so the body is
+                // checked against a hole-free sig (Type::Hole
+                // doesn't unify with anything except another
+                // identical Type::Hole — leaving it in place
+                // would block downstream inference).
+                let hole_sites = env.local_signed_hole_sites.get(name).cloned();
+                let prepared_sig = if let Some(sites) = hole_sites.clone() {
+                    rewrite_type_holes(&mut state, full_sig.clone(), &sites, env)
+                } else {
+                    full_sig.clone()
+                };
                 check_equation(
                     &mut state,
                     env,
                     type_ops,
                     binders,
                     &guarded_with_where,
-                    &full_sig,
+                    &prepared_sig,
                 )?;
                 // Pin the slot to a deep-instantiated monotype of
                 // the sig so the final generalize step
@@ -958,7 +972,7 @@ pub fn infer_value_scc_with_all(
                 // without substituting their vars — leaving rigid
                 // `Var` ids leaking into the final scheme.
                 let slot_shape =
-                    deep_instantiate_positive(&mut state, full_sig.clone(), true);
+                    deep_instantiate_positive(&mut state, prepared_sig, true);
                 let _ = state.unify(&expected, &slot_shape);
             } else {
                 // Scoped type variables (rank-1 path): when the
