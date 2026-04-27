@@ -883,19 +883,183 @@ fn check_one_module(
         all_schemes.extend(schemes);
     }
 
-    // Run non-value decls' side effects that inference-for-values
-    // doesn't cover: for now, nothing extra — class/instance body
-    // members are handled through the instance_index + solver
-    // interaction at each call site.
+    // Type-check instance method bodies. The class method's full
+    // scheme already lives in `env.top_level` keyed by method name
+    // (`forall (class+method vars). C <class vars> => <body>`). For
+    // each instance method we:
+    //   1. Look up that scheme.
+    //   2. Substitute class type-vars with the instance's head types.
+    //   3. Strip the leading `Constrained` layer (the class
+    //      constraint is satisfied *by* this instance).
+    //   4. Re-quantify the remaining method-only forall vars.
+    //   5. Run a singleton SCC inference over the member's
+    //      `Decl::Value` against the synthesised sig, swapping the
+    //      class-method scheme out of `env.top_level` for the
+    //      duration so the F2 sig-pin uses the instance-specialised
+    //      sig instead of the polymorphic class one.
+    //
+    // The HoleDiagnostics + InferredScheme produced flow into
+    // `all_schemes` so the rest of the pipeline (constraint
+    // surfacing, hole reporting, validation) treats them the same as
+    // ordinary value decls.
+    let mut instance_method_schemes: Vec<InferredScheme> = Vec::new();
+    for d in non_value_decls.iter() {
+        if let crate::typecheck_db::ir::Decl::Instance {
+            class_name,
+            types,
+            members,
+            ..
+        } = d
+        {
+            let class_qi = class_name.to_qi();
+            let class_name_str =
+                crate::typecheck_db::util::resolve_symbol(class_qi.name);
+            // Class info: prefer the local declaration; otherwise
+            // walk the importer's direct imports to find the class
+            // in another module's exported `ClassInfo`. We only
+            // need `type_vars` from it (to build the
+            // class-var → instance-head subst).
+            let class_info = local_classes
+                .get(&class_name_str)
+                .cloned()
+                .or_else(|| {
+                    for imp in &module.imports {
+                        let imp_name = join_module_name(&imp.module);
+                        if let Some(exports) = registry.get(&imp_name) {
+                            if let Some(ci) = exports.classes.get(&class_name_str)
+                            {
+                                return Some(ci.clone());
+                            }
+                        }
+                    }
+                    None
+                });
+            let class_info = match class_info {
+                Some(ci) => ci,
+                None => continue,
+            };
+            let head_tys: Vec<crate::typecheck_db::types::Type> = types
+                .iter()
+                .map(|t| crate::typecheck_db::types::convert_type_expr(t, &type_ops))
+                .collect();
+            if head_tys.len() != class_info.type_vars.len() {
+                continue; // Arity mismatch is reported elsewhere.
+            }
+            let mut subst: std::collections::HashMap<
+                String,
+                crate::typecheck_db::types::Type,
+            > = std::collections::HashMap::new();
+            for (v, t) in class_info.type_vars.iter().zip(head_tys.iter()) {
+                subst.insert(v.clone(), t.clone());
+            }
+            for member in members {
+                let crate::typecheck_db::ir::Decl::Value { name, .. } = member
+                else {
+                    continue;
+                };
+                let method_name =
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                let class_method_scheme = env
+                    .top_level
+                    .get(&crate::typecheck_db::types::QName::unqualified(&method_name))
+                    .cloned();
+                let Some(full_scheme) = class_method_scheme else {
+                    continue;
+                };
+                // Substitute the class type-vars in the method
+                // scheme's body. `apply_var_subst` is capture-
+                // avoiding for the inner `Forall` (so the method
+                // can have its own quantifiers without colliding).
+                let body_substed =
+                    crate::typecheck_db::generalize::apply_var_subst(
+                        &full_scheme.ty,
+                        &subst,
+                    );
+                // Peel any number of leading Constrained layers (the
+                // class constraint we're providing).
+                let mut peeled = body_substed;
+                while let crate::typecheck_db::types::Type::Constrained(_, body) =
+                    peeled
+                {
+                    peeled = *body;
+                }
+                // Re-quantify any method-only vars from full_scheme.vars
+                // that aren't class vars.
+                let method_vars: Vec<String> = full_scheme
+                    .vars
+                    .iter()
+                    .filter(|v| !subst.contains_key(*v))
+                    .cloned()
+                    .collect();
+                let synthesized_sig = if method_vars.is_empty() {
+                    crate::typecheck_db::types::Scheme {
+                        vars: Vec::new(),
+                        ty: peeled,
+                    }
+                } else {
+                    crate::typecheck_db::types::Scheme {
+                        vars: method_vars,
+                        ty: peeled,
+                    }
+                };
+                // Swap the class-method scheme for the synthesized
+                // instance-specialised one for the duration of body
+                // inference.
+                let key = crate::typecheck_db::types::QName::unqualified(&method_name);
+                let saved_scheme = env.top_level.insert(key.clone(), synthesized_sig);
+                let was_signed = env.local_signed.insert(method_name.clone());
+                let saved_hole_sites =
+                    env.local_signed_hole_sites.remove(&method_name);
+                // Drop any stale local slot binding for this method
+                // name from earlier value SCCs so lookup hits the
+                // synthesised top-level scheme.
+                let saved_local = env
+                    .locals
+                    .last_mut()
+                    .and_then(|s| s.remove(&method_name));
+                let inference = infer_value_scc_with_all(
+                    &type_ops,
+                    &mut env,
+                    &[member],
+                    &data_constructors,
+                    &ctor_details,
+                    &instance_index,
+                );
+                // Restore env state regardless of inference outcome.
+                if let Some(s) = saved_scheme {
+                    env.top_level.insert(key.clone(), s);
+                } else {
+                    env.top_level.remove(&key);
+                }
+                if !was_signed {
+                    env.local_signed.remove(&method_name);
+                }
+                if let Some(s) = saved_hole_sites {
+                    env.local_signed_hole_sites.insert(method_name.clone(), s);
+                }
+                if let Some(slot) = saved_local {
+                    if let Some(scope) = env.locals.last_mut() {
+                        scope.insert(method_name.clone(), slot);
+                    }
+                }
+                if let Ok(schemes) = inference {
+                    instance_method_schemes.extend(schemes);
+                }
+            }
+        }
+    }
     let _ = non_value_decls;
 
-    // 5) Aggregate per-decl diagnostics.
+    // 5) Aggregate per-decl diagnostics. Instance-method-body
+    // schemes flow through the same channel as value-decl schemes
+    // so their hole diagnostics + constraint errors land in the
+    // module's report.
     let mut exhaustiveness_errors = Vec::new();
     let mut constraint_errors = Vec::new();
     let mut deferred_constraints = Vec::new();
     let mut resolved_dicts = Vec::new();
     let mut hole_diagnostics = Vec::new();
-    for s in &all_schemes {
+    for s in all_schemes.iter().chain(instance_method_schemes.iter()) {
         exhaustiveness_errors.extend(s.exhaustiveness_errors.iter().cloned());
         constraint_errors.extend(s.constraint_errors.iter().cloned());
         deferred_constraints.extend(s.pending_constraints.iter().cloned());
