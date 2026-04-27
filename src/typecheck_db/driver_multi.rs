@@ -953,16 +953,36 @@ fn check_one_module(
                 subst.insert(v.clone(), t.clone());
             }
             for member in members {
-                let crate::typecheck_db::ir::Decl::Value { name, .. } = member
+                let crate::typecheck_db::ir::Decl::Value { name: member_name, .. } = member
                 else {
                     continue;
                 };
                 let method_name =
-                    crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                    crate::typecheck_db::util::resolve_symbol(member_name.value.symbol());
+                // Class methods of locally declared classes are in
+                // `env.top_level` (driver_multi binds them around
+                // line 1953). For imported classes, `import M
+                // (class C)` doesn't pull methods in — explicit
+                // imports list each method separately. Fall back
+                // to a direct registry lookup so an instance for
+                // an imported class can still drive its method
+                // body inference even when the method isn't in
+                // env.top_level.
                 let class_method_scheme = env
                     .top_level
                     .get(&crate::typecheck_db::types::QName::unqualified(&method_name))
-                    .cloned();
+                    .cloned()
+                    .or_else(|| {
+                        for imp in &module.imports {
+                            let imp_name = join_module_name(&imp.module);
+                            if let Some(exports) = registry.get(&imp_name) {
+                                if let Some(s) = exports.values.get(&method_name) {
+                                    return Some(s.clone());
+                                }
+                            }
+                        }
+                        None
+                    });
                 let Some(full_scheme) = class_method_scheme else {
                     continue;
                 };
