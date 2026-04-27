@@ -288,6 +288,24 @@ pub fn solve_one(
     if pending.constraint.args.iter().any(|a| contains_rigid_var(a, state)) {
         return SolveOutcome::Deferred;
     }
+    // Classes with no in-scope candidates always defer rather than
+    // emit NoInstance. A class with zero candidates is one of:
+    //  * a marker / open class (`Partial`, `Warn`, `Fail`) that
+    //    the user discharges via a special-case mechanism, never
+    //    via instance resolution;
+    //  * a class whose instances haven't been imported into this
+    //    module's scope — the constraint legitimately propagates
+    //    until a downstream caller produces a concrete arg the
+    //    instance can match.
+    // Either way, the right move is to defer: the constraint
+    // ratchets into the inferred scheme and the use-site re-tries
+    // with fresh unifs.
+    if instances
+        .candidates(&pending.constraint.class.name)
+        .is_empty()
+    {
+        return SolveOutcome::Deferred;
+    }
     // Kind-mismatch / wrong-head defer: if any arg's App-spine
     // head zonks to `Con(X)` AND no instance candidate has the
     // same `Con(X)` head at that position (allowing for arity

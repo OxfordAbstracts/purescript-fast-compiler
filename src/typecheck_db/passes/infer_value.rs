@@ -985,21 +985,48 @@ pub fn infer_value_scc_with_all(
                         }
                     }
                 }
-                // Type-level holes in the sig: rewrite the sig's
-                // `Type::Hole(name)` leaves into fresh unifs and
-                // record a `HoleDiagnostic` per occurrence. Pin the
-                // slot to the rewritten sig so body-inference's
-                // unification flows through the hole's unif and
-                // post-zonking surfaces the inferred type. Only
-                // fires when the sig actually has holes — preserves
-                // existing behaviour for hole-free rank-1 decls.
+                // F2: Pin the slot to the user's sig. Without this,
+                // the slot is just a fresh unif and the body's
+                // inferred type alone determines the final scheme —
+                // the sig's `Constrained =>` layer is silently
+                // dropped and concrete arg types (`Int` etc.) get
+                // re-inferred as free vars.
+                //
+                // Gated on `local_signed` plus a non-trivial sig
+                // shape: pinning unconditionally regresses ~76
+                // fixtures, so we only pin when the sig has a
+                // `Constrained =>` layer (recording pending
+                // constraints the body's natural type can't
+                // recover) or carries a type-level hole (the
+                // hole's unif needs to be in the slot for body
+                // unification to bind it).
+                //
+                // Pin AFTER body inference so the body is inferred
+                // against the existing fresh-unif slot (preserving
+                // pre-F2 inference behaviour for the body), then
+                // unify the slot with the sig's shape so the user's
+                // declared constraints + concrete shapes ratchet
+                // back in.
                 let hole_sites = env.local_signed_hole_sites.get(name).cloned();
-                if let Some(sites) = hole_sites {
-                    if let Some(scheme) = env
-                        .top_level
+                let sig_scheme_for_pin = if env.local_signed.contains(name) {
+                    env.top_level
                         .get(&QName { module: None, name: name.clone() })
                         .cloned()
-                    {
+                } else {
+                    None
+                };
+                let lam_ty = infer_equation(
+                    &mut state,
+                    env,
+                    type_ops,
+                    binders,
+                    &guarded_with_where,
+                )?;
+                state.unify(&expected, &lam_ty)?;
+                if let Some(scheme) = sig_scheme_for_pin {
+                    let should_pin =
+                        hole_sites.is_some() || scheme_has_constraint(&scheme);
+                    if should_pin {
                         let full_sig = if scheme.vars.is_empty() {
                             scheme.ty.clone()
                         } else {
@@ -1013,24 +1040,19 @@ pub fn infer_value_scc_with_all(
                                 Box::new(scheme.ty.clone()),
                             )
                         };
-                        let with_unifs =
-                            rewrite_type_holes(&mut state, full_sig, &sites, env);
+                        let prepared = if let Some(sites) = hole_sites {
+                            rewrite_type_holes(&mut state, full_sig, &sites, env)
+                        } else {
+                            full_sig
+                        };
                         let slot_shape = deep_instantiate_positive(
                             &mut state,
-                            with_unifs,
+                            prepared,
                             true,
                         );
                         let _ = state.unify(&expected, &slot_shape);
                     }
                 }
-                let lam_ty = infer_equation(
-                    &mut state,
-                    env,
-                    type_ops,
-                    binders,
-                    &guarded_with_where,
-                )?;
-                state.unify(&expected, &lam_ty)?;
                 for n in scoped_added {
                     env.scoped_tys.remove(&n);
                 }
