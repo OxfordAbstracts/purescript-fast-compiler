@@ -436,9 +436,15 @@ fn detect_transitive_export_errors(
     let mut class_methods: HashMap<Symbol, (Span, Vec<(Span, Symbol)>)> =
         HashMap::new();
     let mut value_to_class: HashMap<Symbol, Symbol> = HashMap::new();
+    // Class → its superclass class-names. Cross-module superclasses
+    // (`class.module.is_some()`) aren't recorded — only locally
+    // defined classes matter for the export-coupling rule.
+    let mut class_superclasses: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    let mut local_classes: HashSet<Symbol> = HashSet::new();
     for d in &module.decls {
-        if let cst::Decl::Class { span, name, members, .. } = d {
+        if let cst::Decl::Class { span, name, members, constraints, .. } = d {
             let cname = name.value.symbol();
+            local_classes.insert(cname);
             let mems: Vec<(Span, Symbol)> = members
                 .iter()
                 .map(|m| (m.span, m.name.value.symbol()))
@@ -447,6 +453,17 @@ fn detect_transitive_export_errors(
                 value_to_class.insert(*msym, cname);
             }
             class_methods.insert(cname, (*span, mems));
+            let supers: Vec<Symbol> = constraints
+                .iter()
+                .filter_map(|c| {
+                    if c.class.module.is_none() {
+                        Some(c.class.name.symbol())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            class_superclasses.insert(cname, supers);
         }
     }
 
@@ -638,6 +655,193 @@ fn detect_transitive_export_errors(
                         });
                         break;
                     }
+                }
+            }
+        }
+        // Build a name → decl-span lookup for value/type/alias lookups
+        // we need below.
+        let mut value_decl_span: HashMap<Symbol, Span> = HashMap::new();
+        let mut value_decl_ty: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+        let mut data_decl_span: HashMap<Symbol, Span> = HashMap::new();
+        let mut data_decl_fields: HashMap<Symbol, Vec<&cst::TypeExpr>> = HashMap::new();
+        let mut data_decl_kind_anns: HashMap<Symbol, Vec<&cst::TypeExpr>> = HashMap::new();
+        let mut alias_decl_span: HashMap<Symbol, Span> = HashMap::new();
+        let mut alias_decl_body: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+        let mut newtype_decl_span: HashMap<Symbol, Span> = HashMap::new();
+        let mut newtype_decl_field: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+        let mut newtype_decl_kind_anns: HashMap<Symbol, Vec<&cst::TypeExpr>> = HashMap::new();
+        for d in &module.decls {
+            match d {
+                cst::Decl::TypeSignature { name, ty, span, .. } => {
+                    value_decl_span.insert(name.value.symbol(), *span);
+                    value_decl_ty.insert(name.value.symbol(), ty);
+                }
+                cst::Decl::Data {
+                    name,
+                    constructors,
+                    span,
+                    type_var_kind_anns,
+                    ..
+                } => {
+                    let n = name.value.symbol();
+                    data_decl_span.insert(n, *span);
+                    let fs: Vec<&cst::TypeExpr> = constructors
+                        .iter()
+                        .flat_map(|c| c.fields.iter())
+                        .collect();
+                    data_decl_fields.insert(n, fs);
+                    let anns: Vec<&cst::TypeExpr> = type_var_kind_anns
+                        .iter()
+                        .filter_map(|a| a.as_deref())
+                        .collect();
+                    data_decl_kind_anns.insert(n, anns);
+                }
+                cst::Decl::TypeAlias { name, ty, span, .. } => {
+                    alias_decl_span.insert(name.value.symbol(), *span);
+                    alias_decl_body.insert(name.value.symbol(), ty);
+                }
+                cst::Decl::Newtype {
+                    name,
+                    ty,
+                    span,
+                    type_var_kind_anns,
+                    ..
+                } => {
+                    let n = name.value.symbol();
+                    newtype_decl_span.insert(n, *span);
+                    newtype_decl_field.insert(n, ty);
+                    let anns: Vec<&cst::TypeExpr> = type_var_kind_anns
+                        .iter()
+                        .filter_map(|a| a.as_deref())
+                        .collect();
+                    newtype_decl_kind_anns.insert(n, anns);
+                }
+                _ => {}
+            }
+        }
+
+        // Helper: walk a TypeExpr and emit a TransitiveExportError on
+        // `owner_sym` if the body references a local-but-unexported
+        // type / class.
+        let mut check_ty_refs = |
+            owner_sym: Symbol,
+            owner_span: Span,
+            ty: &cst::TypeExpr,
+            errors: &mut Vec<ValidationError>,
+            reported: &mut HashSet<Symbol>,
+        | {
+            collect_type_refs(ty, &mut |name: Symbol, _is_class| {
+                if !local_types.contains(&name) {
+                    return;
+                }
+                if exported_types.contains(&name) {
+                    return;
+                }
+                if reported.insert(owner_sym) {
+                    errors.push(ValidationError {
+                        span: owner_span,
+                        kind: ValidationErrorKind::TransitiveExportError(
+                            resolve(owner_sym),
+                        ),
+                    });
+                }
+            });
+        };
+
+        let mut reported_decl: HashSet<Symbol> = HashSet::new();
+
+        // Exported value with type referring to a non-exported local type.
+        for v in &exported_values {
+            if let Some(ty) = value_decl_ty.get(v) {
+                let span = value_decl_span.get(v).copied()
+                    .unwrap_or(crate::span::Span::new(0, 0));
+                check_ty_refs(*v, span, ty, errors, &mut reported_decl);
+            }
+        }
+
+        // Exported alias with body referring to a non-exported local type.
+        for t in &exported_types {
+            if let Some(body) = alias_decl_body.get(t) {
+                let span = alias_decl_span.get(t).copied()
+                    .unwrap_or(crate::span::Span::new(0, 0));
+                check_ty_refs(*t, span, body, errors, &mut reported_decl);
+            }
+        }
+
+        // Exported data type whose ctor fields or kind annotations
+        // reference a non-exported local type — only relevant when
+        // ctors are exported (otherwise the field types aren't
+        // observable to the importer).
+        for c in &exported_ctors {
+            // Find the parent data type for this ctor.
+            let parent_opt = data_ctors
+                .iter()
+                .find(|(_, (_, cs))| cs.contains(c))
+                .map(|(t, _)| *t);
+            if let Some(parent) = parent_opt {
+                if let Some(fields) = data_decl_fields.get(&parent) {
+                    let span = data_decl_span.get(&parent).copied()
+                        .unwrap_or(crate::span::Span::new(0, 0));
+                    for f in fields {
+                        check_ty_refs(parent, span, f, errors, &mut reported_decl);
+                    }
+                }
+            }
+        }
+        for t in &exported_types {
+            if let Some(anns) = data_decl_kind_anns.get(t) {
+                let span = data_decl_span.get(t).copied()
+                    .unwrap_or(crate::span::Span::new(0, 0));
+                for ann in anns {
+                    check_ty_refs(*t, span, ann, errors, &mut reported_decl);
+                }
+            }
+            if let Some(anns) = newtype_decl_kind_anns.get(t) {
+                let span = newtype_decl_span.get(t).copied()
+                    .unwrap_or(crate::span::Span::new(0, 0));
+                for ann in anns {
+                    check_ty_refs(*t, span, ann, errors, &mut reported_decl);
+                }
+            }
+            if let Some(body) = newtype_decl_field.get(t) {
+                let span = newtype_decl_span.get(t).copied()
+                    .unwrap_or(crate::span::Span::new(0, 0));
+                check_ty_refs(*t, span, body, errors, &mut reported_decl);
+            }
+        }
+
+        // Transitive superclass export: an exported class's locally
+        // defined superclasses (and their superclasses) must also be
+        // exported. `class C1 <= C2 a; class C2 a <= C3 a b` →
+        // exporting `class C3` requires `class C2` and `class C1`.
+        for c in exported_classes.clone() {
+            let mut stack: Vec<Symbol> = class_superclasses
+                .get(&c)
+                .cloned()
+                .unwrap_or_default();
+            let mut visited: HashSet<Symbol> = HashSet::new();
+            while let Some(sup) = stack.pop() {
+                if !visited.insert(sup) {
+                    continue;
+                }
+                if !local_classes.contains(&sup) {
+                    continue;
+                }
+                if !exported_classes.contains(&sup) {
+                    let span = class_methods
+                        .get(&c)
+                        .map(|(s, _)| *s)
+                        .unwrap_or(crate::span::Span::new(0, 0));
+                    errors.push(ValidationError {
+                        span,
+                        kind: ValidationErrorKind::TransitiveExportError(
+                            resolve(c),
+                        ),
+                    });
+                    break;
+                }
+                if let Some(more) = class_superclasses.get(&sup) {
+                    stack.extend(more.iter().copied());
                 }
             }
         }
@@ -1164,6 +1368,81 @@ fn collect_all_cons(te: &cst::TypeExpr, out: &mut Vec<Symbol>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Walk a TypeExpr and invoke `cb(name, is_class)` for every
+/// unqualified type-constructor and class-constraint name reference.
+/// Used by `detect_transitive_export_errors` to find type/class
+/// references in exported decls' signatures, alias bodies, ctor fields,
+/// and kind annotations.
+fn collect_type_refs<F: FnMut(Symbol, bool)>(te: &cst::TypeExpr, cb: &mut F) {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            if name.module.is_none() {
+                cb(name.name.symbol(), false);
+            }
+        }
+        cst::TypeExpr::Var { .. }
+        | cst::TypeExpr::Hole { .. }
+        | cst::TypeExpr::Wildcard { .. }
+        | cst::TypeExpr::StringLiteral { .. }
+        | cst::TypeExpr::IntLiteral { .. } => {}
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            collect_type_refs(constructor, cb);
+            collect_type_refs(arg, cb);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            collect_type_refs(from, cb);
+            collect_type_refs(to, cb);
+        }
+        cst::TypeExpr::Forall { ty, vars, .. } => {
+            for (_, _, k) in vars {
+                if let Some(k) = k {
+                    collect_type_refs(k, cb);
+                }
+            }
+            collect_type_refs(ty, cb);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                if c.class.module.is_none() {
+                    cb(c.class.name.symbol(), true);
+                }
+                for a in &c.args {
+                    collect_type_refs(a, cb);
+                }
+            }
+            collect_type_refs(ty, cb);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                collect_type_refs(&f.ty, cb);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                collect_type_refs(&f.ty, cb);
+            }
+            if let Some(t) = tail {
+                collect_type_refs(t, cb);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => collect_type_refs(ty, cb),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            collect_type_refs(left, cb);
+            collect_type_refs(right, cb);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            collect_type_refs(ty, cb);
+            collect_type_refs(kind, cb);
+        }
+        cst::TypeExpr::ArrayPattern { elements, .. } => {
+            for e in elements {
+                collect_type_refs(e, cb);
+            }
+        }
+        cst::TypeExpr::AsPattern { ty, .. } => collect_type_refs(ty, cb),
     }
 }
 
