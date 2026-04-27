@@ -90,6 +90,18 @@ impl ValidationErrorKind {
 /// Top-level entry point. Walks the module's decls once, emitting
 /// every structural issue it finds.
 pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
+    validate_module_with_imports(module, &HashMap::new())
+}
+
+/// Like [`validate_module`], but also given a map of imported alias
+/// names → arity (interned). Used by `detect_partially_applied_synonyms`
+/// so that operator-aliased imported synonyms (e.g. `(~>)` from a
+/// `infixr 4 type NaturalTransformation as ~>` declaration in a
+/// supporting module) are caught.
+pub fn validate_module_with_imports(
+    module: &cst::Module,
+    imported_alias_arity: &HashMap<Symbol, usize>,
+) -> Vec<ValidationError> {
     let mut errors: Vec<ValidationError> = Vec::new();
 
     // Collect symbol-keyed views of each namespace. We need both
@@ -359,13 +371,7 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
     // constructor in the instance head is defined locally.
     detect_orphan_instances(&module.decls, &mut errors);
 
-    // NOTE: Partially-applied type synonyms are detected conservatively
-    // via `detect_partially_applied_synonyms` below, but disabled here —
-    // without kind information we can't distinguish `type Identity a = a;
-    // type Patch = Template Identity` (valid HKT argument) from
-    // `newtype N = N S where type S a = D a` (actual partial). Enable
-    // once Bucket 3 (kind checker) lands kind-aware detection.
-    let _ = detect_partially_applied_synonyms;
+    detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
 
     errors
 }
@@ -1059,10 +1065,12 @@ fn collect_all_cons(te: &cst::TypeExpr, out: &mut Vec<Symbol>) {
 /// aliases aren't accessible from this CST-only pass.
 fn detect_partially_applied_synonyms(
     decls: &[cst::Decl],
+    imported_alias_arity: &HashMap<Symbol, usize>,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Collect arity of every local alias.
-    let mut alias_arity: HashMap<Symbol, usize> = HashMap::new();
+    // Start with imported aliases (and operator aliases) as the
+    // baseline. Local declarations override these on collision.
+    let mut alias_arity: HashMap<Symbol, usize> = imported_alias_arity.clone();
     for d in decls {
         if let cst::Decl::TypeAlias { name, type_vars, .. } = d {
             alias_arity.insert(name.value.symbol(), type_vars.len());
@@ -1070,6 +1078,20 @@ fn detect_partially_applied_synonyms(
     }
     if alias_arity.is_empty() {
         return;
+    }
+    // Collect type-level fixity mappings from local Decl::Fixity:
+    // an operator name like `~>` bound via `infixr 6 type Foo as ~>`
+    // should resolve to its target alias's arity. (Imported type
+    // fixities are already folded into `imported_alias_arity` by the
+    // driver.)
+    for d in decls {
+        if let cst::Decl::Fixity { target, operator, is_type: true, .. } = d {
+            if target.module.is_none() {
+                if let Some(&n) = alias_arity.get(&target.name) {
+                    alias_arity.insert(operator.value.symbol(), n);
+                }
+            }
+        }
     }
 
     // Helper used on every TypeExpr site.
@@ -1080,11 +1102,18 @@ fn detect_partially_applied_synonyms(
 
     for d in decls {
         match d {
-            cst::Decl::TypeAlias { ty, .. } => check(ty, errors),
+            cst::Decl::TypeAlias { ty, type_var_kind_anns, .. } => {
+                check(ty, errors);
+                for ann in type_var_kind_anns.iter().flatten() {
+                    check(ann, errors);
+                }
+            }
             cst::Decl::TypeSignature { ty, .. } => check(ty, errors),
             cst::Decl::Foreign { ty, .. } => check(ty, errors),
             cst::Decl::ForeignData { kind, .. } => check(kind, errors),
-            cst::Decl::Data { constructors, kind_type, .. } => {
+            cst::Decl::Data {
+                constructors, kind_type, type_var_kind_anns, ..
+            } => {
                 for c in constructors {
                     for f in &c.fields {
                         check(f, errors);
@@ -1093,9 +1122,19 @@ fn detect_partially_applied_synonyms(
                 if let Some(k) = kind_type {
                     check(k, errors);
                 }
+                for ann in type_var_kind_anns.iter().flatten() {
+                    check(ann, errors);
+                }
             }
-            cst::Decl::Newtype { ty, .. } => check(ty, errors),
-            cst::Decl::Class { members, constraints, kind_type, .. } => {
+            cst::Decl::Newtype { ty, type_var_kind_anns, .. } => {
+                check(ty, errors);
+                for ann in type_var_kind_anns.iter().flatten() {
+                    check(ann, errors);
+                }
+            }
+            cst::Decl::Class {
+                members, constraints, kind_type, type_var_kind_anns, ..
+            } => {
                 for c in constraints {
                     for arg in &c.args {
                         check(arg, errors);
@@ -1106,6 +1145,9 @@ fn detect_partially_applied_synonyms(
                 }
                 if let Some(k) = kind_type {
                     check(k, errors);
+                }
+                for ann in type_var_kind_anns.iter().flatten() {
+                    check(ann, errors);
                 }
             }
             cst::Decl::Instance { constraints, types, .. }
@@ -1152,10 +1194,12 @@ fn walk_partial_apps(
         cst::TypeExpr::App { span, .. } => {
             // Peel the App chain to find head + arg count.
             let (head, args) = peel_app_chain(te);
+            let mut head_is_alias = false;
             if let cst::TypeExpr::Constructor { name, .. } = head {
                 if name.module.is_none() {
                     let sym = name.name.symbol();
                     if let Some(&n) = alias_arity.get(&sym) {
+                        head_is_alias = true;
                         if args.len() < n {
                             if reported.insert((sym, span.start)) {
                                 errors.push(ValidationError {
@@ -1169,10 +1213,17 @@ fn walk_partial_apps(
                     }
                 }
             }
-            // Recurse into args regardless — nested apps may have their
-            // own partial alias applications.
-            for a in &args {
-                walk_partial_apps(a, alias_arity, errors, reported);
+            // Skip recursing into args when the App is an alias call:
+            // we can't tell whether each arg is expected to be saturated
+            // (Type) or unsaturated (HKT) without kind information, so a
+            // bare alias-Constructor in arg position (e.g. `Template Identity`
+            // where `Template` expects an HKT) would otherwise be flagged
+            // as PAS. The kind checker catches genuine arity mismatches at
+            // the alias's own expansion site.
+            if !head_is_alias {
+                for a in &args {
+                    walk_partial_apps(a, alias_arity, errors, reported);
+                }
             }
         }
         cst::TypeExpr::Function { from, to, .. } => {

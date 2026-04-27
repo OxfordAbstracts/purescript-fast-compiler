@@ -183,10 +183,18 @@ fn check_one_module(
         build_env_from_imports(module, registry);
 
     // 1b) Structural validation (duplicates, orphans, fixity conflicts,
-    //     duplicate type arguments). Pure traversal over the CST — no
-    //     dependence on type/kind inference or the registry.
+    //     duplicate type arguments). Pure traversal over the CST plus
+    //     a small map of imported alias arities so the
+    //     PartiallyAppliedSynonym detector can recognise imported
+    //     synonyms used via type-operator syntax (e.g. `(~>)` from a
+    //     `infixr type NaturalTransformation as ~>` in Prelude).
+    let imported_alias_arity =
+        build_imported_alias_arity(module, registry);
     let validation_errors =
-        crate::typecheck_db::passes::validate_decls::validate_module(module);
+        crate::typecheck_db::passes::validate_decls::validate_module_with_imports(
+            module,
+            &imported_alias_arity,
+        );
 
     // 1c) Kind-arity check. Catches over-application of type
     //     constructors and arity mismatches in class constraints.
@@ -1129,6 +1137,45 @@ fn compute_sccs(
 /// For an unqualified name referenced from a module's body, find
 /// which imported module it was brought in from (if any) and look up
 /// that module's scheme output hash in the registry.
+/// Build a map of imported alias names → arity, used by
+/// `validate_module_with_imports` for the PartiallyAppliedSynonym
+/// detector. Includes both:
+/// - direct type-alias imports (alias name → arity), and
+/// - type-fixity-operator imports whose target is a type alias
+///   (operator name → target alias's arity).
+///
+/// Only unqualified imports contribute (qualified `import M as Q`
+/// keeps the alias under `Q.Foo`, which bare `Constructor("Foo")`
+/// references in the importer don't shadow). Module-aliased uses
+/// hit a different code path that the detector doesn't probe.
+fn build_imported_alias_arity(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> std::collections::HashMap<crate::interner::Symbol, usize> {
+    use crate::interner::intern;
+    let mut out: std::collections::HashMap<crate::interner::Symbol, usize> =
+        std::collections::HashMap::new();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports = match registry.get(&target) {
+            Some(e) => e,
+            None => continue,
+        };
+        for (alias_name, alias) in &exports.type_aliases {
+            out.insert(intern(alias_name), alias.type_vars.len());
+        }
+        for (op_name, fix) in &exports.type_fixities {
+            if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
+                out.insert(intern(op_name), alias.type_vars.len());
+            }
+        }
+    }
+    out
+}
+
 fn lookup_unqualified_import(
     module: &cst::Module,
     registry: &ModuleRegistry,
