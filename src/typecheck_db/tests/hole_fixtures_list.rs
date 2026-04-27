@@ -91,7 +91,7 @@ check_hole_variant_ignored!(hole_2972_1, "2972-1", "no HoleDiagnostic produced f
 check_hole_variant!(hole_2972_2, "2972-2");
 check_hole_variant!(hole_2972_3, "2972-3");
 check_hole_variant!(hole_3114_1, "3114-1");
-check_hole_variant_ignored!(hole_3114_2, "3114-2", "no HoleDiagnostic produced for Main");
+check_hole_variant!(hole_3114_2, "3114-2");
 check_hole_variant_ignored!(hole_3114_3, "3114-3", "no HoleDiagnostic produced for Main");
 check_hole_variant!(hole_3125_1, "3125-1");
 check_hole_variant_ignored!(hole_3125_2, "3125-2", "inferred type");
