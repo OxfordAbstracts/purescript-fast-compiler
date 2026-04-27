@@ -1704,6 +1704,8 @@ fn bind_pattern(
             Ok(v)
         }
         Binder::Typed { binder, ty, .. } => {
+            let mut hole_sites: Vec<(crate::span::Span, String)> = Vec::new();
+            crate::typecheck_db::types::collect_type_holes(ty, &mut hole_sites);
             let mut declared = crate::typecheck_db::types::expand_aliases(
                 convert_type_expr(ty, type_ops),
                 &env.aliases,
@@ -1719,6 +1721,9 @@ fn bind_pattern(
                     &declared,
                     &env.scoped_tys,
                 );
+            }
+            if !hole_sites.is_empty() {
+                declared = rewrite_type_holes(state, declared, &hole_sites, env);
             }
             let inferred = bind_pattern(state, env, type_ops, binder)?;
             state.unify(&inferred, &declared)?;
@@ -1996,6 +2001,9 @@ fn infer_let(
     for b in bindings {
         if let LetBinding::Signature { name, ty, .. } = b {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+            // Collect hole sites BEFORE conversion so spans survive.
+            let mut hole_sites: Vec<(crate::span::Span, String)> = Vec::new();
+            crate::typecheck_db::types::collect_type_holes(ty, &mut hole_sites);
             let mut converted = convert_type_expr(ty, type_ops);
             // Scoped type variables: replace any `Var("r")` here
             // that matches an outer-decl skolem (via check_equation
@@ -2011,7 +2019,16 @@ fn infer_let(
                     &env.scoped_tys,
                 );
             }
-            sigs.insert(n, crate::typecheck_db::types::expand_aliases(converted, &env.aliases));
+            let mut expanded =
+                crate::typecheck_db::types::expand_aliases(converted, &env.aliases);
+            // Type-level holes in let-binding sigs (`where` clauses,
+            // `let` expressions): replace each `Type::Hole(name)` with a
+            // fresh unif and emit a `HoleDiagnostic` per occurrence so
+            // the user gets the hole's inferred type back.
+            if !hole_sites.is_empty() {
+                expanded = rewrite_type_holes(state, expanded, &hole_sites, env);
+            }
+            sigs.insert(n, expanded);
         }
     }
 
@@ -2255,11 +2272,15 @@ fn process_do_let_bindings(
     for b in bindings {
         if let LetBinding::Signature { name, ty, .. } = b {
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+            let mut hole_sites: Vec<(crate::span::Span, String)> = Vec::new();
+            crate::typecheck_db::types::collect_type_holes(ty, &mut hole_sites);
             let converted = convert_type_expr(ty, type_ops);
-            sigs.insert(
-                n,
-                crate::typecheck_db::types::expand_aliases(converted, &env.aliases),
-            );
+            let mut expanded =
+                crate::typecheck_db::types::expand_aliases(converted, &env.aliases);
+            if !hole_sites.is_empty() {
+                expanded = rewrite_type_holes(state, expanded, &hole_sites, env);
+            }
+            sigs.insert(n, expanded);
         }
     }
     for b in bindings {
@@ -2546,12 +2567,27 @@ fn instantiate_scheme_no_constraints(
 }
 
 fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
-    use crate::typecheck_db::generalize::instantiate;
+    use crate::typecheck_db::generalize::apply_var_subst;
     use crate::typecheck_db::passes::constraints::{
         peel_constraints, ConstraintOrigin, PendingConstraint,
     };
     let scheme = sig_to_scheme(sig_ty);
-    let instantiated = instantiate(state, &scheme);
+    // Freshen scheme.vars with fresh unifs. Don't run stray-unif
+    // re-basing (the way `generalize::instantiate` does) — let-binding
+    // sigs carrying type-level holes embed fresh unifs whose identity
+    // is shared with the in-flight `HoleDiagnostic`'s `inferred_type`,
+    // and rebasing those would break the connection so post-zonking
+    // wouldn't surface what the body pinned the hole to.
+    let mut subst: std::collections::HashMap<String, Type> =
+        std::collections::HashMap::new();
+    for v in &scheme.vars {
+        subst.insert(v.clone(), state.fresh());
+    }
+    let instantiated = if subst.is_empty() {
+        scheme.ty.clone()
+    } else {
+        apply_var_subst(&scheme.ty, &subst)
+    };
     let (cs, body) = peel_constraints(instantiated);
     for c in cs {
         state.record_pending_constraint(PendingConstraint {
