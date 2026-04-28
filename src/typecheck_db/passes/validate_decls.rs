@@ -121,6 +121,16 @@ pub enum ValidationErrorKind {
     /// a' :: …`. The reference compiler reports as
     /// `DeprecatedFFIPrime`.
     DeprecatedFFIPrime(String),
+    /// Type-variable applied to itself — `data F a = F (a a)` has
+    /// `a` applied to `a`, requiring kind `k -> k -> ...`. Reference
+    /// compiler reports as `InfiniteKind`.
+    InfiniteKind(String),
+    /// Reference to a name that doesn't resolve — typically a
+    /// class name in an instance/superclass that isn't declared
+    /// anywhere, or a type constructor used in a signature when
+    /// it isn't imported. Reference compiler reports as
+    /// `UnknownName`.
+    UnknownName(String),
 }
 
 impl ValidationErrorKind {
@@ -169,6 +179,8 @@ impl ValidationErrorKind {
             Self::InvalidNewtypeInstance(_) => "InvalidNewtypeInstance",
             Self::OrphanTypeDeclaration(_) => "OrphanTypeDeclaration",
             Self::DeprecatedFFIPrime(_) => "DeprecatedFFIPrime",
+            Self::InfiniteKind(_) => "InfiniteKind",
+            Self::UnknownName(_) => "UnknownName",
         }
     }
 }
@@ -575,9 +587,26 @@ pub fn validate_module_with_class_fundeps(
     // names inside one decl or across data decls in the module.
     detect_decl_conflicts(&module.decls, &mut errors);
 
+    // Unknown class references: instance / derive / class
+    // superclass clauses that name a class neither declared locally
+    // nor brought in via an unqualified import.
+    detect_unknown_class_references(
+        &module.decls,
+        imported_class_arity,
+        &mut errors,
+    );
+
+
     // Orphan instances: declared where neither the class nor any type
-    // constructor in the instance head is defined locally.
-    detect_orphan_instances(&module.decls, imported_class_fundeps, &mut errors);
+    // constructor in the instance head is defined locally. Skips
+    // instances whose class is unknown — those already emitted
+    // UnknownName above.
+    detect_orphan_instances(
+        &module.decls,
+        imported_class_arity,
+        imported_class_fundeps,
+        &mut errors,
+    );
 
     detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
     detect_invalid_instance_heads(&module.decls, &mut errors);
@@ -622,6 +651,16 @@ pub fn validate_module_with_class_fundeps(
 
     // Direct self-referential let bindings (`let x = x in ...`).
     detect_let_self_cycle(&module.decls, &mut errors);
+
+    // Instance method CAF cycle: a 0-binder method body that
+    // references another method of the same class without a lambda
+    // barrier creates a dictionary-construction cycle.
+    detect_instance_method_caf_cycle(&module.decls, &mut errors);
+
+    // InfiniteKind: type-variable applied to itself
+    // (`data F a = F (a a)`). A self-application would require an
+    // infinite kind, so the kind unifier rejects it.
+    detect_infinite_kind(&module.decls, &mut errors);
 
     // Equation arity mismatch (same value name, different binder
     // counts).
@@ -707,14 +746,23 @@ fn detect_invalid_instance_heads(
                 }
                 if let Some(body) = alias_body.get(&sym) {
                     // Alias body that's a bare Record literal (closed
-                    // record) is record-headed. We can't reliably
-                    // distinguish open from closed records when the
-                    // alias body is a Row (open records can be made
-                    // closed by row composition with `()` —
-                    // `type Env = { | EnvRow () }`), so we skip Row
-                    // here.
-                    matches!(peel_parens(body), cst::TypeExpr::Record { .. })
-                        || walk_to_record_alias(body, alias_body, seen)
+                    // record) is record-headed. A Row with
+                    // `is_record = true` (the `{ … | tail }` form)
+                    // is record-headed only when its tail is a
+                    // *bare type variable* — that's the open-record
+                    // case the original compiler rejects. When the
+                    // tail is an APPLICATION (`EnvRow ()`) we can't
+                    // tell from the CST whether it's open or closed,
+                    // so we conservatively allow it.
+                    match peel_parens(body) {
+                        cst::TypeExpr::Record { .. } => true,
+                        cst::TypeExpr::Row {
+                            is_record: true,
+                            tail: Some(t),
+                            ..
+                        } if matches!(peel_parens(t), cst::TypeExpr::Var { .. }) => true,
+                        _ => walk_to_record_alias(body, alias_body, seen),
+                    }
                 } else {
                     false
                 }
@@ -735,10 +783,16 @@ fn detect_invalid_instance_heads(
         match peel_parens(te) {
             cst::TypeExpr::Wildcard { .. } => !allow_top_wildcard,
             // Bare record literal `{}` / `{ x :: Int }` — not a named
-            // type. Empty row `()` is fine (it's Row { fields: [] }
-            // under our parser, distinct from Record), so we don't
-            // flag rows here.
+            // type. `{ … | r }` (Row with `is_record: true`) is
+            // record-headed only when the tail is a bare type var
+            // (open record); applied tails are conservatively
+            // allowed since they may resolve to a closed row.
             cst::TypeExpr::Record { .. } => true,
+            cst::TypeExpr::Row {
+                is_record: true,
+                tail: Some(t),
+                ..
+            } if matches!(peel_parens(t), cst::TypeExpr::Var { .. }) => true,
             other => {
                 if has_wildcard(other) {
                     return true;
@@ -1691,6 +1745,7 @@ fn emit_conflict(
 /// is just an alias; PureScript's orphan check sees through it.
 fn detect_orphan_instances(
     decls: &[cst::Decl],
+    imported_class_arity: &HashMap<Symbol, usize>,
     imported_class_fundeps: &HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>>,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1786,6 +1841,18 @@ fn detect_orphan_instances(
             && local_classes.contains(&class_name.name.symbol());
         if class_local {
             continue;
+        }
+        // Skip orphan check entirely if the class isn't known
+        // (neither local nor imported). The unknown-class check
+        // already emitted `UnknownName` for these cases — we
+        // don't want to ALSO emit OrphanInstance.
+        if class_name.module.is_none() {
+            let csym = class_name.name.symbol();
+            let class_known = local_classes.contains(&csym)
+                || imported_class_arity.contains_key(&csym);
+            if !class_known {
+                continue;
+            }
         }
 
         // Per-position locality: positions[i] = true when types[i]'s
@@ -3990,7 +4057,7 @@ fn detect_undefined_type_variables(
                     type_vars.iter().map(|v| v.value.symbol()).collect();
                 check_free_type_vars(ty, &mut bound, errors);
             }
-            cst::Decl::Class { type_vars, constraints, is_kind_sig, .. }
+            cst::Decl::Class { type_vars, constraints, members, is_kind_sig, .. }
                 if !*is_kind_sig =>
             {
                 let mut bound: HashSet<Symbol> =
@@ -4002,10 +4069,132 @@ fn detect_undefined_type_variables(
                     }
                     let _ = &mut bound;
                 }
+                // Class members: each member sig sees the class's
+                // type-vars as bound (plus implicit quantification
+                // for any other free vars in the member sig).
+                for m in members {
+                    check_signature_type(&m.ty, Some(&bound), errors);
+                }
+            }
+            cst::Decl::TypeSignature { ty, .. } => {
+                // Top-level signatures: implicit forall quantifies
+                // every free type var. Inner explicit foralls still
+                // need to declare vars before referencing them.
+                check_signature_type(ty, None, errors);
+            }
+            cst::Decl::Foreign { ty, .. } => {
+                check_signature_type(ty, None, errors);
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_undefined_type_variables(members, errors);
             }
             _ => {}
         }
     }
+}
+
+/// Check a top-level / class-member / instance-member type
+/// signature, treating all "outer-free" type vars as implicitly
+/// quantified. `extra_bound` lets the caller pre-bind class
+/// type-vars (so a class member sig sees them as in-scope).
+fn check_signature_type(
+    ty: &cst::TypeExpr,
+    extra_bound: Option<&HashSet<Symbol>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut all_free: HashSet<Symbol> = HashSet::new();
+    collect_free_outer_type_vars(ty, &mut all_free);
+    let mut bound = all_free;
+    if let Some(extra) = extra_bound {
+        for s in extra {
+            bound.insert(*s);
+        }
+    }
+    check_free_type_vars(ty, &mut bound, errors);
+}
+
+/// Collect type-vars that appear free at the OUTERMOST level —
+/// i.e. NOT bound by any explicit `forall`. These are implicitly
+/// quantified at the top of the signature, so they don't trigger
+/// `UndefinedTypeVariable` when the outer scope walks them.
+fn collect_free_outer_type_vars(
+    te: &cst::TypeExpr,
+    out: &mut HashSet<Symbol>,
+) {
+    fn go(te: &cst::TypeExpr, bound: &mut HashSet<Symbol>, out: &mut HashSet<Symbol>) {
+        match te {
+            cst::TypeExpr::Var { name, .. } => {
+                let sym = name.value.symbol();
+                if !bound.contains(&sym) {
+                    out.insert(sym);
+                }
+            }
+            cst::TypeExpr::Constructor { .. }
+            | cst::TypeExpr::Hole { .. }
+            | cst::TypeExpr::Wildcard { .. }
+            | cst::TypeExpr::StringLiteral { .. }
+            | cst::TypeExpr::IntLiteral { .. } => {}
+            cst::TypeExpr::App { constructor, arg, .. } => {
+                go(constructor, bound, out);
+                go(arg, bound, out);
+            }
+            cst::TypeExpr::Function { from, to, .. } => {
+                go(from, bound, out);
+                go(to, bound, out);
+            }
+            cst::TypeExpr::Forall { vars, ty, .. } => {
+                // Pre-bind all forall vars BEFORE walking kind
+                // annotations: a forall's vars are scoped over the
+                // whole forall, not left-to-right. Order issues
+                // (referencing a sibling not yet declared) are
+                // caught by `check_free_type_vars` later, not by
+                // this "free outer var" pass.
+                let mut new_bound = bound.clone();
+                for (v, _, _) in vars {
+                    new_bound.insert(v.value.symbol());
+                }
+                for (_, _, kind) in vars {
+                    if let Some(k) = kind {
+                        go(k, &mut new_bound, out);
+                    }
+                }
+                go(ty, &mut new_bound, out);
+            }
+            cst::TypeExpr::Constrained { constraints, ty, .. } => {
+                for c in constraints {
+                    for arg in &c.args {
+                        go(arg, bound, out);
+                    }
+                }
+                go(ty, bound, out);
+            }
+            cst::TypeExpr::Record { fields, .. } => {
+                for f in fields {
+                    go(&f.ty, bound, out);
+                }
+            }
+            cst::TypeExpr::Row { fields, tail, .. } => {
+                for f in fields {
+                    go(&f.ty, bound, out);
+                }
+                if let Some(t) = tail {
+                    go(t, bound, out);
+                }
+            }
+            cst::TypeExpr::Parens { ty, .. } => go(ty, bound, out),
+            cst::TypeExpr::TypeOp { left, right, .. } => {
+                go(left, bound, out);
+                go(right, bound, out);
+            }
+            cst::TypeExpr::Kinded { ty, kind, .. } => {
+                go(ty, bound, out);
+                go(kind, bound, out);
+            }
+            _ => {}
+        }
+    }
+    let mut bound = HashSet::new();
+    go(te, &mut bound, out);
 }
 
 fn check_free_type_vars(
@@ -4705,6 +4894,459 @@ fn detect_deprecated_ffi_prime(
                 });
             }
         }
+    }
+}
+
+/// Instance method CAF cycle. `instance C T where g = f` — when
+/// `g` is a 0-binder method body that references another method
+/// of the same class WITHOUT a lambda barrier, the dictionary
+/// record can't be constructed (each field would need to be ready
+/// for the other). Reference compiler reports as
+/// `CycleInDeclaration`.
+fn detect_instance_method_caf_cycle(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Map class name → its method set. Only local classes are
+    // tracked here; imported classes' member sigs aren't reachable
+    // without registry access.
+    let mut class_methods: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Class { name, members, is_kind_sig: false, .. } = d {
+            let ms: HashSet<Symbol> =
+                members.iter().map(|m| m.name.value.symbol()).collect();
+            class_methods.insert(name.value.symbol(), ms);
+        }
+    }
+    for d in decls {
+        let cst::Decl::Instance { class_name, members, .. } = d else {
+            continue;
+        };
+        let cqi = class_name.to_qi();
+        // Local classes only — imported instance methods would need
+        // registry-aware analysis.
+        if cqi.module.is_some() {
+            continue;
+        }
+        let Some(methods) = class_methods.get(&cqi.name) else {
+            continue;
+        };
+        for m in members {
+            if let cst::Decl::Value { name, binders, guarded, span, .. } = m {
+                if !binders.is_empty() {
+                    continue;
+                }
+                // Only flag DIRECT renames: `g = f` where `f` is
+                // a sibling method of the same class, with NO
+                // application around it. Partially-applied forms
+                // (`size = fold (const _) 0.0`,
+                // `sequence = traverse identity`) are valid
+                // eta-reductions and not cyclic at the value level.
+                let body = match guarded {
+                    cst::GuardedExpr::Unconditional(e) => e.as_ref(),
+                    _ => continue,
+                };
+                if let Some(sym) = direct_var_ref(body) {
+                    if methods.contains(&sym) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::CycleInDeclaration(vec![
+                                resolve(name.value.symbol()),
+                            ]),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True if the expression is a direct unqualified `Var` reference
+/// (through Parens / TypeAnnotation only — NO App / Lambda / Case
+/// / etc.). Used to detect `g = f` direct renames.
+fn direct_var_ref(expr: &cst::Expr) -> Option<crate::interner::Symbol> {
+    let mut cur = expr;
+    loop {
+        match cur {
+            cst::Expr::Parens { expr, .. } => cur = expr,
+            cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+            cst::Expr::Var { name, .. } if name.module.is_none() => {
+                return Some(name.name.symbol());
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn walk_guarded_for_caf_method_ref(
+    g: &cst::GuardedExpr,
+    methods: &HashSet<Symbol>,
+    found: &mut Option<Symbol>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_caf_method_ref(e, methods, found);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_caf_method_ref(e, methods, found);
+                        }
+                    }
+                }
+                walk_expr_for_caf_method_ref(&gd.expr, methods, found);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn walk_expr_for_caf_method_ref(
+    expr: &cst::Expr,
+    methods: &HashSet<Symbol>,
+    found: &mut Option<Symbol>,
+) {
+    if found.is_some() {
+        return;
+    }
+    match expr {
+        cst::Expr::Var { name, .. } => {
+            if name.module.is_none() {
+                let sym = name.name.symbol();
+                if methods.contains(&sym) {
+                    *found = Some(sym);
+                }
+            }
+        }
+        cst::Expr::Constructor { .. }
+        | cst::Expr::Literal { .. }
+        | cst::Expr::OpParens { .. }
+        | cst::Expr::Wildcard { .. }
+        | cst::Expr::Hole { .. } => {}
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_caf_method_ref(func, methods, found);
+            walk_expr_for_caf_method_ref(arg, methods, found);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_caf_method_ref(func, methods, found);
+        }
+        cst::Expr::Lambda { .. } => {
+            // Lambda is a barrier — its body doesn't trigger.
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_caf_method_ref(left, methods, found);
+            walk_expr_for_caf_method_ref(right, methods, found);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_caf_method_ref(cond, methods, found);
+            walk_expr_for_caf_method_ref(then_expr, methods, found);
+            walk_expr_for_caf_method_ref(else_expr, methods, found);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_caf_method_ref(e, methods, found);
+            }
+            for alt in alts {
+                walk_guarded_for_caf_method_ref(&alt.result, methods, found);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_caf_method_ref(expr, methods, found);
+                }
+            }
+            walk_expr_for_caf_method_ref(body, methods, found);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_caf_method_ref(expr, methods, found);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_caf_method_ref(expr, methods, found);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_caf_method_ref(result, methods, found);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_caf_method_ref(v, methods, found);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_caf_method_ref(expr, methods, found);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_caf_method_ref(expr, methods, found);
+            for u in updates {
+                walk_expr_for_caf_method_ref(&u.value, methods, found);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => {
+            walk_expr_for_caf_method_ref(expr, methods, found);
+        }
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_caf_method_ref(expr, methods, found);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_caf_method_ref(e, methods, found);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_caf_method_ref(expr, methods, found);
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_caf_method_ref(name, methods, found);
+            walk_expr_for_caf_method_ref(pattern, methods, found);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_caf_method_ref(func, methods, found);
+            walk_expr_for_caf_method_ref(left, methods, found);
+            walk_expr_for_caf_method_ref(right, methods, found);
+        }
+    }
+}
+
+/// Walks every place a class name can appear (instance class_name,
+/// instance constraints, derive class_name, derive constraints,
+/// class superclass constraints) and emits `UnknownName` for any
+/// unqualified class name that isn't declared locally and isn't
+/// imported via an unqualified import. Skips qualified references
+/// (`Foo.Bar.Baz a`) — those resolve through the registry by
+/// module qualifier.
+fn detect_unknown_class_references(
+    decls: &[cst::Decl],
+    imported_class_arity: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_classes: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::Class { name, is_kind_sig: false, .. } = d {
+            local_classes.insert(name.value.symbol());
+        }
+    }
+    let mut seen: HashSet<Symbol> = HashSet::new();
+    let class_known = |sym: Symbol| -> bool {
+        local_classes.contains(&sym) || imported_class_arity.contains_key(&sym)
+    };
+    for d in decls {
+        match d {
+            cst::Decl::Instance { class_name, constraints, span, .. }
+            | cst::Decl::Derive { class_name, constraints, span, .. } => {
+                if class_name.module.is_none() {
+                    let n = class_name.name.symbol();
+                    if !class_known(n) && seen.insert(n) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::UnknownName(resolve(n)),
+                        });
+                    }
+                }
+                for c in constraints {
+                    let cqi = c.class.to_qi();
+                    if cqi.module.is_none() {
+                        let n = cqi.name;
+                        if !class_known(n) && seen.insert(n) {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::UnknownName(resolve(n)),
+                            });
+                        }
+                    }
+                }
+            }
+            cst::Decl::Class { constraints, span, is_kind_sig: false, members, .. } => {
+                for c in constraints {
+                    let cqi = c.class.to_qi();
+                    if cqi.module.is_none() {
+                        let n = cqi.name;
+                        if !class_known(n) && seen.insert(n) {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::UnknownName(resolve(n)),
+                            });
+                        }
+                    }
+                }
+                for m in members {
+                    let mut classes_used: HashSet<Symbol> = HashSet::new();
+                    collect_unqualified_constraint_classes(&m.ty, &mut classes_used);
+                    for sym in classes_used {
+                        if !class_known(sym) && seen.insert(sym) {
+                            errors.push(ValidationError {
+                                span: m.span,
+                                kind: ValidationErrorKind::UnknownName(resolve(sym)),
+                            });
+                        }
+                    }
+                }
+            }
+            cst::Decl::TypeSignature { ty, span, .. }
+            | cst::Decl::Foreign { ty, span, .. } => {
+                let mut classes_used: HashSet<Symbol> = HashSet::new();
+                collect_unqualified_constraint_classes(ty, &mut classes_used);
+                for sym in classes_used {
+                    if !class_known(sym) && seen.insert(sym) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::UnknownName(resolve(sym)),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect every unqualified class name referenced as a constraint
+/// inside `te` (transitively walking Forall / Constrained / etc.).
+fn collect_unqualified_constraint_classes(
+    te: &cst::TypeExpr,
+    out: &mut HashSet<Symbol>,
+) {
+    match te {
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                let cqi = c.class.to_qi();
+                if cqi.module.is_none() {
+                    out.insert(cqi.name);
+                }
+            }
+            collect_unqualified_constraint_classes(ty, out);
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            collect_unqualified_constraint_classes(ty, out);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            collect_unqualified_constraint_classes(from, out);
+            collect_unqualified_constraint_classes(to, out);
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            collect_unqualified_constraint_classes(ty, out);
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            collect_unqualified_constraint_classes(constructor, out);
+            collect_unqualified_constraint_classes(arg, out);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                collect_unqualified_constraint_classes(&f.ty, out);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                collect_unqualified_constraint_classes(&f.ty, out);
+            }
+            if let Some(t) = tail {
+                collect_unqualified_constraint_classes(t, out);
+            }
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            collect_unqualified_constraint_classes(ty, out);
+            collect_unqualified_constraint_classes(kind, out);
+        }
+        _ => {}
+    }
+}
+
+/// Detect type-variables applied to themselves
+/// (`data F a = F (a a)`). The kind unifier would need
+/// `kind(a) = kind(a) -> _` — an occurs failure (`InfiniteKind`).
+fn detect_infinite_kind(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        scan_for_self_app(f, errors);
+                    }
+                }
+            }
+            cst::Decl::Newtype { ty, .. } => {
+                scan_for_self_app(ty, errors);
+            }
+            cst::Decl::TypeAlias { ty, .. } => {
+                scan_for_self_app(ty, errors);
+            }
+            cst::Decl::TypeSignature { ty, .. } => {
+                scan_for_self_app(ty, errors);
+            }
+            cst::Decl::Foreign { ty, .. } => {
+                scan_for_self_app(ty, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_for_self_app(te: &cst::TypeExpr, errors: &mut Vec<ValidationError>) {
+    match te {
+        cst::TypeExpr::App { constructor, arg, span } => {
+            if let (cst::TypeExpr::Var { name: ln, .. }, cst::TypeExpr::Var { name: rn, .. }) =
+                (peel_parens(constructor), peel_parens(arg))
+            {
+                if ln.value.symbol() == rn.value.symbol() {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::InfiniteKind(resolve(
+                            ln.value.symbol(),
+                        )),
+                    });
+                }
+            }
+            scan_for_self_app(constructor, errors);
+            scan_for_self_app(arg, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            scan_for_self_app(from, errors);
+            scan_for_self_app(to, errors);
+        }
+        cst::TypeExpr::Forall { ty, .. } => scan_for_self_app(ty, errors),
+        cst::TypeExpr::Constrained { ty, .. } => scan_for_self_app(ty, errors),
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                scan_for_self_app(&f.ty, errors);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                scan_for_self_app(&f.ty, errors);
+            }
+            if let Some(t) = tail {
+                scan_for_self_app(t, errors);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => scan_for_self_app(ty, errors),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            scan_for_self_app(left, errors);
+            scan_for_self_app(right, errors);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            scan_for_self_app(ty, errors);
+            scan_for_self_app(kind, errors);
+        }
+        _ => {}
     }
 }
 

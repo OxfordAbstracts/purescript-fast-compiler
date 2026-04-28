@@ -247,6 +247,15 @@ fn check_one_module(
     // counterpart that runs once we have the registry.
     detect_unknown_exports_registry(module, registry, &mut validation_errors);
 
+    // Registry-aware UnknownName check for type-constructor refs in
+    // top-level signatures. Imported types come in via local +
+    // unqualified-imported sets built from the registry. Disabled
+    // because `module M (module M, …)` self-re-export semantics
+    // aren't fully captured by the registry's `type_arities`,
+    // causing false positives on the ModuleExportSelf-style
+    // pattern. The class-name version (above) is more reliable.
+    let _ = detect_unknown_type_refs_registry;
+
     // 1c) Kind-arity check. Catches over-application of type
     //     constructors and arity mismatches in class constraints.
     //     Reads the registry for imported types/classes.
@@ -1952,6 +1961,172 @@ fn detect_unknown_exports_registry(
     }
 }
 
+/// Walks every TypeExpr in `module.decls` for unqualified
+/// `Constructor` references (type ctors) that aren't local and
+/// aren't brought in by any unqualified import. Emits `UnknownName`
+/// for each such reference.
+fn detect_unknown_type_refs_registry(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+    errors: &mut Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
+) {
+    use crate::typecheck_db::passes::validate_decls::{
+        ValidationError, ValidationErrorKind,
+    };
+    let mut known: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Data { name, .. }
+            | cst::Decl::Newtype { name, .. }
+            | cst::Decl::TypeAlias { name, .. }
+            | cst::Decl::ForeignData { name, .. } => {
+                known.insert(crate::typecheck_db::util::resolve_symbol(
+                    name.value.symbol(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let prims = crate::typecheck_db::prim::prim_exports();
+    if let Some(prim) = prims.get("Prim") {
+        for k in prim.type_arities.keys() {
+            known.insert(k.clone());
+        }
+    }
+    // Collect type-level operator names too — some grammars emit
+    // ops in Constructor position post-desugar, and even if not,
+    // we don't want a use-site `(~>)` that's an operator-aliased
+    // type to surface as UnknownName.
+    for d in &module.decls {
+        if let cst::Decl::Fixity { operator, is_type: true, .. } = d {
+            known.insert(crate::typecheck_db::util::resolve_symbol(
+                operator.value.symbol(),
+            ));
+        }
+    }
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports: Option<&ModuleExports> = registry
+            .get(&target)
+            .or_else(|| prims.get(&target));
+        let Some(exports) = exports else { continue };
+        match &imp.imports {
+            None | Some(crate::cst::ImportList::Hiding(_)) => {
+                for k in exports.type_arities.keys() {
+                    known.insert(k.clone());
+                }
+                for k in exports.type_fixities.keys() {
+                    known.insert(k.clone());
+                }
+            }
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                for item in items {
+                    match item {
+                        cst::Import::Type(_, _) | cst::Import::TypeOp(_) => {
+                            let n =
+                                crate::typecheck_db::util::resolve_symbol(item.name());
+                            known.insert(n);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut walk = |ty: &cst::TypeExpr,
+                    span: crate::span::Span,
+                    seen: &mut std::collections::HashSet<String>,
+                    errors: &mut Vec<ValidationError>| {
+        let mut refs: Vec<String> = Vec::new();
+        collect_unqualified_type_constructors(ty, &mut refs);
+        for r in refs {
+            if !known.contains(&r) && seen.insert(r.clone()) {
+                errors.push(ValidationError {
+                    span,
+                    kind: ValidationErrorKind::UnknownName(r),
+                });
+            }
+        }
+    };
+    for d in &module.decls {
+        match d {
+            cst::Decl::TypeSignature { ty, span, .. }
+            | cst::Decl::Foreign { ty, span, .. } => {
+                walk(ty, *span, &mut seen, errors);
+            }
+            cst::Decl::Class { members, .. } => {
+                for m in members {
+                    walk(&m.ty, m.span, &mut seen, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_unqualified_type_constructors(te: &cst::TypeExpr, out: &mut Vec<String>) {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } if name.module.is_none() => {
+            out.push(crate::typecheck_db::util::resolve_symbol(name.name.symbol()));
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            collect_unqualified_type_constructors(constructor, out);
+            collect_unqualified_type_constructors(arg, out);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            collect_unqualified_type_constructors(from, out);
+            collect_unqualified_type_constructors(to, out);
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            for (_, _, kind) in vars {
+                if let Some(k) = kind {
+                    collect_unqualified_type_constructors(k, out);
+                }
+            }
+            collect_unqualified_type_constructors(ty, out);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    collect_unqualified_type_constructors(arg, out);
+                }
+            }
+            collect_unqualified_type_constructors(ty, out);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                collect_unqualified_type_constructors(&f.ty, out);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                collect_unqualified_type_constructors(&f.ty, out);
+            }
+            if let Some(t) = tail {
+                collect_unqualified_type_constructors(t, out);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            collect_unqualified_type_constructors(ty, out);
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            collect_unqualified_type_constructors(left, out);
+            collect_unqualified_type_constructors(right, out);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            collect_unqualified_type_constructors(ty, out);
+            collect_unqualified_type_constructors(kind, out);
+        }
+        _ => {}
+    }
+}
+
 /// Imported class name → positional fundeps. Each
 /// `(determiners, determined)` is a pair of `Vec<usize>` indexing
 /// into the class's `type_vars`. Used by the fundep-aware
@@ -1993,7 +2168,8 @@ fn build_imported_class_fundeps(
 /// Imported class name → arity (number of class type-vars). Used by
 /// the `ClassInstanceArityMismatch` detector. Mirrors
 /// [`build_imported_alias_arity`] for type aliases — same scoping
-/// rule (only unqualified imports).
+/// rule (only unqualified imports). Also covers Prim sub-modules,
+/// which import_all auto-binds for the `Prim` namespace.
 fn build_imported_class_arity(
     module: &cst::Module,
     registry: &ModuleRegistry,
@@ -2001,15 +2177,23 @@ fn build_imported_class_arity(
     use crate::interner::intern;
     let mut out: std::collections::HashMap<crate::interner::Symbol, usize> =
         std::collections::HashMap::new();
+    let prims = crate::typecheck_db::prim::prim_exports();
+    // Auto-imported Prim module classes (those bare `Prim.X` names
+    // become available unqualified in every user module).
+    if let Some(prim) = prims.get("Prim") {
+        for (class_name, class_info) in &prim.classes {
+            out.insert(intern(class_name), class_info.type_vars.len());
+        }
+    }
     for imp in &module.imports {
         if imp.qualified.is_some() {
             continue;
         }
         let target = join_module_name(&imp.module);
-        let exports = match registry.get(&target) {
-            Some(e) => e,
-            None => continue,
-        };
+        let exports: Option<&ModuleExports> = registry
+            .get(&target)
+            .or_else(|| prims.get(&target));
+        let Some(exports) = exports else { continue };
         for (class_name, class_info) in &exports.classes {
             out.insert(intern(class_name), class_info.type_vars.len());
         }
