@@ -381,6 +381,16 @@ impl UnifyState {
         Type::Unif(id)
     }
 
+    /// Number of unification variables currently allocated. Used by
+    /// `generalize::instantiate` to detect "foreign" unif ids carried
+    /// in a cached scheme — ids `>= bindings_len()` were allocated
+    /// against a different state and need rebasing; ids strictly less
+    /// are current-state unifs that must be preserved verbatim (e.g.
+    /// the unif a `HoleDiagnostic` is tracking).
+    pub fn bindings_len(&self) -> u32 {
+        self.bindings.len() as u32
+    }
+
     /// Return the currently-bound type for `id`, if any.
     pub fn probe(&self, id: u32) -> Option<&Type> {
         self.bindings.get(id as usize).and_then(|o| o.as_ref())

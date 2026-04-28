@@ -101,12 +101,13 @@ pub fn generalize_with_constraints(
 }
 
 /// Instantiate a scheme: replace each quantified variable with a fresh
-/// unification variable. Also rewrites any stray `Type::Unif(id)` in
-/// the scheme body — those can appear when a cached scheme carries
-/// unif vars from the state that produced it, and blindly reusing
-/// those ids would panic later when we try to `assign` against a
-/// different state's shorter bindings vec. We give every such stray
-/// id a fresh local unif var in the new state.
+/// unification variable. Cached schemes can carry `Type::Unif(id)`
+/// leaves whose ids reference a foreign `UnifyState`'s bindings vec
+/// — those ids need rebasing to fresh current-state unifs (otherwise
+/// `assign` panics on out-of-range slot access). Current-state unifs
+/// are preserved verbatim: a let-binding sig that recorded a
+/// `HoleDiagnostic` against a particular unif id needs that id to
+/// survive instantiation so post-zonking surfaces the inferred type.
 pub fn instantiate(state: &mut UnifyState, scheme: &Scheme) -> Type {
     let mut var_subst: HashMap<String, Type> = HashMap::new();
     for v in &scheme.vars {
@@ -118,16 +119,20 @@ pub fn instantiate(state: &mut UnifyState, scheme: &Scheme) -> Type {
         apply_var_subst(&scheme.ty, &var_subst)
     };
 
-    // Collect stray `Unif` ids in the body (ids the body carries
-    // that weren't introduced by the quantifier substitution above).
-    let mut stray_ids: std::collections::HashSet<u32> =
+    // Rebase ONLY foreign unif ids — those at or beyond the current
+    // state's `bindings_len`. In-range ids are real current-state
+    // unifs (e.g. a hole's unif from `rewrite_type_holes`); rebasing
+    // them would sever the diagnostic from the body's unification.
+    let cutoff = state.bindings_len();
+    let mut foreign_ids: std::collections::HashSet<u32> =
         std::collections::HashSet::new();
-    collect_stray_unif(&body, &mut stray_ids);
-    if stray_ids.is_empty() {
+    collect_stray_unif(&body, &mut foreign_ids);
+    foreign_ids.retain(|id| *id >= cutoff);
+    if foreign_ids.is_empty() {
         return body;
     }
     let mut unif_subst: HashMap<u32, Type> = HashMap::new();
-    for id in stray_ids {
+    for id in foreign_ids {
         unif_subst.insert(id, state.fresh());
     }
     apply_unif_subst(&body, &unif_subst)
