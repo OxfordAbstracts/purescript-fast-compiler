@@ -216,7 +216,7 @@ fn check_one_module(
     let module = &input.module;
 
     // 1) Pull imports into an Env + InstanceIndex.
-    let (mut env, mut instance_index, import_errors) =
+    let (mut env, mut instance_index, mut import_errors) =
         build_env_from_imports(module, registry);
 
     // 1b) Structural validation (duplicates, orphans, fixity conflicts,
@@ -256,6 +256,13 @@ fn check_one_module(
     // safer.
     detect_unknown_kind_refs_registry(module, registry, &mut validation_errors);
     let _ = detect_unknown_type_refs_registry;
+
+    // Use-site ScopeConflict (open + open) — disabled, too eager.
+    // Origin tracking is imperfect across long re-export chains
+    // (e.g. Prelude's `on` appears with multiple origins through
+    // different sub-modules), causing false positives on modules
+    // that import many Data.* siblings.
+    let _ = detect_use_site_scope_conflict;
 
     // 1c) Kind-arity check. Catches over-application of type
     //     constructors and arity mismatches in class constraints.
@@ -1960,6 +1967,288 @@ fn detect_unknown_exports_registry(
             crate::cst::Export::Module(_) => {}
         }
     }
+}
+
+/// Use-site ScopeConflict. Build a set of names that are
+/// unqualified-open-imported from MULTIPLE distinct origin modules
+/// without any explicit-list pin; then walk the module body for
+/// `Var` references to those names. Emit ScopeConflict at the
+/// use site.
+fn detect_use_site_scope_conflict(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+    errors: &mut Vec<crate::typecheck_db::passes::imports::ImportError>,
+) {
+    use crate::typecheck_db::passes::imports::{ImportError, ImportErrorKind};
+    // Collect per-name: origins from open imports + whether any
+    // explicit-list import pins it (to a single origin).
+    let mut open_origins: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    let mut explicit_pinned: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let prims = crate::typecheck_db::prim::prim_exports();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target_name = join_module_name(&imp.module);
+        let exports: Option<&ModuleExports> = registry
+            .get(&target_name)
+            .or_else(|| prims.get(&target_name));
+        let Some(exports) = exports else { continue };
+        match &imp.imports {
+            None => {
+                for (n, _) in &exports.values {
+                    let origin = exports
+                        .value_origins
+                        .get(n)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.clone());
+                    open_origins
+                        .entry(n.clone())
+                        .or_default()
+                        .insert(origin);
+                }
+            }
+            Some(crate::cst::ImportList::Hiding(items)) => {
+                let mut hide_v: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for item in items {
+                    if let cst::Import::Value(_) = item {
+                        hide_v.insert(crate::typecheck_db::util::resolve_symbol(
+                            item.name(),
+                        ));
+                    }
+                }
+                for (n, _) in &exports.values {
+                    if hide_v.contains(n) {
+                        continue;
+                    }
+                    let origin = exports
+                        .value_origins
+                        .get(n)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.clone());
+                    open_origins
+                        .entry(n.clone())
+                        .or_default()
+                        .insert(origin);
+                }
+            }
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                for item in items {
+                    if let cst::Import::Value(_) = item {
+                        let n =
+                            crate::typecheck_db::util::resolve_symbol(item.name());
+                        explicit_pinned.insert(n);
+                    }
+                }
+            }
+        }
+    }
+    // Names that remain ambiguous: 2+ origins from open imports,
+    // not pinned by any explicit list.
+    let ambiguous: std::collections::HashSet<String> = open_origins
+        .into_iter()
+        .filter_map(|(n, origins)| {
+            if origins.len() >= 2 && !explicit_pinned.contains(&n) {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if ambiguous.is_empty() {
+        return;
+    }
+    // Walk module body for Var refs to ambiguous names.
+    let mut emitted: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        if let cst::Decl::Value { guarded, where_clause, span, .. } = d {
+            walk_guarded_for_ambig(
+                guarded,
+                &ambiguous,
+                *span,
+                &mut emitted,
+                errors,
+            );
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_ambig(
+                        expr,
+                        &ambiguous,
+                        *span,
+                        &mut emitted,
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+    let _ = ImportError {
+        span: crate::span::Span::new(0, 0),
+        kind: ImportErrorKind::ScopeConflict {
+            name: String::new(),
+            first_module: String::new(),
+            second_module: String::new(),
+        },
+    };
+}
+
+fn walk_guarded_for_ambig(
+    g: &crate::cst::GuardedExpr,
+    ambiguous: &std::collections::HashSet<String>,
+    span: crate::span::Span,
+    emitted: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<crate::typecheck_db::passes::imports::ImportError>,
+) {
+    match g {
+        crate::cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_ambig(e, ambiguous, span, emitted, errors);
+        }
+        crate::cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        crate::cst::GuardPattern::Pattern(_, e)
+                        | crate::cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_ambig(e, ambiguous, span, emitted, errors);
+                        }
+                    }
+                }
+                walk_expr_for_ambig(&gd.expr, ambiguous, span, emitted, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_ambig(
+    expr: &crate::cst::Expr,
+    ambiguous: &std::collections::HashSet<String>,
+    span: crate::span::Span,
+    emitted: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<crate::typecheck_db::passes::imports::ImportError>,
+) {
+    use crate::typecheck_db::passes::imports::{ImportError, ImportErrorKind};
+    match expr {
+        cst::Expr::Var { name, .. } if name.module.is_none() => {
+            let n = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+            if ambiguous.contains(&n) && emitted.insert(n.clone()) {
+                errors.push(ImportError {
+                    span,
+                    kind: ImportErrorKind::ScopeConflict {
+                        name: n,
+                        first_module: String::new(),
+                        second_module: String::new(),
+                    },
+                });
+            }
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_ambig(func, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(arg, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_ambig(func, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_for_ambig(body, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_ambig(left, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(right, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_ambig(cond, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(then_expr, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(else_expr, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_ambig(e, ambiguous, span, emitted, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_ambig(&alt.result, ambiguous, span, emitted, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_ambig(expr, ambiguous, span, emitted, errors);
+                }
+            }
+            walk_expr_for_ambig(body, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_ambig(expr, ambiguous, span, emitted, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_ambig(
+                                    expr, ambiguous, span, emitted, errors,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_ambig(result, ambiguous, span, emitted, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_ambig(v, ambiguous, span, emitted, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_ambig(expr, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_ambig(expr, ambiguous, span, emitted, errors);
+            for u in updates {
+                walk_expr_for_ambig(&u.value, ambiguous, span, emitted, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_ambig(expr, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_ambig(e, ambiguous, span, emitted, errors);
+            }
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_ambig(name, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(pattern, ambiguous, span, emitted, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_ambig(func, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(left, ambiguous, span, emitted, errors);
+            walk_expr_for_ambig(right, ambiguous, span, emitted, errors);
+        }
+        _ => {}
+    }
+    let _ = ImportError {
+        span: crate::span::Span::new(0, 0),
+        kind: ImportErrorKind::ScopeConflict {
+            name: String::new(),
+            first_module: String::new(),
+            second_module: String::new(),
+        },
+    };
 }
 
 /// Walks every kind-annotation position in `module.decls` (the
