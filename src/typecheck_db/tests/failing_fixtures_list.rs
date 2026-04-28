@@ -1,5 +1,5 @@
 check_failing_build_unit!(f_1071, "1071");
-check_failing_build_unit_ignored!(f_1169, "1169", "expected: IncorrectConstructorArity");
+check_failing_build_unit!(f_1169, "1169");
 check_failing_build_unit_ignored!(f_1175, "1175", "expected: TypesDoNotUnify");
 check_failing_build_unit!(f_1310, "1310");
 check_failing_build_unit_ignored!(f_1570, "1570", "expected: ExpectedType");
@@ -141,7 +141,7 @@ check_failing_build_unit!(f_ConstraintFailure, "ConstraintFailure");
 check_failing_build_unit!(f_ConstraintInForeignImport, "ConstraintInForeignImport");
 check_failing_build_unit_ignored!(f_ConstraintInference, "ConstraintInference", "expected: AmbiguousTypeVariables");
 check_failing_build_unit_ignored!(f_ContravariantInstance1, "ContravariantInstance1", "expected: CannotDeriveInvalidConstructorArg");
-check_failing_build_unit_ignored!(f_CtorArityTooFew, "CtorArityTooFew", "expected: IncorrectConstructorArity");
+check_failing_build_unit!(f_CtorArityTooFew, "CtorArityTooFew");
 check_failing_build_unit!(f_CycleInForeignDataKinds, "CycleInForeignDataKinds");
 check_failing_build_unit!(f_CycleInKindDeclaration, "CycleInKindDeclaration");
 check_failing_build_unit!(f_DctorOperatorAliasExport, "DctorOperatorAliasExport");
@@ -353,7 +353,7 @@ check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined1, "RowInInstanceN
 check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined2, "RowInInstanceNotDetermined2", "expected: InvalidInstanceHead");
 check_failing_build_unit!(f_RowLacks, "RowLacks");
 check_failing_build_unit_ignored!(f_RowsInKinds, "RowsInKinds", "expected: KindsDoNotUnify");
-check_failing_build_unit_ignored!(f_ScopedKindVariableSynonym, "ScopedKindVariableSynonym", "expected: UndefinedTypeVariable");
+check_failing_build_unit!(f_ScopedKindVariableSynonym, "ScopedKindVariableSynonym");
 check_failing_build_unit!(f_SelfCycleInForeignDataKinds, "SelfCycleInForeignDataKinds");
 check_failing_build_unit!(f_SelfCycleInKindDeclaration, "SelfCycleInKindDeclaration");
 check_failing_build_unit!(f_SelfCycleInTypeClassDeclaration, "SelfCycleInTypeClassDeclaration");
@@ -368,7 +368,7 @@ check_failing_build_unit_ignored!(f_StandaloneKindSignatures4, "StandaloneKindSi
 check_failing_build_unit!(f_SuggestComposition, "SuggestComposition");
 check_failing_build_unit!(f_Superclasses1, "Superclasses1");
 check_failing_build_unit!(f_Superclasses2, "Superclasses2");
-check_failing_build_unit_ignored!(f_Superclasses3, "Superclasses3", "expected: UndefinedTypeVariable");
+check_failing_build_unit!(f_Superclasses3, "Superclasses3");
 check_failing_build_unit!(f_Superclasses5, "Superclasses5");
 check_failing_build_unit!(f_TooFewClassInstanceArgs, "TooFewClassInstanceArgs");
 check_failing_build_unit!(f_TooFewUnnamedClassInstanceArgs, "TooFewUnnamedClassInstanceArgs");

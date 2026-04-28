@@ -87,6 +87,17 @@ pub enum ValidationErrorKind {
     /// Instance for a locally-declared class defines a method the
     /// class did not declare.
     ExtraneousClassMember(String),
+    /// Pattern uses a constructor with an arity that doesn't match
+    /// its declaration. `data Pair a b = Pair a b; f (Pair x) = x`.
+    IncorrectConstructorArity {
+        ctor: String,
+        expected: usize,
+        got: usize,
+    },
+    /// Type-variable referenced in a position where it isn't in
+    /// scope. Examples: `class (Foo b) <= Bar a` (b not in
+    /// `[a]`), or `type B y z = a` (a not in `[y, z]`).
+    UndefinedTypeVariable(String),
 }
 
 impl ValidationErrorKind {
@@ -126,6 +137,8 @@ impl ValidationErrorKind {
             Self::UnsupportedRoleDeclaration(_) => "UnsupportedRoleDeclaration",
             Self::MissingClassMember(_) => "MissingClassMember",
             Self::ExtraneousClassMember(_) => "ExtraneousClassMember",
+            Self::IncorrectConstructorArity { .. } => "IncorrectConstructorArity",
+            Self::UndefinedTypeVariable(_) => "UndefinedTypeVariable",
         }
     }
 }
@@ -537,6 +550,13 @@ pub fn validate_module_with_imports(
     // Instance member sets must match the class's declared method
     // set (Missing- or ExtraneousClassMember). Local classes only.
     detect_class_member_mismatch(&module.decls, &mut errors);
+
+    // Constructor pattern arity must match the declared ctor.
+    detect_incorrect_constructor_arity(&module.decls, &mut errors);
+
+    // Free type variables in class superclasses + alias bodies must
+    // be in scope.
+    detect_undefined_type_variables(&module.decls, &mut errors);
 
     errors
 }
@@ -3571,3 +3591,352 @@ fn detect_class_member_mismatch(
         }
     }
 }
+
+/// IncorrectConstructorArity. Pattern uses a constructor with the
+/// wrong number of arguments. Walk every binder in every value
+/// decl / instance member; for each `Binder::Constructor` resolve
+/// the local arity and compare.
+fn detect_incorrect_constructor_arity(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_ctor_arity: HashMap<Symbol, usize> = HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    local_ctor_arity.insert(c.name.value.symbol(), c.fields.len());
+                }
+            }
+            cst::Decl::Newtype { constructor, .. } => {
+                // Newtype ctor has exactly 1 field.
+                local_ctor_arity.insert(constructor.value.symbol(), 1);
+            }
+            _ => {}
+        }
+    }
+    for d in decls {
+        match d {
+            cst::Decl::Value { binders, guarded, where_clause, .. } => {
+                for b in binders {
+                    walk_binder_for_ctor_arity(b, &local_ctor_arity, errors);
+                }
+                walk_guarded_for_ctor_arity(guarded, &local_ctor_arity, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { binder, expr, .. } = b {
+                        walk_binder_for_ctor_arity(binder, &local_ctor_arity, errors);
+                        walk_expr_for_ctor_arity(expr, &local_ctor_arity, errors);
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_incorrect_constructor_arity(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_binder_for_ctor_arity(
+    b: &cst::Binder,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match b {
+        cst::Binder::Constructor { name, args, span } => {
+            if name.module.is_none() {
+                if let Some(&expected) = arities.get(&name.name.symbol()) {
+                    let got = args.len();
+                    if got != expected {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::IncorrectConstructorArity {
+                                ctor: resolve(name.name.symbol()),
+                                expected,
+                                got,
+                            },
+                        });
+                    }
+                }
+            }
+            for a in args {
+                walk_binder_for_ctor_arity(a, arities, errors);
+            }
+        }
+        cst::Binder::Record { fields, .. } => {
+            for f in fields {
+                if let Some(inner) = &f.binder {
+                    walk_binder_for_ctor_arity(inner, arities, errors);
+                }
+            }
+        }
+        cst::Binder::As { binder, .. }
+        | cst::Binder::Parens { binder, .. }
+        | cst::Binder::Typed { binder, .. } => {
+            walk_binder_for_ctor_arity(binder, arities, errors);
+        }
+        cst::Binder::Array { elements, .. } => {
+            for e in elements {
+                walk_binder_for_ctor_arity(e, arities, errors);
+            }
+        }
+        cst::Binder::Op { left, right, .. } => {
+            walk_binder_for_ctor_arity(left, arities, errors);
+            walk_binder_for_ctor_arity(right, arities, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_guarded_for_ctor_arity(
+    g: &cst::GuardedExpr,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_ctor_arity(e, arities, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(b, e) => {
+                            walk_binder_for_ctor_arity(b, arities, errors);
+                            walk_expr_for_ctor_arity(e, arities, errors);
+                        }
+                        cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_ctor_arity(e, arities, errors);
+                        }
+                    }
+                }
+                walk_expr_for_ctor_arity(&gd.expr, arities, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_ctor_arity(
+    expr: &cst::Expr,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_ctor_arity(func, arities, errors);
+            walk_expr_for_ctor_arity(arg, arities, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_ctor_arity(func, arities, errors);
+        }
+        cst::Expr::Lambda { binders, body, .. } => {
+            for b in binders {
+                walk_binder_for_ctor_arity(b, arities, errors);
+            }
+            walk_expr_for_ctor_arity(body, arities, errors);
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_ctor_arity(left, arities, errors);
+            walk_expr_for_ctor_arity(right, arities, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_ctor_arity(cond, arities, errors);
+            walk_expr_for_ctor_arity(then_expr, arities, errors);
+            walk_expr_for_ctor_arity(else_expr, arities, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_ctor_arity(e, arities, errors);
+            }
+            for alt in alts {
+                for b in &alt.binders {
+                    walk_binder_for_ctor_arity(b, arities, errors);
+                }
+                walk_guarded_for_ctor_arity(&alt.result, arities, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { binder, expr, .. } = b {
+                    walk_binder_for_ctor_arity(binder, arities, errors);
+                    walk_expr_for_ctor_arity(expr, arities, errors);
+                }
+            }
+            walk_expr_for_ctor_arity(body, arities, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { binder, expr, .. } => {
+                        walk_binder_for_ctor_arity(binder, arities, errors);
+                        walk_expr_for_ctor_arity(expr, arities, errors);
+                    }
+                    cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_ctor_arity(expr, arities, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { binder, expr, .. } = b {
+                                walk_binder_for_ctor_arity(binder, arities, errors);
+                                walk_expr_for_ctor_arity(expr, arities, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_ctor_arity(result, arities, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_ctor_arity(v, arities, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_ctor_arity(expr, arities, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_ctor_arity(expr, arities, errors);
+            for u in updates {
+                walk_expr_for_ctor_arity(&u.value, arities, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => walk_expr_for_ctor_arity(expr, arities, errors),
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_ctor_arity(expr, arities, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_ctor_arity(e, arities, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => walk_expr_for_ctor_arity(expr, arities, errors),
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_ctor_arity(name, arities, errors);
+            walk_expr_for_ctor_arity(pattern, arities, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_ctor_arity(func, arities, errors);
+            walk_expr_for_ctor_arity(left, arities, errors);
+            walk_expr_for_ctor_arity(right, arities, errors);
+        }
+        _ => {}
+    }
+}
+
+/// UndefinedTypeVariable. Scoped at:
+///   - Type alias body: free type vars must be in `type_vars` (or
+///     locally bound by inner forall).
+///   - Class superclass constraints: free type vars must be in
+///     `class.type_vars`.
+fn detect_undefined_type_variables(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { type_vars, ty, .. } => {
+                let mut bound: HashSet<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                check_free_type_vars(ty, &mut bound, errors);
+            }
+            cst::Decl::Class { type_vars, constraints, is_kind_sig, .. }
+                if !*is_kind_sig =>
+            {
+                let mut bound: HashSet<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                for c in constraints {
+                    for arg in &c.args {
+                        let mut local = bound.clone();
+                        check_free_type_vars(arg, &mut local, errors);
+                    }
+                    let _ = &mut bound;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_free_type_vars(
+    te: &cst::TypeExpr,
+    bound: &mut HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match te {
+        cst::TypeExpr::Var { name, span } => {
+            let sym = name.value.symbol();
+            if !bound.contains(&sym) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::UndefinedTypeVariable(resolve(sym)),
+                });
+            }
+        }
+        cst::TypeExpr::Constructor { .. }
+        | cst::TypeExpr::Hole { .. }
+        | cst::TypeExpr::Wildcard { .. }
+        | cst::TypeExpr::StringLiteral { .. }
+        | cst::TypeExpr::IntLiteral { .. } => {}
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            check_free_type_vars(constructor, bound, errors);
+            check_free_type_vars(arg, bound, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            check_free_type_vars(from, bound, errors);
+            check_free_type_vars(to, bound, errors);
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            // `forall (a :: k) k.` — the kind annotation on `a`
+            // refers to `k` but `k` is declared LATER in the same
+            // forall. The reference compiler rejects this. We
+            // process vars in source order: kind-annotation lookups
+            // can only see the bound set BEFORE this var was added.
+            let mut new_bound = bound.clone();
+            for (v, _, kind) in vars {
+                if let Some(k) = kind {
+                    let mut k_bound = new_bound.clone();
+                    check_free_type_vars(k, &mut k_bound, errors);
+                }
+                new_bound.insert(v.value.symbol());
+            }
+            check_free_type_vars(ty, &mut new_bound, errors);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    let mut local = bound.clone();
+                    check_free_type_vars(arg, &mut local, errors);
+                }
+            }
+            check_free_type_vars(ty, bound, errors);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                check_free_type_vars(&f.ty, bound, errors);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                check_free_type_vars(&f.ty, bound, errors);
+            }
+            if let Some(t) = tail {
+                check_free_type_vars(t, bound, errors);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => check_free_type_vars(ty, bound, errors),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            check_free_type_vars(left, bound, errors);
+            check_free_type_vars(right, bound, errors);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            check_free_type_vars(ty, bound, errors);
+            check_free_type_vars(kind, bound, errors);
+        }
+        _ => {}
+    }
+}
+
