@@ -98,6 +98,29 @@ pub enum ValidationErrorKind {
     /// scope. Examples: `class (Foo b) <= Bar a` (b not in
     /// `[a]`), or `type B y z = a` (a not in `[y, z]`).
     UndefinedTypeVariable(String),
+    /// Two equations of the same value name with different binder
+    /// counts. `f x y = ...; f = ...` is `ArgListLengthsDiffer`.
+    ArgListLengthsDiffer(String),
+    /// Two `instance i :: ...` declarations sharing the same
+    /// instance name (regardless of class/types).
+    DuplicateInstance(String),
+    /// Export-list refers to a name not declared in the module.
+    UnknownExport(String),
+    /// Export-list refers to a constructor not belonging to the
+    /// declared type.
+    UnknownExportDataConstructor(String),
+    /// `derive newtype instance C ...` where the head doesn't fit
+    /// the newtype-deriving shape (no type, or applied to a
+    /// concrete type that isn't a newtype, etc.).
+    InvalidNewtypeInstance(String),
+    /// Instance defines a TypeSignature for a name without also
+    /// providing the value definition. The reference compiler
+    /// reports as `OrphanTypeDeclaration`.
+    OrphanTypeDeclaration(String),
+    /// Foreign import name contains an apostrophe — `foreign import
+    /// a' :: …`. The reference compiler reports as
+    /// `DeprecatedFFIPrime`.
+    DeprecatedFFIPrime(String),
 }
 
 impl ValidationErrorKind {
@@ -139,6 +162,13 @@ impl ValidationErrorKind {
             Self::ExtraneousClassMember(_) => "ExtraneousClassMember",
             Self::IncorrectConstructorArity { .. } => "IncorrectConstructorArity",
             Self::UndefinedTypeVariable(_) => "UndefinedTypeVariable",
+            Self::ArgListLengthsDiffer(_) => "ArgListLengthsDiffer",
+            Self::DuplicateInstance(_) => "DuplicateInstance",
+            Self::UnknownExport(_) => "UnknownExport",
+            Self::UnknownExportDataConstructor(_) => "UnknownExportDataConstructor",
+            Self::InvalidNewtypeInstance(_) => "InvalidNewtypeInstance",
+            Self::OrphanTypeDeclaration(_) => "OrphanTypeDeclaration",
+            Self::DeprecatedFFIPrime(_) => "DeprecatedFFIPrime",
         }
     }
 }
@@ -157,6 +187,19 @@ pub fn validate_module(module: &cst::Module) -> Vec<ValidationError> {
 pub fn validate_module_with_imports(
     module: &cst::Module,
     imported_alias_arity: &HashMap<Symbol, usize>,
+) -> Vec<ValidationError> {
+    validate_module_with_full_imports(module, imported_alias_arity, &HashMap::new())
+}
+
+/// Like [`validate_module_with_imports`], but also given a map of
+/// imported class names → arity. Used by the
+/// `ClassInstanceArityMismatch` detector so that `derive instance
+/// eqX :: Eq X X` (Eq has 1 type-var) is caught even when `Eq` was
+/// imported.
+pub fn validate_module_with_full_imports(
+    module: &cst::Module,
+    imported_alias_arity: &HashMap<Symbol, usize>,
+    imported_class_arity: &HashMap<Symbol, usize>,
 ) -> Vec<ValidationError> {
     let mut errors: Vec<ValidationError> = Vec::new();
 
@@ -500,9 +543,9 @@ pub fn validate_module_with_imports(
     detect_parse_level_rejections(&module.decls, &mut errors);
 
     // ClassInstanceArityMismatch: instance head's type-arg count must
-    // match the class's parameter count (local classes only — imported
-    // classes aren't accessible from this CST-only pass).
-    detect_class_instance_arity(&module.decls, &mut errors);
+    // match the class's parameter count. Local classes are read from
+    // decls; imported classes come in via `imported_class_arity`.
+    detect_class_instance_arity(&module.decls, imported_class_arity, &mut errors);
 
     // RoleDeclarationArityMismatch: `type role Foo r1 r2 …` must match the
     // arity of the matching data/newtype/foreign-data.
@@ -560,6 +603,36 @@ pub fn validate_module_with_imports(
 
     // Direct self-referential let bindings (`let x = x in ...`).
     detect_let_self_cycle(&module.decls, &mut errors);
+
+    // Equation arity mismatch (same value name, different binder
+    // counts).
+    detect_arg_list_lengths_differ(&module.decls, &mut errors);
+
+    // Two `instance i :: ...` decls with the same instance name.
+    detect_duplicate_instance(&module.decls, &mut errors);
+
+    // Export-list referencing names / ctors not declared in this
+    // module. Open imports cause us to skip the value/class/op
+    // checks entirely (callers with registry access can run a more
+    // precise version); the `T(C1, C2)` ctor-membership check
+    // still fires unconditionally since it's local-only.
+    detect_unknown_exports(module, &mut errors);
+
+    // Refined orphan-kind detection: a `type Foo :: Type` standalone
+    // kind sig (KindSigSource::Type) requires a matching type alias,
+    // not a data/newtype. Same for the other source variants.
+    detect_orphan_kind_source_mismatch(&module.decls, &mut errors);
+
+    // Inside an instance body, a TypeSignature without a matching
+    // Value definition becomes `OrphanTypeDeclaration`.
+    detect_instance_orphan_type_signatures(&module.decls, &mut errors);
+
+    // `derive newtype instance ...` shape checks (`InvalidNewtypeInstance`).
+    detect_invalid_newtype_derive(&module.decls, &mut errors);
+
+    // `foreign import a'` etc. — apostrophe in FFI names is
+    // deprecated.
+    detect_deprecated_ffi_prime(&module.decls, &mut errors);
 
     errors
 }
@@ -1388,11 +1461,14 @@ where
 /// that hold the registry.
 fn detect_class_instance_arity(
     decls: &[cst::Decl],
+    imported_class_arity: &HashMap<Symbol, usize>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut class_arity: HashMap<Symbol, usize> = HashMap::new();
+    let mut class_arity: HashMap<Symbol, usize> = imported_class_arity.clone();
     for d in decls {
         if let cst::Decl::Class { name, type_vars, is_kind_sig: false, .. } = d {
+            // Local classes win — imported alias takes a back seat
+            // when a local class with the same name is declared.
             class_arity.insert(name.value.symbol(), type_vars.len());
         }
     }
@@ -4127,6 +4203,440 @@ fn walk_expr_for_let_self_cycle(
             walk_expr_for_let_self_cycle(right, errors);
         }
         _ => {}
+    }
+}
+
+/// Equations of the same value name must agree on binder count.
+/// `f x y = ...; f = ...` is `ArgListLengthsDiffer`.
+fn detect_arg_list_lengths_differ(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Walk consecutive `Decl::Value` runs, recording per-name the
+    // (span, binder_count). At the end of each contiguous group of
+    // the same name, if any pair of binder counts differs, emit
+    // ArgListLengthsDiffer at every offending span.
+    let mut runs: HashMap<Symbol, Vec<(Span, usize)>> = HashMap::new();
+    let mut last_name: Option<Symbol> = None;
+    for d in decls {
+        if let cst::Decl::Value { span, name, binders, .. } = d {
+            let sym = name.value.symbol();
+            // Multi-equation runs are allowed only when ADJACENT.
+            // Reset accumulation for non-adjacent re-encounters.
+            if last_name != Some(sym) {
+                runs.entry(sym).or_default().clear();
+            }
+            runs.entry(sym).or_default().push((*span, binders.len()));
+            last_name = Some(sym);
+        } else {
+            last_name = None;
+        }
+    }
+    emit_arg_list_diffs(&runs, errors);
+    // Also walk into instance member bodies.
+    for d in decls {
+        if let cst::Decl::Instance { members, .. } = d {
+            detect_arg_list_lengths_differ(members, errors);
+        }
+    }
+}
+
+fn emit_arg_list_diffs(
+    runs: &HashMap<Symbol, Vec<(Span, usize)>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (sym, eqs) in runs {
+        if eqs.len() < 2 {
+            continue;
+        }
+        let first_count = eqs[0].1;
+        for (span, count) in eqs.iter().skip(1) {
+            if *count != first_count {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::ArgListLengthsDiffer(resolve(*sym)),
+                });
+            }
+        }
+    }
+}
+
+/// Two `instance i :: ...` decls sharing the same instance name.
+fn detect_duplicate_instance(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut seen: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Instance { name: Some(n), span, .. }
+            | cst::Decl::Derive { name: Some(n), span, .. } => {
+                seen.entry(n.value.symbol()).or_default().push(*span);
+            }
+            _ => {}
+        }
+    }
+    for (sym, spans) in seen {
+        if spans.len() > 1 {
+            for span in spans.iter().skip(1) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::DuplicateInstance(resolve(sym)),
+                });
+            }
+        }
+    }
+}
+
+/// Walk the export list (if any) and emit `UnknownExport` for every
+/// declared name that isn't visible in the module — neither defined
+/// locally, imported under that name, nor re-exported via `module N`.
+/// Class methods + ctors travel with their parent decl, so we
+/// include them in the local-name set.
+fn detect_unknown_exports(
+    module: &cst::Module,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(spanned) = &module.exports else {
+        return;
+    };
+    // Collect every name that the module either defines locally or
+    // brings into scope via an import. For values, we include
+    // explicit-list imports; open imports admit any name from the
+    // target so we can't enumerate without registry access — those
+    // are handled below by skipping the check when at least one
+    // open import exists.
+    let mut local_values: HashSet<Symbol> = HashSet::new();
+    let mut local_classes: HashSet<Symbol> = HashSet::new();
+    let mut local_types: HashSet<Symbol> = HashSet::new();
+    let mut local_ctors: HashSet<Symbol> = HashSet::new();
+    let mut local_value_ops: HashSet<Symbol> = HashSet::new();
+    let mut local_type_ops: HashSet<Symbol> = HashSet::new();
+    let mut data_ctors_of: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Value { name, .. } | cst::Decl::Foreign { name, .. } => {
+                local_values.insert(name.value.symbol());
+            }
+            cst::Decl::Class { name, members, is_kind_sig: false, .. } => {
+                local_classes.insert(name.value.symbol());
+                for m in members {
+                    local_values.insert(m.name.value.symbol());
+                }
+            }
+            cst::Decl::Data { name, constructors, kind_sig: cst::KindSigSource::None, is_role_decl: false, .. } => {
+                local_types.insert(name.value.symbol());
+                let mut ctor_set: HashSet<Symbol> = HashSet::new();
+                for c in constructors {
+                    let csym = c.name.value.symbol();
+                    local_ctors.insert(csym);
+                    ctor_set.insert(csym);
+                }
+                data_ctors_of.insert(name.value.symbol(), ctor_set);
+            }
+            cst::Decl::Newtype { name, constructor, .. } => {
+                local_types.insert(name.value.symbol());
+                let csym = constructor.value.symbol();
+                local_ctors.insert(csym);
+                let mut ctor_set: HashSet<Symbol> = HashSet::new();
+                ctor_set.insert(csym);
+                data_ctors_of.insert(name.value.symbol(), ctor_set);
+            }
+            cst::Decl::TypeAlias { name, .. } => {
+                local_types.insert(name.value.symbol());
+            }
+            cst::Decl::ForeignData { name, .. } => {
+                local_types.insert(name.value.symbol());
+            }
+            cst::Decl::Fixity { operator, is_type, .. } => {
+                if *is_type {
+                    local_type_ops.insert(operator.value.symbol());
+                } else {
+                    local_value_ops.insert(operator.value.symbol());
+                }
+            }
+            _ => {}
+        }
+    }
+    // Imports: any unqualified name referenced via `import M (foo)`
+    // also counts as in-scope. Conservatively, for open imports
+    // (`import M`) we BAIL OUT of the unknown-export check entirely
+    // because we can't enumerate target's exports here.
+    let mut has_open_import = false;
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue; // qualified imports don't put names in unqualified scope
+        }
+        match &imp.imports {
+            None | Some(cst::ImportList::Hiding(_)) => {
+                has_open_import = true;
+            }
+            Some(cst::ImportList::Explicit(items)) => {
+                for item in items {
+                    let n = item.name();
+                    match item {
+                        cst::Import::Value(_) => {
+                            local_values.insert(n);
+                            local_value_ops.insert(n);
+                        }
+                        cst::Import::Class(_) => {
+                            local_classes.insert(n);
+                        }
+                        cst::Import::Type(_, members) => {
+                            local_types.insert(n);
+                            if let Some(m) = members {
+                                match m {
+                                    cst::DataMembers::All => {}
+                                    cst::DataMembers::Explicit(cs) => {
+                                        for c in cs {
+                                            local_ctors
+                                                .insert(c.value.symbol());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cst::Import::TypeOp(_) => {
+                            local_type_ops.insert(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if has_open_import {
+        // Open imports may surface anything; play safe and only
+        // check ctor-of-type membership (which is local-decl driven).
+    }
+    for e in &spanned.value.exports {
+        match e {
+            cst::Export::Value(vn) => {
+                if has_open_import {
+                    continue;
+                }
+                let sym = vn.symbol();
+                if !local_values.contains(&sym) && !local_value_ops.contains(&sym) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(resolve(sym)),
+                    });
+                }
+            }
+            cst::Export::Class(cn) => {
+                if has_open_import {
+                    continue;
+                }
+                let sym = cn.symbol();
+                if !local_classes.contains(&sym) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(resolve(sym)),
+                    });
+                }
+            }
+            cst::Export::TypeOp(on) => {
+                if has_open_import {
+                    continue;
+                }
+                let sym = on.symbol();
+                if !local_type_ops.contains(&sym) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(resolve(sym)),
+                    });
+                }
+            }
+            cst::Export::Type(tn, members) => {
+                let tsym = tn.symbol();
+                if !has_open_import && !local_types.contains(&tsym) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(resolve(tsym)),
+                    });
+                }
+                // Constructor membership check: for `T(C1, C2)` each
+                // C must be a constructor of T (or of any parent if
+                // we don't know — checked locally only).
+                if let Some(cst::DataMembers::Explicit(cs)) = members {
+                    if let Some(allowed) = data_ctors_of.get(&tsym) {
+                        for c in cs {
+                            let csym = c.value.symbol();
+                            if !allowed.contains(&csym) {
+                                errors.push(ValidationError {
+                                    span: spanned.span,
+                                    kind:
+                                        ValidationErrorKind::UnknownExportDataConstructor(
+                                            resolve(csym),
+                                        ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            cst::Export::Module(_) => {}
+        }
+    }
+}
+
+/// Refined orphan-kind detection. A `type Foo :: Type` standalone
+/// kind sig (KindSigSource::Type) followed by a `data Foo = …`
+/// declaration is an orphan kind: the source of the kind sig
+/// (TypeAlias) doesn't match the actual decl shape (Data).
+fn detect_orphan_kind_source_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Map each kind sig name → its source variant.
+    let mut kind_source: HashMap<Symbol, (cst::KindSigSource, Span)> =
+        HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { name, kind_sig: src, span, .. }
+                if !matches!(src, cst::KindSigSource::None) =>
+            {
+                kind_source.insert(name.value.symbol(), (*src, *span));
+            }
+            cst::Decl::Class { name, is_kind_sig: true, span, .. } => {
+                kind_source
+                    .insert(name.value.symbol(), (cst::KindSigSource::Class, *span));
+            }
+            _ => {}
+        }
+    }
+    // For each declaration's actual shape, find the matching kind
+    // sig and check the source matches.
+    for d in decls {
+        let (sym, span, expected_src) = match d {
+            cst::Decl::Data { name, kind_sig: cst::KindSigSource::None, is_role_decl: false, span, .. } => {
+                (name.value.symbol(), *span, cst::KindSigSource::Data)
+            }
+            cst::Decl::Newtype { name, span, .. } => {
+                (name.value.symbol(), *span, cst::KindSigSource::Newtype)
+            }
+            cst::Decl::TypeAlias { name, span, .. } => {
+                (name.value.symbol(), *span, cst::KindSigSource::Type)
+            }
+            cst::Decl::Class { name, is_kind_sig: false, span, .. } => {
+                (name.value.symbol(), *span, cst::KindSigSource::Class)
+            }
+            _ => continue,
+        };
+        let _ = sym;
+        if let Some((src, sig_span)) = kind_source.get(&sym) {
+            // Newtype may use `data Foo :: Kind` OR `newtype Foo ::
+            // Kind` interchangeably — the original compiler accepts
+            // both. Likewise data may use `data` only. Type aliases
+            // need `type`. Classes need `class`.
+            let ok = match (expected_src, src) {
+                (cst::KindSigSource::Newtype, cst::KindSigSource::Newtype)
+                | (cst::KindSigSource::Newtype, cst::KindSigSource::Data)
+                | (cst::KindSigSource::Data, cst::KindSigSource::Data)
+                | (cst::KindSigSource::Type, cst::KindSigSource::Type)
+                | (cst::KindSigSource::Class, cst::KindSigSource::Class) => true,
+                _ => false,
+            };
+            if !ok {
+                errors.push(ValidationError {
+                    span: *sig_span,
+                    kind: ValidationErrorKind::OrphanKindDeclaration(resolve(sym)),
+                });
+            }
+        }
+        let _ = span;
+    }
+}
+
+/// Inside an instance body, a `TypeSignature` for a name without a
+/// matching `Value` definition becomes `OrphanTypeDeclaration`.
+fn detect_instance_orphan_type_signatures(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        if let cst::Decl::Instance { members, .. } = d {
+            let mut value_names: HashSet<Symbol> = HashSet::new();
+            for m in members {
+                if let cst::Decl::Value { name, .. } = m {
+                    value_names.insert(name.value.symbol());
+                }
+            }
+            for m in members {
+                if let cst::Decl::TypeSignature { name, span, .. } = m {
+                    let sym = name.value.symbol();
+                    if !value_names.contains(&sym) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::OrphanTypeDeclaration(
+                                resolve(sym),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `derive newtype instance ...` validation. Two failure modes:
+///   - `derive newtype instance Nullary` — class is nullary so
+///     there's no head to derive over.
+///   - `derive newtype instance functorX :: Functor X` — the
+///     instance head's type isn't a saturated newtype application,
+///     so newtype-coercion can't produce the required instance.
+///     Rule we fire on: head is a bare local newtype constructor
+///     (zero args) but the class has arity 1 expecting `f a`.
+///     Original compiler reports as `InvalidNewtypeInstance`.
+fn detect_invalid_newtype_derive(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_newtypes: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::Newtype { name, .. } = d {
+            local_newtypes.insert(name.value.symbol());
+        }
+    }
+    let _ = local_newtypes;
+    for d in decls {
+        if let cst::Decl::Derive { newtype: true, types, class_name, span, .. } = d
+        {
+            // (existing newtype derive validation logic below)
+            // We can only confidently fire when there's no head at
+            // all (`derive newtype instance Nullary`). Anything
+            // with a head requires registry-aware analysis to
+            // distinguish `Eq1 Last` (valid: Last is a newtype
+            // matching Eq1's `Type -> Type` slot) from `Functor X`
+            // (invalid when X has the wrong arity). Skip those
+            // cases here; they fall through to NoInstanceFound at
+            // type-check time.
+            if types.is_empty() {
+                let display = resolve(class_name.to_qi().name);
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::InvalidNewtypeInstance(display),
+                });
+            }
+        }
+    }
+}
+
+/// `foreign import a' :: …` — apostrophe in an FFI declaration name
+/// is deprecated.
+fn detect_deprecated_ffi_prime(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        if let cst::Decl::Foreign { name, span, .. } = d {
+            let s = resolve(name.value.symbol());
+            if s.contains('\'') {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::DeprecatedFFIPrime(s),
+                });
+            }
+        }
     }
 }
 

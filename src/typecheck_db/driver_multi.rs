@@ -227,11 +227,22 @@ fn check_one_module(
     //     `infixr type NaturalTransformation as ~>` in Prelude).
     let imported_alias_arity =
         build_imported_alias_arity(module, registry);
+    let imported_class_arity =
+        build_imported_class_arity(module, registry);
     let mut validation_errors =
-        crate::typecheck_db::passes::validate_decls::validate_module_with_imports(
+        crate::typecheck_db::passes::validate_decls::validate_module_with_full_imports(
             module,
             &imported_alias_arity,
+            &imported_class_arity,
         );
+
+    // Registry-aware UnknownExport check: walk the module's export
+    // list and emit when a name isn't locally declared AND isn't
+    // brought into scope by any of the module's imports. The
+    // CST-only detector inside validate_decls bails on open imports
+    // because it can't enumerate them — this is the precise
+    // counterpart that runs once we have the registry.
+    detect_unknown_exports_registry(module, registry, &mut validation_errors);
 
     // 1c) Kind-arity check. Catches over-application of type
     //     constructors and arity mismatches in class constraints.
@@ -1768,6 +1779,198 @@ fn build_imported_alias_arity(
             if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
                 out.insert(intern(op_name), alias.type_vars.len());
             }
+        }
+    }
+    out
+}
+
+/// Registry-aware UnknownExport check. Walks `module.exports` and
+/// emits a `ValidationError::UnknownExport` (or
+/// `UnknownExportDataConstructor`) whenever an export-list item
+/// references a name that's neither locally declared nor brought
+/// into scope through one of the module's imports.
+fn detect_unknown_exports_registry(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+    errors: &mut Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
+) {
+    use crate::typecheck_db::passes::validate_decls::{
+        ValidationError, ValidationErrorKind,
+    };
+    let Some(spanned) = &module.exports else {
+        return;
+    };
+    // Build per-namespace name sets from local decls + every import.
+    let mut values: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut classes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut types: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut value_ops: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut type_ops: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut data_ctors_of: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+
+    for d in &module.decls {
+        match d {
+            cst::Decl::Value { name, .. } | cst::Decl::Foreign { name, .. } => {
+                values.insert(crate::typecheck_db::util::resolve_symbol(name.value.symbol()));
+            }
+            cst::Decl::Class { name, members, is_kind_sig: false, .. } => {
+                classes.insert(crate::typecheck_db::util::resolve_symbol(name.value.symbol()));
+                for m in members {
+                    values.insert(crate::typecheck_db::util::resolve_symbol(m.name.value.symbol()));
+                }
+            }
+            cst::Decl::Data { name, constructors, kind_sig: cst::KindSigSource::None, is_role_decl: false, .. } => {
+                let tn = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                types.insert(tn.clone());
+                let mut cs: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for c in constructors {
+                    cs.insert(crate::typecheck_db::util::resolve_symbol(c.name.value.symbol()));
+                }
+                data_ctors_of.insert(tn, cs);
+            }
+            cst::Decl::Newtype { name, constructor, .. } => {
+                let tn = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                types.insert(tn.clone());
+                let mut cs: std::collections::HashSet<String> = std::collections::HashSet::new();
+                cs.insert(crate::typecheck_db::util::resolve_symbol(constructor.value.symbol()));
+                data_ctors_of.insert(tn, cs);
+            }
+            cst::Decl::TypeAlias { name, .. } | cst::Decl::ForeignData { name, .. } => {
+                types.insert(crate::typecheck_db::util::resolve_symbol(name.value.symbol()));
+            }
+            cst::Decl::Fixity { operator, is_type, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(operator.value.symbol());
+                if *is_type { type_ops.insert(n); } else { value_ops.insert(n); }
+            }
+            _ => {}
+        }
+    }
+    // Imports: only unqualified imports introduce names into the
+    // module's unqualified namespace. Walk each and add what they
+    // surface, respecting open / explicit / hiding lists.
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target_name = join_module_name(&imp.module);
+        let Some(target) = registry.get(&target_name) else { continue };
+        match &imp.imports {
+            None => {
+                values.extend(target.values.keys().cloned());
+                classes.extend(target.classes.keys().cloned());
+                types.extend(target.type_arities.keys().cloned());
+                value_ops.extend(target.value_fixities.keys().cloned());
+                type_ops.extend(target.type_fixities.keys().cloned());
+            }
+            Some(crate::cst::ImportList::Hiding(items)) => {
+                let mut hide_v: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut hide_c: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut hide_t: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut hide_top: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for item in items {
+                    let n = crate::typecheck_db::util::resolve_symbol(item.name());
+                    match item {
+                        cst::Import::Value(_) => { hide_v.insert(n); }
+                        cst::Import::Class(_) => { hide_c.insert(n); }
+                        cst::Import::Type(_, _) => { hide_t.insert(n); }
+                        cst::Import::TypeOp(_) => { hide_top.insert(n); }
+                    }
+                }
+                for k in target.values.keys() { if !hide_v.contains(k) { values.insert(k.clone()); } }
+                for k in target.classes.keys() { if !hide_c.contains(k) { classes.insert(k.clone()); } }
+                for k in target.type_arities.keys() { if !hide_t.contains(k) { types.insert(k.clone()); } }
+                for k in target.value_fixities.keys() { if !hide_v.contains(k) { value_ops.insert(k.clone()); } }
+                for k in target.type_fixities.keys() { if !hide_top.contains(k) { type_ops.insert(k.clone()); } }
+            }
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                for item in items {
+                    let n = crate::typecheck_db::util::resolve_symbol(item.name());
+                    match item {
+                        cst::Import::Value(_) => {
+                            values.insert(n.clone());
+                            value_ops.insert(n);
+                        }
+                        cst::Import::Class(_) => { classes.insert(n); }
+                        cst::Import::Type(_, _) => { types.insert(n); }
+                        cst::Import::TypeOp(_) => { type_ops.insert(n); }
+                    }
+                }
+            }
+        }
+    }
+    for e in &spanned.value.exports {
+        match e {
+            crate::cst::Export::Value(vn) => {
+                let n = crate::typecheck_db::util::resolve_symbol(vn.symbol());
+                if !values.contains(&n) && !value_ops.contains(&n) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(n),
+                    });
+                }
+            }
+            crate::cst::Export::Class(cn) => {
+                let n = crate::typecheck_db::util::resolve_symbol(cn.symbol());
+                if !classes.contains(&n) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(n),
+                    });
+                }
+            }
+            crate::cst::Export::TypeOp(on) => {
+                let n = crate::typecheck_db::util::resolve_symbol(on.symbol());
+                if !type_ops.contains(&n) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(n),
+                    });
+                }
+            }
+            crate::cst::Export::Type(tn, _members) => {
+                let n = crate::typecheck_db::util::resolve_symbol(tn.symbol());
+                if !types.contains(&n) {
+                    errors.push(ValidationError {
+                        span: spanned.span,
+                        kind: ValidationErrorKind::UnknownExport(n),
+                    });
+                }
+            }
+            crate::cst::Export::Module(_) => {}
+        }
+    }
+}
+
+/// Imported class name → arity (number of class type-vars). Used by
+/// the `ClassInstanceArityMismatch` detector. Mirrors
+/// [`build_imported_alias_arity`] for type aliases — same scoping
+/// rule (only unqualified imports).
+fn build_imported_class_arity(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> std::collections::HashMap<crate::interner::Symbol, usize> {
+    use crate::interner::intern;
+    let mut out: std::collections::HashMap<crate::interner::Symbol, usize> =
+        std::collections::HashMap::new();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports = match registry.get(&target) {
+            Some(e) => e,
+            None => continue,
+        };
+        for (class_name, class_info) in &exports.classes {
+            out.insert(intern(class_name), class_info.type_vars.len());
         }
     }
     out

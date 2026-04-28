@@ -314,11 +314,17 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
         "CycleInModules" => has("CycleInModules"),
         "MultipleValueOpFixities" => has("MultipleValueOpFixities"),
         "MultipleTypeOpFixities" => has("MultipleTypeOpFixities"),
-        "OrphanTypeDeclaration" => has("OrphanTypeSignature"),
+        "OrphanTypeDeclaration" => {
+            has("OrphanTypeSignature") || has("OrphanTypeDeclaration")
+        }
         "OrphanKindDeclaration" => has("OrphanKindDeclaration"),
-        "UnknownExport" | "UnknownExportDataConstructor" => has("UnkownExport") || has("UnknownExport"),
+        "UnknownExport" | "UnknownExportDataConstructor" => {
+            has("UnkownExport")
+                || has("UnknownExport")
+                || has("UnknownExportDataConstructor")
+        }
         "OverlappingArgNames" => has("OverlappingArgNames") || has("OverlappingPattern"),
-        "ArgListLengthsDiffer" => has("ArityMismatch"),
+        "ArgListLengthsDiffer" => has("ArityMismatch") || has("ArgListLengthsDiffer"),
         "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => {
             has("InvalidNewtypeInstance")
                 || has("InvalidNewtypeDerivation")
