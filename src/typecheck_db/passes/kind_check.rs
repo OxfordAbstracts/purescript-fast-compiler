@@ -376,26 +376,28 @@ pub fn check_module(
                     ctx.check_type(&m.ty);
                 }
             }
-            cst::Decl::Instance { constraints, types, members, .. } => {
+            cst::Decl::Instance { constraints, class_name, types, members, span, .. } => {
                 for c in constraints {
                     ctx.check_constraint(c);
                 }
                 for t in types {
                     ctx.check_type(t);
                 }
+                ctx.check_known_hkt_class_instance(class_name, types, *span);
                 for m in members {
                     if let cst::Decl::TypeSignature { ty, .. } = m {
                         ctx.check_type(ty);
                     }
                 }
             }
-            cst::Decl::Derive { constraints, types, .. } => {
+            cst::Decl::Derive { constraints, class_name, types, span, .. } => {
                 for c in constraints {
                     ctx.check_constraint(c);
                 }
                 for t in types {
                     ctx.check_type(t);
                 }
+                ctx.check_known_hkt_class_instance(class_name, types, *span);
             }
             _ => {}
         }
@@ -553,6 +555,52 @@ impl<'a> Ctx<'a> {
             cst::TypeExpr::StringLiteral { .. }
             | cst::TypeExpr::IntLiteral { .. } => Some(0),
             _ => None,
+        }
+    }
+
+    /// Check `instance C T` / `derive instance C T` against a small
+    /// table of well-known stdlib classes whose type-parameter must be
+    /// of a known kind (`Functor :: (Type → Type) → Constraint`,
+    /// `Bifunctor :: (Type → Type → Type) → Constraint`, etc.). Catches
+    /// `derive instance Foldable Foo` where `Foo :: Type` doesn't have
+    /// the HKT shape Foldable expects.
+    ///
+    /// Restricted to a hardcoded list because we don't reliably track
+    /// imported-class param-kinds; the class-decl param_kinds builder
+    /// defaults too aggressively and would false-positive on classes
+    /// whose only var-uses are in superclasses (`class (Bind m,
+    /// Applicative m) <= Monad m`).
+    fn check_known_hkt_class_instance(
+        &mut self,
+        class_name: &crate::names::Qualified<crate::names::ClassName>,
+        types: &[cst::TypeExpr],
+        span: Span,
+    ) {
+        let class_str =
+            crate::interner::resolve(class_name.name.symbol()).unwrap_or_default();
+        let expected_arrows = match class_str.as_str() {
+            "Functor" | "Foldable" | "Traversable" | "Apply" | "Applicative"
+            | "Bind" | "Monad" | "Alt" | "Plus" | "Alternative"
+            | "MonadPlus" | "MonadZero" | "MonadEffect" | "Extend"
+            | "Comonad" | "Contravariant" | "Invariant" | "Filterable" => 1,
+            "Bifunctor" | "Profunctor" | "Bifoldable" | "Bitraversable" => 2,
+            _ => return,
+        };
+        // Single-arg classes: check the first (only) type arg.
+        if let Some(arg) = types.first() {
+            let actual = self.infer_arg_arrows(arg);
+            if let Some(actual_arrows) = actual {
+                if actual_arrows != expected_arrows {
+                    self.errors.push(KindError {
+                        span,
+                        kind: KindErrorKind::KindsDoNotUnify {
+                            head: class_str,
+                            expected: expected_arrows,
+                            got: actual_arrows,
+                        },
+                    });
+                }
+            }
         }
     }
 

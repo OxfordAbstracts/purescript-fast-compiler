@@ -195,7 +195,7 @@ check_failing_build_unit_ignored!(f_ExtraRecordField, "ExtraRecordField", "expec
 check_failing_build_unit_ignored!(f_ExtraneousClassMember, "ExtraneousClassMember", "expected: ExtraneousClassMember");
 check_failing_build_unit_ignored!(f_FFIDefaultCJSExport, "FFIDefaultCJSExport", "expected: DeprecatedFFICommonJSModule");
 check_failing_build_unit_ignored!(f_Foldable, "Foldable", "expected: CycleInDeclaration");
-check_failing_build_unit_ignored!(f_FoldableInstance1, "FoldableInstance1", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_FoldableInstance1, "FoldableInstance1");
 check_failing_build_unit_ignored!(f_FoldableInstance10, "FoldableInstance10", "expected: CannotDeriveInvalidConstructorArg");
 check_failing_build_unit_ignored!(f_FoldableInstance2, "FoldableInstance2", "expected: KindsDoNotUnify");
 check_failing_build_unit_ignored!(f_FoldableInstance3, "FoldableInstance3", "expected: KindsDoNotUnify");
@@ -278,7 +278,7 @@ check_failing_build_unit_ignored!(f_NewtypeInstance2, "NewtypeInstance2", "expec
 check_failing_build_unit_ignored!(f_NewtypeInstance3, "NewtypeInstance3", "expected: InvalidNewtypeInstance");
 check_failing_build_unit_ignored!(f_NewtypeInstance4, "NewtypeInstance4", "expected: InvalidNewtypeInstance");
 check_failing_build_unit_ignored!(f_NewtypeInstance5, "NewtypeInstance5", "expected: InvalidNewtypeInstance");
-check_failing_build_unit_ignored!(f_NewtypeInstance6, "NewtypeInstance6", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_NewtypeInstance6, "NewtypeInstance6");
 check_failing_build_unit!(f_NewtypeMultiArgs, "NewtypeMultiArgs");
 check_failing_build_unit!(f_NewtypeMultiCtor, "NewtypeMultiCtor");
 check_failing_build_unit_ignored!(f_NewtypeUnnamedInstance, "NewtypeUnnamedInstance", "expected: InvalidNewtypeInstance");
