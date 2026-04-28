@@ -243,13 +243,18 @@ pub fn validate_module_with_imports(
         }
     }
 
-    // Duplicate type decls
+    // Duplicate type decls — `data Fail; data Fail` and friends.
+    // Reference compiler reports these as `DeclConflict`, not as a
+    // distinct "duplicate" category, so use that variant. The
+    // `DuplicateTypeDeclaration` ValidationErrorKind is retained
+    // for downstream-API stability but no longer surfaced from
+    // this pass.
     for (sym, spans) in &type_decls {
         if spans.len() > 1 {
             for span in spans.iter().skip(1) {
                 errors.push(ValidationError {
                     span: *span,
-                    kind: ValidationErrorKind::DuplicateTypeDeclaration(resolve(*sym)),
+                    kind: ValidationErrorKind::DeclConflict(resolve(*sym)),
                 });
             }
         }
@@ -1324,6 +1329,16 @@ fn detect_decl_conflicts(decls: &[cst::Decl], errors: &mut Vec<ValidationError>)
                     } else {
                         ctor_names.insert(csym, c.name.span);
                     }
+                    // Cross-namespace: a class declared (here or
+                    // earlier) under the same name as a data ctor
+                    // collides — `data T = Fail; class Fail` and
+                    // its reverse.
+                    if type_level_names.get(&csym) == Some(&"class") {
+                        errors.push(ValidationError {
+                            span: c.name.span,
+                            kind: ValidationErrorKind::DeclConflict(resolve(csym)),
+                        });
+                    }
                 }
             }
             cst::Decl::Newtype { span, name, constructor, .. } => {
@@ -1337,12 +1352,27 @@ fn detect_decl_conflicts(decls: &[cst::Decl], errors: &mut Vec<ValidationError>)
                 } else {
                     ctor_names.insert(csym, constructor.span);
                 }
+                if type_level_names.get(&csym) == Some(&"class") {
+                    errors.push(ValidationError {
+                        span: constructor.span,
+                        kind: ValidationErrorKind::DeclConflict(resolve(csym)),
+                    });
+                }
             }
             cst::Decl::TypeAlias { span, name, .. } => {
                 emit_conflict(&mut type_level_names, name.value.symbol(), "type", *span, errors);
             }
             cst::Decl::Class { span, name, is_kind_sig: false, .. } => {
-                emit_conflict(&mut type_level_names, name.value.symbol(), "class", *span, errors);
+                let sym = name.value.symbol();
+                emit_conflict(&mut type_level_names, sym, "class", *span, errors);
+                // Cross-namespace: a class whose name was already
+                // claimed by a previously-declared data ctor.
+                if ctor_names.contains_key(&sym) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::DeclConflict(resolve(sym)),
+                    });
+                }
             }
             cst::Decl::ForeignData { span, name, .. } => {
                 emit_conflict(&mut type_level_names, name.value.symbol(), "foreign data", *span, errors);
