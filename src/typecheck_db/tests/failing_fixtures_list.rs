@@ -246,7 +246,7 @@ check_failing_build_unit_ignored!(f_KindStar, "KindStar", "expected: ExpectedTyp
 check_failing_build_unit!(f_LacksWithSubGoal, "LacksWithSubGoal");
 check_failing_build_unit!(f_LeadingZeros1, "LeadingZeros1");
 check_failing_build_unit!(f_LeadingZeros2, "LeadingZeros2");
-check_failing_build_unit_ignored!(f_Let, "Let", "expected: CycleInDeclaration");
+check_failing_build_unit!(f_Let, "Let");
 check_failing_build_unit!(f_LetPatterns1, "LetPatterns1");
 check_failing_build_unit!(f_LetPatterns2, "LetPatterns2");
 check_failing_build_unit!(f_LetPatterns3, "LetPatterns3");

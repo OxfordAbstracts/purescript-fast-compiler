@@ -558,6 +558,9 @@ pub fn validate_module_with_imports(
     // be in scope.
     detect_undefined_type_variables(&module.decls, &mut errors);
 
+    // Direct self-referential let bindings (`let x = x in ...`).
+    detect_let_self_cycle(&module.decls, &mut errors);
+
     errors
 }
 
@@ -3935,6 +3938,193 @@ fn check_free_type_vars(
         cst::TypeExpr::Kinded { ty, kind, .. } => {
             check_free_type_vars(ty, bound, errors);
             check_free_type_vars(kind, bound, errors);
+        }
+        _ => {}
+    }
+}
+
+/// Direct self-referential let bindings: `let x = x in ...` (CAF
+/// cycle without a lambda barrier). Walks every value decl + nested
+/// expression for `LetBinding::Value` whose binder names a name `x`
+/// AND whose body's only Var occurrence is `x` itself.
+fn detect_let_self_cycle(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::Value { guarded, where_clause, .. } => {
+                walk_guarded_for_let_self_cycle(guarded, errors);
+                check_let_block_self_cycle(where_clause, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { expr, .. } = b {
+                        walk_expr_for_let_self_cycle(expr, errors);
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_let_self_cycle(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_let_block_self_cycle(
+    bindings: &[cst::LetBinding],
+    errors: &mut Vec<ValidationError>,
+) {
+    for b in bindings {
+        if let cst::LetBinding::Value { binder, expr, span } = b {
+            if let cst::Binder::Var { name, .. } = peel_paren_binder(binder) {
+                let sym = name.value.symbol();
+                if expr_is_direct_self_ref(expr, sym) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::CycleInDeclaration(vec![
+                            resolve(sym),
+                        ]),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// True iff the expression bottom-reduces to `Var { name }` without
+/// crossing any lambda / case / record (i.e. without forming a
+/// computation barrier). Conservative: only handles trivial Parens
+/// / TypeAnnotation wrappers.
+fn expr_is_direct_self_ref(expr: &cst::Expr, name: Symbol) -> bool {
+    let mut cur = expr;
+    loop {
+        match cur {
+            cst::Expr::Var { name: qn, .. } => {
+                return qn.module.is_none() && qn.name.symbol() == name;
+            }
+            cst::Expr::Parens { expr, .. } => cur = expr,
+            cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+            _ => return false,
+        }
+    }
+}
+
+fn walk_guarded_for_let_self_cycle(
+    g: &cst::GuardedExpr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_let_self_cycle(e, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_let_self_cycle(e, errors);
+                        }
+                    }
+                }
+                walk_expr_for_let_self_cycle(&gd.expr, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_let_self_cycle(
+    expr: &cst::Expr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_let_self_cycle(func, errors);
+            walk_expr_for_let_self_cycle(arg, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_let_self_cycle(func, errors);
+        }
+        cst::Expr::Lambda { body, .. } => walk_expr_for_let_self_cycle(body, errors),
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_let_self_cycle(left, errors);
+            walk_expr_for_let_self_cycle(right, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_let_self_cycle(cond, errors);
+            walk_expr_for_let_self_cycle(then_expr, errors);
+            walk_expr_for_let_self_cycle(else_expr, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_let_self_cycle(e, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_let_self_cycle(&alt.result, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            check_let_block_self_cycle(bindings, errors);
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_let_self_cycle(expr, errors);
+                }
+            }
+            walk_expr_for_let_self_cycle(body, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_let_self_cycle(expr, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        check_let_block_self_cycle(bindings, errors);
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_let_self_cycle(expr, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_let_self_cycle(result, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_let_self_cycle(v, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => walk_expr_for_let_self_cycle(expr, errors),
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_let_self_cycle(expr, errors);
+            for u in updates {
+                walk_expr_for_let_self_cycle(&u.value, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => walk_expr_for_let_self_cycle(expr, errors),
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_let_self_cycle(expr, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_let_self_cycle(e, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => walk_expr_for_let_self_cycle(expr, errors),
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_let_self_cycle(name, errors);
+            walk_expr_for_let_self_cycle(pattern, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_let_self_cycle(func, errors);
+            walk_expr_for_let_self_cycle(left, errors);
+            walk_expr_for_let_self_cycle(right, errors);
         }
         _ => {}
     }
