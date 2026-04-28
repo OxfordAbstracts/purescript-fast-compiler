@@ -229,11 +229,14 @@ fn check_one_module(
         build_imported_alias_arity(module, registry);
     let imported_class_arity =
         build_imported_class_arity(module, registry);
+    let imported_class_fundeps =
+        build_imported_class_fundeps(module, registry);
     let mut validation_errors =
-        crate::typecheck_db::passes::validate_decls::validate_module_with_full_imports(
+        crate::typecheck_db::passes::validate_decls::validate_module_with_class_fundeps(
             module,
             &imported_alias_arity,
             &imported_class_arity,
+            &imported_class_fundeps,
         );
 
     // Registry-aware UnknownExport check: walk the module's export
@@ -1947,6 +1950,44 @@ fn detect_unknown_exports_registry(
             crate::cst::Export::Module(_) => {}
         }
     }
+}
+
+/// Imported class name → positional fundeps. Each
+/// `(determiners, determined)` is a pair of `Vec<usize>` indexing
+/// into the class's `type_vars`. Used by the fundep-aware
+/// orphan-instance detector.
+fn build_imported_class_fundeps(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> std::collections::HashMap<crate::interner::Symbol, Vec<(Vec<usize>, Vec<usize>)>>
+{
+    use crate::interner::intern;
+    let mut out: std::collections::HashMap<
+        crate::interner::Symbol,
+        Vec<(Vec<usize>, Vec<usize>)>,
+    > = std::collections::HashMap::new();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports = match registry.get(&target) {
+            Some(e) => e,
+            None => continue,
+        };
+        for (class_name, class_info) in &exports.classes {
+            let var_names: Vec<&str> =
+                class_info.type_vars.iter().map(|s| s.as_str()).collect();
+            let fds: Vec<(Vec<usize>, Vec<usize>)> = class_info
+                .fundeps
+                .iter()
+                .map(|fd| (fd.determiners.clone(), fd.determined.clone()))
+                .collect();
+            let _ = var_names;
+            out.insert(intern(class_name), fds);
+        }
+    }
+    out
 }
 
 /// Imported class name → arity (number of class type-vars). Used by

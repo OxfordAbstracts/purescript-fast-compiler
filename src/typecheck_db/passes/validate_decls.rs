@@ -201,6 +201,25 @@ pub fn validate_module_with_full_imports(
     imported_alias_arity: &HashMap<Symbol, usize>,
     imported_class_arity: &HashMap<Symbol, usize>,
 ) -> Vec<ValidationError> {
+    validate_module_with_class_fundeps(
+        module,
+        imported_alias_arity,
+        imported_class_arity,
+        &HashMap::new(),
+    )
+}
+
+/// Like [`validate_module_with_full_imports`], but also given a map
+/// of imported class names → positional fundeps. Used by the
+/// `OrphanInstance` detector for fundep-aware covering-set checks.
+/// Each `FunDepPositions(determiners, determined)` is a pair of
+/// `Vec<usize>` indexing into the class's type_vars.
+pub fn validate_module_with_class_fundeps(
+    module: &cst::Module,
+    imported_alias_arity: &HashMap<Symbol, usize>,
+    imported_class_arity: &HashMap<Symbol, usize>,
+    imported_class_fundeps: &HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>>,
+) -> Vec<ValidationError> {
     let mut errors: Vec<ValidationError> = Vec::new();
 
     // Collect symbol-keyed views of each namespace. We need both
@@ -558,7 +577,7 @@ pub fn validate_module_with_full_imports(
 
     // Orphan instances: declared where neither the class nor any type
     // constructor in the instance head is defined locally.
-    detect_orphan_instances(&module.decls, &mut errors);
+    detect_orphan_instances(&module.decls, imported_class_fundeps, &mut errors);
 
     detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
     detect_invalid_instance_heads(&module.decls, &mut errors);
@@ -1670,15 +1689,45 @@ fn emit_conflict(
 /// Type aliases don't count — `type Something = Int` followed by
 /// `derive instance Eq Something` is still an orphan because `Something`
 /// is just an alias; PureScript's orphan check sees through it.
-fn detect_orphan_instances(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
+fn detect_orphan_instances(
+    decls: &[cst::Decl],
+    imported_class_fundeps: &HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>>,
+    errors: &mut Vec<ValidationError>,
+) {
     // Collect local class and data/newtype/foreign-data names.
     let mut local_classes: HashSet<Symbol> = HashSet::new();
     let mut local_data: HashSet<Symbol> = HashSet::new();
     let mut local_aliases: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    // Local class fundeps in positional form, mirrors the imported map.
+    let mut local_class_fundeps: HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>> =
+        HashMap::new();
     for d in decls {
         match d {
-            cst::Decl::Class { name, is_kind_sig: false, .. } => {
+            cst::Decl::Class { name, type_vars, fundeps, is_kind_sig: false, .. } => {
                 local_classes.insert(name.value.symbol());
+                let var_names: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                let fd: Vec<(Vec<usize>, Vec<usize>)> = fundeps
+                    .iter()
+                    .map(|f| {
+                        let lhs: Vec<usize> = f
+                            .lhs
+                            .iter()
+                            .filter_map(|v| {
+                                var_names.iter().position(|s| *s == v.symbol())
+                            })
+                            .collect();
+                        let rhs: Vec<usize> = f
+                            .rhs
+                            .iter()
+                            .filter_map(|v| {
+                                var_names.iter().position(|s| *s == v.symbol())
+                            })
+                            .collect();
+                        (lhs, rhs)
+                    })
+                    .collect();
+                local_class_fundeps.insert(name.value.symbol(), fd);
             }
             cst::Decl::Data { name, kind_sig: cst::KindSigSource::None, is_role_decl: false, .. } => {
                 local_data.insert(name.value.symbol());
@@ -1739,31 +1788,50 @@ fn detect_orphan_instances(decls: &[cst::Decl], errors: &mut Vec<ValidationError
             continue;
         }
 
-        // Walk each type in the head, extract constructor heads, check if any
-        // is locally defined as data/newtype/foreign-data — OR is a local
-        // alias whose expansion anchors locally.
-        let mut head_is_local = false;
-        for t in types {
-            for sym in head_type_cons(t) {
-                if local_data.contains(&sym) || alias_anchors_locally.contains(&sym) {
-                    head_is_local = true;
-                    break;
-                }
-            }
-            if head_is_local {
-                break;
-            }
-        }
-        if head_is_local {
-            continue;
-        }
+        // Per-position locality: positions[i] = true when types[i]'s
+        // head references a locally-defined data/newtype/foreign-data
+        // (or a local alias that transitively anchors locally).
+        let positions_local: Vec<bool> = types
+            .iter()
+            .map(|t| {
+                head_type_cons(t).iter().any(|sym| {
+                    local_data.contains(sym) || alias_anchors_locally.contains(sym)
+                })
+            })
+            .collect();
 
-        // Neither the class nor any head type is local — orphan.
-        let class_display = resolve(class_name.name.symbol());
-        errors.push(ValidationError {
-            span,
-            kind: ValidationErrorKind::OrphanInstance(class_display),
-        });
+        // Look up the class's fundeps. Local classes win over imported.
+        let class_sym = class_name.name.symbol();
+        let fundeps_for_class: Option<&Vec<(Vec<usize>, Vec<usize>)>> =
+            local_class_fundeps
+                .get(&class_sym)
+                .or_else(|| imported_class_fundeps.get(&class_sym));
+
+        // Compute "is orphan" per the fundep-aware rule:
+        //   - No fundeps (or unknown class): orphan iff NO position is local.
+        //   - With fundeps: for each fundep, the COVERING SET is the set
+        //     of positions NOT in the fundep's `determined` list. If any
+        //     covering set is entirely foreign, the instance is orphan.
+        let is_orphan = match fundeps_for_class {
+            Some(fds) if !fds.is_empty() => fds.iter().any(|(_lhs, determined)| {
+                // Covering set = positions not in `determined`.
+                let det_set: HashSet<usize> = determined.iter().copied().collect();
+                let covering_has_local = positions_local
+                    .iter()
+                    .enumerate()
+                    .any(|(i, local)| *local && !det_set.contains(&i));
+                !covering_has_local
+            }),
+            _ => positions_local.iter().all(|local| !*local),
+        };
+
+        if is_orphan {
+            let class_display = resolve(class_sym);
+            errors.push(ValidationError {
+                span,
+                kind: ValidationErrorKind::OrphanInstance(class_display),
+            });
+        }
     }
 }
 
