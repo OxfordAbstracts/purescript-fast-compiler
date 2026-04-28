@@ -142,6 +142,10 @@ pub enum ValidationErrorKind {
     /// associativity used in a chain — `f <$> x == f <$> y` mixes
     /// `<$>` (left, prec 4) with `==` (none, prec 4).
     MixedAssociativityError(String),
+    /// Two instance declarations of the same class whose heads
+    /// can match the same type — typically because one head is
+    /// strictly more general than (or equal to) the other.
+    OverlappingInstances(String),
 }
 
 impl ValidationErrorKind {
@@ -195,6 +199,7 @@ impl ValidationErrorKind {
             Self::InvalidModuleName(_) => "ErrorParsingModule",
             Self::NonAssociativeError(_) => "NonAssociativeError",
             Self::MixedAssociativityError(_) => "MixedAssociativityError",
+            Self::OverlappingInstances(_) => "OverlappingInstances",
         }
     }
 }
@@ -693,6 +698,11 @@ pub fn validate_module_with_class_fundeps(
         &HashMap::new(),
         &mut errors,
     );
+
+    // OverlappingInstances: two instances of the same local class
+    // whose heads can match the same type (one is at least as
+    // general as the other).
+    detect_overlapping_instances(&module.decls, &mut errors);
 
     // Equation arity mismatch (same value name, different binder
     // counts).
@@ -5992,6 +6002,198 @@ fn walk_type_for_mixed(
             walk_type_for_mixed(kind, fix, errors);
         }
         _ => {}
+    }
+}
+
+/// OverlappingInstances. Walk pairs of instances of the same
+/// class; flag pairs whose heads can match the same type.
+///
+/// "Can match" = one head is at least as general as the other:
+///   - Var / Wildcard matches anything
+///   - Same Constructor matches itself
+///   - Function/App/Record match component-wise
+///
+/// Type aliases are expanded one level (local aliases only) before
+/// comparison so `Convert String Bar` and `Convert String String`
+/// (where `type Bar = String`) collide.
+fn detect_overlapping_instances(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut alias_body: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { name, ty, .. } = d {
+            alias_body.insert(name.value.symbol(), ty);
+        }
+    }
+    // Group instance heads by class name. Instance chains (with
+    // `chain: true` for any non-head member) are explicitly
+    // ordered overlap and not an error; we drop ANY chain-member
+    // from the comparison set entirely (along with the head it's
+    // attached to, since chain semantics make ordering deliberate).
+    let mut chain_classes: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::Instance { class_name, chain: true, .. } = d {
+            let cqi = class_name.to_qi();
+            if cqi.module.is_none() {
+                chain_classes.insert(cqi.name);
+            }
+        }
+    }
+    let mut by_class: HashMap<Symbol, Vec<(Vec<&cst::TypeExpr>, Span)>> =
+        HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Instance { class_name, types, span, chain, .. } => {
+                let cqi = class_name.to_qi();
+                if cqi.module.is_some() {
+                    continue;
+                }
+                if *chain || chain_classes.contains(&cqi.name) {
+                    continue;
+                }
+                by_class
+                    .entry(cqi.name)
+                    .or_default()
+                    .push((types.iter().collect(), *span));
+            }
+            cst::Decl::Derive { class_name, types, span, .. } => {
+                let cqi = class_name.to_qi();
+                if cqi.module.is_some() {
+                    continue;
+                }
+                if chain_classes.contains(&cqi.name) {
+                    continue;
+                }
+                by_class
+                    .entry(cqi.name)
+                    .or_default()
+                    .push((types.iter().collect(), *span));
+            }
+            _ => {}
+        }
+    }
+    let mut emitted: HashSet<(Symbol, usize, usize)> = HashSet::new();
+    for (class, instances) in &by_class {
+        for i in 0..instances.len() {
+            for j in (i + 1)..instances.len() {
+                let (a_types, _a_span) = &instances[i];
+                let (b_types, b_span) = &instances[j];
+                if a_types.len() != b_types.len() {
+                    continue;
+                }
+                let a_matches_b = a_types
+                    .iter()
+                    .zip(b_types.iter())
+                    .all(|(a, b)| head_at_least_as_general(a, b, &alias_body));
+                let b_matches_a = b_types
+                    .iter()
+                    .zip(a_types.iter())
+                    .all(|(b, a)| head_at_least_as_general(b, a, &alias_body));
+                if a_matches_b || b_matches_a {
+                    let key = (*class, i, j);
+                    if emitted.insert(key) {
+                        errors.push(ValidationError {
+                            span: *b_span,
+                            kind: ValidationErrorKind::OverlappingInstances(
+                                resolve(*class),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True iff `a` can match `b` by substituting `a`'s type-vars with
+/// arbitrary types — i.e. `a`'s pattern is at least as general as
+/// `b`'s.
+fn head_at_least_as_general(
+    a: &cst::TypeExpr,
+    b: &cst::TypeExpr,
+    aliases: &HashMap<Symbol, &cst::TypeExpr>,
+) -> bool {
+    head_at_least_as_general_seen(a, b, aliases, &mut HashSet::new())
+}
+
+fn head_at_least_as_general_seen(
+    a: &cst::TypeExpr,
+    b: &cst::TypeExpr,
+    aliases: &HashMap<Symbol, &cst::TypeExpr>,
+    seen: &mut HashSet<Symbol>,
+) -> bool {
+    let a = peel_parens(a);
+    let b = peel_parens(b);
+    // Var / Wildcard matches anything.
+    if matches!(a, cst::TypeExpr::Var { .. } | cst::TypeExpr::Wildcard { .. }) {
+        return true;
+    }
+    // Expand a one-level alias on `a` if applicable.
+    if let cst::TypeExpr::Constructor { name, .. } = a {
+        if name.module.is_none() {
+            if let Some(body) = aliases.get(&name.name.symbol()) {
+                if seen.insert(name.name.symbol()) {
+                    return head_at_least_as_general_seen(body, b, aliases, seen);
+                }
+            }
+        }
+    }
+    if let cst::TypeExpr::Constructor { name, .. } = b {
+        if name.module.is_none() {
+            if let Some(body) = aliases.get(&name.name.symbol()) {
+                if seen.insert(name.name.symbol()) {
+                    return head_at_least_as_general_seen(a, body, aliases, seen);
+                }
+            }
+        }
+    }
+    match (a, b) {
+        (
+            cst::TypeExpr::Constructor { name: an, .. },
+            cst::TypeExpr::Constructor { name: bn, .. },
+        ) => an.name.symbol() == bn.name.symbol(),
+        (
+            cst::TypeExpr::App { constructor: a1, arg: a2, .. },
+            cst::TypeExpr::App { constructor: b1, arg: b2, .. },
+        ) => {
+            head_at_least_as_general_seen(a1, b1, aliases, seen)
+                && head_at_least_as_general_seen(a2, b2, aliases, seen)
+        }
+        (
+            cst::TypeExpr::Function { from: a1, to: a2, .. },
+            cst::TypeExpr::Function { from: b1, to: b2, .. },
+        ) => {
+            head_at_least_as_general_seen(a1, b1, aliases, seen)
+                && head_at_least_as_general_seen(a2, b2, aliases, seen)
+        }
+        (
+            cst::TypeExpr::StringLiteral { value: av, .. },
+            cst::TypeExpr::StringLiteral { value: bv, .. },
+        ) => av == bv,
+        (
+            cst::TypeExpr::IntLiteral { value: av, .. },
+            cst::TypeExpr::IntLiteral { value: bv, .. },
+        ) => av == bv,
+        (
+            cst::TypeExpr::Kinded { ty: at, kind: ak, .. },
+            cst::TypeExpr::Kinded { ty: bt, kind: bk, .. },
+        ) => {
+            // Both kind-annotated — kind annotations participate
+            // in matching. `(a :: Type)` vs `(a :: Symbol)` are
+            // NOT overlapping.
+            head_at_least_as_general_seen(at, bt, aliases, seen)
+                && head_at_least_as_general_seen(ak, bk, aliases, seen)
+        }
+        // Mixed Kinded vs non-Kinded: peel and compare. The
+        // unannotated side is treated as the more general one.
+        (cst::TypeExpr::Kinded { ty: at, .. }, _) => {
+            head_at_least_as_general_seen(at, b, aliases, seen)
+        }
+        (_, cst::TypeExpr::Kinded { ty: bt, .. }) => {
+            head_at_least_as_general_seen(a, bt, aliases, seen)
+        }
+        _ => false,
     }
 }
 
