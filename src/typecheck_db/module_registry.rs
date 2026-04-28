@@ -120,6 +120,21 @@ pub struct ModuleExports {
     /// importer can still bind all distinct origin keys.
     #[serde(default)]
     pub qualified_values: HashMap<(String, String), Scheme>,
+
+    /// Defining module for each exported class — same shape and
+    /// semantics as `value_origins`, used by ExportConflict to
+    /// distinguish two locally-declared classes with colliding
+    /// names from a single class re-exported through two paths.
+    #[serde(default)]
+    pub class_origins: HashMap<String, String>,
+
+    /// Defining module for each exported type (data/newtype/alias).
+    #[serde(default)]
+    pub type_origins: HashMap<String, String>,
+
+    /// Defining module for each exported data constructor.
+    #[serde(default)]
+    pub ctor_origins: HashMap<String, String>,
 }
 
 /// In-process cache of every compiled module's export surface,
@@ -546,16 +561,25 @@ pub fn distill_exports(
             }
             for (name, info) in ctor_info {
                 out.ctors.insert(name.clone(), info.clone());
+                out.ctor_origins
+                    .insert(name.clone(), self_module_name.clone());
             }
             out.data_constructors = data_ctors_all;
             out.type_aliases = type_aliases_all;
             for (name, info) in class_info {
                 out.classes.insert(name.clone(), info.clone());
+                out.class_origins
+                    .insert(name.clone(), self_module_name.clone());
             }
             out.value_fixities = value_fixities_all.clone();
             out.type_fixities = type_fixities_all;
             out.newtypes = newtypes_all;
             out.type_arities = type_arities_all;
+            for name in out.type_arities.keys().cloned().collect::<Vec<_>>() {
+                out.type_origins
+                    .entry(name)
+                    .or_insert_with(|| self_module_name.clone());
+            }
             // Make operators importable under their own name by
             // cross-referencing their fixity's target's scheme.
             // `import M (<<<)` parses as `Import::Value("<<<")`;
@@ -607,9 +631,13 @@ pub fn distill_exports(
                         // filtered.
                         if let Some(arity) = type_arities_all.get(&name) {
                             out.type_arities.insert(name.clone(), *arity);
+                            out.type_origins
+                                .insert(name.clone(), self_module_name.clone());
                         }
                         if let Some(alias) = type_aliases_all.get(&name) {
                             out.type_aliases.insert(name.clone(), alias.clone());
+                            out.type_origins
+                                .insert(name.clone(), self_module_name.clone());
                         }
                         if newtypes_all.contains(&name) {
                             out.newtypes.insert(name.clone());
@@ -644,7 +672,9 @@ pub fn distill_exports(
                                 .or_insert_with(|| wanted.clone());
                             for ctor in wanted {
                                 if let Some(info) = ctor_info.get(&ctor) {
-                                    out.ctors.insert(ctor, info.clone());
+                                    out.ctors.insert(ctor.clone(), info.clone());
+                                    out.ctor_origins
+                                        .insert(ctor, self_module_name.clone());
                                 }
                             }
                         } else {
@@ -656,6 +686,8 @@ pub fn distill_exports(
                         let name = crate::typecheck_db::util::resolve_symbol(cn.symbol());
                         if let Some(info) = class_info.get(&name) {
                             out.classes.insert(name.clone(), info.clone());
+                            out.class_origins
+                                .insert(name.clone(), self_module_name.clone());
                         }
                         // Class methods travel with the class.
                         if let Some(methods) = class_methods.get(&name) {
@@ -800,6 +832,12 @@ pub fn expand_module_reexports(
             }
             for (k, v) in &target_exports.ctors {
                 out.ctors.entry(k.clone()).or_insert_with(|| v.clone());
+                let origin = target_exports
+                    .ctor_origins
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| target_name.clone());
+                out.ctor_origins.entry(k.clone()).or_insert(origin);
             }
             for (k, v) in &target_exports.data_constructors {
                 out.data_constructors.entry(k.clone()).or_insert_with(|| v.clone());
@@ -809,6 +847,12 @@ pub fn expand_module_reexports(
             }
             for (k, v) in &target_exports.classes {
                 out.classes.entry(k.clone()).or_insert_with(|| v.clone());
+                let origin = target_exports
+                    .class_origins
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| target_name.clone());
+                out.class_origins.entry(k.clone()).or_insert(origin);
             }
             // Instances are global — already carried via the
             // importer's own `instances` field, but re-exporting
@@ -830,6 +874,12 @@ pub fn expand_module_reexports(
             }
             for (k, v) in &target_exports.type_arities {
                 out.type_arities.entry(k.clone()).or_insert(*v);
+                let origin = target_exports
+                    .type_origins
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| target_name.clone());
+                out.type_origins.entry(k.clone()).or_insert(origin);
             }
         }
     }

@@ -190,7 +190,7 @@ fn check_one_module(
     //     `infixr type NaturalTransformation as ~>` in Prelude).
     let imported_alias_arity =
         build_imported_alias_arity(module, registry);
-    let validation_errors =
+    let mut validation_errors =
         crate::typecheck_db::passes::validate_decls::validate_module_with_imports(
             module,
             &imported_alias_arity,
@@ -1161,6 +1161,324 @@ fn check_one_module(
         module,
         registry,
     );
+    // ExportConflict: `module C (module A, module B)` clauses where
+    // A and B both export the same name (value, ctor, type, class,
+    // or operator alias) collide at C's surface.
+    //
+    // The reference rule is: `module N` re-exports the names that the
+    // current module brought into scope FROM N (via its import list).
+    // It does NOT re-export every name N happens to export. So for
+    // Prelude — which `import Control.Apply (apply, ...)` and
+    // `import Data.Function (const, flip, ...)` (no `apply`) — its
+    // `module Data.Function` re-export carries only the four names it
+    // imported, and there is no `apply` clash with `module Control.Apply`.
+    //
+    // We compute the per-clause imported-name set per namespace,
+    // walk the intersection between every clause pair, and report a
+    // conflict when the underlying definitions genuinely differ.
+    if let Some(spanned_exports) = &module.exports {
+        let module_clauses: Vec<(String, crate::span::Span)> = spanned_exports
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| {
+                if let crate::cst::Export::Module(mn) = e {
+                    let name: String = mn
+                        .parts
+                        .iter()
+                        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    Some((name, spanned_exports.span))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // For each `module N` clause, build the per-namespace name
+        // sets brought in by EVERY matching import (a single clause
+        // can be fed by multiple imports — open + alias of the same
+        // target are unioned).
+        struct ClauseSets {
+            target_module: String,
+            values: std::collections::HashSet<String>,
+            classes: std::collections::HashSet<String>,
+            types: std::collections::HashSet<String>,
+            ctors: std::collections::HashSet<String>,
+            value_ops: std::collections::HashSet<String>,
+            type_ops: std::collections::HashSet<String>,
+        }
+        let build_clause_sets = |clause_name: &str| -> Option<ClauseSets> {
+            let mut sets = ClauseSets {
+                target_module: String::new(),
+                values: Default::default(),
+                classes: Default::default(),
+                types: Default::default(),
+                ctors: Default::default(),
+                value_ops: Default::default(),
+                type_ops: Default::default(),
+            };
+            let mut matched_any = false;
+            for imp in &module.imports {
+                let imp_target = join_module_name(&imp.module);
+                let alias_str = imp
+                    .qualified
+                    .as_ref()
+                    .map(|q| join_module_name(q));
+                let matches_clause = imp_target == clause_name
+                    || alias_str.as_deref() == Some(clause_name);
+                if !matches_clause {
+                    continue;
+                }
+                let Some(target) = registry.get(&imp_target) else {
+                    continue;
+                };
+                matched_any = true;
+                sets.target_module = imp_target.clone();
+                match &imp.imports {
+                    None => {
+                        // Open import — every export of the target.
+                        sets.values
+                            .extend(target.values.keys().cloned());
+                        sets.classes
+                            .extend(target.classes.keys().cloned());
+                        sets.types
+                            .extend(target.type_arities.keys().cloned());
+                        sets.ctors
+                            .extend(target.ctors.keys().cloned());
+                        sets.value_ops
+                            .extend(target.value_fixities.keys().cloned());
+                        sets.type_ops
+                            .extend(target.type_fixities.keys().cloned());
+                    }
+                    Some(crate::cst::ImportList::Hiding(items)) => {
+                        let mut hide_v: std::collections::HashSet<String> =
+                            Default::default();
+                        let mut hide_c: std::collections::HashSet<String> =
+                            Default::default();
+                        let mut hide_t: std::collections::HashSet<String> =
+                            Default::default();
+                        let mut hide_top: std::collections::HashSet<String> =
+                            Default::default();
+                        for item in items {
+                            let name = crate::typecheck_db::util::resolve_symbol(
+                                item.name(),
+                            );
+                            match item {
+                                crate::cst::Import::Value(_) => { hide_v.insert(name); }
+                                crate::cst::Import::Class(_) => { hide_c.insert(name); }
+                                crate::cst::Import::Type(_, _) => { hide_t.insert(name); }
+                                crate::cst::Import::TypeOp(_) => { hide_top.insert(name); }
+                            }
+                        }
+                        for n in target.values.keys() {
+                            if !hide_v.contains(n) {
+                                sets.values.insert(n.clone());
+                            }
+                        }
+                        for n in target.classes.keys() {
+                            if !hide_c.contains(n) {
+                                sets.classes.insert(n.clone());
+                            }
+                        }
+                        for n in target.type_arities.keys() {
+                            if !hide_t.contains(n) {
+                                sets.types.insert(n.clone());
+                            }
+                        }
+                        for n in target.ctors.keys() {
+                            sets.ctors.insert(n.clone());
+                        }
+                        for n in target.value_fixities.keys() {
+                            if !hide_v.contains(n) {
+                                sets.value_ops.insert(n.clone());
+                            }
+                        }
+                        for n in target.type_fixities.keys() {
+                            if !hide_top.contains(n) {
+                                sets.type_ops.insert(n.clone());
+                            }
+                        }
+                    }
+                    Some(crate::cst::ImportList::Explicit(items)) => {
+                        for item in items {
+                            let name = crate::typecheck_db::util::resolve_symbol(
+                                item.name(),
+                            );
+                            match item {
+                                crate::cst::Import::Value(_) => {
+                                    // Value-import items can reference
+                                    // either a regular value or a value
+                                    // operator (parens form).
+                                    sets.values.insert(name.clone());
+                                    sets.value_ops.insert(name);
+                                }
+                                crate::cst::Import::Class(_) => {
+                                    sets.classes.insert(name);
+                                }
+                                crate::cst::Import::Type(_, members) => {
+                                    sets.types.insert(name.clone());
+                                    match members {
+                                        None => {}
+                                        Some(crate::cst::DataMembers::All) => {
+                                            if let Some(ctors) =
+                                                target.data_constructors.get(&name)
+                                            {
+                                                for c in ctors {
+                                                    sets.ctors.insert(c.clone());
+                                                }
+                                            }
+                                        }
+                                        Some(crate::cst::DataMembers::Explicit(cs)) => {
+                                            for c in cs {
+                                                sets.ctors.insert(
+                                                    crate::typecheck_db::util::resolve_symbol(
+                                                        c.value.symbol(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::cst::Import::TypeOp(_) => {
+                                    sets.type_ops.insert(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if matched_any { Some(sets) } else { None }
+        };
+        let clause_sets: Vec<(ClauseSets, crate::span::Span)> = module_clauses
+            .iter()
+            .filter_map(|(name, span)| {
+                build_clause_sets(name).map(|s| (s, *span))
+            })
+            .collect();
+        let mut reported: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for i in 0..clause_sets.len() {
+            for j in (i + 1)..clause_sets.len() {
+                let (a_sets, _) = &clause_sets[i];
+                let (b_sets, span) = &clause_sets[j];
+                let Some(a) = registry.get(&a_sets.target_module) else { continue };
+                let Some(b) = registry.get(&b_sets.target_module) else { continue };
+                let mut report_conflict = |kind: &str, n: &str| {
+                    let key = format!("{}:{}", kind, n);
+                    if reported.insert(key) {
+                        validation_errors.push(
+                            crate::typecheck_db::passes::validate_decls::ValidationError {
+                                span: *span,
+                                kind: crate::typecheck_db::passes::validate_decls::ValidationErrorKind::ExportConflict(
+                                    n.to_string(),
+                                ),
+                            },
+                        );
+                    }
+                };
+                // Walk the intersection of names imported into THIS
+                // module from each side. For each namespace we
+                // compare origin modules — re-exports through
+                // different paths share an upstream origin and so
+                // don't conflict, while two locally-declared `class
+                // X` (or `data T`, etc.) in different modules have
+                // distinct origins and produce a real conflict.
+                for n in &a_sets.values {
+                    if !b_sets.values.contains(n) { continue; }
+                    if a.values.contains_key(n) && b.values.contains_key(n) {
+                        let oa = a
+                            .value_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| a_sets.target_module.clone());
+                        let ob = b
+                            .value_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| b_sets.target_module.clone());
+                        if oa != ob {
+                            report_conflict("value", n);
+                        }
+                    }
+                }
+                for n in &a_sets.classes {
+                    if !b_sets.classes.contains(n) { continue; }
+                    if a.classes.contains_key(n) && b.classes.contains_key(n) {
+                        let oa = a
+                            .class_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| a_sets.target_module.clone());
+                        let ob = b
+                            .class_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| b_sets.target_module.clone());
+                        if oa != ob {
+                            report_conflict("class", n);
+                        }
+                    }
+                }
+                for n in &a_sets.types {
+                    if !b_sets.types.contains(n) { continue; }
+                    if a.type_arities.contains_key(n) && b.type_arities.contains_key(n) {
+                        let oa = a
+                            .type_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| a_sets.target_module.clone());
+                        let ob = b
+                            .type_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| b_sets.target_module.clone());
+                        if oa != ob {
+                            report_conflict("type", n);
+                        }
+                    }
+                }
+                for n in &a_sets.ctors {
+                    if !b_sets.ctors.contains(n) { continue; }
+                    if a.ctors.contains_key(n) && b.ctors.contains_key(n) {
+                        let oa = a
+                            .ctor_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| a_sets.target_module.clone());
+                        let ob = b
+                            .ctor_origins
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| b_sets.target_module.clone());
+                        if oa != ob {
+                            report_conflict("ctor", n);
+                        }
+                    }
+                }
+                for n in &a_sets.value_ops {
+                    if !b_sets.value_ops.contains(n) { continue; }
+                    if let (Some(a_fix), Some(b_fix)) =
+                        (a.value_fixities.get(n), b.value_fixities.get(n))
+                    {
+                        if a_fix != b_fix {
+                            report_conflict("valueOp", n);
+                        }
+                    }
+                }
+                for n in &a_sets.type_ops {
+                    if !b_sets.type_ops.contains(n) { continue; }
+                    if let (Some(a_fix), Some(b_fix)) =
+                        (a.type_fixities.get(n), b.type_fixities.get(n))
+                    {
+                        if a_fix != b_fix {
+                            report_conflict("typeOp", n);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Post-distill: resolve fixity targets that weren't local
     // against our imports. `infixr 6 Tuple as /\` in a module
     // that imports `Tuple` from `Data.Tuple` needs the fixity's

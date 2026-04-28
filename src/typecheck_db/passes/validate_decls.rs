@@ -55,6 +55,11 @@ pub enum ValidationErrorKind {
     TransitiveDctorExportError(String),
     TransitiveExportError(String),
     InvalidInstanceHead,
+    /// `module C (module A, module B) where` — both A and B export
+    /// the same name, so re-exporting both via two `module N`
+    /// clauses creates an unresolvable ambiguity at C's surface.
+    /// Original compiler's `ExportConflict` failure.
+    ExportConflict(String),
 }
 
 impl ValidationErrorKind {
@@ -85,6 +90,7 @@ impl ValidationErrorKind {
             Self::TransitiveDctorExportError(_) => "TransitiveDctorExportError",
             Self::TransitiveExportError(_) => "TransitiveExportError",
             Self::InvalidInstanceHead => "InvalidInstanceHead",
+            Self::ExportConflict(_) => "ExportConflict",
         }
     }
 }
