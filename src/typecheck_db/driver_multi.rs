@@ -248,12 +248,13 @@ fn check_one_module(
     detect_unknown_exports_registry(module, registry, &mut validation_errors);
 
     // Registry-aware UnknownName check for type-constructor refs in
-    // top-level signatures. Imported types come in via local +
-    // unqualified-imported sets built from the registry. Disabled
-    // because `module M (module M, …)` self-re-export semantics
-    // aren't fully captured by the registry's `type_arities`,
-    // causing false positives on the ModuleExportSelf-style
-    // pattern. The class-name version (above) is more reliable.
+    // top-level signatures. Restricted to kind-annotation positions
+    // (`forall (a :: K).` and `data T :: K`) — bare type-position
+    // refs are skipped because of `module M (module M, …)`
+    // self-re-export interactions that aren't reflected in
+    // `type_arities`. Kind-annotation positions are narrower and
+    // safer.
+    detect_unknown_kind_refs_registry(module, registry, &mut validation_errors);
     let _ = detect_unknown_type_refs_registry;
 
     // 1c) Kind-arity check. Catches over-application of type
@@ -1958,6 +1959,201 @@ fn detect_unknown_exports_registry(
             }
             crate::cst::Export::Module(_) => {}
         }
+    }
+}
+
+/// Walks every kind-annotation position in `module.decls` (the
+/// `K` in `forall (a :: K).`, in `data T :: K`, in `class C :: K`,
+/// in `(x :: K)` annotations) for unqualified `Constructor`
+/// references that aren't local and aren't brought in by any
+/// unqualified import. Emits `UnknownName` for each.
+fn detect_unknown_kind_refs_registry(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+    errors: &mut Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
+) {
+    use crate::typecheck_db::passes::validate_decls::{
+        ValidationError, ValidationErrorKind,
+    };
+    let mut known: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Data { name, .. }
+            | cst::Decl::Newtype { name, .. }
+            | cst::Decl::TypeAlias { name, .. }
+            | cst::Decl::ForeignData { name, .. } => {
+                known.insert(crate::typecheck_db::util::resolve_symbol(
+                    name.value.symbol(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let prims = crate::typecheck_db::prim::prim_exports();
+    if let Some(prim) = prims.get("Prim") {
+        for k in prim.type_arities.keys() {
+            known.insert(k.clone());
+        }
+    }
+    for imp in &module.imports {
+        let target = join_module_name(&imp.module);
+        let exports: Option<&ModuleExports> = registry
+            .get(&target)
+            .or_else(|| prims.get(&target));
+        let Some(exports) = exports else { continue };
+        if imp.qualified.is_some() {
+            continue;
+        }
+        match &imp.imports {
+            None | Some(crate::cst::ImportList::Hiding(_)) => {
+                for k in exports.type_arities.keys() {
+                    known.insert(k.clone());
+                }
+                for k in exports.type_aliases.keys() {
+                    known.insert(k.clone());
+                }
+            }
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                for item in items {
+                    if let cst::Import::Type(_, _) = item {
+                        let n =
+                            crate::typecheck_db::util::resolve_symbol(item.name());
+                        known.insert(n);
+                    }
+                }
+            }
+        }
+    }
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::TypeSignature { ty, span, .. }
+            | cst::Decl::Foreign { ty, span, .. } => {
+                check_kind_anns(ty, *span, &known, &mut seen, errors);
+            }
+            cst::Decl::Class { members, kind_type, span, .. } => {
+                if let Some(k) = kind_type {
+                    check_kind_anns_in_kind(k, *span, &known, &mut seen, errors);
+                }
+                for m in members {
+                    check_kind_anns(&m.ty, m.span, &known, &mut seen, errors);
+                }
+            }
+            cst::Decl::Data { kind_type, span, .. } => {
+                if let Some(k) = kind_type {
+                    check_kind_anns_in_kind(k, *span, &known, &mut seen, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = ValidationErrorKind::UnknownName(String::new());
+    let _ = ValidationError {
+        span: crate::span::Span::new(0, 0),
+        kind: ValidationErrorKind::UnknownName(String::new()),
+    };
+}
+
+fn check_kind_anns(
+    ty: &cst::TypeExpr,
+    span: crate::span::Span,
+    known: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
+) {
+    use crate::typecheck_db::passes::validate_decls::{
+        ValidationError, ValidationErrorKind,
+    };
+    match ty {
+        cst::TypeExpr::Forall { vars, ty: inner, .. } => {
+            for (_, _, kind) in vars {
+                if let Some(k) = kind {
+                    check_kind_anns_in_kind(k, span, known, seen, errors);
+                }
+            }
+            check_kind_anns(inner, span, known, seen, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            check_kind_anns(from, span, known, seen, errors);
+            check_kind_anns(to, span, known, seen, errors);
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            check_kind_anns(constructor, span, known, seen, errors);
+            check_kind_anns(arg, span, known, seen, errors);
+        }
+        cst::TypeExpr::Constrained { constraints, ty: inner, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    check_kind_anns(arg, span, known, seen, errors);
+                }
+            }
+            check_kind_anns(inner, span, known, seen, errors);
+        }
+        cst::TypeExpr::Parens { ty: inner, .. } => {
+            check_kind_anns(inner, span, known, seen, errors);
+        }
+        cst::TypeExpr::Kinded { ty: inner, kind, .. } => {
+            check_kind_anns(inner, span, known, seen, errors);
+            check_kind_anns_in_kind(kind, span, known, seen, errors);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                check_kind_anns(&f.ty, span, known, seen, errors);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                check_kind_anns(&f.ty, span, known, seen, errors);
+            }
+            if let Some(t) = tail {
+                check_kind_anns(t, span, known, seen, errors);
+            }
+        }
+        _ => {}
+    }
+    let _ = ValidationError {
+        span,
+        kind: ValidationErrorKind::UnknownName(String::new()),
+    };
+}
+
+fn check_kind_anns_in_kind(
+    ty: &cst::TypeExpr,
+    span: crate::span::Span,
+    known: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<crate::typecheck_db::passes::validate_decls::ValidationError>,
+) {
+    use crate::typecheck_db::passes::validate_decls::{
+        ValidationError, ValidationErrorKind,
+    };
+    match ty {
+        cst::TypeExpr::Constructor { name, .. } if name.module.is_none() => {
+            let n = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+            if !known.contains(&n) && seen.insert(n.clone()) {
+                errors.push(ValidationError {
+                    span,
+                    kind: ValidationErrorKind::UnknownName(n),
+                });
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            check_kind_anns_in_kind(constructor, span, known, seen, errors);
+            check_kind_anns_in_kind(arg, span, known, seen, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            check_kind_anns_in_kind(from, span, known, seen, errors);
+            check_kind_anns_in_kind(to, span, known, seen, errors);
+        }
+        cst::TypeExpr::Parens { ty: inner, .. } => {
+            check_kind_anns_in_kind(inner, span, known, seen, errors);
+        }
+        cst::TypeExpr::Forall { ty: inner, .. } => {
+            check_kind_anns_in_kind(inner, span, known, seen, errors);
+        }
+        _ => {}
     }
 }
 

@@ -41,7 +41,7 @@ check_failing_build_unit!(f_3531_4, "3531-4");
 check_failing_build_unit!(f_3531_5, "3531-5");
 check_failing_build_unit!(f_3531_6, "3531-6");
 check_failing_build_unit!(f_3531, "3531");
-check_failing_build_unit_ignored!(f_3549_a, "3549-a", "expected: UnknownName");
+check_failing_build_unit!(f_3549_a, "3549-a");
 check_failing_build_unit_ignored!(f_3549, "3549", "expected: KindsDoNotUnify");
 check_failing_build_unit!(f_365, "365");
 check_failing_build_unit!(f_3689, "3689");
