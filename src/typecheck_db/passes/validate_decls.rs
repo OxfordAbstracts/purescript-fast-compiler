@@ -131,6 +131,13 @@ pub enum ValidationErrorKind {
     /// it isn't imported. Reference compiler reports as
     /// `UnknownName`.
     UnknownName(String),
+    /// Module name contains characters that aren't valid in
+    /// PureScript module names (apostrophe, underscore). Reference
+    /// compiler reports as `ErrorParsingModule`.
+    InvalidModuleName(String),
+    /// Non-associative operator chained with itself (`a == b == c`
+    /// where `==` is `infix` not `infixl`/`infixr`).
+    NonAssociativeError(String),
 }
 
 impl ValidationErrorKind {
@@ -181,6 +188,8 @@ impl ValidationErrorKind {
             Self::DeprecatedFFIPrime(_) => "DeprecatedFFIPrime",
             Self::InfiniteKind(_) => "InfiniteKind",
             Self::UnknownName(_) => "UnknownName",
+            Self::InvalidModuleName(_) => "ErrorParsingModule",
+            Self::NonAssociativeError(_) => "NonAssociativeError",
         }
     }
 }
@@ -661,6 +670,15 @@ pub fn validate_module_with_class_fundeps(
     // (`data F a = F (a a)`). A self-application would require an
     // infinite kind, so the kind unifier rejects it.
     detect_infinite_kind(&module.decls, &mut errors);
+
+    // Invalid module name: apostrophes / underscores in any part
+    // of the module name string. The reference compiler reports
+    // these as `ErrorParsingModule`.
+    detect_invalid_module_name(module, &mut errors);
+
+    // Non-associative operator chained with itself (`a == b == c`
+    // or `a >> b >> a` where the op is `infix`).
+    detect_non_associative_chain(&module.decls, &mut errors);
 
     // Equation arity mismatch (same value name, different binder
     // counts).
@@ -5276,15 +5294,23 @@ fn detect_infinite_kind(
 ) {
     for d in decls {
         match d {
-            cst::Decl::Data { constructors, .. } => {
+            cst::Decl::Data { name, type_vars, constructors, .. } => {
+                let self_name = name.value.symbol();
+                let self_vars: HashSet<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
                 for c in constructors {
                     for f in &c.fields {
                         scan_for_self_app(f, errors);
+                        scan_for_data_self_app(f, self_name, &self_vars, errors);
                     }
                 }
             }
-            cst::Decl::Newtype { ty, .. } => {
+            cst::Decl::Newtype { name, type_vars, ty, .. } => {
+                let self_name = name.value.symbol();
+                let self_vars: HashSet<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
                 scan_for_self_app(ty, errors);
+                scan_for_data_self_app(ty, self_name, &self_vars, errors);
             }
             cst::Decl::TypeAlias { ty, .. } => {
                 scan_for_self_app(ty, errors);
@@ -5296,6 +5322,405 @@ fn detect_infinite_kind(
                 scan_for_self_app(ty, errors);
             }
             _ => {}
+        }
+    }
+}
+
+/// `data Tree m = Tree (m Tree)` — a data ctor field has the form
+/// `App(Var(v), Constructor(SelfName))` where `v` is one of the
+/// data's type-vars AND `SelfName` is BARE (unsaturated). The kind
+/// unifier would require `kind(v) = (kind(SelfName) -> _)` but
+/// SelfName itself takes `v` as arg, producing the infinite cycle
+/// the reference compiler reports as `InfiniteKind`.
+///
+/// Saturated forms (`In (f (Mu f))` where `Mu f` IS the recursive
+/// reference) are valid fixed-point newtypes/data and not flagged.
+fn scan_for_data_self_app(
+    te: &cst::TypeExpr,
+    self_name: Symbol,
+    self_vars: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match te {
+        cst::TypeExpr::App { constructor, arg, span } => {
+            let l = peel_parens(constructor);
+            let r = peel_parens(arg);
+            if let cst::TypeExpr::Var { name: ln, .. } = l {
+                if self_vars.contains(&ln.value.symbol())
+                    && is_bare_self_ctor(r, self_name)
+                {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::InfiniteKind(resolve(
+                            ln.value.symbol(),
+                        )),
+                    });
+                }
+            }
+            scan_for_data_self_app(constructor, self_name, self_vars, errors);
+            scan_for_data_self_app(arg, self_name, self_vars, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            scan_for_data_self_app(from, self_name, self_vars, errors);
+            scan_for_data_self_app(to, self_name, self_vars, errors);
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            scan_for_data_self_app(ty, self_name, self_vars, errors);
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            scan_for_data_self_app(ty, self_name, self_vars, errors);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                scan_for_data_self_app(&f.ty, self_name, self_vars, errors);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                scan_for_data_self_app(&f.ty, self_name, self_vars, errors);
+            }
+            if let Some(t) = tail {
+                scan_for_data_self_app(t, self_name, self_vars, errors);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            scan_for_data_self_app(ty, self_name, self_vars, errors);
+        }
+        cst::TypeExpr::Kinded { ty, .. } => {
+            scan_for_data_self_app(ty, self_name, self_vars, errors);
+        }
+        _ => {}
+    }
+}
+
+/// True iff `te` is exactly the bare unqualified Constructor
+/// `self_name` (peeling Parens). NOT true for App-wrapped forms
+/// (`Mu f` is a saturated application, not bare).
+fn is_bare_self_ctor(te: &cst::TypeExpr, self_name: Symbol) -> bool {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            name.module.is_none() && name.name.symbol() == self_name
+        }
+        cst::TypeExpr::Parens { ty, .. } => is_bare_self_ctor(ty, self_name),
+        _ => false,
+    }
+}
+
+/// Non-associative operator chained with itself.
+///
+/// `a == b == c` (where `==` is declared `infix` not `infixl`/r)
+/// or the type-level analogue `a >> b >> a` (with `infix 6 type
+/// Function as >>`). Both produce `NonAssociativeError`.
+///
+/// Detection: walk every Op (value-level) and TypeOp (type-level)
+/// in the module. For each whose operator has `Associativity::None`
+/// (locally declared), check whether either child uses the SAME
+/// operator. If so, fire.
+fn detect_non_associative_chain(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    detect_non_associative_chain_with_imports(
+        decls,
+        &HashMap::new(),
+        &HashMap::new(),
+        errors,
+    );
+}
+
+pub(crate) fn detect_non_associative_chain_with_imports(
+    decls: &[cst::Decl],
+    imported_value_op_assoc: &HashMap<Symbol, cst::Associativity>,
+    imported_type_op_assoc: &HashMap<Symbol, cst::Associativity>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut value_op_assoc: HashMap<Symbol, cst::Associativity> =
+        imported_value_op_assoc.clone();
+    let mut type_op_assoc: HashMap<Symbol, cst::Associativity> =
+        imported_type_op_assoc.clone();
+    for d in decls {
+        if let cst::Decl::Fixity { operator, associativity, is_type, .. } = d {
+            let map = if *is_type { &mut type_op_assoc } else { &mut value_op_assoc };
+            map.insert(operator.value.symbol(), *associativity);
+        }
+    }
+    // Walk type expressions for TypeOp chains.
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { ty, .. }
+            | cst::Decl::TypeSignature { ty, .. }
+            | cst::Decl::Foreign { ty, .. } => {
+                walk_type_for_non_assoc_chain(ty, &type_op_assoc, errors);
+            }
+            cst::Decl::Class { members, .. } => {
+                for m in members {
+                    walk_type_for_non_assoc_chain(&m.ty, &type_op_assoc, errors);
+                }
+            }
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        walk_type_for_non_assoc_chain(f, &type_op_assoc, errors);
+                    }
+                }
+            }
+            cst::Decl::Newtype { ty, .. } => {
+                walk_type_for_non_assoc_chain(ty, &type_op_assoc, errors);
+            }
+            _ => {}
+        }
+    }
+    // Walk value expressions for Op chains.
+    for d in decls {
+        match d {
+            cst::Decl::Value { guarded, where_clause, .. } => {
+                walk_guarded_for_non_assoc(guarded, &value_op_assoc, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { expr, .. } = b {
+                        walk_expr_for_non_assoc(expr, &value_op_assoc, errors);
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_non_associative_chain(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_type_for_non_assoc_chain(
+    te: &cst::TypeExpr,
+    assoc: &HashMap<Symbol, cst::Associativity>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::TypeExpr::TypeOp { left, op, right, span } = te {
+        if op.value.module.is_none() {
+            let op_sym = op.value.name.symbol();
+            if let Some(cst::Associativity::None) = assoc.get(&op_sym) {
+                if type_uses_op(left, op_sym) || type_uses_op(right, op_sym) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::NonAssociativeError(resolve(op_sym)),
+                    });
+                }
+            }
+        }
+    }
+    match te {
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_type_for_non_assoc_chain(constructor, assoc, errors);
+            walk_type_for_non_assoc_chain(arg, assoc, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_type_for_non_assoc_chain(from, assoc, errors);
+            walk_type_for_non_assoc_chain(to, assoc, errors);
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            walk_type_for_non_assoc_chain(ty, assoc, errors);
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            walk_type_for_non_assoc_chain(ty, assoc, errors);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_type_for_non_assoc_chain(&f.ty, assoc, errors);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_type_for_non_assoc_chain(&f.ty, assoc, errors);
+            }
+            if let Some(t) = tail {
+                walk_type_for_non_assoc_chain(t, assoc, errors);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            walk_type_for_non_assoc_chain(ty, assoc, errors);
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_type_for_non_assoc_chain(left, assoc, errors);
+            walk_type_for_non_assoc_chain(right, assoc, errors);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_type_for_non_assoc_chain(ty, assoc, errors);
+            walk_type_for_non_assoc_chain(kind, assoc, errors);
+        }
+        _ => {}
+    }
+}
+
+/// True iff `te` is an immediate TypeOp using `op_sym`. Same
+/// rationale as `expr_uses_op` — no recursion into children.
+fn type_uses_op(te: &cst::TypeExpr, op_sym: Symbol) -> bool {
+    if let cst::TypeExpr::TypeOp { op, .. } = te {
+        op.value.module.is_none() && op.value.name.symbol() == op_sym
+    } else {
+        false
+    }
+}
+
+fn walk_guarded_for_non_assoc(
+    g: &cst::GuardedExpr,
+    assoc: &HashMap<Symbol, cst::Associativity>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_non_assoc(e, assoc, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_non_assoc(e, assoc, errors);
+                        }
+                    }
+                }
+                walk_expr_for_non_assoc(&gd.expr, assoc, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_non_assoc(
+    expr: &cst::Expr,
+    assoc: &HashMap<Symbol, cst::Associativity>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::Expr::Op { left, op, right, span } = expr {
+        if op.value.module.is_none() {
+            let op_sym = op.value.name.symbol();
+            if let Some(cst::Associativity::None) = assoc.get(&op_sym) {
+                if expr_uses_op(left, op_sym) || expr_uses_op(right, op_sym) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::NonAssociativeError(resolve(op_sym)),
+                    });
+                }
+            }
+        }
+    }
+    match expr {
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_non_assoc(func, assoc, errors);
+            walk_expr_for_non_assoc(arg, assoc, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_non_assoc(func, assoc, errors);
+        }
+        cst::Expr::Lambda { body, .. } => walk_expr_for_non_assoc(body, assoc, errors),
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_non_assoc(left, assoc, errors);
+            walk_expr_for_non_assoc(right, assoc, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_non_assoc(cond, assoc, errors);
+            walk_expr_for_non_assoc(then_expr, assoc, errors);
+            walk_expr_for_non_assoc(else_expr, assoc, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_non_assoc(e, assoc, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_non_assoc(&alt.result, assoc, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_non_assoc(expr, assoc, errors);
+                }
+            }
+            walk_expr_for_non_assoc(body, assoc, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_non_assoc(expr, assoc, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_non_assoc(expr, assoc, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_non_assoc(result, assoc, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_non_assoc(v, assoc, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => walk_expr_for_non_assoc(expr, assoc, errors),
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_non_assoc(expr, assoc, errors);
+            for u in updates {
+                walk_expr_for_non_assoc(&u.value, assoc, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => walk_expr_for_non_assoc(expr, assoc, errors),
+        cst::Expr::TypeAnnotation { expr, .. } => walk_expr_for_non_assoc(expr, assoc, errors),
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_non_assoc(e, assoc, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => walk_expr_for_non_assoc(expr, assoc, errors),
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_non_assoc(name, assoc, errors);
+            walk_expr_for_non_assoc(pattern, assoc, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_non_assoc(func, assoc, errors);
+            walk_expr_for_non_assoc(left, assoc, errors);
+            walk_expr_for_non_assoc(right, assoc, errors);
+        }
+        _ => {}
+    }
+}
+
+/// True iff `expr` is an immediate `Op` node using `op_sym`. Does
+/// NOT recurse into children — only the OUTERMOST shape counts.
+/// Parens explicitly disambiguate; deeper nested ops with the
+/// same name (after the rebracketer settles) are a separate
+/// concern. We only want to catch direct chains like
+/// `Op(Op(a, ==, b), ==, c)` or `Op(a, ==, Op(b, ==, c))`.
+fn expr_uses_op(expr: &cst::Expr, op_sym: Symbol) -> bool {
+    if let cst::Expr::Op { op, .. } = expr {
+        op.value.module.is_none() && op.value.name.symbol() == op_sym
+    } else {
+        false
+    }
+}
+
+/// Module names containing apostrophes or underscores are rejected
+/// by the reference compiler's parser. We catch them post-parse
+/// since our lexer is more permissive.
+fn detect_invalid_module_name(
+    module: &cst::Module,
+    errors: &mut Vec<ValidationError>,
+) {
+    for part in &module.name.value.parts {
+        let s = crate::interner::resolve(*part).unwrap_or_default();
+        if s.contains('\'') || s.contains('_') {
+            errors.push(ValidationError {
+                span: module.name.span,
+                kind: ValidationErrorKind::InvalidModuleName(s.to_string()),
+            });
+            return;
         }
     }
 }

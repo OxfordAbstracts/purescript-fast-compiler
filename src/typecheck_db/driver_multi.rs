@@ -264,6 +264,19 @@ fn check_one_module(
     // that import many Data.* siblings.
     let _ = detect_use_site_scope_conflict;
 
+    // NonAssociativeError on imported operators: the in-pass
+    // detector inside validate_decls only knows local fixities.
+    // Build imported value/type fixities → associativity from the
+    // registry and re-run the chain check.
+    let (imp_val_op_assoc, imp_type_op_assoc) =
+        build_imported_op_associativity(module, registry);
+    crate::typecheck_db::passes::validate_decls::detect_non_associative_chain_with_imports(
+        &module.decls,
+        &imp_val_op_assoc,
+        &imp_type_op_assoc,
+        &mut validation_errors,
+    );
+
     // 1c) Kind-arity check. Catches over-application of type
     //     constructors and arity mismatches in class constraints.
     //     Reads the registry for imported types/classes.
@@ -2610,6 +2623,45 @@ fn collect_unqualified_type_constructors(te: &cst::TypeExpr, out: &mut Vec<Strin
         }
         _ => {}
     }
+}
+
+/// Imported value-operator and type-operator names → associativity.
+/// Used by the NonAssociativeError detector for chains involving
+/// imported operators (e.g. `==` from Data.Eq).
+fn build_imported_op_associativity(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> (
+    std::collections::HashMap<crate::interner::Symbol, crate::cst::Associativity>,
+    std::collections::HashMap<crate::interner::Symbol, crate::cst::Associativity>,
+) {
+    use crate::interner::intern;
+    let mut val: std::collections::HashMap<
+        crate::interner::Symbol,
+        crate::cst::Associativity,
+    > = std::collections::HashMap::new();
+    let mut typ: std::collections::HashMap<
+        crate::interner::Symbol,
+        crate::cst::Associativity,
+    > = std::collections::HashMap::new();
+    let prims = crate::typecheck_db::prim::prim_exports();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports: Option<&ModuleExports> = registry
+            .get(&target)
+            .or_else(|| prims.get(&target));
+        let Some(exports) = exports else { continue };
+        for (op, fix) in &exports.value_fixities {
+            val.insert(intern(op), fix.associativity);
+        }
+        for (op, fix) in &exports.type_fixities {
+            typ.insert(intern(op), fix.associativity);
+        }
+    }
+    (val, typ)
 }
 
 /// Imported class name → positional fundeps. Each

@@ -284,6 +284,7 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
                 || has("WildcardInTypeDefinition")
                 || has("ConstraintInForeignImport")
                 || has("InvalidConstraintArgument")
+                || has("ErrorParsingModule")
         }
         "UnknownName" => {
             has("UnknownName")
