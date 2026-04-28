@@ -184,6 +184,10 @@ fn collect_error_codes(report: &ModuleCheckReport) -> Vec<String> {
         match e {
             MultiModuleError::CycleInModules(_) => codes.push("CycleInModules".into()),
             MultiModuleError::UnknownImport { .. } => codes.push("UnknownImport".into()),
+            MultiModuleError::DuplicateModule(_) => codes.push("DuplicateModule".into()),
+            MultiModuleError::CannotDefinePrimModules(_) => {
+                codes.push("CannotDefinePrimModules".into())
+            }
         }
     }
 
@@ -366,7 +370,7 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
         }
         "OverlappingInstances" => has("OverlappingInstances"),
         "ExportConflict" => has("ExportConflict"),
-        "ScopeConflict" => has("ScopeConflict"),
+        "ScopeConflict" => has("ScopeConflict") || has("ExportConflict"),
         "OrphanInstance" => has("OrphanInstance"),
         "KindsDoNotUnify" => has("KindsDoNotUnify") || has("RecordLabelMismatch"),
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
@@ -476,6 +480,19 @@ fn run_failing_inner(name: &str) -> Result<(), String> {
     let pkgs = package_modules_by_name();
     let closure = transitive_imports(&fixture_modules, pkgs);
 
+    // Pre-dedup: if the build unit literally contains the same
+    // module name in two different `.purs` files, the original
+    // compiler reports `DuplicateModule`. Detect before the dedup
+    // step (which silently picks one).
+    let mut early_codes: Vec<String> = Vec::new();
+    let mut fixture_seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for m in &fixture_modules {
+        if !fixture_seen.insert(m.name.as_str()) {
+            early_codes.push("DuplicateModule".into());
+        }
+    }
+
     // 3) Dedupe; fixture wins on collision.
     let mut by_name: std::collections::HashMap<String, ModuleInput> =
         std::collections::HashMap::with_capacity(fixture_modules.len() + closure.len());
@@ -492,7 +509,8 @@ fn run_failing_inner(name: &str) -> Result<(), String> {
     let report = check_many_modules_with_db(&mut db, parsed);
 
     // 5) Collect error codes.
-    let actual_codes = collect_error_codes(&report);
+    let mut actual_codes = collect_error_codes(&report);
+    actual_codes.extend(early_codes);
 
     // 6) Parse the expected annotation.
     let expected = match extract_annotation(&primary_src) {

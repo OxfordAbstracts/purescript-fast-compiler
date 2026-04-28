@@ -93,6 +93,14 @@ pub enum MultiModuleError {
     /// Module M imports N, but N is neither in the input nor in
     /// the registry (and isn't a Prim module).
     UnknownImport { from: String, missing: String },
+    /// The same module name was declared in two source files of
+    /// the same build unit. Reference compiler reports as
+    /// `DuplicateModule`.
+    DuplicateModule(String),
+    /// A user module declared a name in the `Prim` namespace
+    /// (`module Prim where` or `module Prim.X where`). Reserved
+    /// for compiler-defined terms.
+    CannotDefinePrimModules(String),
 }
 
 /// Aggregate return of a multi-module check.
@@ -151,6 +159,35 @@ pub fn check_many_modules_with_db(
         results: Vec::new(),
         errors: Vec::new(),
     };
+
+    // Reject build units that declare the same module name in two
+    // different source files. The HashMap above silently dedupes by
+    // last-write so we re-scan the original list to catch the dup.
+    let mut seen_names: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    let mut duplicate_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for m in &modules {
+        if !seen_names.insert(m.name.as_str()) {
+            duplicate_names.insert(m.name.clone());
+        }
+    }
+    for name in &duplicate_names {
+        report
+            .errors
+            .push(MultiModuleError::DuplicateModule(name.clone()));
+    }
+
+    // User modules may not declare a name in the `Prim` namespace —
+    // `Prim` and its sub-modules are reserved for compiler-defined
+    // terms. The reference compiler's `CannotDefinePrimModules`.
+    for m in &modules {
+        if m.name == "Prim" || m.name.starts_with("Prim.") {
+            report
+                .errors
+                .push(MultiModuleError::CannotDefinePrimModules(m.name.clone()));
+        }
+    }
 
     let (order, cycles) = topo_sort_modules(&modules, &name_index);
     for cycle in cycles {

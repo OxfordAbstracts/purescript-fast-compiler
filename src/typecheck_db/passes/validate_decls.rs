@@ -81,6 +81,12 @@ pub enum ValidationErrorKind {
     /// `type role` declared on a class or type-alias (only valid
     /// for data/newtype/foreign-data).
     UnsupportedRoleDeclaration(String),
+    /// Instance for a locally-declared class is missing one or more
+    /// of the class's methods.
+    MissingClassMember(String),
+    /// Instance for a locally-declared class defines a method the
+    /// class did not declare.
+    ExtraneousClassMember(String),
 }
 
 impl ValidationErrorKind {
@@ -118,6 +124,8 @@ impl ValidationErrorKind {
             Self::IntOutOfRange => "IntOutOfRange",
             Self::InvalidOperatorInBinder(_) => "InvalidOperatorInBinder",
             Self::UnsupportedRoleDeclaration(_) => "UnsupportedRoleDeclaration",
+            Self::MissingClassMember(_) => "MissingClassMember",
+            Self::ExtraneousClassMember(_) => "ExtraneousClassMember",
         }
     }
 }
@@ -395,14 +403,65 @@ pub fn validate_module_with_imports(
         }
     }
 
-    // Orphan role decls: role targeting a type that doesn't exist locally.
-    for (sym, spans) in &role_decls {
-        if !type_decls.contains_key(sym) {
-            for span in spans {
-                errors.push(ValidationError {
-                    span: *span,
-                    kind: ValidationErrorKind::OrphanRoleDeclaration(resolve(*sym)),
+    // Orphan role decls. Two conditions:
+    //   (a) role targets a name that doesn't exist locally, OR
+    //   (b) role isn't adjacent (immediately before or after) the
+    //       matching data/newtype decl.
+    {
+        // Build positional indices of each Decl::Data (real, not
+        // role/kind), Decl::Newtype, Decl::ForeignData, plus the
+        // role decls themselves.
+        let mut data_positions: HashMap<Symbol, Vec<usize>> = HashMap::new();
+        let mut role_positions: HashMap<Symbol, Vec<usize>> = HashMap::new();
+        for (i, d) in module.decls.iter().enumerate() {
+            match d {
+                cst::Decl::Data { name, kind_sig, is_role_decl, .. } => {
+                    if *is_role_decl {
+                        role_positions.entry(name.value.symbol()).or_default().push(i);
+                    } else if matches!(kind_sig, cst::KindSigSource::None) {
+                        data_positions.entry(name.value.symbol()).or_default().push(i);
+                    }
+                }
+                cst::Decl::Newtype { name, .. } => {
+                    data_positions.entry(name.value.symbol()).or_default().push(i);
+                }
+                cst::Decl::ForeignData { name, .. } => {
+                    data_positions.entry(name.value.symbol()).or_default().push(i);
+                }
+                _ => {}
+            }
+        }
+        for (sym, spans) in &role_decls {
+            // No matching data decl at all → orphan.
+            if !type_decls.contains_key(sym) {
+                for span in spans {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::OrphanRoleDeclaration(resolve(*sym)),
+                    });
+                }
+                continue;
+            }
+            // Adjacency check: role must be at index ±1 of its data
+            // decl. Otherwise the original compiler reports it as
+            // orphan (a role separated from its decl by other decls
+            // is treated the same as an unattached role).
+            let Some(role_idxs) = role_positions.get(sym) else { continue };
+            let Some(data_idxs) = data_positions.get(sym) else { continue };
+            for (role_idx, span) in role_idxs.iter().zip(spans.iter()) {
+                // Role must IMMEDIATELY follow its matching data
+                // decl (i.e. data_idx == role_idx - 1). The original
+                // compiler does not accept role-before-data nor
+                // role separated by intervening decls.
+                let well_placed = data_idxs.iter().any(|d| {
+                    *d + 1 == *role_idx
                 });
+                if !well_placed {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::OrphanRoleDeclaration(resolve(*sym)),
+                    });
+                }
             }
         }
     }
@@ -474,6 +533,10 @@ pub fn validate_module_with_imports(
 
     // `type role` only valid on data/newtype/foreign-data.
     detect_unsupported_role_declaration(&module.decls, &mut errors);
+
+    // Instance member sets must match the class's declared method
+    // set (Missing- or ExtraneousClassMember). Local classes only.
+    detect_class_member_mismatch(&module.decls, &mut errors);
 
     errors
 }
@@ -3433,6 +3496,76 @@ fn detect_unsupported_role_declaration(
                 errors.push(ValidationError {
                     span: *span,
                     kind: ValidationErrorKind::UnsupportedRoleDeclaration(resolve(sym)),
+                });
+            }
+        }
+    }
+}
+
+/// MissingClassMember + ExtraneousClassMember.
+///
+/// For each instance whose class is locally declared, compare the
+/// instance's defined methods against the class's declared members:
+///   - members in class but not instance → MissingClassMember
+///   - members in instance but not class → ExtraneousClassMember
+fn detect_class_member_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut class_members: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Class { name, members, is_kind_sig, .. } = d {
+            if !*is_kind_sig {
+                let m_syms: Vec<Symbol> =
+                    members.iter().map(|m| m.name.value.symbol()).collect();
+                class_members.insert(name.value.symbol(), m_syms);
+            }
+        }
+    }
+    for d in decls {
+        let cst::Decl::Instance { class_name, members, span, .. } = d else {
+            continue;
+        };
+        // Only check locally-declared classes; imported classes
+        // would need registry lookup, deferred.
+        let cqi = class_name.to_qi();
+        if cqi.module.is_some() {
+            continue;
+        }
+        let Some(declared) = class_members.get(&cqi.name) else {
+            continue;
+        };
+        let declared_set: HashSet<Symbol> = declared.iter().copied().collect();
+        let mut instance_set: HashSet<Symbol> = HashSet::new();
+        for m in members {
+            // Instance members are themselves Decl::Value (or
+            // Decl::TypeSignature for instance method sigs); only
+            // count Value definitions toward the implementation
+            // set — TypeSignature is a sig, not an impl.
+            if let cst::Decl::Value { name, .. } = m {
+                instance_set.insert(name.value.symbol());
+            }
+        }
+        // The reference compiler permits the FULLY-empty instance
+        // body (`instance Foo X`) — common when a `Fail` constraint
+        // makes the instance unreachable. Only emit MissingClassMember
+        // for *partial* implementations.
+        if !instance_set.is_empty() {
+            for n in &declared_set {
+                if !instance_set.contains(n) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::MissingClassMember(resolve(*n)),
+                    });
+                }
+            }
+        }
+        // Extraneous = in instance but not declared.
+        for n in &instance_set {
+            if !declared_set.contains(n) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::ExtraneousClassMember(resolve(*n)),
                 });
             }
         }
