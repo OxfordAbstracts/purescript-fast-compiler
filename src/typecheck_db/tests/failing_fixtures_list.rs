@@ -134,9 +134,9 @@ check_failing_build_unit_ignored!(f_CompareInt8, "CompareInt8", "expected: Types
 check_failing_build_unit_ignored!(f_CompareInt9, "CompareInt9", "expected: TypesDoNotUnify");
 check_failing_build_unit_ignored!(f_ConflictingExports, "ConflictingExports", "expected: ScopeConflict");
 check_failing_build_unit_ignored!(f_ConflictingImports, "ConflictingImports", "expected: ScopeConflict");
-check_failing_build_unit_ignored!(f_ConflictingImports2, "ConflictingImports2", "expected: ScopeConflict");
-check_failing_build_unit_ignored!(f_ConflictingQualifiedImports, "ConflictingQualifiedImports", "expected: ScopeConflict");
-check_failing_build_unit_ignored!(f_ConflictingQualifiedImports2, "ConflictingQualifiedImports2", "expected: ScopeConflict");
+check_failing_build_unit!(f_ConflictingImports2, "ConflictingImports2");
+check_failing_build_unit!(f_ConflictingQualifiedImports, "ConflictingQualifiedImports");
+check_failing_build_unit!(f_ConflictingQualifiedImports2, "ConflictingQualifiedImports2");
 check_failing_build_unit!(f_ConstraintFailure, "ConstraintFailure");
 check_failing_build_unit!(f_ConstraintInForeignImport, "ConstraintInForeignImport");
 check_failing_build_unit_ignored!(f_ConstraintInference, "ConstraintInference", "expected: AmbiguousTypeVariables");

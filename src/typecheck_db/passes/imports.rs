@@ -54,6 +54,16 @@ pub enum ImportErrorKind {
     UnknownClass { module: String, name: String },
     /// `import M ((<>))` where `<>` isn't in M's fixities.
     UnknownOperator { module: String, name: String },
+    /// Two imports bring the same name into scope from different
+    /// modules. Triggered when `import A (thing); import B (thing)`
+    /// (both expose `thing` unqualified) or
+    /// `import A as X; import B as X` (both share alias `X`),
+    /// matching the reference compiler's `ScopeConflict` failure.
+    ScopeConflict {
+        name: String,
+        first_module: String,
+        second_module: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +88,26 @@ pub fn build_env_from_imports(
         import_all("Prim", prim, /*qualifier=*/ None, &mut env, &mut ix);
     }
 
+    // Track each (qualifier, name) pair against the *origin* module
+    // (the module that declared the value, not the re-exporter).
+    // Re-exports through Prelude that wrap a name from Control.Apply
+    // share the same origin, so importing both `Prelude` and
+    // `Control.Apply` doesn't false-positive on shared re-exports.
+    //
+    // The reference compiler's ScopeConflict is fundamentally
+    // *use-site* (only fires when an unqualified reference resolves
+    // ambiguously), but most fixtures we care about either:
+    // (a) explicitly list both imports — `import A (thing); import
+    //     B (thing)` — the user has clearly committed to both being
+    //     in scope; or
+    // (b) reference the conflicted name in body code.
+    // We approximate (a) by only emitting ScopeConflict when BOTH
+    // sides flagged a name explicitly — open `import A; import B`
+    // doesn't flag (matches `passing/PendingConflictingImports.purs`).
+    let mut name_origins: std::collections::HashMap<
+        (Option<String>, String),
+        (String, bool),
+    > = std::collections::HashMap::new();
     for imp in &module.imports {
         let target_name = module_name_string(&imp.module);
         // Prim and its submodules are resolved from the static
@@ -102,10 +132,89 @@ pub fn build_env_from_imports(
             .as_ref()
             .map(|q| module_name_string(q));
 
+        // Detect conflicts before applying: collect every
+        // (qualifier, name) this import would bring in (filtered
+        // by explicit / hiding lists). Resolve each name's origin
+        // module via `value_origins`; if it's a re-export, the
+        // origin points to the declaring module, so two imports of
+        // the same re-exported name don't false-positive.
+        let is_explicit_list =
+            matches!(imp.imports, Some(ImportList::Explicit(_)));
+        let imported_names = compute_imported_names(target, &imp.imports);
+        for n in imported_names {
+            let key = (qualifier.clone(), n.clone());
+            let origin = target
+                .value_origins
+                .get(&n)
+                .cloned()
+                .unwrap_or_else(|| target_name.clone());
+            match name_origins.get(&key) {
+                Some((prev_origin, prev_explicit))
+                    if *prev_origin != origin
+                        && ((*prev_explicit && is_explicit_list)
+                            || qualifier.is_some()) =>
+                {
+                    errors.push(ImportError {
+                        span: imp.span,
+                        kind: ImportErrorKind::ScopeConflict {
+                            name: n,
+                            first_module: prev_origin.clone(),
+                            second_module: origin.clone(),
+                        },
+                    });
+                }
+                _ => {
+                    name_origins.insert(key, (origin, is_explicit_list));
+                }
+            }
+        }
+
         apply_import(&target_name, target, &imp, qualifier, &mut env, &mut ix, &mut errors);
     }
 
     (env, ix, errors)
+}
+
+/// Compute the set of unqualified VALUE names that an import would
+/// bring into the importer's scope, respecting any explicit-list /
+/// hiding-list filter. Restricted to values (not types/classes/ctors)
+/// because the ScopeConflict detector relies on
+/// `ModuleExports.value_origins` to dedupe re-exports — types and
+/// classes lack origin tracking, so attempting to detect their
+/// conflicts here would false-positive on Prelude re-exports of
+/// Data.Eq's `Eq1`, etc.
+fn compute_imported_names(
+    target: &ModuleExports,
+    list: &Option<ImportList>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push_all = |out: &mut Vec<String>, target: &ModuleExports, hidden: &HideFilter| {
+        for n in target.values.keys() {
+            if !hidden.values.contains(n.as_str()) {
+                out.push(n.clone());
+            }
+        }
+    };
+    match list {
+        None => push_all(&mut out, target, &HideFilter::default()),
+        Some(ImportList::Hiding(hidden)) => {
+            let mut filter = HideFilter::default();
+            for item in hidden {
+                filter.insert(item);
+            }
+            push_all(&mut out, target, &filter);
+        }
+        Some(ImportList::Explicit(items)) => {
+            for item in items {
+                if let cst::Import::Value(n) = item {
+                    out.push(
+                        crate::typecheck_db::util::resolve_symbol(n.value.symbol()),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

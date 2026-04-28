@@ -259,6 +259,7 @@ fn import_error_code(kind: &ImportErrorKind) -> String {
         ImportErrorKind::UnknownConstructor { .. } => "UnknownImport".into(),
         ImportErrorKind::UnknownClass { .. } => "UnknownImport".into(),
         ImportErrorKind::UnknownOperator { .. } => "UnknownImport".into(),
+        ImportErrorKind::ScopeConflict { .. } => "ScopeConflict".into(),
     }
 }
 
