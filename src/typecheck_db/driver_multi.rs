@@ -248,14 +248,11 @@ fn check_one_module(
     detect_unknown_exports_registry(module, registry, &mut validation_errors);
 
     // Registry-aware UnknownName check for type-constructor refs in
-    // top-level signatures. Restricted to kind-annotation positions
-    // (`forall (a :: K).` and `data T :: K`) — bare type-position
-    // refs are skipped because of `module M (module M, …)`
-    // self-re-export interactions that aren't reflected in
-    // `type_arities`. Kind-annotation positions are narrower and
-    // safer.
+    // top-level signatures. The self-re-export `module M (module M)`
+    // case is now handled by `expand_module_reexports`, so the
+    // full type-position check is safe.
     detect_unknown_kind_refs_registry(module, registry, &mut validation_errors);
-    let _ = detect_unknown_type_refs_registry;
+    detect_unknown_type_refs_registry(module, registry, &mut validation_errors);
 
     // Use-site ScopeConflict (open + open) — disabled, too eager.
     // Origin tracking is imperfect across long re-export chains
@@ -274,6 +271,16 @@ fn check_one_module(
         &module.decls,
         &imp_val_op_assoc,
         &imp_type_op_assoc,
+        &mut validation_errors,
+    );
+
+    // MixedAssociativityError on imported operators (precedence +
+    // assoc together).
+    let (imp_val_fix, imp_type_fix) = build_imported_op_fixity(module, registry);
+    crate::typecheck_db::passes::validate_decls::detect_mixed_associativity(
+        &module.decls,
+        &imp_val_fix,
+        &imp_type_fix,
         &mut validation_errors,
     );
 
@@ -2623,6 +2630,44 @@ fn collect_unqualified_type_constructors(te: &cst::TypeExpr, out: &mut Vec<Strin
         }
         _ => {}
     }
+}
+
+/// Imported value-operator and type-operator names → (precedence,
+/// associativity). Used by the MixedAssociativityError detector.
+fn build_imported_op_fixity(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> (
+    std::collections::HashMap<crate::interner::Symbol, (u8, crate::cst::Associativity)>,
+    std::collections::HashMap<crate::interner::Symbol, (u8, crate::cst::Associativity)>,
+) {
+    use crate::interner::intern;
+    let mut val: std::collections::HashMap<
+        crate::interner::Symbol,
+        (u8, crate::cst::Associativity),
+    > = std::collections::HashMap::new();
+    let mut typ: std::collections::HashMap<
+        crate::interner::Symbol,
+        (u8, crate::cst::Associativity),
+    > = std::collections::HashMap::new();
+    let prims = crate::typecheck_db::prim::prim_exports();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports: Option<&ModuleExports> = registry
+            .get(&target)
+            .or_else(|| prims.get(&target));
+        let Some(exports) = exports else { continue };
+        for (op, fix) in &exports.value_fixities {
+            val.insert(intern(op), (fix.precedence, fix.associativity));
+        }
+        for (op, fix) in &exports.type_fixities {
+            typ.insert(intern(op), (fix.precedence, fix.associativity));
+        }
+    }
+    (val, typ)
 }
 
 /// Imported value-operator and type-operator names → associativity.

@@ -138,6 +138,10 @@ pub enum ValidationErrorKind {
     /// Non-associative operator chained with itself (`a == b == c`
     /// where `==` is `infix` not `infixl`/`infixr`).
     NonAssociativeError(String),
+    /// Two operators at the same precedence with different
+    /// associativity used in a chain — `f <$> x == f <$> y` mixes
+    /// `<$>` (left, prec 4) with `==` (none, prec 4).
+    MixedAssociativityError(String),
 }
 
 impl ValidationErrorKind {
@@ -190,6 +194,7 @@ impl ValidationErrorKind {
             Self::UnknownName(_) => "UnknownName",
             Self::InvalidModuleName(_) => "ErrorParsingModule",
             Self::NonAssociativeError(_) => "NonAssociativeError",
+            Self::MixedAssociativityError(_) => "MixedAssociativityError",
         }
     }
 }
@@ -679,6 +684,15 @@ pub fn validate_module_with_class_fundeps(
     // Non-associative operator chained with itself (`a == b == c`
     // or `a >> b >> a` where the op is `infix`).
     detect_non_associative_chain(&module.decls, &mut errors);
+
+    // Mixed associativity at the same precedence — local-only
+    // version (no imports). Driver re-runs the imported variant.
+    detect_mixed_associativity(
+        &module.decls,
+        &HashMap::new(),
+        &HashMap::new(),
+        &mut errors,
+    );
 
     // Equation arity mismatch (same value name, different binder
     // counts).
@@ -5703,6 +5717,281 @@ fn expr_uses_op(expr: &cst::Expr, op_sym: Symbol) -> bool {
         op.value.module.is_none() && op.value.name.symbol() == op_sym
     } else {
         false
+    }
+}
+
+/// MixedAssociativityError. Two operators at the same precedence
+/// with different associativity chained without explicit grouping
+/// — e.g. `f <$> x == f <$> y` mixes `<$>` (left, prec 4) with
+/// `==` (none, prec 4). Fires only on the OUTERMOST mismatch
+/// (immediate child Op of same precedence + different assoc, no
+/// Parens between).
+pub(crate) fn detect_mixed_associativity(
+    decls: &[cst::Decl],
+    imported_value_op_fixity: &HashMap<Symbol, (u8, cst::Associativity)>,
+    imported_type_op_fixity: &HashMap<Symbol, (u8, cst::Associativity)>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut value_fix: HashMap<Symbol, (u8, cst::Associativity)> =
+        imported_value_op_fixity.clone();
+    let mut type_fix: HashMap<Symbol, (u8, cst::Associativity)> =
+        imported_type_op_fixity.clone();
+    for d in decls {
+        if let cst::Decl::Fixity {
+            operator,
+            associativity,
+            precedence,
+            is_type,
+            ..
+        } = d
+        {
+            let map = if *is_type { &mut type_fix } else { &mut value_fix };
+            map.insert(operator.value.symbol(), (*precedence, *associativity));
+        }
+    }
+    for d in decls {
+        match d {
+            cst::Decl::Value { guarded, where_clause, .. } => {
+                walk_guarded_for_mixed(guarded, &value_fix, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { expr, .. } = b {
+                        walk_expr_for_mixed(expr, &value_fix, errors);
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_mixed_associativity(members, &value_fix, &type_fix, errors);
+            }
+            cst::Decl::TypeAlias { ty, .. }
+            | cst::Decl::TypeSignature { ty, .. }
+            | cst::Decl::Foreign { ty, .. } => {
+                walk_type_for_mixed(ty, &type_fix, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_op_mixed(
+    outer_op_sym: Symbol,
+    outer_module_none: bool,
+    child: Option<(Symbol, bool)>,
+    fix: &HashMap<Symbol, (u8, cst::Associativity)>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !outer_module_none {
+        return;
+    }
+    let Some((outer_prec, outer_assoc)) = fix.get(&outer_op_sym).copied() else {
+        return;
+    };
+    let Some((child_sym, child_module_none)) = child else { return };
+    if !child_module_none {
+        return;
+    }
+    let Some((child_prec, child_assoc)) = fix.get(&child_sym).copied() else {
+        return;
+    };
+    if outer_prec != child_prec {
+        return;
+    }
+    if outer_assoc == child_assoc {
+        return;
+    }
+    // The same-op same-prec chain is `NonAssociativeError`'s
+    // territory (when both are None). A mixed-assoc chain at the
+    // same precedence with DIFFERENT operators (or one None and
+    // the other L/R) is the MixedAssociativityError case.
+    if outer_op_sym == child_sym {
+        return;
+    }
+    errors.push(ValidationError {
+        span,
+        kind: ValidationErrorKind::MixedAssociativityError(resolve(outer_op_sym)),
+    });
+}
+
+fn walk_guarded_for_mixed(
+    g: &cst::GuardedExpr,
+    fix: &HashMap<Symbol, (u8, cst::Associativity)>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => walk_expr_for_mixed(e, fix, errors),
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_mixed(e, fix, errors);
+                        }
+                    }
+                }
+                walk_expr_for_mixed(&gd.expr, fix, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_mixed(
+    expr: &cst::Expr,
+    fix: &HashMap<Symbol, (u8, cst::Associativity)>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::Expr::Op { left, op, right, span } = expr {
+        let outer_sym = op.value.name.symbol();
+        let outer_mod_none = op.value.module.is_none();
+        let child_info = |c: &cst::Expr| -> Option<(Symbol, bool)> {
+            if let cst::Expr::Op { op, .. } = c {
+                Some((op.value.name.symbol(), op.value.module.is_none()))
+            } else {
+                None
+            }
+        };
+        check_op_mixed(outer_sym, outer_mod_none, child_info(left), fix, *span, errors);
+        check_op_mixed(outer_sym, outer_mod_none, child_info(right), fix, *span, errors);
+    }
+    match expr {
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_mixed(func, fix, errors);
+            walk_expr_for_mixed(arg, fix, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => walk_expr_for_mixed(func, fix, errors),
+        cst::Expr::Lambda { body, .. } => walk_expr_for_mixed(body, fix, errors),
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_mixed(left, fix, errors);
+            walk_expr_for_mixed(right, fix, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_mixed(cond, fix, errors);
+            walk_expr_for_mixed(then_expr, fix, errors);
+            walk_expr_for_mixed(else_expr, fix, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_mixed(e, fix, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_mixed(&alt.result, fix, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_mixed(expr, fix, errors);
+                }
+            }
+            walk_expr_for_mixed(body, fix, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_mixed(expr, fix, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_mixed(expr, fix, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_mixed(result, fix, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_mixed(v, fix, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => walk_expr_for_mixed(expr, fix, errors),
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_mixed(expr, fix, errors);
+            for u in updates {
+                walk_expr_for_mixed(&u.value, fix, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => walk_expr_for_mixed(expr, fix, errors),
+        cst::Expr::TypeAnnotation { expr, .. } => walk_expr_for_mixed(expr, fix, errors),
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_mixed(e, fix, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => walk_expr_for_mixed(expr, fix, errors),
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_mixed(name, fix, errors);
+            walk_expr_for_mixed(pattern, fix, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_mixed(func, fix, errors);
+            walk_expr_for_mixed(left, fix, errors);
+            walk_expr_for_mixed(right, fix, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_type_for_mixed(
+    te: &cst::TypeExpr,
+    fix: &HashMap<Symbol, (u8, cst::Associativity)>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::TypeExpr::TypeOp { left, op, right, span } = te {
+        let outer_sym = op.value.name.symbol();
+        let outer_mod_none = op.value.module.is_none();
+        let child_info = |c: &cst::TypeExpr| -> Option<(Symbol, bool)> {
+            if let cst::TypeExpr::TypeOp { op, .. } = c {
+                Some((op.value.name.symbol(), op.value.module.is_none()))
+            } else {
+                None
+            }
+        };
+        check_op_mixed(outer_sym, outer_mod_none, child_info(left), fix, *span, errors);
+        check_op_mixed(outer_sym, outer_mod_none, child_info(right), fix, *span, errors);
+    }
+    match te {
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_type_for_mixed(constructor, fix, errors);
+            walk_type_for_mixed(arg, fix, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_type_for_mixed(from, fix, errors);
+            walk_type_for_mixed(to, fix, errors);
+        }
+        cst::TypeExpr::Forall { ty, .. } => walk_type_for_mixed(ty, fix, errors),
+        cst::TypeExpr::Constrained { ty, .. } => walk_type_for_mixed(ty, fix, errors),
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_type_for_mixed(&f.ty, fix, errors);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_type_for_mixed(&f.ty, fix, errors);
+            }
+            if let Some(t) = tail {
+                walk_type_for_mixed(t, fix, errors);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => walk_type_for_mixed(ty, fix, errors),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_type_for_mixed(left, fix, errors);
+            walk_type_for_mixed(right, fix, errors);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_type_for_mixed(ty, fix, errors);
+            walk_type_for_mixed(kind, fix, errors);
+        }
+        _ => {}
     }
 }
 

@@ -747,6 +747,14 @@ pub fn expand_module_reexports(
         Some(s) => s,
         None => return,
     };
+    let self_module_name: String = module
+        .name
+        .value
+        .parts
+        .iter()
+        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+        .collect::<Vec<_>>()
+        .join(".");
     for item in &spanned.value.exports {
         if let Export::Module(mn) = item {
             let re_exported_name: String = mn
@@ -755,6 +763,60 @@ pub fn expand_module_reexports(
                 .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
                 .collect::<Vec<_>>()
                 .join(".");
+
+            // Self re-export: `module M (module M)` — surface all
+            // local declarations as if they'd been listed
+            // explicitly. We scan `module.decls` directly since
+            // `out`'s explicit-export logic only added items
+            // listed in the export list; local-only types like
+            // a `type Foo = Boolean` referenced via `module M`
+            // wouldn't otherwise reach `out`.
+            if re_exported_name == self_module_name {
+                for d in &module.decls {
+                    match d {
+                        crate::cst::Decl::Data {
+                            name,
+                            type_vars,
+                            kind_sig: crate::cst::KindSigSource::None,
+                            is_role_decl: false,
+                            ..
+                        } => {
+                            let n = crate::typecheck_db::util::resolve_symbol(
+                                name.value.symbol(),
+                            );
+                            out.type_arities
+                                .entry(n)
+                                .or_insert(type_vars.len());
+                        }
+                        crate::cst::Decl::Newtype { name, type_vars, .. } => {
+                            let n = crate::typecheck_db::util::resolve_symbol(
+                                name.value.symbol(),
+                            );
+                            out.type_arities
+                                .entry(n)
+                                .or_insert(type_vars.len());
+                        }
+                        crate::cst::Decl::TypeAlias {
+                            name, type_vars, ..
+                        } => {
+                            let n = crate::typecheck_db::util::resolve_symbol(
+                                name.value.symbol(),
+                            );
+                            out.type_arities
+                                .entry(n)
+                                .or_insert(type_vars.len());
+                        }
+                        crate::cst::Decl::ForeignData { name, .. } => {
+                            let n = crate::typecheck_db::util::resolve_symbol(
+                                name.value.symbol(),
+                            );
+                            out.type_arities.entry(n).or_insert(0);
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
 
             // Find which import target this `module X` clause
             // refers to: either an `import M as X` aliased as
