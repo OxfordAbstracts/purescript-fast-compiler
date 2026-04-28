@@ -514,6 +514,16 @@ fn scheme_has_constraint(scheme: &Scheme) -> bool {
         match ty {
             Type::Constrained(_, _) => true,
             Type::Forall(_, body) => walk(body),
+            // A `Constrained` layer can hide inside a function arg
+            // position too — `unsafePartial :: forall a. (Partial =>
+            // a) -> a` has its `Partial` constraint nested inside
+            // the `Fun.arg` of the outer return type. Without
+            // recursing into Fun + App we'd miss those sigs and
+            // F2's slot-pin would skip them, silently losing the
+            // declared constraint and producing the wrong scheme
+            // (`forall a b. b -> a` for unsafePartial instead of
+            // its true rank-N type).
+            Type::Fun(a, b) | Type::App(a, b) => walk(a) || walk(b),
             _ => false,
         }
     }
