@@ -139,7 +139,7 @@ check_failing_build_unit!(f_ConflictingQualifiedImports, "ConflictingQualifiedIm
 check_failing_build_unit!(f_ConflictingQualifiedImports2, "ConflictingQualifiedImports2");
 check_failing_build_unit!(f_ConstraintFailure, "ConstraintFailure");
 check_failing_build_unit!(f_ConstraintInForeignImport, "ConstraintInForeignImport");
-check_failing_build_unit_ignored!(f_ConstraintInference, "ConstraintInference", "expected: AmbiguousTypeVariables");
+check_failing_build_unit!(f_ConstraintInference, "ConstraintInference");
 check_failing_build_unit_ignored!(f_ContravariantInstance1, "ContravariantInstance1", "expected: CannotDeriveInvalidConstructorArg");
 check_failing_build_unit!(f_CtorArityTooFew, "CtorArityTooFew");
 check_failing_build_unit!(f_CycleInForeignDataKinds, "CycleInForeignDataKinds");

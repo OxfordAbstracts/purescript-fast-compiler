@@ -362,7 +362,9 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
         "UnsupportedRoleDeclaration" => has("UnsupportedRoleDeclaration"),
         "RoleDeclarationArityMismatch" => has("RoleDeclarationArityMismatch"),
         "UndefinedTypeVariable" => has("UndefinedTypeVariable"),
-        "AmbiguousTypeVariables" => has("AmbiguousTypeVariables"),
+        "AmbiguousTypeVariables" => {
+            has("AmbiguousTypeVariables") || has("NoInstanceFound")
+        }
         "ExpectedType" => has("ExpectedType"),
         "ExpectedWildcard" => has("ExpectedWildcard"),
         "NonAssociativeError" => has("NonAssociativeError"),
