@@ -316,7 +316,9 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
         "OverlappingArgNames" => has("OverlappingArgNames") || has("OverlappingPattern"),
         "ArgListLengthsDiffer" => has("ArityMismatch"),
         "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => {
-            has("InvalidNewtypeInstance") || has("InvalidNewtypeDerivation")
+            has("InvalidNewtypeInstance")
+                || has("InvalidNewtypeDerivation")
+                || has("CannotDeriveNewtypeForData")
         }
         "InvalidNewtypeDerivation" => has("InvalidNewtypeDerivation"),
         "OverlappingPattern" => has("OverlappingPattern"),

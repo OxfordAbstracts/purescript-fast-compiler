@@ -60,6 +60,27 @@ pub enum ValidationErrorKind {
     /// clauses creates an unresolvable ambiguity at C's surface.
     /// Original compiler's `ExportConflict` failure.
     ExportConflict(String),
+    /// Same name used twice in a single argument list / case
+    /// pattern. `f x x = x` or `case x of (S y (S y@_)) -> y`.
+    OverlappingArgNames(String),
+    /// Same name declared twice non-adjacently inside a single
+    /// `let` block (or `where`). Reference compiler's
+    /// `OverlappingNamesInLet`.
+    OverlappingNamesInLet(String),
+    /// `derive newtype instance C (T ...)` where T was declared
+    /// `data` (not `newtype`).
+    CannotDeriveNewtypeForData(String),
+    /// `Int` literal whose value falls outside the i32 range.
+    IntOutOfRange,
+    /// Operator used in a binder position (e.g. `(_ : x : _)`).
+    /// The reference compiler routes operator parsing in binders
+    /// through the same fixity machinery as expressions, but only
+    /// for ctor-shaped operators (`infixl 6 Cons as :` works,
+    /// alias of plain function does not).
+    InvalidOperatorInBinder(String),
+    /// `type role` declared on a class or type-alias (only valid
+    /// for data/newtype/foreign-data).
+    UnsupportedRoleDeclaration(String),
 }
 
 impl ValidationErrorKind {
@@ -91,6 +112,12 @@ impl ValidationErrorKind {
             Self::TransitiveExportError(_) => "TransitiveExportError",
             Self::InvalidInstanceHead => "InvalidInstanceHead",
             Self::ExportConflict(_) => "ExportConflict",
+            Self::OverlappingArgNames(_) => "OverlappingArgNames",
+            Self::OverlappingNamesInLet(_) => "OverlappingNamesInLet",
+            Self::CannotDeriveNewtypeForData(_) => "CannotDeriveNewtypeForData",
+            Self::IntOutOfRange => "IntOutOfRange",
+            Self::InvalidOperatorInBinder(_) => "InvalidOperatorInBinder",
+            Self::UnsupportedRoleDeclaration(_) => "UnsupportedRoleDeclaration",
         }
     }
 }
@@ -136,12 +163,15 @@ pub fn validate_module_with_imports(
 
     for decl in &module.decls {
         match decl {
-            cst::Decl::Value { span, name, .. } => {
+            cst::Decl::Value { span, name, binders, .. } => {
                 let sym = name.value.symbol();
                 value_has_any.insert(sym);
                 // Start a new group unless this equation is adjacent
-                // to the previous one with the same name.
-                if last_value_name != Some(sym) {
+                // to the previous one with the same name. An
+                // arg-less equation (`foo = 1`) is itself a complete
+                // definition — a second `foo = 2` even adjacent is a
+                // genuine duplicate.
+                if last_value_name != Some(sym) || binders.is_empty() {
                     value_groups.entry(sym).or_default().push(*span);
                 }
                 last_value_name = Some(sym);
@@ -229,7 +259,38 @@ pub fn validate_module_with_imports(
                     value_ops.entry(operator.value.symbol()).or_default().push(*span);
                 }
             }
-            cst::Decl::Instance { .. } | cst::Decl::Derive { .. } => {
+            cst::Decl::Instance { members, .. } => {
+                // Walk each instance member's name with the same
+                // adjacency rule as top-level values, emitting
+                // `DuplicateValueDeclaration` for non-adjacent
+                // re-definitions of the same method.
+                let mut last_method: Option<Symbol> = None;
+                let mut method_groups: HashMap<Symbol, Vec<Span>> = HashMap::new();
+                for m in members {
+                    if let cst::Decl::Value { span, name, binders, .. } = m {
+                        let sym = name.value.symbol();
+                        if last_method != Some(sym) || binders.is_empty() {
+                            method_groups.entry(sym).or_default().push(*span);
+                        }
+                        last_method = Some(sym);
+                    } else {
+                        last_method = None;
+                    }
+                }
+                for (sym, spans) in &method_groups {
+                    if spans.len() > 1 {
+                        for span in spans.iter().skip(1) {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::DuplicateValueDeclaration(
+                                    resolve(*sym),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            cst::Decl::Derive { .. } => {
                 // Overlapping / duplicate instance checking happens in
                 // Bucket 6 — needs InstanceIndex which is built later.
             }
@@ -386,6 +447,33 @@ pub fn validate_module_with_imports(
 
     detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
     detect_invalid_instance_heads(&module.decls, &mut errors);
+
+    // Single-pass walk over each Decl::Value's binders + every nested
+    // Case alternative + every Lambda inside it. Looks for the same
+    // var name appearing twice in a single binder list (or one
+    // top-level Decl::Value's whole arg list).
+    detect_overlapping_arg_names(&module.decls, &mut errors);
+
+    // Walk each `let` / `where` block looking for the same name
+    // declared twice non-adjacently (multi-equation defs are
+    // allowed when contiguous, just like at the module level).
+    detect_overlapping_names_in_let(&module.decls, &mut errors);
+
+    // `derive newtype instance C (T ...)` requires T to be a `newtype`,
+    // not a `data`. Local data/newtype distinction only.
+    detect_cannot_derive_newtype_for_data(&module.decls, &mut errors);
+
+    // Operator usage in binder position — only ctor-shaped operators
+    // (`infixl 6 Cons as :`) are valid binders. Function-aliased
+    // operators (`infixl 6 cons as :` where `cons` is a function)
+    // make the binder un-deconstructable.
+    detect_invalid_operator_in_binder(&module.decls, &mut errors);
+
+    // `Int` literal whose value is outside the i32 range.
+    detect_int_out_of_range(&module.decls, &mut errors);
+
+    // `type role` only valid on data/newtype/foreign-data.
+    detect_unsupported_role_declaration(&module.decls, &mut errors);
 
     errors
 }
@@ -2329,4 +2417,1024 @@ fn check_duplicate_type_args(
 
 fn resolve(sym: Symbol) -> String {
     crate::interner::resolve(sym).unwrap_or_default()
+}
+
+/// Walk a binder tree, collecting every name it introduces. Each
+/// pushed entry is `(name, span_where_introduced)`. Punned record
+/// fields (`{ x }`) introduce the label as a name. As-patterns
+/// introduce both the bound name and recurse into the inner binder.
+fn collect_binder_names(b: &cst::Binder, out: &mut Vec<(Symbol, Span)>) {
+    match b {
+        cst::Binder::Wildcard { .. } | cst::Binder::Literal { .. } => {}
+        cst::Binder::Var { name, .. } => {
+            out.push((name.value.symbol(), name.span));
+        }
+        cst::Binder::Constructor { args, .. } => {
+            for a in args {
+                collect_binder_names(a, out);
+            }
+        }
+        cst::Binder::Record { fields, .. } => {
+            for f in fields {
+                match &f.binder {
+                    Some(inner) => collect_binder_names(inner, out),
+                    None => {
+                        out.push((f.label.value.symbol(), f.label.span));
+                    }
+                }
+            }
+        }
+        cst::Binder::As { name, binder, .. } => {
+            out.push((name.value.symbol(), name.span));
+            collect_binder_names(binder, out);
+        }
+        cst::Binder::Parens { binder, .. } => collect_binder_names(binder, out),
+        cst::Binder::Array { elements, .. } => {
+            for e in elements {
+                collect_binder_names(e, out);
+            }
+        }
+        cst::Binder::Op { left, right, .. } => {
+            collect_binder_names(left, out);
+            collect_binder_names(right, out);
+        }
+        cst::Binder::Typed { binder, .. } => collect_binder_names(binder, out),
+    }
+}
+
+/// Run [`collect_binder_names`] over every binder in `binders`,
+/// emitting an `OverlappingArgNames` for each repeated name.
+fn check_binder_list_overlap(
+    binders: &[cst::Binder],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut names: Vec<(Symbol, Span)> = Vec::new();
+    for b in binders {
+        collect_binder_names(b, &mut names);
+    }
+    let mut seen: HashSet<Symbol> = HashSet::new();
+    for (sym, span) in &names {
+        if !seen.insert(*sym) {
+            errors.push(ValidationError {
+                span: *span,
+                kind: ValidationErrorKind::OverlappingArgNames(resolve(*sym)),
+            });
+        }
+    }
+}
+
+/// Walk every expression inside `expr` looking for binder lists
+/// (Lambda args, Case alt patterns, Do/Ado bind patterns, nested
+/// Let bindings) and apply the overlap check to each one.
+fn walk_expr_for_overlapping_binders(
+    expr: &cst::Expr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::Var { .. }
+        | cst::Expr::Constructor { .. }
+        | cst::Expr::Literal { .. }
+        | cst::Expr::OpParens { .. }
+        | cst::Expr::Wildcard { .. }
+        | cst::Expr::Hole { .. } => {}
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_overlapping_binders(func, errors);
+            walk_expr_for_overlapping_binders(arg, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_overlapping_binders(func, errors);
+        }
+        cst::Expr::Lambda { binders, body, .. } => {
+            check_binder_list_overlap(binders, errors);
+            walk_expr_for_overlapping_binders(body, errors);
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_overlapping_binders(left, errors);
+            walk_expr_for_overlapping_binders(right, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_overlapping_binders(cond, errors);
+            walk_expr_for_overlapping_binders(then_expr, errors);
+            walk_expr_for_overlapping_binders(else_expr, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_overlapping_binders(e, errors);
+            }
+            for alt in alts {
+                check_binder_list_overlap(&alt.binders, errors);
+                walk_guarded_for_overlapping_binders(&alt.result, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            walk_let_bindings_for_overlapping_binders(bindings, errors);
+            walk_expr_for_overlapping_binders(body, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            walk_do_statements_for_overlapping_binders(statements, errors);
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_overlapping_binders(result, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_overlapping_binders(v, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_overlapping_binders(expr, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_overlapping_binders(expr, errors);
+            for u in updates {
+                walk_expr_for_overlapping_binders(&u.value, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => {
+            walk_expr_for_overlapping_binders(expr, errors);
+        }
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_overlapping_binders(expr, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_overlapping_binders(e, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_overlapping_binders(expr, errors);
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_overlapping_binders(name, errors);
+            walk_expr_for_overlapping_binders(pattern, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_overlapping_binders(func, errors);
+            walk_expr_for_overlapping_binders(left, errors);
+            walk_expr_for_overlapping_binders(right, errors);
+        }
+    }
+}
+
+fn walk_guarded_for_overlapping_binders(
+    g: &cst::GuardedExpr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_overlapping_binders(e, errors);
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            for gd in guards {
+                for p in &gd.patterns {
+                    if let cst::GuardPattern::Pattern(b, e) = p {
+                        check_binder_list_overlap(std::slice::from_ref(b), errors);
+                        walk_expr_for_overlapping_binders(e, errors);
+                    } else if let cst::GuardPattern::Boolean(e) = p {
+                        walk_expr_for_overlapping_binders(e, errors);
+                    }
+                }
+                walk_expr_for_overlapping_binders(&gd.expr, errors);
+            }
+        }
+    }
+}
+
+fn walk_let_bindings_for_overlapping_binders(
+    bindings: &[cst::LetBinding],
+    errors: &mut Vec<ValidationError>,
+) {
+    for b in bindings {
+        if let cst::LetBinding::Value { binder, expr, .. } = b {
+            check_binder_list_overlap(std::slice::from_ref(binder), errors);
+            walk_expr_for_overlapping_binders(expr, errors);
+        }
+    }
+}
+
+fn walk_do_statements_for_overlapping_binders(
+    statements: &[cst::DoStatement],
+    errors: &mut Vec<ValidationError>,
+) {
+    for s in statements {
+        match s {
+            cst::DoStatement::Bind { binder, expr, .. } => {
+                check_binder_list_overlap(std::slice::from_ref(binder), errors);
+                walk_expr_for_overlapping_binders(expr, errors);
+            }
+            cst::DoStatement::Let { bindings, .. } => {
+                walk_let_bindings_for_overlapping_binders(bindings, errors);
+            }
+            cst::DoStatement::Discard { expr, .. } => {
+                walk_expr_for_overlapping_binders(expr, errors);
+            }
+        }
+    }
+}
+
+fn detect_overlapping_arg_names(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::Value { binders, guarded, where_clause, .. } => {
+                check_binder_list_overlap(binders, errors);
+                walk_guarded_for_overlapping_binders(guarded, errors);
+                walk_let_bindings_for_overlapping_binders(where_clause, errors);
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_overlapping_arg_names(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Detect duplicate value names within a single `let` / `where` /
+/// instance-member let block, with the same "non-adjacent group"
+/// rule the top-level pass uses (multi-equation defs are fine when
+/// contiguous, broken when interleaved).
+fn check_let_block_for_dup_names(
+    bindings: &[cst::LetBinding],
+    errors: &mut Vec<ValidationError>,
+) {
+    // value_groups: name -> [span of each non-adjacent group]
+    let mut value_groups: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    let mut last_value_name: Option<Symbol> = None;
+    let mut sig_counts: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    for b in bindings {
+        match b {
+            cst::LetBinding::Value { binder, span, .. } => {
+                // For overlap, only Var-shaped top-level binders carry
+                // a let-name. Pattern lets (`(Tuple a b) = ...`) don't
+                // create a value name in the same sense.
+                if let cst::Binder::Var { name, .. } = peel_paren_binder(binder) {
+                    let sym = name.value.symbol();
+                    if last_value_name != Some(sym) {
+                        value_groups.entry(sym).or_default().push(*span);
+                    }
+                    last_value_name = Some(sym);
+                } else {
+                    last_value_name = None;
+                }
+            }
+            cst::LetBinding::Signature { name, span, .. } => {
+                sig_counts.entry(name.value.symbol()).or_default().push(*span);
+                last_value_name = None;
+            }
+        }
+    }
+    for (sym, spans) in &value_groups {
+        if spans.len() > 1 {
+            for span in spans.iter().skip(1) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::OverlappingNamesInLet(resolve(*sym)),
+                });
+            }
+        }
+    }
+    // Two signatures for the same name in a let block — a binding
+    // error too. Also two value-defs with a sig in between gets
+    // captured by the group walk.
+    for (sym, spans) in &sig_counts {
+        if spans.len() > 1 {
+            for span in spans.iter().skip(1) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::OverlappingNamesInLet(resolve(*sym)),
+                });
+            }
+        }
+    }
+}
+
+fn peel_paren_binder(b: &cst::Binder) -> &cst::Binder {
+    let mut cur = b;
+    while let cst::Binder::Parens { binder, .. } = cur {
+        cur = binder;
+    }
+    cur
+}
+
+fn walk_expr_for_let_dup_names(
+    expr: &cst::Expr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::Var { .. }
+        | cst::Expr::Constructor { .. }
+        | cst::Expr::Literal { .. }
+        | cst::Expr::OpParens { .. }
+        | cst::Expr::Wildcard { .. }
+        | cst::Expr::Hole { .. } => {}
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_let_dup_names(func, errors);
+            walk_expr_for_let_dup_names(arg, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_let_dup_names(func, errors);
+        }
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_for_let_dup_names(body, errors);
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_let_dup_names(left, errors);
+            walk_expr_for_let_dup_names(right, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_let_dup_names(cond, errors);
+            walk_expr_for_let_dup_names(then_expr, errors);
+            walk_expr_for_let_dup_names(else_expr, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_let_dup_names(e, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_let_dup_names(&alt.result, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            check_let_block_for_dup_names(bindings, errors);
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_let_dup_names(expr, errors);
+                }
+            }
+            walk_expr_for_let_dup_names(body, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_let_dup_names(expr, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        check_let_block_for_dup_names(bindings, errors);
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_let_dup_names(expr, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_let_dup_names(result, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_let_dup_names(v, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_let_dup_names(expr, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_let_dup_names(expr, errors);
+            for u in updates {
+                walk_expr_for_let_dup_names(&u.value, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => walk_expr_for_let_dup_names(expr, errors),
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_let_dup_names(expr, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_let_dup_names(e, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => walk_expr_for_let_dup_names(expr, errors),
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_let_dup_names(name, errors);
+            walk_expr_for_let_dup_names(pattern, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_let_dup_names(func, errors);
+            walk_expr_for_let_dup_names(left, errors);
+            walk_expr_for_let_dup_names(right, errors);
+        }
+    }
+}
+
+fn walk_guarded_for_let_dup_names(
+    g: &cst::GuardedExpr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_let_dup_names(e, errors);
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            for gd in guards {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e) => {
+                            walk_expr_for_let_dup_names(e, errors);
+                        }
+                        cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_let_dup_names(e, errors);
+                        }
+                    }
+                }
+                walk_expr_for_let_dup_names(&gd.expr, errors);
+            }
+        }
+    }
+}
+
+fn detect_overlapping_names_in_let(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::Value { guarded, where_clause, .. } => {
+                // The where clause behaves like a let block.
+                check_let_block_for_dup_names(where_clause, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { expr, .. } = b {
+                        walk_expr_for_let_dup_names(expr, errors);
+                    }
+                }
+                walk_guarded_for_let_dup_names(guarded, errors);
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_overlapping_names_in_let(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `derive newtype instance C (T ...)` requires T to be a `newtype`.
+/// We only check local types here — imported types are checked via
+/// the registry elsewhere.
+fn detect_cannot_derive_newtype_for_data(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_data: HashSet<Symbol> = HashSet::new();
+    let mut local_newtype: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { name, kind_sig, is_role_decl, .. } => {
+                if !*is_role_decl && matches!(kind_sig, cst::KindSigSource::None) {
+                    local_data.insert(name.value.symbol());
+                }
+            }
+            cst::Decl::Newtype { name, .. } => {
+                local_newtype.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    for d in decls {
+        if let cst::Decl::Derive { class_name, types, span, .. } = d {
+            // Two paths surface this error in the original compiler:
+            //   - `derive newtype instance C T` (Derive.newtype = true)
+            //     — needs T to be a newtype.
+            //   - `derive instance Newtype T _` — the `Newtype` class
+            //     specifically requires its head to be a newtype,
+            //     even without the `newtype` keyword.
+            let class_sym = class_name.to_qi().name;
+            let class_str = resolve(class_sym);
+            let head = match d {
+                cst::Decl::Derive { newtype: true, .. } => types.first(),
+                _ if class_str == "Newtype" => types.first(),
+                _ => None,
+            };
+            let Some(head) = head else { continue };
+            let Some(head_sym) = type_head_symbol(head) else { continue };
+            if local_data.contains(&head_sym)
+                && !local_newtype.contains(&head_sym)
+            {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::CannotDeriveNewtypeForData(
+                        resolve(head_sym),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn type_head_symbol(te: &cst::TypeExpr) -> Option<Symbol> {
+    match peel_parens(te) {
+        cst::TypeExpr::Constructor { name, .. } if name.module.is_none() => {
+            Some(name.name.symbol())
+        }
+        cst::TypeExpr::App { constructor, .. } => type_head_symbol(constructor),
+        _ => None,
+    }
+}
+
+/// Detect `Int` literals whose value falls outside the i32 range.
+/// PureScript `Int` is 32-bit signed.
+fn detect_int_out_of_range(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        if let cst::Decl::Value { guarded, where_clause, .. } = d {
+            walk_guarded_for_int_range(guarded, errors);
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_int_range(expr, errors);
+                }
+            }
+        }
+    }
+}
+
+fn walk_guarded_for_int_range(
+    g: &cst::GuardedExpr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => walk_expr_for_int_range(e, errors),
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    if let cst::GuardPattern::Boolean(e)
+                    | cst::GuardPattern::Pattern(_, e) = p
+                    {
+                        walk_expr_for_int_range(e, errors);
+                    }
+                }
+                walk_expr_for_int_range(&gd.expr, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_int_range(
+    expr: &cst::Expr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::Literal { lit, span } => {
+            if let cst::Literal::Int(n) = lit {
+                if *n > i32::MAX as i64 || *n < i32::MIN as i64 {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::IntOutOfRange,
+                    });
+                }
+            }
+        }
+        // `Negate(Literal(Int(n)))` represents `-n`; the i32 range
+        // is asymmetric (i32::MIN.abs() = 2^31 = i32::MAX + 1), so
+        // `-2147483648` is valid even though `2147483648` alone
+        // exceeds i32::MAX. Special-case this exact pattern so we
+        // don't flag the syntactic literal under negation.
+        cst::Expr::Negate { expr: inner, .. } => {
+            if let cst::Expr::Literal {
+                lit: cst::Literal::Int(n),
+                span,
+            } = inner.as_ref()
+            {
+                let neg = -(*n);
+                if neg > i32::MAX as i64 || neg < i32::MIN as i64 {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::IntOutOfRange,
+                    });
+                }
+            } else {
+                walk_expr_for_int_range(inner, errors);
+            }
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_int_range(func, errors);
+            walk_expr_for_int_range(arg, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_int_range(func, errors);
+        }
+        cst::Expr::Lambda { body, .. } => walk_expr_for_int_range(body, errors),
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_int_range(left, errors);
+            walk_expr_for_int_range(right, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_int_range(cond, errors);
+            walk_expr_for_int_range(then_expr, errors);
+            walk_expr_for_int_range(else_expr, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_int_range(e, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_int_range(&alt.result, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_int_range(expr, errors);
+                }
+            }
+            walk_expr_for_int_range(body, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_int_range(expr, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_int_range(expr, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_int_range(result, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_int_range(v, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => walk_expr_for_int_range(expr, errors),
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_int_range(expr, errors);
+            for u in updates {
+                walk_expr_for_int_range(&u.value, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => walk_expr_for_int_range(expr, errors),
+        cst::Expr::TypeAnnotation { expr, .. } => walk_expr_for_int_range(expr, errors),
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_int_range(e, errors);
+            }
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_int_range(name, errors);
+            walk_expr_for_int_range(pattern, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_int_range(func, errors);
+            walk_expr_for_int_range(left, errors);
+            walk_expr_for_int_range(right, errors);
+        }
+        _ => {}
+    }
+}
+
+/// `Binder::Op` introduces an operator alias in pattern position.
+/// Only ctor-shaped operators (`infixl 6 Cons as :`) are valid;
+/// function-shaped (`infixl 6 cons as :`) are not deconstructable.
+/// We approximate "ctor-shaped" by checking the local `Decl::Fixity`
+/// list — if the operator's `target_name` is locally a value (not
+/// a ctor), the binder is invalid.
+fn detect_invalid_operator_in_binder(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_value_op_targets: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut local_values: HashSet<Symbol> = HashSet::new();
+    let mut local_ctors: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        match d {
+            cst::Decl::Fixity { operator, target, is_type, .. } if !*is_type => {
+                local_value_op_targets
+                    .insert(operator.value.symbol(), target.name);
+            }
+            cst::Decl::Value { name, .. } => {
+                local_values.insert(name.value.symbol());
+            }
+            cst::Decl::Foreign { name, .. } => {
+                local_values.insert(name.value.symbol());
+            }
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    local_ctors.insert(c.name.value.symbol());
+                }
+            }
+            cst::Decl::Newtype { constructor, .. } => {
+                local_ctors.insert(constructor.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    for d in decls {
+        match d {
+            cst::Decl::Value { binders, guarded, where_clause, .. } => {
+                for b in binders {
+                    walk_binder_for_invalid_op(
+                        b,
+                        &local_value_op_targets,
+                        &local_values,
+                        &local_ctors,
+                        errors,
+                    );
+                }
+                walk_guarded_for_invalid_op_in_binder(
+                    guarded,
+                    &local_value_op_targets,
+                    &local_values,
+                    &local_ctors,
+                    errors,
+                );
+                for b in where_clause {
+                    if let cst::LetBinding::Value { binder, expr, .. } = b {
+                        walk_binder_for_invalid_op(
+                            binder,
+                            &local_value_op_targets,
+                            &local_values,
+                            &local_ctors,
+                            errors,
+                        );
+                        walk_expr_for_invalid_op_in_binder(
+                            expr,
+                            &local_value_op_targets,
+                            &local_values,
+                            &local_ctors,
+                            errors,
+                        );
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_invalid_operator_in_binder(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_binder_for_invalid_op(
+    b: &cst::Binder,
+    op_targets: &HashMap<Symbol, Symbol>,
+    local_values: &HashSet<Symbol>,
+    local_ctors: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match b {
+        cst::Binder::Op { left, op, right, span } => {
+            // Local function-aliased operator → invalid binder.
+            // We only fire for definitively-local-and-value-aliased
+            // operators; ambiguous cases (imported, unknown) are left
+            // for downstream type inference.
+            if op.value.module.is_none() {
+                let op_sym = op.value.name.symbol();
+                if let Some(target) = op_targets.get(&op_sym) {
+                    if local_values.contains(target) && !local_ctors.contains(target) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::InvalidOperatorInBinder(
+                                resolve(op_sym),
+                            ),
+                        });
+                    }
+                }
+            }
+            walk_binder_for_invalid_op(left, op_targets, local_values, local_ctors, errors);
+            walk_binder_for_invalid_op(right, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Binder::Constructor { args, .. } => {
+            for a in args {
+                walk_binder_for_invalid_op(a, op_targets, local_values, local_ctors, errors);
+            }
+        }
+        cst::Binder::Record { fields, .. } => {
+            for f in fields {
+                if let Some(inner) = &f.binder {
+                    walk_binder_for_invalid_op(
+                        inner,
+                        op_targets,
+                        local_values,
+                        local_ctors,
+                        errors,
+                    );
+                }
+            }
+        }
+        cst::Binder::As { binder, .. }
+        | cst::Binder::Parens { binder, .. }
+        | cst::Binder::Typed { binder, .. } => {
+            walk_binder_for_invalid_op(binder, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Binder::Array { elements, .. } => {
+            for e in elements {
+                walk_binder_for_invalid_op(e, op_targets, local_values, local_ctors, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_guarded_for_invalid_op_in_binder(
+    g: &cst::GuardedExpr,
+    op_targets: &HashMap<Symbol, Symbol>,
+    local_values: &HashSet<Symbol>,
+    local_ctors: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_invalid_op_in_binder(e, op_targets, local_values, local_ctors, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(b, e) => {
+                            walk_binder_for_invalid_op(b, op_targets, local_values, local_ctors, errors);
+                            walk_expr_for_invalid_op_in_binder(e, op_targets, local_values, local_ctors, errors);
+                        }
+                        cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_invalid_op_in_binder(e, op_targets, local_values, local_ctors, errors);
+                        }
+                    }
+                }
+                walk_expr_for_invalid_op_in_binder(&gd.expr, op_targets, local_values, local_ctors, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_invalid_op_in_binder(
+    expr: &cst::Expr,
+    op_targets: &HashMap<Symbol, Symbol>,
+    local_values: &HashSet<Symbol>,
+    local_ctors: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_invalid_op_in_binder(func, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(arg, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_invalid_op_in_binder(func, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::Lambda { binders, body, .. } => {
+            for b in binders {
+                walk_binder_for_invalid_op(b, op_targets, local_values, local_ctors, errors);
+            }
+            walk_expr_for_invalid_op_in_binder(body, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_invalid_op_in_binder(left, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(right, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_invalid_op_in_binder(cond, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(then_expr, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(else_expr, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_invalid_op_in_binder(e, op_targets, local_values, local_ctors, errors);
+            }
+            for alt in alts {
+                for b in &alt.binders {
+                    walk_binder_for_invalid_op(b, op_targets, local_values, local_ctors, errors);
+                }
+                walk_guarded_for_invalid_op_in_binder(&alt.result, op_targets, local_values, local_ctors, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { binder, expr, .. } = b {
+                    walk_binder_for_invalid_op(binder, op_targets, local_values, local_ctors, errors);
+                    walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+                }
+            }
+            walk_expr_for_invalid_op_in_binder(body, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { binder, expr, .. } => {
+                        walk_binder_for_invalid_op(binder, op_targets, local_values, local_ctors, errors);
+                        walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+                    }
+                    cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { binder, expr, .. } = b {
+                                walk_binder_for_invalid_op(binder, op_targets, local_values, local_ctors, errors);
+                                walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_invalid_op_in_binder(result, op_targets, local_values, local_ctors, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_invalid_op_in_binder(v, op_targets, local_values, local_ctors, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+            for u in updates {
+                walk_expr_for_invalid_op_in_binder(&u.value, op_targets, local_values, local_ctors, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. } => {
+            walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_invalid_op_in_binder(e, op_targets, local_values, local_ctors, errors);
+            }
+        }
+        cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_invalid_op_in_binder(expr, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_invalid_op_in_binder(name, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(pattern, op_targets, local_values, local_ctors, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_invalid_op_in_binder(func, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(left, op_targets, local_values, local_ctors, errors);
+            walk_expr_for_invalid_op_in_binder(right, op_targets, local_values, local_ctors, errors);
+        }
+        _ => {}
+    }
+}
+
+/// `type role` only valid on data/newtype/foreign-data. Reject roles
+/// for type-aliases or classes (the original compiler reports
+/// `UnsupportedRoleDeclaration`).
+fn detect_unsupported_role_declaration(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut data_or_newtype: HashSet<Symbol> = HashSet::new();
+    let mut aliases: HashSet<Symbol> = HashSet::new();
+    let mut classes: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { name, kind_sig, is_role_decl, .. } => {
+                if !*is_role_decl && matches!(kind_sig, cst::KindSigSource::None) {
+                    data_or_newtype.insert(name.value.symbol());
+                }
+            }
+            cst::Decl::Newtype { name, .. } => {
+                data_or_newtype.insert(name.value.symbol());
+            }
+            cst::Decl::ForeignData { name, .. } => {
+                data_or_newtype.insert(name.value.symbol());
+            }
+            cst::Decl::TypeAlias { name, .. } => {
+                aliases.insert(name.value.symbol());
+            }
+            cst::Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => {
+                classes.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    for d in decls {
+        if let cst::Decl::Data { name, is_role_decl: true, span, .. } = d {
+            let sym = name.value.symbol();
+            if !data_or_newtype.contains(&sym)
+                && (aliases.contains(&sym) || classes.contains(&sym))
+            {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::UnsupportedRoleDeclaration(resolve(sym)),
+                });
+            }
+        }
+    }
 }
