@@ -155,6 +155,11 @@ pub enum ValidationErrorKind {
     /// is invalid. Reference compiler reports as
     /// `CannotDeriveInvalidConstructorArg`.
     CannotDeriveInvalidConstructorArg(String),
+    /// A type annotation expects a Type-kinded type but received a
+    /// type-constructor of a higher kind. E.g. `(x :: F)` where
+    /// `data F a = F a` (`F :: Type -> Type`). Reference compiler
+    /// reports as `ExpectedType`.
+    ExpectedType(String),
 }
 
 impl ValidationErrorKind {
@@ -212,6 +217,7 @@ impl ValidationErrorKind {
             Self::CannotDeriveInvalidConstructorArg(_) => {
                 "CannotDeriveInvalidConstructorArg"
             }
+            Self::ExpectedType(_) => "ExpectedType",
         }
     }
 }
@@ -755,6 +761,10 @@ pub fn validate_module_with_class_fundeps(
     // `foreign import a'` etc. — apostrophe in FFI names is
     // deprecated.
     detect_deprecated_ffi_prime(&module.decls, &mut errors);
+
+    // Type annotations like `(x :: F)` where `F` is a higher-kinded
+    // type constructor (`data F a = ...`) used without args.
+    detect_expected_type_in_annotations(&module.decls, &mut errors);
 
     errors
 }
@@ -5684,6 +5694,278 @@ fn detect_deprecated_ffi_prime(
                     span: *span,
                     kind: ValidationErrorKind::DeprecatedFFIPrime(s),
                 });
+            }
+        }
+    }
+}
+
+/// Walks every `Binder::Typed` and every `Expr::TypeAnnotation` in
+/// the module, flagging annotations whose type is a bare local
+/// data/newtype/alias constructor with non-zero arity (`(x :: F)`
+/// where `data F a = …`). The reference compiler emits
+/// `ExpectedType` for these — the annotation requires a
+/// `Type`-kinded type, but `F` has kind `Type -> Type`.
+fn detect_expected_type_in_annotations(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_higher_arity: HashMap<Symbol, usize> = HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { name, type_vars, .. }
+            | cst::Decl::Newtype { name, type_vars, .. } => {
+                let n = type_vars.len();
+                if n > 0 {
+                    local_higher_arity.insert(name.value.symbol(), n);
+                }
+            }
+            cst::Decl::TypeAlias { name, type_vars, .. } => {
+                let n = type_vars.len();
+                if n > 0 {
+                    local_higher_arity.insert(name.value.symbol(), n);
+                }
+            }
+            _ => {}
+        }
+    }
+    if local_higher_arity.is_empty() {
+        return;
+    }
+    for d in decls {
+        match d {
+            cst::Decl::Value { binders, guarded, where_clause, .. } => {
+                for b in binders {
+                    walk_binder_for_expected_type(
+                        b,
+                        &local_higher_arity,
+                        errors,
+                    );
+                }
+                walk_guarded_expr_for_expected_type(
+                    guarded,
+                    &local_higher_arity,
+                    errors,
+                );
+                for w in where_clause {
+                    walk_let_binding_for_expected_type(
+                        w,
+                        &local_higher_arity,
+                        errors,
+                    );
+                }
+            }
+            // `test :: List` where `List` is a bare arity-1
+            // constructor — the sig itself is the annotation.
+            cst::Decl::TypeSignature { ty, span, .. } => {
+                check_type_annotation_for_expected_type(
+                    ty,
+                    *span,
+                    &local_higher_arity,
+                    errors,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_type_annotation_for_expected_type(
+    ty: &cst::TypeExpr,
+    span: Span,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let inner = peel_parens(ty);
+    if let cst::TypeExpr::Constructor { name, .. } = inner {
+        let qi = name.to_qi();
+        if qi.module.is_none() {
+            if arities.contains_key(&qi.name) {
+                errors.push(ValidationError {
+                    span,
+                    kind: ValidationErrorKind::ExpectedType(resolve(qi.name)),
+                });
+            }
+        }
+    }
+}
+
+fn walk_binder_for_expected_type(
+    b: &cst::Binder,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match b {
+        cst::Binder::Typed { binder, ty, span } => {
+            check_type_annotation_for_expected_type(ty, *span, arities, errors);
+            walk_binder_for_expected_type(binder, arities, errors);
+        }
+        cst::Binder::Parens { binder, .. } => {
+            walk_binder_for_expected_type(binder, arities, errors);
+        }
+        cst::Binder::Constructor { args, .. } => {
+            for a in args {
+                walk_binder_for_expected_type(a, arities, errors);
+            }
+        }
+        cst::Binder::Record { fields, .. } => {
+            for f in fields {
+                if let Some(b) = &f.binder {
+                    walk_binder_for_expected_type(b, arities, errors);
+                }
+            }
+        }
+        cst::Binder::Array { elements, .. } => {
+            for e in elements {
+                walk_binder_for_expected_type(e, arities, errors);
+            }
+        }
+        cst::Binder::As { binder, .. } => {
+            walk_binder_for_expected_type(binder, arities, errors);
+        }
+        cst::Binder::Op { left, right, .. } => {
+            walk_binder_for_expected_type(left, arities, errors);
+            walk_binder_for_expected_type(right, arities, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_guarded_expr_for_expected_type(
+    g: &cst::GuardedExpr,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(expr) => {
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            for g in guards {
+                walk_expr_for_expected_type(&g.expr, arities, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_expected_type(
+    e: &cst::Expr,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match e {
+        cst::Expr::TypeAnnotation { expr, ty, span } => {
+            check_type_annotation_for_expected_type(ty, *span, arities, errors);
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        cst::Expr::Lambda { binders, body, .. } => {
+            for b in binders {
+                walk_binder_for_expected_type(b, arities, errors);
+            }
+            walk_expr_for_expected_type(body, arities, errors);
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_expected_type(func, arities, errors);
+            walk_expr_for_expected_type(arg, arities, errors);
+        }
+        cst::Expr::Parens { expr, .. } => {
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_expected_type(cond, arities, errors);
+            walk_expr_for_expected_type(then_expr, arities, errors);
+            walk_expr_for_expected_type(else_expr, arities, errors);
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for lb in bindings {
+                walk_let_binding_for_expected_type(lb, arities, errors);
+            }
+            walk_expr_for_expected_type(body, arities, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for s in exprs {
+                walk_expr_for_expected_type(s, arities, errors);
+            }
+            for alt in alts {
+                for b in &alt.binders {
+                    walk_binder_for_expected_type(b, arities, errors);
+                }
+                walk_guarded_expr_for_expected_type(
+                    &alt.result,
+                    arities,
+                    errors,
+                );
+            }
+        }
+        cst::Expr::Do { statements, .. } => {
+            for s in statements {
+                walk_do_statement_for_expected_type(s, arities, errors);
+            }
+        }
+        cst::Expr::Ado { statements, result, .. } => {
+            for s in statements {
+                walk_do_statement_for_expected_type(s, arities, errors);
+            }
+            walk_expr_for_expected_type(result, arities, errors);
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_expected_type(v, arities, errors);
+                }
+            }
+        }
+        cst::Expr::Array { elements, .. } => {
+            for el in elements {
+                walk_expr_for_expected_type(el, arities, errors);
+            }
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_expected_type(expr, arities, errors);
+            for u in updates {
+                walk_expr_for_expected_type(&u.value, arities, errors);
+            }
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_expected_type(left, arities, errors);
+            walk_expr_for_expected_type(right, arities, errors);
+        }
+        cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_let_binding_for_expected_type(
+    lb: &cst::LetBinding,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match lb {
+        cst::LetBinding::Value { binder, expr, .. } => {
+            walk_binder_for_expected_type(binder, arities, errors);
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        cst::LetBinding::Signature { .. } => {}
+    }
+}
+
+fn walk_do_statement_for_expected_type(
+    s: &cst::DoStatement,
+    arities: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match s {
+        cst::DoStatement::Bind { binder, expr, .. } => {
+            walk_binder_for_expected_type(binder, arities, errors);
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        cst::DoStatement::Discard { expr, .. } => {
+            walk_expr_for_expected_type(expr, arities, errors);
+        }
+        cst::DoStatement::Let { bindings, .. } => {
+            for lb in bindings {
+                walk_let_binding_for_expected_type(lb, arities, errors);
             }
         }
     }
