@@ -39,6 +39,21 @@ fn packages_root() -> PathBuf {
     manifest_dir().join(FIXTURES_ROOT).join("packages")
 }
 
+fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some(ext) {
+                out.push(path);
+            } else if path.is_dir() {
+                out.extend(collect_files_with_ext(&path, ext));
+            }
+        }
+    }
+    out
+}
+
 fn collect_purs_files(root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if !root.exists() {
@@ -463,6 +478,33 @@ fn run_failing_inner(name: &str) -> Result<(), String> {
     let sources = build_unit_sources(name);
     let primary_src = sources.first().map(|(_, s)| s.clone()).unwrap_or_default();
 
+    // 1a) Scan FFI sidecars (.js next to the primary, plus any
+    // .js files in the support directory). The FFI checker is a
+    // small standalone pass — it doesn't touch the typechecker's
+    // state. Codes are added to `actual_codes` later.
+    let mut ffi_codes: Vec<String> = Vec::new();
+    {
+        let root = failing_root();
+        let primary_js = root.join(format!("{name}.js"));
+        if primary_js.exists() {
+            if let Ok(js_src) = fs::read_to_string(&primary_js) {
+                for e in crate::typecheck_db::passes::check_ffi::check_ffi_module(&js_src) {
+                    ffi_codes.push(e.code().to_string());
+                }
+            }
+        }
+        let support_dir = root.join(name);
+        if support_dir.is_dir() {
+            for path in collect_files_with_ext(&support_dir, "js") {
+                if let Ok(js_src) = fs::read_to_string(&path) {
+                    for e in crate::typecheck_db::passes::check_ffi::check_ffi_module(&js_src) {
+                        ffi_codes.push(e.code().to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let mut fixture_modules: Vec<ModuleInput> = Vec::new();
     for (path, src) in &sources {
         let module = match parse(src) {
@@ -528,6 +570,7 @@ fn run_failing_inner(name: &str) -> Result<(), String> {
     // 5) Collect error codes.
     let mut actual_codes = collect_error_codes(&report);
     actual_codes.extend(early_codes);
+    actual_codes.extend(ffi_codes);
 
     // 6) Parse the expected annotation.
     let expected = match extract_annotation(&primary_src) {
