@@ -191,6 +191,22 @@ fn extract_annotation(source: &str) -> Option<String> {
         })
 }
 
+/// Parse a PureScript source and return every `foreign import name`
+/// (value-level) declaration's name. Used to verify the JS sidecar
+/// exports each one (`MissingFFIImplementations`).
+fn collect_foreign_names(source: &str) -> Option<Vec<String>> {
+    let module = parse(source).ok()?;
+    let mut out: Vec<String> = Vec::new();
+    for d in &module.decls {
+        if let crate::cst::Decl::Foreign { name, .. } = d {
+            out.push(crate::typecheck_db::util::resolve_symbol(
+                name.value.symbol(),
+            ));
+        }
+    }
+    Some(out)
+}
+
 /// Collect all error codes produced by a `ModuleCheckReport` as short strings.
 fn collect_error_codes(report: &ModuleCheckReport) -> Vec<String> {
     let mut codes: Vec<String> = Vec::new();
@@ -488,10 +504,22 @@ fn run_failing_inner(name: &str) -> Result<(), String> {
     let mut ffi_codes: Vec<String> = Vec::new();
     {
         let root = failing_root();
+        // Collect every PureScript-declared `foreign import` name
+        // from the primary source so the JS sidecar can be checked
+        // for `MissingFFIImplementations`. Sidecar files in the
+        // support directory belong to satellite modules, so they're
+        // checked against THEIR module's foreign decls below.
+        let primary_foreign_names =
+            collect_foreign_names(&primary_src).unwrap_or_default();
         let primary_js = root.join(format!("{name}.js"));
         if primary_js.exists() {
             if let Ok(js_src) = fs::read_to_string(&primary_js) {
                 for e in crate::typecheck_db::passes::check_ffi::check_ffi_module(&js_src) {
+                    ffi_codes.push(e.code().to_string());
+                }
+                for e in crate::typecheck_db::passes::check_ffi
+                    ::check_ffi_required_exports(&js_src, &primary_foreign_names)
+                {
                     ffi_codes.push(e.code().to_string());
                 }
             }
@@ -502,6 +530,21 @@ fn run_failing_inner(name: &str) -> Result<(), String> {
                 if let Ok(js_src) = fs::read_to_string(&path) {
                     for e in crate::typecheck_db::passes::check_ffi::check_ffi_module(&js_src) {
                         ffi_codes.push(e.code().to_string());
+                    }
+                    // For satellite JS files: pair each with its
+                    // sibling .purs (same stem) and check the
+                    // foreign-import set.
+                    let purs_path = path.with_extension("purs");
+                    if purs_path.exists() {
+                        if let Ok(purs_src) = fs::read_to_string(&purs_path) {
+                            let names =
+                                collect_foreign_names(&purs_src).unwrap_or_default();
+                            for e in crate::typecheck_db::passes::check_ffi
+                                ::check_ffi_required_exports(&js_src, &names)
+                            {
+                                ffi_codes.push(e.code().to_string());
+                            }
+                        }
                     }
                 }
             }

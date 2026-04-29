@@ -22,6 +22,10 @@ pub enum FfiError {
     UnsupportedFFICommonJSImports,
     UnsupportedFFICommonJSExports,
     DeprecatedFFICommonJSModule,
+    /// PureScript declared `foreign import name :: ...` but the JS
+    /// sidecar doesn't export `name`. Reference compiler reports
+    /// as `MissingFFIImplementations`.
+    MissingFFIImplementations(Vec<String>),
 }
 
 impl FfiError {
@@ -30,6 +34,7 @@ impl FfiError {
             FfiError::UnsupportedFFICommonJSImports => "UnsupportedFFICommonJSImports",
             FfiError::UnsupportedFFICommonJSExports => "UnsupportedFFICommonJSExports",
             FfiError::DeprecatedFFICommonJSModule => "DeprecatedFFICommonJSModule",
+            FfiError::MissingFFIImplementations(_) => "MissingFFIImplementations",
         }
     }
 }
@@ -225,6 +230,167 @@ pub fn check_ffi_module(js_source: &str) -> Vec<FfiError> {
         }
     }
     out
+}
+
+/// Verify that the JS source exports every name PureScript declared
+/// via `foreign import name :: ...`. Returns one
+/// `MissingFFIImplementations` error listing the missing names if
+/// any are absent.
+pub fn check_ffi_required_exports(
+    js_source: &str,
+    required: &[String],
+) -> Vec<FfiError> {
+    if required.is_empty() {
+        return Vec::new();
+    }
+    let cleaned = strip_comments_and_strings(js_source);
+    let exported = collect_js_exported_names(&cleaned);
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|n| !exported.contains(n.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        Vec::new()
+    } else {
+        vec![FfiError::MissingFFIImplementations(missing)]
+    }
+}
+
+/// Collect identifiers exported by ES `export var`/`export const`/
+/// `export let`/`export function` declarations, plus CommonJS
+/// `exports.NAME = ...` assignments. Used by
+/// `check_ffi_required_exports` to verify each PureScript
+/// `foreign import` has a JS implementation.
+fn collect_js_exported_names(cleaned: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let bytes = cleaned.as_bytes();
+    let mut out: HashSet<String> = HashSet::new();
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        // Word boundary check: previous byte must NOT be ident.
+        let prev_ident = i > 0 && is_ident_char(bytes[i - 1]);
+        if !prev_ident {
+            // ES `export ` prefix.
+            if starts_with_at(bytes, i, b"export") && i + 6 < len {
+                let after = i + 6;
+                let next = bytes[after];
+                if next == b' ' || next == b'\t' || next == b'\n' {
+                    let mut j = skip_ws(bytes, after);
+                    // Optional `default` keyword.
+                    if starts_with_at(bytes, j, b"default") {
+                        j = skip_ws(bytes, j + 7);
+                    }
+                    // `var` / `let` / `const` / `function`: parse
+                    // the next ident.
+                    let kw_lens: [&[u8]; 4] = [b"var", b"let", b"const", b"function"];
+                    for kw in kw_lens {
+                        if starts_with_at(bytes, j, kw)
+                            && j + kw.len() < len
+                            && !is_ident_char(bytes[j + kw.len()])
+                        {
+                            let k = skip_ws(bytes, j + kw.len());
+                            if let Some(name) = read_ident(bytes, k) {
+                                out.insert(name);
+                            }
+                            break;
+                        }
+                    }
+                    // `export { a, b as c, d }` form.
+                    if j < len && bytes[j] == b'{' {
+                        let close = find_close_brace(bytes, j);
+                        let inside = std::str::from_utf8(&bytes[j + 1..close])
+                            .unwrap_or("");
+                        for chunk in inside.split(',') {
+                            let chunk = chunk.trim();
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            // `name as alias` → exported as `alias`.
+                            let name = if let Some(idx) = chunk.find(" as ") {
+                                chunk[idx + 4..].trim()
+                            } else {
+                                chunk
+                            };
+                            if name
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                            {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // CommonJS `exports.NAME = ...`.
+            if starts_with_at(bytes, i, b"exports.") {
+                let k = i + 8;
+                if let Some(name) = read_ident(bytes, k) {
+                    out.insert(name);
+                }
+            }
+            // CommonJS `module.exports.NAME = ...`.
+            if starts_with_at(bytes, i, b"module.exports.") {
+                let k = i + 15;
+                if let Some(name) = read_ident(bytes, k) {
+                    out.insert(name);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn starts_with_at(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    if i + kw.len() > bytes.len() {
+        return false;
+    }
+    &bytes[i..i + kw.len()] == kw
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+fn read_ident(bytes: &[u8], i: usize) -> Option<String> {
+    let mut j = i;
+    while j < bytes.len() && is_ident_char(bytes[j]) {
+        j += 1;
+    }
+    if j == i {
+        None
+    } else {
+        Some(std::str::from_utf8(&bytes[i..j]).ok()?.to_string())
+    }
+}
+
+fn find_close_brace(bytes: &[u8], open: usize) -> usize {
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 #[cfg(test)]

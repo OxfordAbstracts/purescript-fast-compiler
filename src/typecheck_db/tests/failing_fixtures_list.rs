@@ -255,7 +255,7 @@ check_failing_build_unit!(f_MPTCs, "MPTCs");
 check_failing_build_unit!(f_MissingClassExport, "MissingClassExport");
 check_failing_build_unit!(f_MissingClassMember, "MissingClassMember");
 check_failing_build_unit!(f_MissingClassMemberExport, "MissingClassMemberExport");
-check_failing_build_unit_ignored!(f_MissingFFIImplementations, "MissingFFIImplementations", "expected: MissingFFIImplementations");
+check_failing_build_unit!(f_MissingFFIImplementations, "MissingFFIImplementations");
 check_failing_build_unit!(f_MissingRecordField, "MissingRecordField");
 check_failing_build_unit!(f_MixedAssociativityError, "MixedAssociativityError");
 check_failing_build_unit_ignored!(f_MonoKindDataBindingGroup, "MonoKindDataBindingGroup", "expected: KindsDoNotUnify");
