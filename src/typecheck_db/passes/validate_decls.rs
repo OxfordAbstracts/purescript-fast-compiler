@@ -1143,6 +1143,39 @@ fn detect_invalid_derive_constructor_arg(
                 .zip(track.iter())
                 .map(|(s, v)| (*s, *v))
                 .collect();
+            // Map instance-bound type-var names back to their
+            // corresponding data-decl type-var names by walking the
+            // instance head's App spine. Without this, a derive
+            // like `Functor k => Functor (TypedCache k)` for
+            // `data TypedCache key a` would fail to translate the
+            // constraint's `k` to the data decl's `key`, leaving
+            // `key` looking unconstrained and the field `key a`
+            // wrongly flagged.
+            let mut inst_to_data: HashMap<Symbol, Symbol> = HashMap::new();
+            {
+                let mut args: Vec<Option<Symbol>> = Vec::new();
+                let mut cur = head;
+                loop {
+                    match peel_parens(cur) {
+                        cst::TypeExpr::App { constructor, arg, .. } => {
+                            if let cst::TypeExpr::Var { name, .. } = peel_parens(arg)
+                            {
+                                args.push(Some(name.value.symbol()));
+                            } else {
+                                args.push(None);
+                            }
+                            cur = constructor;
+                        }
+                        _ => break,
+                    }
+                }
+                args.reverse();
+                for (i, inst_var) in args.iter().enumerate() {
+                    if let (Some(iv), Some(dv)) = (inst_var, data_vars.get(i)) {
+                        inst_to_data.insert(*iv, *dv);
+                    }
+                }
+            }
             // Build per-typevar variance signatures from the
             // derive's CONSTRAINTS. `Contravariant f =>` records
             // f's last-arg as Contra; `Functor f =>` Co; etc. The
@@ -1165,10 +1198,25 @@ fn detect_invalid_derive_constructor_arg(
                 if c.args.len() == 1 {
                     if let cst::TypeExpr::Var { name, .. } = peel_parens(&c.args[0])
                     {
-                        var_variance.insert(name.value.symbol(), sig.to_vec());
+                        let inst_sym = name.value.symbol();
+                        // Store under the data-decl-side name when
+                        // we have a mapping (lookups in the field
+                        // walker use data-var names).
+                        let key = inst_to_data.get(&inst_sym).copied().unwrap_or(inst_sym);
+                        var_variance.insert(key, sig.to_vec());
                     }
                 }
             }
+            // Data-vars whose corresponding instance head arg is a
+            // bare type variable (i.e. "passed through" rather than
+            // substituted to something concrete). The
+            // unconstrained-var check should only fire for these:
+            // when an instance substitutes the data var to a
+            // concrete shape like `Const k`, the substituted
+            // shape's variance applies and the data-var name in
+            // the field text is irrelevant.
+            let passed_through: HashSet<Symbol> =
+                inst_to_data.values().copied().collect();
             let mut bad = false;
             for fields in ctor_fields {
                 for f in fields {
@@ -1177,6 +1225,7 @@ fn detect_invalid_derive_constructor_arg(
                             f,
                             &tracked,
                             &var_variance,
+                            &passed_through,
                             Variance::Co,
                             strict_forall,
                         );
@@ -1222,6 +1271,7 @@ fn check_variance_field(
     te: &cst::TypeExpr,
     tracked: &[(Symbol, Variance)],
     var_variance: &HashMap<Symbol, Vec<Variance>>,
+    passed_through: &HashSet<Symbol>,
     cur: Variance,
     strict_forall: bool,
 ) -> bool {
@@ -1245,11 +1295,43 @@ fn check_variance_field(
                 from,
                 tracked,
                 var_variance,
+                passed_through,
                 cur.flip(),
                 strict_forall,
-            ) || check_variance_field(to, tracked, var_variance, cur, strict_forall)
+            ) || check_variance_field(
+                to,
+                tracked,
+                var_variance,
+                passed_through,
+                cur,
+                strict_forall,
+            )
         }
         cst::TypeExpr::App { constructor, arg, .. } => {
+            // App whose head is an unconstrained type variable
+            // (e.g. `f a a` in `data Test f a = Test (f a a)`):
+            // we don't know `f`'s variance signature, so any
+            // tracked-var occurrence in the spine is unsafe. The
+            // reference compiler rejects these unless the derive
+            // carries a `Functor f =>` (or similar) constraint
+            // (captured in `var_variance`).
+            //
+            // Only fires for data-vars that are passed through to
+            // the instance head as bare type variables. When the
+            // instance substitutes the data-var to something
+            // concrete (e.g. `derive instance Functor (Test (Const k))`
+            // for `data Test key a = ...(key a)`), the derive is
+            // well-defined and we don't flag.
+            if app_head_is_unconstrained_var_passed_through(
+                constructor,
+                var_variance,
+                passed_through,
+            ) {
+                if forall_contains_tracked(te, tracked) {
+                    return true;
+                }
+                return false;
+            }
             // Determine arg's variance via:
             //   - hardcoded contravariant Constructors (Predicate,
             //     Op, Comparison, Equivalence)
@@ -1276,12 +1358,14 @@ fn check_variance_field(
                 constructor,
                 tracked,
                 var_variance,
+                passed_through,
                 cur,
                 strict_forall,
             ) || check_variance_field(
                 arg,
                 tracked,
                 var_variance,
+                passed_through,
                 arg_var,
                 strict_forall,
             )
@@ -1297,18 +1381,39 @@ fn check_variance_field(
                         !vars.iter().any(|(v, _, _)| v.value.symbol() == *s)
                     })
                     .collect();
-                check_variance_field(ty, &inner, var_variance, cur, strict_forall)
+                check_variance_field(
+                    ty,
+                    &inner,
+                    var_variance,
+                    passed_through,
+                    cur,
+                    strict_forall,
+                )
             }
         }
         cst::TypeExpr::Constrained { ty, .. } => {
             if strict_forall {
                 forall_contains_tracked(te, tracked)
             } else {
-                check_variance_field(ty, tracked, var_variance, cur, strict_forall)
+                check_variance_field(
+                    ty,
+                    tracked,
+                    var_variance,
+                    passed_through,
+                    cur,
+                    strict_forall,
+                )
             }
         }
         cst::TypeExpr::Record { fields, .. } => fields.iter().any(|f| {
-            check_variance_field(&f.ty, tracked, var_variance, cur, strict_forall)
+            check_variance_field(
+                &f.ty,
+                tracked,
+                var_variance,
+                passed_through,
+                cur,
+                strict_forall,
+            )
         }),
         cst::TypeExpr::Row { fields, tail, .. } => {
             fields.iter().any(|f| {
@@ -1316,29 +1421,54 @@ fn check_variance_field(
                     &f.ty,
                     tracked,
                     var_variance,
+                    passed_through,
                     cur,
                     strict_forall,
                 )
             }) || tail.as_ref().map_or(false, |t| {
-                check_variance_field(t, tracked, var_variance, cur, strict_forall)
-            })
-        }
-        cst::TypeExpr::Parens { ty, .. } => {
-            check_variance_field(ty, tracked, var_variance, cur, strict_forall)
-        }
-        cst::TypeExpr::TypeOp { left, right, .. } => {
-            check_variance_field(left, tracked, var_variance, cur, strict_forall)
-                || check_variance_field(
-                    right,
+                check_variance_field(
+                    t,
                     tracked,
                     var_variance,
+                    passed_through,
                     cur,
                     strict_forall,
                 )
+            })
         }
-        cst::TypeExpr::Kinded { ty, .. } => {
-            check_variance_field(ty, tracked, var_variance, cur, strict_forall)
+        cst::TypeExpr::Parens { ty, .. } => check_variance_field(
+            ty,
+            tracked,
+            var_variance,
+            passed_through,
+            cur,
+            strict_forall,
+        ),
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            check_variance_field(
+                left,
+                tracked,
+                var_variance,
+                passed_through,
+                cur,
+                strict_forall,
+            ) || check_variance_field(
+                right,
+                tracked,
+                var_variance,
+                passed_through,
+                cur,
+                strict_forall,
+            )
         }
+        cst::TypeExpr::Kinded { ty, .. } => check_variance_field(
+            ty,
+            tracked,
+            var_variance,
+            passed_through,
+            cur,
+            strict_forall,
+        ),
         _ => false,
     }
 }
@@ -1374,6 +1504,36 @@ fn app_head_arg_position_variance(
                 return sig.get(depth).copied();
             }
             _ => return None,
+        }
+    }
+}
+
+/// True iff the App spine of `te` bottoms out at a `Var` that is
+///   1. not in `var_variance` (no `Functor f =>`-style constraint
+///      tells us its variance), AND
+///   2. is in `passed_through` (the data-var is passed through
+///      to the instance head as a bare type variable, not
+///      substituted to something concrete).
+///
+/// Both conditions are needed: passing through without a constraint
+/// is unsafe, but a substituted data-var (like `key` substituted to
+/// `Const k` at the instance head) doesn't appear at runtime under
+/// that name and doesn't need to be flagged.
+fn app_head_is_unconstrained_var_passed_through(
+    te: &cst::TypeExpr,
+    var_variance: &HashMap<Symbol, Vec<Variance>>,
+    passed_through: &HashSet<Symbol>,
+) -> bool {
+    let mut cur = te;
+    loop {
+        match peel_parens(cur) {
+            cst::TypeExpr::App { constructor: c, .. } => cur = c,
+            cst::TypeExpr::Var { name, .. } => {
+                let sym = name.value.symbol();
+                return !var_variance.contains_key(&sym)
+                    && passed_through.contains(&sym);
+            }
+            _ => return false,
         }
     }
 }

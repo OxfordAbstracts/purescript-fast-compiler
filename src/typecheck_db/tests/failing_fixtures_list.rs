@@ -201,8 +201,8 @@ check_failing_build_unit_ignored!(f_FoldableInstance2, "FoldableInstance2", "exp
 check_failing_build_unit_ignored!(f_FoldableInstance3, "FoldableInstance3", "expected: KindsDoNotUnify");
 check_failing_build_unit!(f_FoldableInstance4, "FoldableInstance4");
 check_failing_build_unit!(f_FoldableInstance6, "FoldableInstance6");
-check_failing_build_unit_ignored!(f_FoldableInstance8, "FoldableInstance8", "expected: CannotDeriveInvalidConstructorArg");
-check_failing_build_unit_ignored!(f_FoldableInstance9, "FoldableInstance9", "expected: CannotDeriveInvalidConstructorArg");
+check_failing_build_unit!(f_FoldableInstance8, "FoldableInstance8");
+check_failing_build_unit!(f_FoldableInstance9, "FoldableInstance9");
 check_failing_build_unit!(f_FunctorInstance1, "FunctorInstance1");
 check_failing_build_unit!(f_FundepMissingField, "FundepMissingField");
 check_failing_build_unit!(f_FundepMissingFieldDeeper, "FundepMissingFieldDeeper");
