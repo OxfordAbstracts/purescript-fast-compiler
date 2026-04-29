@@ -146,6 +146,15 @@ pub enum ValidationErrorKind {
     /// can match the same type — typically because one head is
     /// strictly more general than (or equal to) the other.
     OverlappingInstances(String),
+    /// A `derive instance` (Functor / Foldable / Traversable /
+    /// Contravariant / Bifunctor / Profunctor / Bifoldable /
+    /// Bitraversable / Bicontravariant) where one of the data
+    /// constructor's argument types uses the abstracted type-var
+    /// in a position incompatible with the class's variance —
+    /// e.g. `Functor` requires `a` covariant, so `Test (a -> Int)`
+    /// is invalid. Reference compiler reports as
+    /// `CannotDeriveInvalidConstructorArg`.
+    CannotDeriveInvalidConstructorArg(String),
 }
 
 impl ValidationErrorKind {
@@ -200,6 +209,9 @@ impl ValidationErrorKind {
             Self::NonAssociativeError(_) => "NonAssociativeError",
             Self::MixedAssociativityError(_) => "MixedAssociativityError",
             Self::OverlappingInstances(_) => "OverlappingInstances",
+            Self::CannotDeriveInvalidConstructorArg(_) => {
+                "CannotDeriveInvalidConstructorArg"
+            }
         }
     }
 }
@@ -708,6 +720,12 @@ pub fn validate_module_with_class_fundeps(
     // general as the other).
     detect_overlapping_instances(&module.decls, &mut errors);
 
+    // CannotDeriveInvalidConstructorArg: walk derive-instance
+    // constructor field types tracking variance; flag if the
+    // tracked type-var(s) appear in a position incompatible with
+    // the class's variance contract.
+    detect_invalid_derive_constructor_arg(&module.decls, &mut errors);
+
     // Equation arity mismatch (same value name, different binder
     // counts).
     detect_arg_list_lengths_differ(&module.decls, &mut errors);
@@ -1009,6 +1027,460 @@ fn fundep_closure(
             return cur;
         }
         cur = next;
+    }
+}
+
+/// CannotDeriveInvalidConstructorArg. Walks data-ctor field types
+/// for `derive instance C T` where C is a variance-bearing class
+/// (Functor/Foldable/Traversable/Contravariant/Bifunctor/Profunctor
+/// /Bifoldable/Bitraversable). For each tracked type-var, walks
+/// the field type tracking variance and flags any occurrence in
+/// a position incompatible with the class's contract.
+///
+/// Variance accounting:
+///   - Function arrow `from -> to`: `from` flips, `to` keeps.
+///   - App on a known-contravariant ctor (Predicate, Op, …):
+///     the arg's variance is flipped.
+///   - App on any other ctor / type-var: assumed COVARIANT
+///     (conservative; misses some cases but avoids false
+///     positives on user types whose variance we don't know).
+///   - Forall / Constrained: skip (the body's variance involves
+///     the constraint context which our shallow walk can't
+///     analyse — we conservatively flag any tracked-var
+///     occurrence inside as "invalid" only when the surrounding
+///     position itself was already invalid).
+fn detect_invalid_derive_constructor_arg(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap;
+    // Build local data-ctor field lists keyed by data-type name,
+    // along with the type-var list (in source order).
+    let mut data_info: HashMap<Symbol, (Vec<Symbol>, Vec<Vec<&cst::TypeExpr>>)> =
+        HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data {
+                name,
+                type_vars,
+                constructors,
+                kind_sig: cst::KindSigSource::None,
+                is_role_decl: false,
+                ..
+            } => {
+                let vars: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                let fields: Vec<Vec<&cst::TypeExpr>> = constructors
+                    .iter()
+                    .map(|c| c.fields.iter().collect())
+                    .collect();
+                data_info.insert(name.value.symbol(), (vars, fields));
+            }
+            cst::Decl::Newtype { name, type_vars, ty, .. } => {
+                let vars: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                let fields: Vec<Vec<&cst::TypeExpr>> = vec![vec![ty]];
+                data_info.insert(name.value.symbol(), (vars, fields));
+            }
+            _ => {}
+        }
+    }
+    for d in decls {
+        if let cst::Decl::Derive {
+            newtype: false,
+            class_name,
+            types,
+            constraints,
+            span,
+            ..
+        } = d
+        {
+            let class_qi = class_name.to_qi();
+            // Determine which positions of the head data type are
+            // "tracked" (and with what variance). We model:
+            //   class           tracked positions (last-N)  required-variance
+            //   Functor / Foldable / Traversable           1   covariant
+            //   Contravariant                              1   contravariant
+            //   Bifunctor / Bifoldable / Bitraversable     2   covariant, covariant
+            //   Profunctor                                 2   contravariant, covariant
+            let class_str: &str = &resolve(class_qi.name);
+            let track: &[Variance] = match class_str {
+                "Functor" | "Foldable" | "Traversable" | "Filterable" => {
+                    &[Variance::Co]
+                }
+                "Contravariant" => &[Variance::Contra],
+                "Bifunctor" | "Bifoldable" | "Bitraversable" => {
+                    &[Variance::Co, Variance::Co]
+                }
+                "Profunctor" => &[Variance::Contra, Variance::Co],
+                _ => continue,
+            };
+            // Foldable/Traversable variants additionally reject any
+            // tracked-var occurrence under a forall or constraint —
+            // the body would need an arbitrary `t :: Type` (or a
+            // dictionary) at fold time, which derivation can't
+            // produce. Functor/Profunctor/etc. work through forall
+            // bodies as long as variance is right.
+            let strict_forall = matches!(
+                class_str,
+                "Foldable" | "Traversable" | "Bifoldable" | "Bitraversable"
+            );
+            // Head type: last position is the data type's name + applied vars.
+            let Some(head) = types.last() else { continue };
+            let Some(head_sym) = data_decl_head_symbol(head) else { continue };
+            let Some((data_vars, ctor_fields)) = data_info.get(&head_sym) else {
+                continue;
+            };
+            // Tracked vars = the LAST N type-vars of the data
+            // declaration, paired with the required-variance
+            // class's signature.
+            if data_vars.len() < track.len() {
+                continue;
+            }
+            let tracked: Vec<(Symbol, Variance)> = data_vars
+                .iter()
+                .skip(data_vars.len() - track.len())
+                .zip(track.iter())
+                .map(|(s, v)| (*s, *v))
+                .collect();
+            // Build per-typevar variance signatures from the
+            // derive's CONSTRAINTS. `Contravariant f =>` records
+            // f's last-arg as Contra; `Functor f =>` Co; etc. The
+            // App walker uses this when the head is a Var.
+            let mut var_variance: HashMap<Symbol, Vec<Variance>> = HashMap::new();
+            for c in constraints {
+                let cqi = c.class.to_qi();
+                let cname = resolve(cqi.name);
+                let sig: &[Variance] = match cname.as_str() {
+                    "Functor" | "Foldable" | "Traversable" | "Filterable" => {
+                        &[Variance::Co]
+                    }
+                    "Contravariant" => &[Variance::Contra],
+                    "Bifunctor" | "Bifoldable" | "Bitraversable" => {
+                        &[Variance::Co, Variance::Co]
+                    }
+                    "Profunctor" => &[Variance::Contra, Variance::Co],
+                    _ => continue,
+                };
+                if c.args.len() == 1 {
+                    if let cst::TypeExpr::Var { name, .. } = peel_parens(&c.args[0])
+                    {
+                        var_variance.insert(name.value.symbol(), sig.to_vec());
+                    }
+                }
+            }
+            let mut bad = false;
+            for fields in ctor_fields {
+                for f in fields {
+                    if !bad {
+                        bad = check_variance_field(
+                            f,
+                            &tracked,
+                            &var_variance,
+                            Variance::Co,
+                            strict_forall,
+                        );
+                    }
+                }
+            }
+            if bad {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::CannotDeriveInvalidConstructorArg(
+                        resolve(head_sym),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variance {
+    Co,
+    Contra,
+}
+
+impl Variance {
+    fn flip(self) -> Variance {
+        match self {
+            Variance::Co => Variance::Contra,
+            Variance::Contra => Variance::Co,
+        }
+    }
+}
+
+/// Recursively check field type for tracked-var occurrences in
+/// wrong-variance positions. Returns `true` if any violation is
+/// found.
+///
+/// `strict_forall`: when true (Foldable/Traversable etc.), any
+/// tracked-var occurrence under a Forall or Constrained is
+/// flagged — derivation can't produce arbitrary `forall`-bound
+/// values or constraint dictionaries at fold-time.
+fn check_variance_field(
+    te: &cst::TypeExpr,
+    tracked: &[(Symbol, Variance)],
+    var_variance: &HashMap<Symbol, Vec<Variance>>,
+    cur: Variance,
+    strict_forall: bool,
+) -> bool {
+    match te {
+        cst::TypeExpr::Var { name, .. } => {
+            let sym = name.value.symbol();
+            for (t, required) in tracked {
+                if *t == sym && *required != cur {
+                    return true;
+                }
+            }
+            false
+        }
+        cst::TypeExpr::Constructor { .. }
+        | cst::TypeExpr::Hole { .. }
+        | cst::TypeExpr::Wildcard { .. }
+        | cst::TypeExpr::StringLiteral { .. }
+        | cst::TypeExpr::IntLiteral { .. } => false,
+        cst::TypeExpr::Function { from, to, .. } => {
+            check_variance_field(
+                from,
+                tracked,
+                var_variance,
+                cur.flip(),
+                strict_forall,
+            ) || check_variance_field(to, tracked, var_variance, cur, strict_forall)
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            // Determine arg's variance via:
+            //   - hardcoded contravariant Constructors (Predicate,
+            //     Op, Comparison, Equivalence)
+            //   - constraint-derived var_variance map (head Var
+            //     with constraint `Contravariant f` etc.)
+            let arg_var = match app_head_arg_position_variance(
+                constructor,
+                arg,
+                var_variance,
+            ) {
+                Some(arg_pos_v) => match arg_pos_v {
+                    Variance::Co => cur,
+                    Variance::Contra => cur.flip(),
+                },
+                None => {
+                    if is_contravariant_head(constructor) {
+                        cur.flip()
+                    } else {
+                        cur
+                    }
+                }
+            };
+            check_variance_field(
+                constructor,
+                tracked,
+                var_variance,
+                cur,
+                strict_forall,
+            ) || check_variance_field(
+                arg,
+                tracked,
+                var_variance,
+                arg_var,
+                strict_forall,
+            )
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            if strict_forall {
+                forall_contains_tracked(te, tracked)
+            } else {
+                let inner: Vec<(Symbol, Variance)> = tracked
+                    .iter()
+                    .copied()
+                    .filter(|(s, _)| {
+                        !vars.iter().any(|(v, _, _)| v.value.symbol() == *s)
+                    })
+                    .collect();
+                check_variance_field(ty, &inner, var_variance, cur, strict_forall)
+            }
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            if strict_forall {
+                forall_contains_tracked(te, tracked)
+            } else {
+                check_variance_field(ty, tracked, var_variance, cur, strict_forall)
+            }
+        }
+        cst::TypeExpr::Record { fields, .. } => fields.iter().any(|f| {
+            check_variance_field(&f.ty, tracked, var_variance, cur, strict_forall)
+        }),
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            fields.iter().any(|f| {
+                check_variance_field(
+                    &f.ty,
+                    tracked,
+                    var_variance,
+                    cur,
+                    strict_forall,
+                )
+            }) || tail.as_ref().map_or(false, |t| {
+                check_variance_field(t, tracked, var_variance, cur, strict_forall)
+            })
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            check_variance_field(ty, tracked, var_variance, cur, strict_forall)
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            check_variance_field(left, tracked, var_variance, cur, strict_forall)
+                || check_variance_field(
+                    right,
+                    tracked,
+                    var_variance,
+                    cur,
+                    strict_forall,
+                )
+        }
+        cst::TypeExpr::Kinded { ty, .. } => {
+            check_variance_field(ty, tracked, var_variance, cur, strict_forall)
+        }
+        _ => false,
+    }
+}
+
+/// For an `App(constructor, arg)` node, look up the arg-position
+/// variance of the constructor's head. Returns the variance of
+/// the arg position relative to the constructor, or `None` to
+/// fall back to default rules.
+///
+/// This walks the App spine of `constructor` to find the head Var
+/// and the arg-index of THIS application. E.g. for `App(App(Var(f),
+/// arg1), arg2)` and we're at the outer App, the arg-index is 1
+/// (second arg). If `f` has constraint `Profunctor`, signature is
+/// `[Contra, Co]`, so arg-index 1 is `Co`.
+fn app_head_arg_position_variance(
+    constructor: &cst::TypeExpr,
+    _arg: &cst::TypeExpr,
+    var_variance: &HashMap<Symbol, Vec<Variance>>,
+) -> Option<Variance> {
+    // Count how many App-spine slots are to the LEFT of `arg` —
+    // that's our arg-index. Then walk to the head Var.
+    let mut depth: usize = 0;
+    let mut cur = constructor;
+    loop {
+        match peel_parens(cur) {
+            cst::TypeExpr::App { constructor: c, .. } => {
+                depth += 1;
+                cur = c;
+            }
+            cst::TypeExpr::Var { name, .. } => {
+                let sig = var_variance.get(&name.value.symbol())?;
+                // arg-index in our App is `depth` (0 for innermost).
+                return sig.get(depth).copied();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// True iff `te` (a constructor, possibly under Parens / App
+/// chain) is one of the well-known contravariant type
+/// constructors (Predicate, Op, Comparison, Equivalence).
+fn is_contravariant_head(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            let s = resolve(name.name.symbol());
+            matches!(s.as_str(), "Predicate" | "Op" | "Comparison" | "Equivalence")
+        }
+        cst::TypeExpr::Parens { ty, .. } => is_contravariant_head(ty),
+        cst::TypeExpr::App { constructor, .. } => is_contravariant_head(constructor),
+        _ => false,
+    }
+}
+
+/// True iff `te` contains any tracked type-variable as a free
+/// reference (used as a fallback for Forall/Constrained where
+/// variance analysis is infeasible).
+fn forall_contains_tracked(
+    te: &cst::TypeExpr,
+    tracked: &[(Symbol, Variance)],
+) -> bool {
+    let names: HashSet<Symbol> = tracked.iter().map(|(s, _)| *s).collect();
+    let mut found = false;
+    walk_type_find_var(te, &names, &mut found);
+    found
+}
+
+fn walk_type_find_var(
+    te: &cst::TypeExpr,
+    names: &HashSet<Symbol>,
+    found: &mut bool,
+) {
+    if *found {
+        return;
+    }
+    match te {
+        cst::TypeExpr::Var { name, .. } => {
+            if names.contains(&name.value.symbol()) {
+                *found = true;
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_type_find_var(constructor, names, found);
+            walk_type_find_var(arg, names, found);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_type_find_var(from, names, found);
+            walk_type_find_var(to, names, found);
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            // Inner forall may SHADOW outer tracked names.
+            // Remove the shadowed ones from the tracked set
+            // before recursing.
+            let mut inner_names = names.clone();
+            for (v, _, _) in vars {
+                inner_names.remove(&v.value.symbol());
+            }
+            walk_type_find_var(ty, &inner_names, found);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    walk_type_find_var(arg, names, found);
+                }
+            }
+            walk_type_find_var(ty, names, found);
+        }
+        cst::TypeExpr::Parens { ty, .. } => walk_type_find_var(ty, names, found),
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_type_find_var(&f.ty, names, found);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_type_find_var(&f.ty, names, found);
+            }
+            if let Some(t) = tail {
+                walk_type_find_var(t, names, found);
+            }
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_type_find_var(left, names, found);
+            walk_type_find_var(right, names, found);
+        }
+        cst::TypeExpr::Kinded { ty, .. } => walk_type_find_var(ty, names, found),
+        _ => {}
+    }
+}
+
+/// Extract the head data-type symbol from a derive-instance type
+/// argument: `Functor (Test f g)` → `Test`. Walks Parens and
+/// peels App's constructor side until reaching a Constructor.
+fn data_decl_head_symbol(te: &cst::TypeExpr) -> Option<Symbol> {
+    match peel_parens(te) {
+        cst::TypeExpr::Constructor { name, .. } if name.module.is_none() => {
+            Some(name.name.symbol())
+        }
+        cst::TypeExpr::App { constructor, .. } => {
+            data_decl_head_symbol(constructor)
+        }
+        _ => None,
     }
 }
 
