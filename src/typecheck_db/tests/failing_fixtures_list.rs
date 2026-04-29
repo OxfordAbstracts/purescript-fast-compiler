@@ -349,8 +349,8 @@ check_failing_build_unit_ignored!(f_RowConstructors1, "RowConstructors1", "expec
 check_failing_build_unit!(f_RowConstructors2, "RowConstructors2");
 check_failing_build_unit_ignored!(f_RowConstructors3, "RowConstructors3", "expected: KindsDoNotUnify");
 check_failing_build_unit!(f_RowInInstanceNotDetermined0, "RowInInstanceNotDetermined0");
-check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined1, "RowInInstanceNotDetermined1", "expected: InvalidInstanceHead");
-check_failing_build_unit_ignored!(f_RowInInstanceNotDetermined2, "RowInInstanceNotDetermined2", "expected: InvalidInstanceHead");
+check_failing_build_unit!(f_RowInInstanceNotDetermined1, "RowInInstanceNotDetermined1");
+check_failing_build_unit!(f_RowInInstanceNotDetermined2, "RowInInstanceNotDetermined2");
 check_failing_build_unit!(f_RowLacks, "RowLacks");
 check_failing_build_unit_ignored!(f_RowsInKinds, "RowsInKinds", "expected: KindsDoNotUnify");
 check_failing_build_unit!(f_ScopedKindVariableSynonym, "ScopedKindVariableSynonym");

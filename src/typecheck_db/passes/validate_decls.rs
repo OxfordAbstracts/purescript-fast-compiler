@@ -628,7 +628,11 @@ pub fn validate_module_with_class_fundeps(
     );
 
     detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
-    detect_invalid_instance_heads(&module.decls, &mut errors);
+    detect_invalid_instance_heads(
+        &module.decls,
+        imported_class_fundeps,
+        &mut errors,
+    );
 
     // Single-pass walk over each Decl::Value's binders + every nested
     // Case alternative + every Lambda inside it. Looks for the same
@@ -748,25 +752,49 @@ pub fn validate_module_with_class_fundeps(
 /// aliases aren't accessible here so we conservatively skip them.
 fn detect_invalid_instance_heads(
     decls: &[cst::Decl],
+    imported_class_fundeps: &HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>>,
     errors: &mut Vec<ValidationError>,
 ) {
     // Build a map of local type-alias name → body, so we can look
     // through one level of aliasing for the record/row check.
     let mut alias_body: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
-    // Local classes that declare any fundep — these allow record/row
-    // literals in determined positions and we conservatively skip
-    // record-checking for any instance of such a class. (A precise
-    // "is position i determined" rule would be better but requires
-    // imported fundep visibility too; classes-with-fundeps is the
-    // common case.)
-    let mut classes_with_fundeps: HashSet<Symbol> = HashSet::new();
+    // Per-class positional fundep info. We use this to compute
+    // "allowed-record positions" — a position p is allowed to be
+    // a bare record/row literal iff p is in some fundep's
+    // `determined` AND p is NOT in any fundep's `determiners`.
+    // (Cyclic fundeps like `a -> b, b -> a` make every position
+    // both — none qualifies as truly determined.)
+    let mut local_class_fundeps: HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>> =
+        HashMap::new();
     for d in decls {
         match d {
             cst::Decl::TypeAlias { name, ty, .. } => {
                 alias_body.insert(name.value.symbol(), ty);
             }
-            cst::Decl::Class { name, fundeps, .. } if !fundeps.is_empty() => {
-                classes_with_fundeps.insert(name.value.symbol());
+            cst::Decl::Class { name, type_vars, fundeps, .. } if !fundeps.is_empty() => {
+                let var_names: Vec<Symbol> =
+                    type_vars.iter().map(|v| v.value.symbol()).collect();
+                let fd: Vec<(Vec<usize>, Vec<usize>)> = fundeps
+                    .iter()
+                    .map(|f| {
+                        let lhs: Vec<usize> = f
+                            .lhs
+                            .iter()
+                            .filter_map(|v| {
+                                var_names.iter().position(|s| *s == v.symbol())
+                            })
+                            .collect();
+                        let rhs: Vec<usize> = f
+                            .rhs
+                            .iter()
+                            .filter_map(|v| {
+                                var_names.iter().position(|s| *s == v.symbol())
+                            })
+                            .collect();
+                        (lhs, rhs)
+                    })
+                    .collect();
+                local_class_fundeps.insert(name.value.symbol(), fd);
             }
             _ => {}
         }
@@ -855,20 +883,39 @@ fn detect_invalid_instance_heads(
             }
             _ => continue,
         };
-        // Skip classes with fundeps — records in determined
-        // positions are legitimate (`class Simple a b | a -> b;
-        // instance Simple Empty {}`). Imported classes whose
-        // fundeps we can't see are also skipped, since we can't
-        // distinguish `Foo Empty {}` from `Foo Unit {}` without
-        // them.
         let cqi = class_name.to_qi();
         if cqi.module.is_some() {
             continue;
         }
-        if classes_with_fundeps.contains(&cqi.name) {
-            continue;
-        }
-        for t in types {
+        // Per-position record-allowed mask. Classes WITH fundeps
+        // get fundep-aware checks (record allowed only in truly
+        // determined positions); classes without fundeps disallow
+        // record/row in every position.
+        let fundeps = local_class_fundeps
+            .get(&cqi.name)
+            .or_else(|| imported_class_fundeps.get(&cqi.name));
+        let allowed_record_pos: Vec<bool> = match fundeps {
+            None => vec![false; types.len()],
+            Some(fds) => {
+                // A position is "allowed-record" iff it is NOT in
+                // any MINIMAL covering set of the fundep system.
+                // (A covering set S is one whose fundep-closure
+                // covers every position. Minimal = no proper subset
+                // is covering.) Cyclic fundeps like `a -> b, b -> a`
+                // produce minimal covers {a} and {b} — both
+                // positions appear in some minimal cover, so
+                // neither is allowed-record. But for `a -> b` alone,
+                // {a, c} is the only minimal cover (where c is
+                // unmentioned), so b is never in a minimal cover
+                // → allowed-record.
+                let n = types.len();
+                always_determined_positions(n, fds)
+            }
+        };
+        for (i, t) in types.iter().enumerate() {
+            if allowed_record_pos.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             // `derive instance Newtype (Min a) _` puts a top-level
             // wildcard in the second arg as the canonical
             // newtype-representation pattern; that's legitimate.
@@ -891,6 +938,78 @@ fn peel_parens(te: &cst::TypeExpr) -> &cst::TypeExpr {
         cur = ty;
     }
     cur
+}
+
+/// Compute `[bool; n]` where `out[i]` is `true` iff position `i`
+/// is "always determined" — i.e. NOT in any minimal covering set
+/// of the fundep system. Falls back to `false` (not allowed for
+/// record) when computation would be infeasible.
+///
+/// Algorithm: enumerate all 2^n subsets, compute closure under
+/// fundeps, retain those whose closure covers all `n` positions
+/// (covering sets), filter to MINIMAL covers (no proper subset is
+/// also a cover). A position is always-determined iff it appears
+/// in NONE of the minimal covers.
+fn always_determined_positions(
+    n: usize,
+    fundeps: &[(Vec<usize>, Vec<usize>)],
+) -> Vec<bool> {
+    if n == 0 || n > 12 {
+        // 2^12 = 4096 subsets is the practical limit; bail on
+        // larger classes (extraordinarily rare in practice).
+        return vec![false; n];
+    }
+    let total = 1u32 << n;
+    let mut covers: Vec<u32> = Vec::new();
+    for s in 0..total {
+        let closure = fundep_closure(s, n, fundeps);
+        if closure == total - 1 {
+            covers.push(s);
+        }
+    }
+    // Filter to minimal: drop any cover that has a strict subset
+    // also in the cover list.
+    let minimal: Vec<u32> = covers
+        .iter()
+        .copied()
+        .filter(|&c| {
+            !covers
+                .iter()
+                .any(|&other| other != c && (other & c) == other)
+        })
+        .collect();
+    let mut union: u32 = 0;
+    for c in &minimal {
+        union |= c;
+    }
+    // Position i is always-determined iff its bit is NOT in union.
+    (0..n).map(|i| (union & (1u32 << i)) == 0).collect()
+}
+
+/// Bitset closure: starting from `set`, repeatedly add `rhs` of
+/// any fundep whose `lhs` is fully contained.
+fn fundep_closure(
+    initial: u32,
+    n: usize,
+    fundeps: &[(Vec<usize>, Vec<usize>)],
+) -> u32 {
+    let _ = n;
+    let mut cur = initial;
+    loop {
+        let mut next = cur;
+        for (lhs, rhs) in fundeps {
+            let lhs_bits: u32 = lhs.iter().fold(0, |acc, &p| acc | (1u32 << p));
+            if (cur & lhs_bits) == lhs_bits {
+                let rhs_bits: u32 =
+                    rhs.iter().fold(0, |acc, &p| acc | (1u32 << p));
+                next |= rhs_bits;
+            }
+        }
+        if next == cur {
+            return cur;
+        }
+        cur = next;
+    }
 }
 
 fn has_wildcard(te: &cst::TypeExpr) -> bool {
