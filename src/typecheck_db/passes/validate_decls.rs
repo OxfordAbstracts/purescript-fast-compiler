@@ -1081,6 +1081,10 @@ fn detect_invalid_derive_constructor_arg(
     // along with the type-var list (in source order).
     let mut data_info: HashMap<Symbol, (Vec<Symbol>, Vec<Vec<&cst::TypeExpr>>)> =
         HashMap::new();
+    // Track foreign-imported type constructors. Their variance is
+    // unknown (no instance machinery available), so any tracked-var
+    // occurrence under such a head should be flagged.
+    let mut foreign_types: HashSet<Symbol> = HashSet::new();
     for d in decls {
         match d {
             cst::Decl::Data {
@@ -1104,6 +1108,9 @@ fn detect_invalid_derive_constructor_arg(
                     type_vars.iter().map(|v| v.value.symbol()).collect();
                 let fields: Vec<Vec<&cst::TypeExpr>> = vec![vec![ty]];
                 data_info.insert(name.value.symbol(), (vars, fields));
+            }
+            cst::Decl::ForeignData { name, .. } => {
+                foreign_types.insert(name.value.symbol());
             }
             _ => {}
         }
@@ -1251,6 +1258,16 @@ fn detect_invalid_derive_constructor_arg(
                             &passed_through,
                             Variance::Co,
                             strict_forall,
+                        );
+                    }
+                    if !bad {
+                        // Foreign-typed App: tracked-var inside is
+                        // unsafe (we don't know foreign type's
+                        // variance behavior).
+                        bad = field_passes_tracked_through_foreign(
+                            f,
+                            &tracked,
+                            &foreign_types,
                         );
                     }
                 }
@@ -1527,6 +1544,148 @@ fn app_head_arg_position_variance(
                 return sig.get(depth).copied();
             }
             _ => return None,
+        }
+    }
+}
+
+/// True iff `te` contains a tracked type variable as an arg to a
+/// foreign-imported type constructor (e.g. `Variant (left :: a)`
+/// where `Variant` is `foreign import data`). The reference
+/// compiler can't derive variance through foreign types, so any
+/// such occurrence is unsafe.
+fn field_passes_tracked_through_foreign(
+    te: &cst::TypeExpr,
+    tracked: &[(Symbol, Variance)],
+    foreign_types: &HashSet<Symbol>,
+) -> bool {
+    let names: HashSet<Symbol> = tracked.iter().map(|(s, _)| *s).collect();
+    let mut found = false;
+    walk_field_for_foreign(te, &names, foreign_types, false, &mut found);
+    found
+}
+
+fn walk_field_for_foreign(
+    te: &cst::TypeExpr,
+    tracked_names: &HashSet<Symbol>,
+    foreign_types: &HashSet<Symbol>,
+    under_foreign: bool,
+    found: &mut bool,
+) {
+    if *found {
+        return;
+    }
+    match te {
+        cst::TypeExpr::Var { name, .. } => {
+            if under_foreign && tracked_names.contains(&name.value.symbol()) {
+                *found = true;
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            // Walk the constructor first (to detect a foreign head).
+            walk_field_for_foreign(
+                constructor,
+                tracked_names,
+                foreign_types,
+                under_foreign,
+                found,
+            );
+            // The arg position picks up `under_foreign` if the
+            // App's head spine bottoms at a foreign Constructor.
+            let arg_under = under_foreign
+                || app_head_is_foreign(constructor, foreign_types);
+            walk_field_for_foreign(
+                arg,
+                tracked_names,
+                foreign_types,
+                arg_under,
+                found,
+            );
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_field_for_foreign(
+                from,
+                tracked_names,
+                foreign_types,
+                under_foreign,
+                found,
+            );
+            walk_field_for_foreign(
+                to,
+                tracked_names,
+                foreign_types,
+                under_foreign,
+                found,
+            );
+        }
+        cst::TypeExpr::Parens { ty, .. }
+        | cst::TypeExpr::Kinded { ty, .. } => {
+            walk_field_for_foreign(
+                ty,
+                tracked_names,
+                foreign_types,
+                under_foreign,
+                found,
+            );
+        }
+        cst::TypeExpr::Forall { ty, .. }
+        | cst::TypeExpr::Constrained { ty, .. } => {
+            walk_field_for_foreign(
+                ty,
+                tracked_names,
+                foreign_types,
+                under_foreign,
+                found,
+            );
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_field_for_foreign(
+                    &f.ty,
+                    tracked_names,
+                    foreign_types,
+                    under_foreign,
+                    found,
+                );
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_field_for_foreign(
+                    &f.ty,
+                    tracked_names,
+                    foreign_types,
+                    under_foreign,
+                    found,
+                );
+            }
+            if let Some(t) = tail {
+                walk_field_for_foreign(
+                    t,
+                    tracked_names,
+                    foreign_types,
+                    under_foreign,
+                    found,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn app_head_is_foreign(
+    te: &cst::TypeExpr,
+    foreign_types: &HashSet<Symbol>,
+) -> bool {
+    let mut cur = te;
+    loop {
+        match peel_parens(cur) {
+            cst::TypeExpr::App { constructor, .. } => cur = constructor,
+            cst::TypeExpr::Constructor { name, .. } => {
+                let qi = name.to_qi();
+                return qi.module.is_none()
+                    && foreign_types.contains(&qi.name);
+            }
+            _ => return false,
         }
     }
 }

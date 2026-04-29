@@ -196,7 +196,7 @@ check_failing_build_unit!(f_ExtraneousClassMember, "ExtraneousClassMember");
 check_failing_build_unit!(f_FFIDefaultCJSExport, "FFIDefaultCJSExport");
 check_failing_build_unit_ignored!(f_Foldable, "Foldable", "expected: CycleInDeclaration");
 check_failing_build_unit!(f_FoldableInstance1, "FoldableInstance1");
-check_failing_build_unit_ignored!(f_FoldableInstance10, "FoldableInstance10", "expected: CannotDeriveInvalidConstructorArg");
+check_failing_build_unit!(f_FoldableInstance10, "FoldableInstance10");
 check_failing_build_unit_ignored!(f_FoldableInstance2, "FoldableInstance2", "expected: KindsDoNotUnify");
 check_failing_build_unit_ignored!(f_FoldableInstance3, "FoldableInstance3", "expected: KindsDoNotUnify");
 check_failing_build_unit!(f_FoldableInstance4, "FoldableInstance4");
