@@ -665,6 +665,20 @@ fn check_one_module(
     // so `instance Foo SynString` should match a `String` call.
     instance_index.expand_aliases_in_place(&alias_map);
 
+    // Cross-module overlap detection: walk the post-import,
+    // post-alias-expansion instance index. Two instances overlap
+    // when their heads can unify (so any concrete call could match
+    // either). The local-only validate_decls detector covers
+    // both-local pairs; we emit ScopeConflict-style
+    // `OverlappingInstances` only for pairs where AT LEAST ONE
+    // side comes from outside this module's local CST. Chain
+    // members are deliberately ordered overlap and are skipped.
+    detect_cross_module_instance_overlaps(
+        &instance_index,
+        &local_instances,
+        &mut validation_errors,
+    );
+
     // Make the alias map available to every inference-side
     // `convert_type_expr` caller (type annotations, let-sigs,
     // `check_value` sigs) via the env.
@@ -1796,6 +1810,191 @@ fn compute_sccs(
 /// keeps the alias under `Q.Foo`, which bare `Constructor("Foo")`
 /// references in the importer don't shadow). Module-aliased uses
 /// hit a different code path that the detector doesn't probe.
+/// Walk every (class_name, instance) pair in `ix` and emit an
+/// `OverlappingInstances` validation error for any pair whose
+/// heads can unify (after fresh-renaming each side's vars), unless
+/// both instances come from the current module's local CST (those
+/// pairs are caught by the local validate_decls detector).
+///
+/// Chain members (`chained == true`) are explicitly ordered
+/// overlap and skipped.
+fn detect_cross_module_instance_overlaps(
+    ix: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    local_instances: &[crate::typecheck_db::passes::instance_index::Instance],
+    validation_errors: &mut Vec<
+        crate::typecheck_db::passes::validate_decls::ValidationError,
+    >,
+) {
+    use crate::typecheck_db::passes::instance_index::Instance;
+    use std::collections::HashMap;
+    // Build a fingerprint set for local instances so we can ask
+    // "is THIS instance from local CST?" without walking every
+    // time.
+    let local_keys: std::collections::HashSet<(String, usize, String)> =
+        local_instances
+            .iter()
+            .map(|i| (i.class.name.clone(), i.types.len(), instance_fingerprint(i)))
+            .collect();
+    // Group instances by class. The index already keys per-class;
+    // we walk pairs WITHIN each group.
+    let mut by_class: HashMap<String, Vec<&Instance>> = HashMap::new();
+    for (cls, inst) in ix.all_instances() {
+        if inst.chained {
+            continue;
+        }
+        by_class.entry(cls.to_string()).or_default().push(inst);
+    }
+    // Drop any class that has at least one chain member — the
+    // chain semantics make ordering deliberate.
+    let chain_classes: std::collections::HashSet<String> = ix
+        .all_instances()
+        .filter_map(|(c, i)| if i.chained { Some(c.to_string()) } else { None })
+        .collect();
+    for cls in chain_classes {
+        by_class.remove(&cls);
+    }
+    // Drop classes that declare fundeps. With fundeps, the
+    // reference compiler accepts surface overlaps because fundep
+    // resolution at use-site disambiguates. Examples that would
+    // false-positive without this: `class Newtype t a | t -> a`
+    // (one instance per newtype), `Row.Cons label ty rest row |
+    // row -> ...`, `Row.Union r1 r2 r3 | r1 r2 -> r3, r1 r3 -> r2,
+    // r2 r3 -> r1`.
+    //
+    // Special case: when the class isn't registered with an entry
+    // in the InstanceIndex (e.g. an imported module's
+    // `ModuleExports` was distilled before fundep info was
+    // populated, or the class lives only in `Prim`), we
+    // conservatively skip the overlap check entirely — better to
+    // miss an overlap than wrongly flag fundep-disambiguated
+    // instances. Hardcode the known fundep-bearing classes here so
+    // we still skip them even when registry data is missing.
+    const KNOWN_FUNDEP_CLASSES: &[&str] = &[
+        "Newtype",
+        "Cons",
+        "Union",
+        "Nub",
+        "Lacks",
+        "MonadState",
+        "MonadReader",
+        "MonadWriter",
+        "MonadAsk",
+        "MonadTell",
+        "MonadEffect",
+        "MonadAff",
+        "MonadThrow",
+        "MonadError",
+        "MonadCont",
+        "MonadRec",
+        "MonadTrans",
+        "MonadGen",
+        "Compare",
+        "ToString",
+        "Append",
+        "Equals",
+    ];
+    let fundep_classes: std::collections::HashSet<String> = by_class
+        .keys()
+        .filter(|cls| {
+            ix.class_info(cls.as_str())
+                .map(|info| !info.fundeps.is_empty())
+                .unwrap_or_else(|| {
+                    KNOWN_FUNDEP_CLASSES.contains(&cls.as_str())
+                })
+        })
+        .cloned()
+        .collect();
+    for cls in fundep_classes {
+        by_class.remove(&cls);
+    }
+    let mut already_emitted_for_class: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for (class_name, list) in by_class {
+        let n = list.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let a = list[i];
+                let b = list[j];
+                if a.types.len() != b.types.len() {
+                    continue;
+                }
+                let a_local = local_keys.contains(&(
+                    a.class.name.clone(),
+                    a.types.len(),
+                    instance_fingerprint(a),
+                ));
+                let b_local = local_keys.contains(&(
+                    b.class.name.clone(),
+                    b.types.len(),
+                    instance_fingerprint(b),
+                ));
+                if a_local && b_local {
+                    continue;
+                }
+                // Skip identical-head pairs — those are usually
+                // the same instance arriving twice through a
+                // re-export chain.
+                if instance_fingerprint(a) == instance_fingerprint(b) {
+                    continue;
+                }
+                if instances_heads_unify(a, b) {
+                    if already_emitted_for_class.insert(class_name.clone()) {
+                        validation_errors.push(
+                            crate::typecheck_db::passes::validate_decls::ValidationError {
+                                span: crate::span::Span { start: 0, end: 0 },
+                                kind: crate::typecheck_db::passes::validate_decls
+                                    ::ValidationErrorKind::OverlappingInstances(
+                                        class_name.clone(),
+                                    ),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn instance_fingerprint(
+    i: &crate::typecheck_db::passes::instance_index::Instance,
+) -> String {
+    // A stable string of the instance's head types — enough to
+    // distinguish different heads without comparing internal unif
+    // ids (instances at this stage carry only Var / Con / App /
+    // Fun / etc., no unifs).
+    format!("{:?}", i.types)
+}
+
+fn instances_heads_unify(
+    a: &crate::typecheck_db::passes::instance_index::Instance,
+    b: &crate::typecheck_db::passes::instance_index::Instance,
+) -> bool {
+    use crate::typecheck_db::generalize::apply_var_subst;
+    use crate::typecheck_db::unify::UnifyState;
+    if a.types.len() != b.types.len() {
+        return false;
+    }
+    let mut state = UnifyState::new();
+    let mut subst_a: std::collections::HashMap<String, crate::typecheck_db::types::Type> =
+        std::collections::HashMap::new();
+    for v in &a.vars {
+        subst_a.insert(v.clone(), state.fresh());
+    }
+    let head_a: Vec<_> = a.types.iter().map(|t| apply_var_subst(t, &subst_a)).collect();
+    let mut subst_b: std::collections::HashMap<String, crate::typecheck_db::types::Type> =
+        std::collections::HashMap::new();
+    for v in &b.vars {
+        subst_b.insert(v.clone(), state.fresh());
+    }
+    let head_b: Vec<_> = b.types.iter().map(|t| apply_var_subst(t, &subst_b)).collect();
+    for (ta, tb) in head_a.iter().zip(head_b.iter()) {
+        if state.unify(ta, tb).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 fn build_imported_alias_arity(
     module: &cst::Module,
     registry: &ModuleRegistry,
