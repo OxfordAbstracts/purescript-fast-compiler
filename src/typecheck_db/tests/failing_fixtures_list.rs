@@ -277,7 +277,7 @@ check_failing_build_unit!(f_NewtypeInstance, "NewtypeInstance");
 check_failing_build_unit!(f_NewtypeInstance2, "NewtypeInstance2");
 check_failing_build_unit!(f_NewtypeInstance3, "NewtypeInstance3");
 check_failing_build_unit!(f_NewtypeInstance4, "NewtypeInstance4");
-check_failing_build_unit_ignored!(f_NewtypeInstance5, "NewtypeInstance5", "expected: InvalidNewtypeInstance");
+check_failing_build_unit!(f_NewtypeInstance5, "NewtypeInstance5");
 check_failing_build_unit!(f_NewtypeInstance6, "NewtypeInstance6");
 check_failing_build_unit!(f_NewtypeMultiArgs, "NewtypeMultiArgs");
 check_failing_build_unit!(f_NewtypeMultiCtor, "NewtypeMultiCtor");

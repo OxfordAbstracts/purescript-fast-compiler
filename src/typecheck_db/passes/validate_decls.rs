@@ -5651,30 +5651,69 @@ fn detect_invalid_newtype_derive(
     decls: &[cst::Decl],
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut local_newtypes: HashSet<Symbol> = HashSet::new();
+    // Build: newtype-name → (type-vars, body)
+    let mut local_newtypes: HashMap<Symbol, (Vec<Symbol>, &cst::TypeExpr)> =
+        HashMap::new();
     for d in decls {
-        if let cst::Decl::Newtype { name, .. } = d {
-            local_newtypes.insert(name.value.symbol());
+        if let cst::Decl::Newtype { name, type_vars, ty, .. } = d {
+            let vs: Vec<Symbol> =
+                type_vars.iter().map(|v| v.value.symbol()).collect();
+            local_newtypes.insert(name.value.symbol(), (vs, ty));
         }
     }
-    let _ = local_newtypes;
     for d in decls {
         if let cst::Decl::Derive { newtype: true, types, class_name, span, .. } = d
         {
-            // We can only confidently fire when there's no head at
-            // all (`derive newtype instance Nullary`). Anything
-            // with a head requires registry-aware analysis to
-            // distinguish `Eq1 Last` (valid: Last is a newtype
-            // matching Eq1's `Type -> Type` slot) from `Functor X`
-            // (invalid when X has the wrong arity). Skip those
-            // cases here; they fall through to NoInstanceFound at
-            // type-check time.
+            // Nullary classes: `derive newtype instance Nullary` —
+            // no head to derive over.
             if types.is_empty() {
                 let display = resolve(class_name.to_qi().name);
                 errors.push(ValidationError {
                     span: *span,
                     kind: ValidationErrorKind::InvalidNewtypeInstance(display),
                 });
+                continue;
+            }
+            // `derive newtype instance Functor X` for
+            // `newtype X a = X a`: the newtype's representation
+            // body is a bare type variable, so newtype-coercion
+            // can't pull a `Functor a` instance out of thin air
+            // (`a` is universally quantified at the instance).
+            // Reference compiler reports as InvalidNewtypeInstance.
+            //
+            // Fires only when the head is a bare local newtype
+            // constructor with no args (the class is expected to
+            // have arity 1, like `Functor`, hence X is passed
+            // unsaturated).
+            let head = types.last().unwrap();
+            let head_sym = match peel_parens(head) {
+                cst::TypeExpr::Constructor { name, .. } => {
+                    let qi = name.to_qi();
+                    if qi.module.is_some() {
+                        continue;
+                    }
+                    qi.name
+                }
+                _ => continue,
+            };
+            let (nt_vars, nt_body) = match local_newtypes.get(&head_sym) {
+                Some(p) => p,
+                None => continue,
+            };
+            // Body must be a bare Var that is the LAST nt-var.
+            let body_inner = peel_parens(nt_body);
+            if let cst::TypeExpr::Var { name, .. } = body_inner {
+                if let Some(last) = nt_vars.last() {
+                    if name.value.symbol() == *last {
+                        let display = resolve(class_name.to_qi().name);
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::InvalidNewtypeInstance(
+                                display,
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
