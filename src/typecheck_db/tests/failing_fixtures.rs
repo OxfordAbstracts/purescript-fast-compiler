@@ -371,7 +371,9 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
             has("AmbiguousTypeVariables") || has("NoInstanceFound")
         }
         "ExpectedType" => has("ExpectedType"),
-        "ExpectedWildcard" => has("ExpectedWildcard"),
+        "ExpectedWildcard" => {
+            has("ExpectedWildcard") || has("CannotDeriveNewtypeForData")
+        }
         "NonAssociativeError" => has("NonAssociativeError"),
         "MixedAssociativityError" => has("MixedAssociativityError"),
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),

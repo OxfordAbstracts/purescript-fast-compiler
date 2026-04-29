@@ -179,7 +179,7 @@ check_failing_build_unit!(f_DuplicateTypeVars, "DuplicateTypeVars");
 check_failing_build_unit!(f_EmptyCase, "EmptyCase");
 check_failing_build_unit!(f_EmptyClass, "EmptyClass");
 check_failing_build_unit!(f_EmptyDo, "EmptyDo");
-check_failing_build_unit_ignored!(f_ExpectedWildcard, "ExpectedWildcard", "expected: ExpectedWildcard");
+check_failing_build_unit!(f_ExpectedWildcard, "ExpectedWildcard");
 check_failing_build_unit!(f_ExportConflictClass, "ExportConflictClass");
 check_failing_build_unit!(f_ExportConflictClassAndType, "ExportConflictClassAndType");
 check_failing_build_unit!(f_ExportConflictCtor, "ExportConflictCtor");
