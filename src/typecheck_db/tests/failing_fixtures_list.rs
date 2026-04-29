@@ -409,7 +409,7 @@ check_failing_build_unit!(f_UnsupportedFFICommonJSImports1, "UnsupportedFFICommo
 check_failing_build_unit!(f_UnsupportedFFICommonJSImports2, "UnsupportedFFICommonJSImports2");
 check_failing_build_unit!(f_UnsupportedRoleDeclarationTypeClass, "UnsupportedRoleDeclarationTypeClass");
 check_failing_build_unit!(f_UnsupportedRoleDeclarationTypeSynonym, "UnsupportedRoleDeclarationTypeSynonym");
-check_failing_build_unit_ignored!(f_UnsupportedTypeInKind, "UnsupportedTypeInKind", "expected: UnsupportedTypeInKind");
+check_failing_build_unit!(f_UnsupportedTypeInKind, "UnsupportedTypeInKind");
 check_failing_build_unit_ignored!(f_VisibleTypeApplications1, "VisibleTypeApplications1", "expected: CannotApplyExpressionOfTypeOnType");
 check_failing_build_unit_ignored!(f_VisibleTypeApplications2, "VisibleTypeApplications2", "expected: CannotApplyExpressionOfTypeOnType");
 check_failing_build_unit_ignored!(f_WhereBindingChainAmbiguity, "WhereBindingChainAmbiguity", "expected: NoInstanceFound");

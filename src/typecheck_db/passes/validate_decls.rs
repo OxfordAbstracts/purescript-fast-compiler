@@ -160,6 +160,10 @@ pub enum ValidationErrorKind {
     /// `data F a = F a` (`F :: Type -> Type`). Reference compiler
     /// reports as `ExpectedType`.
     ExpectedType(String),
+    /// A kind signature (typically on `foreign import data X :: K`)
+    /// uses a constrained-arrow shape `C => K` that the reference
+    /// compiler doesn't support. Reports as `UnsupportedTypeInKind`.
+    UnsupportedTypeInKind(String),
 }
 
 impl ValidationErrorKind {
@@ -218,6 +222,7 @@ impl ValidationErrorKind {
                 "CannotDeriveInvalidConstructorArg"
             }
             Self::ExpectedType(_) => "ExpectedType",
+            Self::UnsupportedTypeInKind(_) => "UnsupportedTypeInKind",
         }
     }
 }
@@ -765,6 +770,10 @@ pub fn validate_module_with_class_fundeps(
     // Type annotations like `(x :: F)` where `F` is a higher-kinded
     // type constructor (`data F a = ...`) used without args.
     detect_expected_type_in_annotations(&module.decls, &mut errors);
+
+    // Constraint-arrow shapes inside kind signatures (`foreign
+    // import data X :: C => K`) — reference compiler rejects.
+    detect_unsupported_type_in_kind(&module.decls, &mut errors);
 
     errors
 }
@@ -5735,6 +5744,47 @@ fn detect_deprecated_ffi_prime(
                 });
             }
         }
+    }
+}
+
+/// `foreign import data X :: C => K` — kind signatures can't
+/// carry constraint arrows. Walks each `ForeignData`'s kind and
+/// flags any `Constrained` shape. Reference compiler reports as
+/// `UnsupportedTypeInKind`.
+fn detect_unsupported_type_in_kind(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        if let cst::Decl::ForeignData { name, kind, span, .. } = d {
+            if kind_contains_constraint(kind) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::UnsupportedTypeInKind(resolve(
+                        name.value.symbol(),
+                    )),
+                });
+            }
+        }
+    }
+}
+
+fn kind_contains_constraint(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Constrained { .. } => true,
+        cst::TypeExpr::Forall { ty, .. } => kind_contains_constraint(ty),
+        cst::TypeExpr::Function { from, to, .. } => {
+            kind_contains_constraint(from) || kind_contains_constraint(to)
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            kind_contains_constraint(constructor)
+                || kind_contains_constraint(arg)
+        }
+        cst::TypeExpr::Parens { ty, .. } => kind_contains_constraint(ty),
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            kind_contains_constraint(ty) || kind_contains_constraint(kind)
+        }
+        _ => false,
     }
 }
 
