@@ -11,7 +11,7 @@ check_failing_build_unit!(f_2109_discard, "2109-discard");
 check_failing_build_unit!(f_2109_negate, "2109-negate");
 check_failing_build_unit!(f_2128_class, "2128-class");
 check_failing_build_unit!(f_2128_instance, "2128-instance");
-check_failing_build_unit_ignored!(f_2197_shouldFail, "2197-shouldFail", "expected: ScopeConflict");
+check_failing_build_unit!(f_2197_shouldFail, "2197-shouldFail");
 check_failing_build_unit!(f_2197_shouldFail2, "2197-shouldFail2");
 check_failing_build_unit!(f_2378, "2378");
 check_failing_build_unit!(f_2379, "2379");

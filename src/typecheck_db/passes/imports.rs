@@ -172,7 +172,115 @@ pub fn build_env_from_imports(
         apply_import(&target_name, target, &imp, qualifier, &mut env, &mut ix, &mut errors);
     }
 
+    // Local-decl-vs-explicit-import scope conflict: a `type T = ...`
+    // or `data T` (or value) when `T` was also imported via
+    // `import M (T)`. Reference compiler reports as ScopeConflict.
+    detect_local_explicit_import_conflicts(module, registry, &prims, &mut errors);
+
     (env, ix, errors)
+}
+
+fn detect_local_explicit_import_conflicts(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+    prims: &std::collections::HashMap<String, ModuleExports>,
+    errors: &mut Vec<ImportError>,
+) {
+    use std::collections::HashMap as Map;
+    #[derive(Hash, Eq, PartialEq, Clone, Copy)]
+    enum Ns {
+        Value,
+        Type,
+        Class,
+    }
+    // Collect (namespace, name → source module) from unqualified
+    // explicit imports. Qualified imports (`import M as Q`) don't
+    // bring names into the unqualified namespace.
+    let mut imported: Map<(Ns, String), String> = Map::new();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target_name = module_name_string(&imp.module);
+        let target: Option<&ModuleExports> = prims
+            .get(&target_name)
+            .or_else(|| registry.get(&target_name));
+        let target = match target {
+            Some(t) => t,
+            None => continue,
+        };
+        if let Some(ImportList::Explicit(items)) = &imp.imports {
+            for item in items {
+                let (ns, name) = match item {
+                    cst::Import::Value(n) => (
+                        Ns::Value,
+                        crate::typecheck_db::util::resolve_symbol(
+                            n.value.symbol(),
+                        ),
+                    ),
+                    cst::Import::Type(n, _) => (
+                        Ns::Type,
+                        crate::typecheck_db::util::resolve_symbol(
+                            n.value.symbol(),
+                        ),
+                    ),
+                    cst::Import::Class(n) => (
+                        Ns::Class,
+                        crate::typecheck_db::util::resolve_symbol(
+                            n.value.symbol(),
+                        ),
+                    ),
+                    _ => continue,
+                };
+                let _ = target;
+                imported.insert((ns, name), target_name.clone());
+            }
+        }
+    }
+    if imported.is_empty() {
+        return;
+    }
+    // Walk local decls; flag any whose (namespace, name) is in
+    // `imported`. A `data Cons` (type) doesn't conflict with an
+    // `import M (class Cons)` (class) because they're in different
+    // namespaces.
+    for d in &module.decls {
+        let (ns, decl_name, span) = match d {
+            cst::Decl::TypeAlias { name, span, .. }
+            | cst::Decl::Data { name, span, .. }
+            | cst::Decl::Newtype { name, span, .. } => (
+                Ns::Type,
+                crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                *span,
+            ),
+            cst::Decl::Class { name, span, .. } => (
+                Ns::Class,
+                crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                *span,
+            ),
+            cst::Decl::Value { name, span, .. } => (
+                Ns::Value,
+                crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                *span,
+            ),
+            cst::Decl::Foreign { name, span, .. } => (
+                Ns::Value,
+                crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                *span,
+            ),
+            _ => continue,
+        };
+        if let Some(src) = imported.get(&(ns, decl_name.clone())) {
+            errors.push(ImportError {
+                span,
+                kind: ImportErrorKind::ScopeConflict {
+                    name: decl_name,
+                    first_module: src.clone(),
+                    second_module: module_name_string(&module.name.value),
+                },
+            });
+        }
+    }
 }
 
 /// Compute the set of unqualified VALUE names that an import would
