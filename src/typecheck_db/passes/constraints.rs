@@ -238,8 +238,10 @@ pub fn solve_one(
     // instance declarations. Handle them up-front so a fixture
     // that only reaches these via a Prelude call-site doesn't
     // trip over a `NoInstanceFound`.
-    if let Some(dict) = try_magic(state, pending) {
-        return SolveOutcome::Resolved(dict);
+    match try_magic(state, pending) {
+        MagicOutcome::Resolved(dict) => return SolveOutcome::Resolved(dict),
+        MagicOutcome::Mismatch => return SolveOutcome::HeadMismatch,
+        MagicOutcome::None => {}
     }
 
     // Fundep-aware defer: if the class declares fundeps, a position
@@ -538,6 +540,20 @@ fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bo
     matches!(state.zonk(ty), Type::Unif(_))
 }
 
+/// Result of a `try_magic` attempt.
+#[derive(Debug)]
+enum MagicOutcome {
+    /// The class is unknown to magic — caller should proceed with
+    /// regular instance lookup.
+    None,
+    /// Magic discharged the constraint with the resulting dict.
+    Resolved(ResolvedDict),
+    /// Magic recognised the class shape and the constraint is
+    /// definitively wrong — surface as `InstanceHeadMismatch` so
+    /// callers can report the mismatch.
+    Mismatch,
+}
+
 /// Try to discharge a constraint via built-in compiler magic.
 ///
 /// * `IsSymbol "literal"` — every symbol literal has an
@@ -552,7 +568,7 @@ fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bo
 fn try_magic(
     state: &mut crate::typecheck_db::unify::UnifyState,
     pending: &PendingConstraint,
-) -> Option<ResolvedDict> {
+) -> MagicOutcome {
     let class_name = pending.constraint.class.name.as_str();
     let args: Vec<Type> = pending
         .constraint
@@ -563,7 +579,7 @@ fn try_magic(
     match class_name {
         "IsSymbol" => {
             if let [Type::TypeString(_)] = args.as_slice() {
-                return Some(ResolvedDict {
+                return MagicOutcome::Resolved(ResolvedDict {
                     class: pending.constraint.class.clone(),
                     instance_types: args,
                     instance_idx: 0,
@@ -572,13 +588,10 @@ fn try_magic(
             }
         }
         "Nub" => {
-            // `Nub row result | row -> result`. If `row` is a
-            // closed record/row, `result = row` works (no
-            // duplicate labels by parser invariant).
             if args.len() == 2 {
                 if let Type::Row(_, None) | Type::Record(_, None) = &args[0] {
                     if state.unify(&args[0], &args[1]).is_ok() {
-                        return Some(ResolvedDict {
+                        return MagicOutcome::Resolved(ResolvedDict {
                             class: pending.constraint.class.clone(),
                             instance_types: args,
                             instance_idx: 0,
@@ -588,9 +601,32 @@ fn try_magic(
                 }
             }
         }
+        // `Prim.Int.ToString i sym | i -> sym` — when `i` is a
+        // concrete Int literal, `sym` is determined as that
+        // integer's decimal-string representation.
+        "ToString" => {
+            if args.len() == 2 {
+                if let Type::TypeInt(n) = &args[0] {
+                    let expected = Type::TypeString(n.to_string());
+                    let snapshot = state.snapshot_bindings();
+                    if state.unify(&args[1], &expected).is_ok() {
+                        return MagicOutcome::Resolved(ResolvedDict {
+                            class: pending.constraint.class.clone(),
+                            instance_types: vec![args[0].clone(), expected],
+                            instance_idx: 0,
+                            context: Vec::new(),
+                        });
+                    }
+                    state.restore_bindings(snapshot);
+                    // Definite mismatch: known Int can't produce
+                    // the requested Symbol.
+                    return MagicOutcome::Mismatch;
+                }
+            }
+        }
         _ => {}
     }
-    None
+    MagicOutcome::None
 }
 
 /// Freshen an instance's quantified vars, unify its head with the
