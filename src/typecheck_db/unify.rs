@@ -614,10 +614,27 @@ impl UnifyState {
             // tail is `r`. Unify as `Record([], Some(r))` so
             // call-site `{ a :: Int }` literal records align
             // with the kind-level `Record` constructor.
+            //
+            // When the App head is a unif var (`App(?f, ?row)`),
+            // bind `?f := Con("Record")` and proceed — analogous
+            // to the `Fun ↔ App(App(α,x),y)` reconciliation that
+            // binds α to `Con("->")`. This lets a polymorphic
+            // function like `apply :: forall f a. f a -> f a`
+            // unify against a record literal at the call site
+            // (`apply { x: 42 }`).
             (Type::App(f, row), Type::Record(fields, tail))
             | (Type::Record(fields, tail), Type::App(f, row))
-                if matches!(f.as_ref(), Type::Con(qn) if qn.name == "Record") =>
+                if matches!(f.as_ref(), Type::Con(qn) if qn.name == "Record")
+                    || matches!(f.as_ref(), Type::Unif(_)) =>
             {
+                if let Type::Unif(_) = f.as_ref() {
+                    self.unify(
+                        f,
+                        &Type::Con(crate::typecheck_db::types::QName::unqualified(
+                            "Record",
+                        )),
+                    )?;
+                }
                 let empty: Vec<(String, Type)> = Vec::new();
                 let tail_box: Option<Box<Type>> = Some(Box::new((**row).clone()));
                 // Canonical order: `Record` side as the first arg
