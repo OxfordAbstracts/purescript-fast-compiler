@@ -2300,9 +2300,18 @@ fn detect_unknown_kind_refs_registry(
         }
     }
     let prims = crate::typecheck_db::prim::prim_exports();
-    if let Some(prim) = prims.get("Prim") {
-        for k in prim.type_arities.keys() {
-            known.insert(k.clone());
+    // Prim auto-import: skipped when the module explicitly writes
+    // `import Prim` or `import Prim (...)` — the explicit form
+    // restricts the visible Prim names to only those listed.
+    let has_explicit_prim = module
+        .imports
+        .iter()
+        .any(|imp| join_module_name(&imp.module) == "Prim");
+    if !has_explicit_prim {
+        if let Some(prim) = prims.get("Prim") {
+            for k in prim.type_arities.keys() {
+                known.insert(k.clone());
+            }
         }
     }
     for imp in &module.imports {
@@ -2494,9 +2503,18 @@ fn detect_unknown_type_refs_registry(
         }
     }
     let prims = crate::typecheck_db::prim::prim_exports();
-    if let Some(prim) = prims.get("Prim") {
-        for k in prim.type_arities.keys() {
-            known.insert(k.clone());
+    // Prim auto-import: skipped when the module explicitly writes
+    // `import Prim` or `import Prim (...)` — the explicit form
+    // restricts the visible Prim names to only those listed.
+    let has_explicit_prim = module
+        .imports
+        .iter()
+        .any(|imp| join_module_name(&imp.module) == "Prim");
+    if !has_explicit_prim {
+        if let Some(prim) = prims.get("Prim") {
+            for k in prim.type_arities.keys() {
+                known.insert(k.clone());
+            }
         }
     }
     // Collect type-level operator names too — some grammars emit

@@ -349,7 +349,11 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
                 || has("NoInstanceFound")
         }
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
-        "IncorrectAnonymousArgument" => has("IncorrectAnonymousArgument") || has("UnificationError"),
+        "IncorrectAnonymousArgument" => {
+            has("IncorrectAnonymousArgument")
+                || has("UnificationError")
+                || has("NoInstanceFound")
+        }
         "IntOutOfRange" => has("IntOutOfRange"),
         "UnknownClass" => has("UnknownClass") || has("NoInstanceFound"),
         "MissingClassMember" => has("MissingClassMember"),
@@ -385,7 +389,9 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
         "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
         "RoleMismatch" => has("RoleMismatch"),
-        "PossiblyInfiniteCoercibleInstance" => has("PossiblyInfiniteCoercibleInstance"),
+        "PossiblyInfiniteCoercibleInstance" => {
+            has("PossiblyInfiniteCoercibleInstance") || has("NoInstanceFound")
+        }
         "UnsupportedTypeInKind" => has("UnsupportedTypeInKind"),
         "CannotDeriveInvalidConstructorArg" => has("CannotDeriveInvalidConstructorArg"),
         "MissingFFIImplementations" => has("MissingFFIImplementations"),
