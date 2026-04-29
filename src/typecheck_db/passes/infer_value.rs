@@ -1143,10 +1143,11 @@ pub fn infer_value_scc_with_all(
             Some((n.clone(), ty))
         })
         .collect();
-    // Unify each slot with its full declared sig — but only for decls that
-    // actually contain a typed hole. Without the guard every decl's slot gets
-    // unified with its sig, which corrupts state for `Partial`-constrained or
-    // wildcard-typed decls that don't have holes.
+    // Unify each slot with its full declared sig — only for decls that
+    // actually contain a typed hole. (Wider sig-pinning regresses
+    // record/row-flexible inference like AppRecordUnify; we trigger
+    // a more targeted re-drive in `solve_all` below for the
+    // fundep-improvement case.)
     let hole_decls = state.decls_with_holes();
     for (n, sig_ty) in &full_sig_map {
         if !hole_decls.contains(n) {
@@ -1327,6 +1328,84 @@ pub fn infer_value_scc_with_all(
         mut errors,
         deferred,
     } = report;
+
+    // Sig-driven re-drive: for any deferred constraint owned by a
+    // signed RANK-1 decl whose sig is "clean" (no Partial, no
+    // wildcard, no inner forall), unify the decl's slot with its
+    // sig — which may bind unif vars the deferred constraint
+    // depends on — then re-run the solver on the deferred set.
+    //
+    // The unification is snapshotted: if `unify(slot, sig)` itself
+    // produces a Mismatch we roll back (the sig was incompatible
+    // with the body's natural type — original error reporting
+    // handles this elsewhere). If it succeeds but the re-drive
+    // makes no progress, we keep the binding (it may help
+    // downstream) and just leave the constraint deferred.
+    let deferred = if !deferred.is_empty() {
+        let signed_decls_with_deferred: std::collections::HashSet<String> = deferred
+            .iter()
+            .filter_map(|pc| pc.decl_name.clone())
+            .collect();
+        for n in &signed_decls_with_deferred {
+            if !env.local_signed.contains(n) {
+                continue;
+            }
+            let scheme = match env
+                .top_level
+                .get(&QName { module: None, name: n.clone() })
+            {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            if scheme_has_inner_forall(&scheme) {
+                continue;
+            }
+            // Build the full sig type and check pin-safety.
+            let full_sig = if scheme.vars.is_empty() {
+                scheme.ty.clone()
+            } else {
+                Type::Forall(
+                    scheme
+                        .vars
+                        .iter()
+                        .cloned()
+                        .map(|nm| (nm, false, None))
+                        .collect(),
+                    Box::new(scheme.ty.clone()),
+                )
+            };
+            if sig_ty_unsafe_to_pin(&full_sig) {
+                continue;
+            }
+            let sig_ty = instantiate_scheme_no_constraints(&mut state, &scheme);
+            if let Some(slot) = slot_of.get(n) {
+                let snapshot = state.snapshot_bindings();
+                if state.unify(slot, &sig_ty).is_err() {
+                    state.restore_bindings(snapshot);
+                }
+            }
+        }
+        // Re-run the solver on the still-deferred constraints with
+        // the (possibly improved) state.
+        let report2 = crate::typecheck_db::passes::constraints::solve_all(
+            &mut state,
+            instances,
+            &deferred,
+        );
+        for (k, mut v) in report2.dicts {
+            dicts.entry(k).or_default().append(&mut v);
+        }
+        for (k, mut v) in report2.dicts_by_span {
+            dicts_by_span.entry(k).or_default().extend(v.drain());
+        }
+        for (k, mut v) in report2.errors {
+            errors.entry(k).or_default().append(&mut v);
+        }
+        report2.deferred
+    } else {
+        deferred
+    };
+
     // Deferred constraints get rewritten back onto their owners so a
     // follow-up pass can revisit them.
     let mut deferred_by_decl: HashMap<
@@ -2566,6 +2645,34 @@ fn sig_to_scheme(sig_ty: Type) -> Scheme {
 /// share the same unif identities.
 /// Instantiate a scheme with fresh unif vars for its forall-bound vars,
 /// stripping any `Constrained` or nested `Forall` wrappers. Does NOT
+/// True iff a sig-pin would be unsafe — sig contains a wildcard
+/// (introduces fresh unifs that would over-constrain the body)
+/// or a `Partial` constraint (changes exhaustiveness handling).
+fn sig_ty_unsafe_to_pin(ty: &Type) -> bool {
+    match ty {
+        Type::Wildcard => true,
+        Type::Forall(_, body) => sig_ty_unsafe_to_pin(body),
+        Type::Constrained(cs, body) => {
+            cs.iter().any(|c| {
+                let n = c.class.name.as_str();
+                n == "Partial" || n.ends_with(".Partial")
+            }) || sig_ty_unsafe_to_pin(body)
+        }
+        Type::Fun(a, b) => sig_ty_unsafe_to_pin(a) || sig_ty_unsafe_to_pin(b),
+        Type::App(a, b) => sig_ty_unsafe_to_pin(a) || sig_ty_unsafe_to_pin(b),
+        Type::Record(fs, tail) => {
+            fs.iter().any(|(_, t)| sig_ty_unsafe_to_pin(t))
+                || tail.as_deref().map_or(false, sig_ty_unsafe_to_pin)
+        }
+        Type::Row(fs, tail) => {
+            fs.iter().any(|(_, t)| sig_ty_unsafe_to_pin(t))
+                || tail.as_deref().map_or(false, sig_ty_unsafe_to_pin)
+        }
+        Type::Kinded(t, k) => sig_ty_unsafe_to_pin(t) || sig_ty_unsafe_to_pin(k),
+        _ => false,
+    }
+}
+
 /// record pending constraints — safe to call for diagnostic annotation
 /// without affecting inference.
 fn instantiate_scheme_no_constraints(

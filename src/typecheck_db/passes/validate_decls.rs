@@ -5491,7 +5491,6 @@ fn detect_invalid_newtype_derive(
     for d in decls {
         if let cst::Decl::Derive { newtype: true, types, class_name, span, .. } = d
         {
-            // (existing newtype derive validation logic below)
             // We can only confidently fire when there's no head at
             // all (`derive newtype instance Nullary`). Anything
             // with a head requires registry-aware analysis to
