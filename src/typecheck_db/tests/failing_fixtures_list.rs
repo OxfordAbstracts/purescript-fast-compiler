@@ -270,7 +270,7 @@ check_failing_build_unit_ignored!(f_NestedRecordUpdateAliasWrongType, "NestedRec
 check_failing_build_unit_ignored!(f_NestedRecordUpdateFlatInModify, "NestedRecordUpdateFlatInModify", "expected: TypesDoNotUnify");
 check_failing_build_unit!(f_NestedRecordUpdateFlatMismatch, "NestedRecordUpdateFlatMismatch");
 check_failing_build_unit_ignored!(f_NestedRecordUpdateFlatVsNested, "NestedRecordUpdateFlatVsNested", "expected: TypesDoNotUnify");
-check_failing_build_unit_ignored!(f_NestedRecordUpdatePolyModify, "NestedRecordUpdatePolyModify", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_NestedRecordUpdatePolyModify, "NestedRecordUpdatePolyModify");
 check_failing_build_unit!(f_NestedRecordUpdateTypeMismatch, "NestedRecordUpdateTypeMismatch");
 check_failing_build_unit!(f_NestedRecordUpdateWrongValueType, "NestedRecordUpdateWrongValueType");
 check_failing_build_unit!(f_NewtypeInstance, "NewtypeInstance");

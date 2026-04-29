@@ -129,6 +129,10 @@ pub enum SolveOutcome {
     /// lets the caller decide what to do; Phase D's fundep-driven
     /// improvement loop is what actually consumes these.
     Deferred,
+    /// Exactly one candidate instance exists for the class but its
+    /// head doesn't unify with the constraint args. Reported as
+    /// `InstanceHeadMismatch` (coded as UnificationError).
+    HeadMismatch,
 }
 
 /// Shallow dictionary — enough for codegen to reference the right
@@ -176,6 +180,13 @@ pub enum ConstraintErrorKind {
     /// instances both match the constraint. Reference compiler
     /// reports this as `OverlappingInstances`.
     OverlappingInstances,
+    /// All candidate instances exist but their heads can't be
+    /// unified with the constraint args — the underlying type
+    /// mismatch surfaced through instance resolution. Coded as
+    /// `UnificationError` for fixture matching, mirrors what the
+    /// reference compiler reports as `TypesDoNotUnify` when
+    /// fundep-improvement reveals the conflict.
+    InstanceHeadMismatch,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,11 +270,9 @@ pub fn solve_one(
         return SolveOutcome::Deferred;
     }
 
-    for (instance_idx, cand) in instances
-        .candidates(&pending.constraint.class.name)
-        .iter()
-        .enumerate()
-    {
+    let cands = instances.candidates(&pending.constraint.class.name);
+    let cand_count = cands.len();
+    for (instance_idx, cand) in cands.iter().enumerate() {
         let snapshot = state.snapshot_bindings();
         if let Some((head, context)) = try_match(state, cand, &pending.constraint.args) {
             return SolveOutcome::Resolved(ResolvedDict {
@@ -274,6 +283,22 @@ pub fn solve_one(
             });
         }
         state.restore_bindings(snapshot);
+    }
+    // Specialised diagnostic: when the class has fundeps and the
+    // SOLE candidate failed to unify, surface as
+    // `InstanceHeadMismatch` (coded as `UnificationError`). The
+    // reference compiler treats this as `TypesDoNotUnify` post
+    // fundep improvement. Restricted to fundep classes because
+    // non-fundep classes can have legitimate "candidate present
+    // but wrong type" cases (e.g. `Semigroupoid Function` where
+    // a different built-in instance is expected); their failure
+    // is correctly `NoInstance`.
+    if cand_count == 1
+        && class_info
+            .map(|info| !info.fundeps.is_empty())
+            .unwrap_or(false)
+    {
+        return SolveOutcome::HeadMismatch;
     }
     // No instance matched. Before declaring failure, check whether
     // any argument contains a rigid `Type::Var`. Rigid type vars
@@ -703,6 +728,27 @@ pub fn solve_all(
                             span: pc.span,
                             constraint: zonked,
                             kind: ConstraintErrorKind::NoInstanceFound,
+                        });
+                }
+                SolveOutcome::HeadMismatch => {
+                    made_progress = true;
+                    let zonked = Constraint {
+                        class: pc.constraint.class.clone(),
+                        args: pc
+                            .constraint
+                            .args
+                            .iter()
+                            .map(|a| state.zonk(a))
+                            .collect(),
+                    };
+                    report
+                        .errors
+                        .entry(owner)
+                        .or_default()
+                        .push(ConstraintError {
+                            span: pc.span,
+                            constraint: zonked,
+                            kind: ConstraintErrorKind::InstanceHeadMismatch,
                         });
                 }
                 SolveOutcome::Overlap => {

@@ -234,6 +234,9 @@ fn collect_error_codes(report: &ModuleCheckReport) -> Vec<String> {
                 ConstraintErrorKind::OverlappingInstances => {
                     codes.push("OverlappingInstances".into())
                 }
+                ConstraintErrorKind::InstanceHeadMismatch => {
+                    codes.push("UnificationError".into())
+                }
             }
         }
         if !r.hole_diagnostics.is_empty() {
