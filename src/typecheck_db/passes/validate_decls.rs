@@ -775,6 +775,10 @@ pub fn validate_module_with_class_fundeps(
     // import data X :: C => K`) — reference compiler rejects.
     detect_unsupported_type_in_kind(&module.decls, &mut errors);
 
+    // Exported values whose body uses local data constructors
+    // whose parent type isn't itself exported → TransitiveExportError.
+    detect_transitive_export_via_hidden_type(module, &mut errors);
+
     errors
 }
 
@@ -5743,6 +5747,131 @@ fn detect_deprecated_ffi_prime(
                     kind: ValidationErrorKind::DeprecatedFFIPrime(s),
                 });
             }
+        }
+    }
+}
+
+/// `module M (a) where data A = A; a = A`: exporting `a` exposes
+/// hidden type `A`. Reference compiler reports as
+/// `TransitiveExportError`.
+///
+/// CST-only approximation: for every locally-declared exported
+/// value, walk its body collecting referenced data constructors,
+/// look up each ctor's parent data type, and flag if the parent
+/// type is locally declared but NOT in the export list.
+fn detect_transitive_export_via_hidden_type(
+    module: &cst::Module,
+    errors: &mut Vec<ValidationError>,
+) {
+    let export_list: &Vec<cst::Export> = match &module.exports {
+        Some(es) => &es.value.exports,
+        None => return,
+    };
+    // Local data/newtype/alias name set, plus a map ctor →
+    // (parent type symbol). Type aliases don't have ctors but
+    // we still track their names in `local_types` to know what's
+    // "ours".
+    let mut local_types: HashSet<Symbol> = HashSet::new();
+    let mut ctor_to_type: HashMap<Symbol, Symbol> = HashMap::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Data { name, constructors, .. } => {
+                let tsym = name.value.symbol();
+                local_types.insert(tsym);
+                for c in constructors {
+                    ctor_to_type.insert(c.name.value.symbol(), tsym);
+                }
+            }
+            cst::Decl::Newtype { name, constructor, .. } => {
+                let tsym = name.value.symbol();
+                local_types.insert(tsym);
+                ctor_to_type.insert(constructor.value.symbol(), tsym);
+            }
+            cst::Decl::TypeAlias { name, .. }
+            | cst::Decl::ForeignData { name, .. } => {
+                local_types.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    // Build the exported-types set from the export list.
+    let mut exported_types: HashSet<Symbol> = HashSet::new();
+    let mut exported_values: HashSet<Symbol> = HashSet::new();
+    let mut wild_module_export = false;
+    for e in export_list {
+        match e {
+            cst::Export::Type(t, _) => {
+                exported_types.insert(t.symbol());
+            }
+            cst::Export::Value(n) => {
+                exported_values.insert(n.symbol());
+            }
+            cst::Export::Module(_) => {
+                wild_module_export = true;
+            }
+            _ => {}
+        }
+    }
+    if wild_module_export {
+        // `module X` re-exports may bring more types into scope —
+        // we'd need the registry to know what they cover. Bail.
+        return;
+    }
+    if exported_values.is_empty() {
+        return;
+    }
+    // For each exported, locally-defined value decl, look at its
+    // body. To stay sound without inference, only flag when the
+    // body's TOP-LEVEL expression is a bare Constructor (modulo
+    // Parens / TypeAnnotation wrappers). This catches the
+    // simple `a = A` fixture pattern without false-positiving on
+    // helpers that USE local ctors internally but expose only
+    // public types in their result type.
+    for d in &module.decls {
+        if let cst::Decl::Value { name, binders, guarded, .. } = d {
+            // Only no-arg value bindings. With binders the value
+            // is a function — its result type isn't determinable
+            // from a syntactic scan.
+            if !binders.is_empty() {
+                continue;
+            }
+            let vsym = name.value.symbol();
+            if !exported_values.contains(&vsym) {
+                continue;
+            }
+            let body_expr = match guarded {
+                cst::GuardedExpr::Unconditional(e) => e.as_ref(),
+                _ => continue,
+            };
+            let inner = peel_parens_typeann(body_expr);
+            if let cst::Expr::Constructor { name: ctor_name, .. } = inner {
+                let qi = ctor_name.to_qi();
+                if qi.module.is_none() {
+                    if let Some(parent) = ctor_to_type.get(&qi.name) {
+                        if local_types.contains(parent)
+                            && !exported_types.contains(parent)
+                        {
+                            errors.push(ValidationError {
+                                span: name.span,
+                                kind: ValidationErrorKind::TransitiveExportError(
+                                    resolve(*parent),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn peel_parens_typeann(e: &cst::Expr) -> &cst::Expr {
+    let mut cur = e;
+    loop {
+        match cur {
+            cst::Expr::Parens { expr, .. }
+            | cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+            _ => return cur,
         }
     }
 }

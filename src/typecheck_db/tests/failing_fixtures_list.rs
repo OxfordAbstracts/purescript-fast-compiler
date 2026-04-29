@@ -338,7 +338,7 @@ check_failing_build_unit!(f_QuantifiedKind, "QuantifiedKind");
 check_failing_build_unit!(f_Rank2Types, "Rank2Types");
 check_failing_build_unit_ignored!(f_RecordLabelOnTypeError, "RecordLabelOnTypeError", "expected: TypesDoNotUnify");
 check_failing_build_unit_ignored!(f_RecordLabelOnTypeErrorImmediate, "RecordLabelOnTypeErrorImmediate", "expected: TypesDoNotUnify");
-check_failing_build_unit_ignored!(f_RequiredHiddenType, "RequiredHiddenType", "expected: TransitiveExportError");
+check_failing_build_unit!(f_RequiredHiddenType, "RequiredHiddenType");
 check_failing_build_unit!(f_Reserved, "Reserved");
 check_failing_build_unit!(f_RoleDeclarationArityMismatch, "RoleDeclarationArityMismatch");
 check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign, "RoleDeclarationArityMismatchForeign");
