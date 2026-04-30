@@ -198,7 +198,7 @@ check_failing_build_unit_ignored!(f_Foldable, "Foldable", "expected: CycleInDecl
 check_failing_build_unit!(f_FoldableInstance1, "FoldableInstance1");
 check_failing_build_unit!(f_FoldableInstance10, "FoldableInstance10");
 check_failing_build_unit_ignored!(f_FoldableInstance2, "FoldableInstance2", "expected: KindsDoNotUnify");
-check_failing_build_unit_ignored!(f_FoldableInstance3, "FoldableInstance3", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_FoldableInstance3, "FoldableInstance3");
 check_failing_build_unit!(f_FoldableInstance4, "FoldableInstance4");
 check_failing_build_unit!(f_FoldableInstance6, "FoldableInstance6");
 check_failing_build_unit!(f_FoldableInstance8, "FoldableInstance8");

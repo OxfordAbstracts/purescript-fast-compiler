@@ -1258,8 +1258,33 @@ fn detect_invalid_derive_constructor_arg(
             // concrete shape like `Const k`, the substituted
             // shape's variance applies and the data-var name in
             // the field text is irrelevant.
-            let passed_through: HashSet<Symbol> =
+            //
+            // When the instance head has fewer ARG SLOTS than the
+            // data type has type vars (e.g. `derive instance
+            // Foldable Foo` for `data Foo f = …`), the trailing
+            // data vars are effectively forall-bound at the
+            // instance level — treat them as passed-through too.
+            let head_arg_count = {
+                let mut count = 0usize;
+                let mut cur = head;
+                loop {
+                    match peel_parens(cur) {
+                        cst::TypeExpr::App { constructor, .. } => {
+                            count += 1;
+                            cur = constructor;
+                        }
+                        _ => break,
+                    }
+                }
+                count
+            };
+            let mut passed_through: HashSet<Symbol> =
                 inst_to_data.values().copied().collect();
+            if head_arg_count < data_vars.len() {
+                for dv in &data_vars[head_arg_count..] {
+                    passed_through.insert(*dv);
+                }
+            }
             let mut bad = false;
             for fields in ctor_fields {
                 for f in fields {
