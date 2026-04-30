@@ -164,6 +164,12 @@ pub enum ValidationErrorKind {
     /// uses a constrained-arrow shape `C => K` that the reference
     /// compiler doesn't support. Reports as `UnsupportedTypeInKind`.
     UnsupportedTypeInKind(String),
+    /// `f @T` where `f`'s declared type doesn't have a top-level
+    /// VISIBLE forall (`forall @a. ...`). Either the sig has no
+    /// outer forall (`f :: Int -> Int`) or its outer forall is
+    /// INVISIBLE (`f :: forall a. a -> a`). Reference compiler
+    /// reports as `CannotApplyExpressionOfTypeOnType`.
+    CannotApplyExpressionOfTypeOnType(String),
 }
 
 impl ValidationErrorKind {
@@ -223,6 +229,9 @@ impl ValidationErrorKind {
             }
             Self::ExpectedType(_) => "ExpectedType",
             Self::UnsupportedTypeInKind(_) => "UnsupportedTypeInKind",
+            Self::CannotApplyExpressionOfTypeOnType(_) => {
+                "CannotApplyExpressionOfTypeOnType"
+            }
         }
     }
 }
@@ -778,6 +787,10 @@ pub fn validate_module_with_class_fundeps(
     // Exported values whose body uses local data constructors
     // whose parent type isn't itself exported → TransitiveExportError.
     detect_transitive_export_via_hidden_type(module, &mut errors);
+
+    // `f @Int` where `f`'s declared sig either has no forall or
+    // has an INVISIBLE forall — VTA isn't allowed there.
+    detect_visible_type_app_on_non_visible_forall(&module.decls, &mut errors);
 
     errors
 }
@@ -6031,6 +6044,255 @@ fn peel_parens_typeann(e: &cst::Expr) -> &cst::Expr {
             cst::Expr::Parens { expr, .. }
             | cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
             _ => return cur,
+        }
+    }
+}
+
+/// `f @Int` where `f`'s declared sig either has no top-level
+/// `forall` or its outer forall is INVISIBLE (`forall a.` not
+/// `forall @a.`). Reference compiler reports as
+/// `CannotApplyExpressionOfTypeOnType`.
+///
+/// CST-only approximation: build a map from local value name to
+/// its TypeSignature's outer-forall visibility (None = no forall,
+/// Some(false) = invisible, Some(true) = visible). Then walk
+/// every `Expr::VisibleTypeApp`, resolve the func to a local
+/// signed value, and flag if the visibility check fails.
+fn detect_visible_type_app_on_non_visible_forall(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut sig_visibility: HashMap<Symbol, Option<bool>> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            let vis = outer_forall_visible(ty);
+            sig_visibility.insert(name.value.symbol(), vis);
+        }
+    }
+    if sig_visibility.is_empty() {
+        return;
+    }
+    for d in decls {
+        if let cst::Decl::Value { binders, guarded, where_clause, .. } = d {
+            for b in binders {
+                walk_binder_for_vta_check(b, &sig_visibility, errors);
+            }
+            walk_guarded_for_vta_check(guarded, &sig_visibility, errors);
+            for w in where_clause {
+                walk_let_for_vta_check(w, &sig_visibility, errors);
+            }
+        }
+    }
+}
+
+/// Returns:
+///   `None` if the type has no outer-level `Forall` (after
+///   peeling Parens / Constrained).
+///   `Some(false)` if the outer forall exists but ALL of its
+///   vars are invisible — VTA can't reach any of them.
+///   `Some(true)` if the outer forall has AT LEAST ONE visible
+///   (`@a`) var. PureScript VTA skips leading invisible vars to
+///   apply to the next visible one.
+fn outer_forall_visible(ty: &cst::TypeExpr) -> Option<bool> {
+    let mut cur = ty;
+    loop {
+        match cur {
+            cst::TypeExpr::Parens { ty: inner, .. }
+            | cst::TypeExpr::Constrained { ty: inner, .. } => cur = inner,
+            cst::TypeExpr::Forall { vars, .. } => {
+                let any_visible = vars.iter().any(|(_, v, _)| *v);
+                return Some(any_visible);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn walk_binder_for_vta_check(
+    b: &cst::Binder,
+    sig_visibility: &HashMap<Symbol, Option<bool>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match b {
+        cst::Binder::Typed { binder, .. } | cst::Binder::Parens { binder, .. } => {
+            walk_binder_for_vta_check(binder, sig_visibility, errors);
+        }
+        cst::Binder::Constructor { args, .. } => {
+            for a in args {
+                walk_binder_for_vta_check(a, sig_visibility, errors);
+            }
+        }
+        cst::Binder::Record { fields, .. } => {
+            for f in fields {
+                if let Some(b) = &f.binder {
+                    walk_binder_for_vta_check(b, sig_visibility, errors);
+                }
+            }
+        }
+        cst::Binder::Array { elements, .. } => {
+            for e in elements {
+                walk_binder_for_vta_check(e, sig_visibility, errors);
+            }
+        }
+        cst::Binder::As { binder, .. } => {
+            walk_binder_for_vta_check(binder, sig_visibility, errors);
+        }
+        cst::Binder::Op { left, right, .. } => {
+            walk_binder_for_vta_check(left, sig_visibility, errors);
+            walk_binder_for_vta_check(right, sig_visibility, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_guarded_for_vta_check(
+    g: &cst::GuardedExpr,
+    sig_visibility: &HashMap<Symbol, Option<bool>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(expr) => {
+            walk_expr_for_vta_check(expr, sig_visibility, errors);
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            for gd in guards {
+                walk_expr_for_vta_check(&gd.expr, sig_visibility, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_vta_check(
+    e: &cst::Expr,
+    sig_visibility: &HashMap<Symbol, Option<bool>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match e {
+        cst::Expr::VisibleTypeApp { func, span, .. } => {
+            // Find the underlying var (peel Parens / TypeAnnotation).
+            let mut cur: &cst::Expr = func;
+            loop {
+                match cur {
+                    cst::Expr::Parens { expr, .. }
+                    | cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+                    _ => break,
+                }
+            }
+            if let cst::Expr::Var { name, .. } = cur {
+                let qi = name.to_qi();
+                if qi.module.is_none() {
+                    if let Some(vis) = sig_visibility.get(&qi.name) {
+                        let bad = match vis {
+                            None => true,
+                            Some(false) => true,
+                            Some(true) => false,
+                        };
+                        if bad {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind
+                                    ::CannotApplyExpressionOfTypeOnType(
+                                    resolve(qi.name),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            walk_expr_for_vta_check(func, sig_visibility, errors);
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_vta_check(func, sig_visibility, errors);
+            walk_expr_for_vta_check(arg, sig_visibility, errors);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_vta_check(expr, sig_visibility, errors);
+        }
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_for_vta_check(body, sig_visibility, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_vta_check(cond, sig_visibility, errors);
+            walk_expr_for_vta_check(then_expr, sig_visibility, errors);
+            walk_expr_for_vta_check(else_expr, sig_visibility, errors);
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for lb in bindings {
+                walk_let_for_vta_check(lb, sig_visibility, errors);
+            }
+            walk_expr_for_vta_check(body, sig_visibility, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for ex in exprs {
+                walk_expr_for_vta_check(ex, sig_visibility, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_vta_check(&alt.result, sig_visibility, errors);
+            }
+        }
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_vta_check(left, sig_visibility, errors);
+            walk_expr_for_vta_check(right, sig_visibility, errors);
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_vta_check(v, sig_visibility, errors);
+                }
+            }
+        }
+        cst::Expr::Array { elements, .. } => {
+            for el in elements {
+                walk_expr_for_vta_check(el, sig_visibility, errors);
+            }
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_vta_check(expr, sig_visibility, errors);
+            for u in updates {
+                walk_expr_for_vta_check(&u.value, sig_visibility, errors);
+            }
+        }
+        cst::Expr::Do { statements, .. } => {
+            for s in statements {
+                walk_do_for_vta_check(s, sig_visibility, errors);
+            }
+        }
+        cst::Expr::Ado { statements, result, .. } => {
+            for s in statements {
+                walk_do_for_vta_check(s, sig_visibility, errors);
+            }
+            walk_expr_for_vta_check(result, sig_visibility, errors);
+        }
+        _ => {}
+    }
+}
+
+fn walk_let_for_vta_check(
+    lb: &cst::LetBinding,
+    sig_visibility: &HashMap<Symbol, Option<bool>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::LetBinding::Value { expr, .. } = lb {
+        walk_expr_for_vta_check(expr, sig_visibility, errors);
+    }
+}
+
+fn walk_do_for_vta_check(
+    s: &cst::DoStatement,
+    sig_visibility: &HashMap<Symbol, Option<bool>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match s {
+        cst::DoStatement::Bind { expr, .. }
+        | cst::DoStatement::Discard { expr, .. } => {
+            walk_expr_for_vta_check(expr, sig_visibility, errors);
+        }
+        cst::DoStatement::Let { bindings, .. } => {
+            for lb in bindings {
+                walk_let_for_vta_check(lb, sig_visibility, errors);
+            }
         }
     }
 }
