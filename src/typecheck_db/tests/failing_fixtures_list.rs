@@ -337,7 +337,7 @@ check_failing_build_unit_ignored!(f_QuantificationCheckFailure3, "Quantification
 check_failing_build_unit!(f_QuantifiedKind, "QuantifiedKind");
 check_failing_build_unit!(f_Rank2Types, "Rank2Types");
 check_failing_build_unit!(f_RecordLabelOnTypeError, "RecordLabelOnTypeError");
-check_failing_build_unit_ignored!(f_RecordLabelOnTypeErrorImmediate, "RecordLabelOnTypeErrorImmediate", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_RecordLabelOnTypeErrorImmediate, "RecordLabelOnTypeErrorImmediate");
 check_failing_build_unit!(f_RequiredHiddenType, "RequiredHiddenType");
 check_failing_build_unit!(f_Reserved, "Reserved");
 check_failing_build_unit!(f_RoleDeclarationArityMismatch, "RoleDeclarationArityMismatch");

@@ -5045,18 +5045,104 @@ fn check_literal_body_decl(
         },
         _ => None,
     };
-    let Some(lit_name) = lit_kind else {
+    if let Some(lit_name) = lit_kind {
+        let sig_inner = peel_parens(sig);
+        if let Some(sig_name) = primitive_con_name(sig_inner) {
+            if !primitives_compatible(lit_name, sig_name) {
+                errors.push(ValidationError {
+                    span: name.span,
+                    kind: ValidationErrorKind::LiteralBodySigMismatch(resolve(n)),
+                });
+            }
+        }
         return;
-    };
-    let sig_inner = peel_parens(sig);
-    let Some(sig_name) = primitive_con_name(sig_inner) else {
-        return;
-    };
-    if !primitives_compatible(lit_name, sig_name) {
-        errors.push(ValidationError {
-            span: name.span,
-            kind: ValidationErrorKind::LiteralBodySigMismatch(resolve(n)),
-        });
+    }
+    // Record literal body vs record sig: compare each field's
+    // literal type to the sig's field type. Fires only when ALL
+    // fields are primitive literals with matching names.
+    if let cst::Expr::Record { fields: body_fields, .. } = inner {
+        let sig_inner = peel_parens(sig);
+        let sig_fields: Option<Vec<(Symbol, &cst::TypeExpr)>> = match sig_inner {
+            cst::TypeExpr::Record { fields, .. } => Some(
+                fields
+                    .iter()
+                    .map(|f| (f.label.value.symbol(), &f.ty))
+                    .collect(),
+            ),
+            cst::TypeExpr::Row { fields, tail: None, is_record: true, .. } => {
+                Some(
+                    fields
+                        .iter()
+                        .map(|f| (f.label.value.symbol(), &f.ty))
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+        let Some(sig_fields) = sig_fields else {
+            return;
+        };
+        let sig_map: HashMap<Symbol, &cst::TypeExpr> =
+            sig_fields.into_iter().collect();
+        let mut bad = false;
+        for f in body_fields {
+            // Skip pun fields and update fields — only literal-
+            // valued fields participate.
+            if f.is_update {
+                return;
+            }
+            let Some(value) = &f.value else { continue };
+            let label_sym = f.label.value.symbol();
+            let Some(field_sig) = sig_map.get(&label_sym) else {
+                // Extra field not in sig — that's
+                // AdditionalProperty, separate detector.
+                return;
+            };
+            if type_expr_has_forall(field_sig)
+                || type_expr_has_wildcard(field_sig)
+                || type_expr_has_constraint(field_sig)
+            {
+                return;
+            }
+            let v_inner = peel_expr_parens(value);
+            let v_lit = match v_inner {
+                cst::Expr::Literal { lit, .. } => {
+                    Some(literal_primitive_name(lit))
+                }
+                cst::Expr::Negate { expr, .. } => match peel_expr_parens(expr) {
+                    cst::Expr::Literal { lit, .. } => {
+                        Some(literal_primitive_name(lit))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(v_lit) = v_lit else {
+                return;
+            };
+            let f_sig_inner = peel_parens(field_sig);
+            // Skip when the field sig's Constructor matches a
+            // local type-alias.
+            if let cst::TypeExpr::Constructor { name: con, .. } = f_sig_inner {
+                let qi = con.to_qi();
+                if qi.module.is_none() && local_alias_names.contains(&qi.name) {
+                    return;
+                }
+            }
+            let Some(f_sig_name) = primitive_con_name(f_sig_inner) else {
+                return;
+            };
+            if !primitives_compatible(v_lit, f_sig_name) {
+                bad = true;
+                break;
+            }
+        }
+        if bad {
+            errors.push(ValidationError {
+                span: name.span,
+                kind: ValidationErrorKind::LiteralBodySigMismatch(resolve(n)),
+            });
+        }
     }
 }
 
