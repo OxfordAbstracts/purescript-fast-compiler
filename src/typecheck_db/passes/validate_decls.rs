@@ -190,6 +190,12 @@ pub enum ValidationErrorKind {
     /// instance Foo Number where foo :: Int; foo = 0`. Reference
     /// compiler reports as `TypesDoNotUnify`.
     InstanceMemberSigMismatch(String),
+    /// A value decl whose body is a bare reference to another
+    /// signed value, where the two sigs are structurally different
+    /// concrete types. E.g. `a :: { field :: Int }; a = ...;
+    /// b :: { field :: String }; b = a`. Reference compiler
+    /// reports as `TypesDoNotUnify`.
+    ValueDeclSigAliasMismatch(String),
 }
 
 impl ValidationErrorKind {
@@ -257,6 +263,7 @@ impl ValidationErrorKind {
                 "CannotGeneralizeRecursiveFunction"
             }
             Self::InstanceMemberSigMismatch(_) => "UnificationError",
+            Self::ValueDeclSigAliasMismatch(_) => "UnificationError",
         }
     }
 }
@@ -833,6 +840,10 @@ pub fn validate_module_with_class_fundeps(
     // sig after substitution (`class Foo a where foo :: a;
     // instance Foo Number where foo :: Int`).
     detect_instance_member_sig_mismatch(&module.decls, &mut errors);
+
+    // `a :: T1; a = ...; b :: T2; b = a` where T1 and T2 are
+    // structurally different concrete types.
+    detect_value_decl_sig_alias_mismatch(&module.decls, &mut errors);
 
     errors
 }
@@ -4858,6 +4869,112 @@ fn detect_class_member_mismatch(
                 });
             }
         }
+    }
+}
+
+/// `b :: T2; b = a` where `a :: T1` and `T1` ≠ `T2` (both
+/// concrete) — these are clear `TypesDoNotUnify`. Catches cases
+/// like `a :: { field :: Int }; b :: { field :: String }; b = a`
+/// without requiring sig-pinning.
+fn detect_value_decl_sig_alias_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Build name → signed-type map for top-level value sigs.
+    let mut sig_of: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            sig_of.insert(name.value.symbol(), ty);
+        }
+    }
+    if sig_of.is_empty() {
+        return;
+    }
+    for d in decls {
+        let cst::Decl::Value { name, binders, guarded, .. } = d else {
+            continue;
+        };
+        if !binders.is_empty() {
+            continue;
+        }
+        let cst::GuardedExpr::Unconditional(body) = guarded else {
+            continue;
+        };
+        // Body must be a bare Var (modulo Parens / TypeAnnotation).
+        let inner = peel_expr_parens(body);
+        let cst::Expr::Var { name: ref_name, .. } = inner else {
+            continue;
+        };
+        let qi = ref_name.to_qi();
+        if qi.module.is_some() {
+            continue;
+        }
+        let n = name.value.symbol();
+        let Some(my_sig) = sig_of.get(&n) else {
+            continue;
+        };
+        let Some(other_sig) = sig_of.get(&qi.name) else {
+            continue;
+        };
+        // Skip when either side has forall/wildcard/constraints —
+        // could be legitimately polymorphic, or the constraint
+        // may discharge to a matching shape (`f :: C T => Int`,
+        // `v :: Int; v = f` is valid when `C T` has an instance).
+        if type_expr_has_forall(my_sig) || type_expr_has_forall(other_sig) {
+            continue;
+        }
+        if type_expr_has_wildcard(my_sig) || type_expr_has_wildcard(other_sig) {
+            continue;
+        }
+        if type_expr_has_constraint(my_sig)
+            || type_expr_has_constraint(other_sig)
+        {
+            continue;
+        }
+        if !type_expr_alpha_eq(my_sig, other_sig) {
+            errors.push(ValidationError {
+                span: name.span,
+                kind: ValidationErrorKind::ValueDeclSigAliasMismatch(resolve(n)),
+            });
+        }
+    }
+}
+
+fn type_expr_has_constraint(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Constrained { .. } => true,
+        cst::TypeExpr::Forall { ty, .. }
+        | cst::TypeExpr::Parens { ty, .. }
+        | cst::TypeExpr::Kinded { ty, .. } => type_expr_has_constraint(ty),
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_has_constraint(from) || type_expr_has_constraint(to)
+        }
+        _ => false,
+    }
+}
+
+fn type_expr_has_wildcard(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Wildcard { .. } => true,
+        cst::TypeExpr::Parens { ty, .. } | cst::TypeExpr::Kinded { ty, .. } => {
+            type_expr_has_wildcard(ty)
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            type_expr_has_wildcard(constructor) || type_expr_has_wildcard(arg)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_has_wildcard(from) || type_expr_has_wildcard(to)
+        }
+        cst::TypeExpr::Forall { ty, .. }
+        | cst::TypeExpr::Constrained { ty, .. } => type_expr_has_wildcard(ty),
+        cst::TypeExpr::Record { fields, .. } => {
+            fields.iter().any(|f| type_expr_has_wildcard(&f.ty))
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            fields.iter().any(|f| type_expr_has_wildcard(&f.ty))
+                || tail.as_ref().map_or(false, |t| type_expr_has_wildcard(t))
+        }
+        _ => false,
     }
 }
 

@@ -265,7 +265,7 @@ check_failing_build_unit!(f_MultipleTypeOpFixities, "MultipleTypeOpFixities");
 check_failing_build_unit!(f_MultipleValueOpFixities, "MultipleValueOpFixities");
 check_failing_build_unit!(f_MutRec, "MutRec");
 check_failing_build_unit!(f_MutRec2, "MutRec2");
-check_failing_build_unit_ignored!(f_NestedRecordLabelOnTypeError, "NestedRecordLabelOnTypeError", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_NestedRecordLabelOnTypeError, "NestedRecordLabelOnTypeError");
 check_failing_build_unit_ignored!(f_NestedRecordUpdateAliasWrongType, "NestedRecordUpdateAliasWrongType", "expected: TypesDoNotUnify");
 check_failing_build_unit_ignored!(f_NestedRecordUpdateFlatInModify, "NestedRecordUpdateFlatInModify", "expected: TypesDoNotUnify");
 check_failing_build_unit!(f_NestedRecordUpdateFlatMismatch, "NestedRecordUpdateFlatMismatch");
@@ -336,7 +336,7 @@ check_failing_build_unit_ignored!(f_QuantificationCheckFailure2, "Quantification
 check_failing_build_unit_ignored!(f_QuantificationCheckFailure3, "QuantificationCheckFailure3", "expected: VisibleQuantificationCheckFailureInType");
 check_failing_build_unit!(f_QuantifiedKind, "QuantifiedKind");
 check_failing_build_unit!(f_Rank2Types, "Rank2Types");
-check_failing_build_unit_ignored!(f_RecordLabelOnTypeError, "RecordLabelOnTypeError", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_RecordLabelOnTypeError, "RecordLabelOnTypeError");
 check_failing_build_unit_ignored!(f_RecordLabelOnTypeErrorImmediate, "RecordLabelOnTypeErrorImmediate", "expected: TypesDoNotUnify");
 check_failing_build_unit!(f_RequiredHiddenType, "RequiredHiddenType");
 check_failing_build_unit!(f_Reserved, "Reserved");
