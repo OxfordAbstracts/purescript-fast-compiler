@@ -184,6 +184,12 @@ pub enum ValidationErrorKind {
     /// the reference compiler rejects as
     /// `CannotGeneralizeRecursiveFunction`.
     CannotGeneralizeRecursiveFunction(String),
+    /// An instance member's explicit signature contradicts the
+    /// class's declared member signature after substituting the
+    /// instance's type arguments. E.g. `class Foo a where foo :: a;
+    /// instance Foo Number where foo :: Int; foo = 0`. Reference
+    /// compiler reports as `TypesDoNotUnify`.
+    InstanceMemberSigMismatch(String),
 }
 
 impl ValidationErrorKind {
@@ -250,6 +256,7 @@ impl ValidationErrorKind {
             Self::CannotGeneralizeRecursiveFunction(_) => {
                 "CannotGeneralizeRecursiveFunction"
             }
+            Self::InstanceMemberSigMismatch(_) => "UnificationError",
         }
     }
 }
@@ -821,6 +828,11 @@ pub fn validate_module_with_class_fundeps(
     // generalization can't introduce the required class constraint
     // on the recursive function's quantified type-var.
     detect_cannot_generalize_recursive_function(&module.decls, &mut errors);
+
+    // Instance member sigs that contradict the class's declared
+    // sig after substitution (`class Foo a where foo :: a;
+    // instance Foo Number where foo :: Int`).
+    detect_instance_member_sig_mismatch(&module.decls, &mut errors);
 
     errors
 }
@@ -4846,6 +4858,253 @@ fn detect_class_member_mismatch(
                 });
             }
         }
+    }
+}
+
+/// Compare an instance member's explicit signature against the
+/// class's declared member signature (after substituting class
+/// type-vars with the instance's type arguments). Mismatches are
+/// reference-compiler `TypesDoNotUnify`. CST-only — restricted to
+/// locally-declared classes; imported classes' member sigs aren't
+/// reachable here.
+fn detect_instance_member_sig_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // class_name → (type_vars, member_name → member_ty)
+    let mut class_info: HashMap<
+        Symbol,
+        (Vec<Symbol>, HashMap<Symbol, &cst::TypeExpr>),
+    > = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Class { name, type_vars, members, is_kind_sig: false, .. } =
+            d
+        {
+            let vs: Vec<Symbol> =
+                type_vars.iter().map(|v| v.value.symbol()).collect();
+            let mut m: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+            for memb in members {
+                m.insert(memb.name.value.symbol(), &memb.ty);
+            }
+            class_info.insert(name.value.symbol(), (vs, m));
+        }
+    }
+    if class_info.is_empty() {
+        return;
+    }
+    for d in decls {
+        let cst::Decl::Instance { class_name, types, members, .. } = d else {
+            continue;
+        };
+        let cqi = class_name.to_qi();
+        if cqi.module.is_some() {
+            continue;
+        }
+        let Some((cls_vars, cls_members)) = class_info.get(&cqi.name) else {
+            continue;
+        };
+        if cls_vars.len() != types.len() {
+            continue;
+        }
+        let subst: HashMap<Symbol, &cst::TypeExpr> = cls_vars
+            .iter()
+            .zip(types.iter())
+            .map(|(v, t)| (*v, t))
+            .collect();
+        for memb in members {
+            let cst::Decl::TypeSignature { name, ty: inst_sig, span, .. } = memb
+            else {
+                continue;
+            };
+            let Some(class_sig) = cls_members.get(&name.value.symbol()) else {
+                continue;
+            };
+            // PureScript allows instance member sigs to be MORE
+            // general than the class's expected sig (e.g.
+            // `instance Eq Number where eq :: forall x y. x -> y
+            // -> Boolean`). To stay conservative we only flag
+            // when both sides are forall-free post-substitution
+            // — those are clearly-mismatched concrete shapes.
+            let expected = subst_type_expr(class_sig, &subst);
+            if type_expr_has_forall(&expected) || type_expr_has_forall(inst_sig)
+            {
+                continue;
+            }
+            if !type_expr_alpha_eq(&expected, inst_sig) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::InstanceMemberSigMismatch(
+                        resolve(name.value.symbol()),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Substitute `subst[var]` for each `TypeExpr::Var { var }` in
+/// `te`, leaving everything else structurally identical. Used by
+/// `detect_instance_member_sig_mismatch` to specialize the class's
+/// member sig to the instance's type arguments before comparison.
+fn subst_type_expr(
+    te: &cst::TypeExpr,
+    subst: &HashMap<Symbol, &cst::TypeExpr>,
+) -> cst::TypeExpr {
+    match te {
+        cst::TypeExpr::Var { name, span } => {
+            if let Some(replacement) = subst.get(&name.value.symbol()) {
+                (*replacement).clone()
+            } else {
+                cst::TypeExpr::Var { name: name.clone(), span: *span }
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, span } => cst::TypeExpr::App {
+            constructor: Box::new(subst_type_expr(constructor, subst)),
+            arg: Box::new(subst_type_expr(arg, subst)),
+            span: *span,
+        },
+        cst::TypeExpr::Function { from, to, span } => cst::TypeExpr::Function {
+            from: Box::new(subst_type_expr(from, subst)),
+            to: Box::new(subst_type_expr(to, subst)),
+            span: *span,
+        },
+        cst::TypeExpr::Forall { vars, ty, span } => {
+            // Drop substitutions for shadowed names.
+            let mut inner = subst.clone();
+            for (v, _, _) in vars {
+                inner.remove(&v.value.symbol());
+            }
+            cst::TypeExpr::Forall {
+                vars: vars.clone(),
+                ty: Box::new(subst_type_expr(ty, &inner)),
+                span: *span,
+            }
+        }
+        cst::TypeExpr::Constrained { constraints, ty, span } => {
+            let cs: Vec<cst::Constraint> = constraints
+                .iter()
+                .map(|c| cst::Constraint {
+                    span: c.span,
+                    class: c.class.clone(),
+                    args: c.args.iter().map(|a| subst_type_expr(a, subst)).collect(),
+                })
+                .collect();
+            cst::TypeExpr::Constrained {
+                constraints: cs,
+                ty: Box::new(subst_type_expr(ty, subst)),
+                span: *span,
+            }
+        }
+        cst::TypeExpr::Parens { ty, span } => cst::TypeExpr::Parens {
+            ty: Box::new(subst_type_expr(ty, subst)),
+            span: *span,
+        },
+        cst::TypeExpr::Kinded { ty, kind, span } => cst::TypeExpr::Kinded {
+            ty: Box::new(subst_type_expr(ty, subst)),
+            kind: Box::new(subst_type_expr(kind, subst)),
+            span: *span,
+        },
+        cst::TypeExpr::Record { fields, span } => cst::TypeExpr::Record {
+            fields: fields
+                .iter()
+                .map(|f| cst::TypeField {
+                    span: f.span,
+                    label: f.label.clone(),
+                    ty: subst_type_expr(&f.ty, subst),
+                })
+                .collect(),
+            span: *span,
+        },
+        cst::TypeExpr::Row { fields, tail, span, is_record } => cst::TypeExpr::Row {
+            fields: fields
+                .iter()
+                .map(|f| cst::TypeField {
+                    span: f.span,
+                    label: f.label.clone(),
+                    ty: subst_type_expr(&f.ty, subst),
+                })
+                .collect(),
+            tail: tail.as_ref().map(|t| Box::new(subst_type_expr(t, subst))),
+            span: *span,
+            is_record: *is_record,
+        },
+        cst::TypeExpr::TypeOp { left, op, right, span } => cst::TypeExpr::TypeOp {
+            left: Box::new(subst_type_expr(left, subst)),
+            op: op.clone(),
+            right: Box::new(subst_type_expr(right, subst)),
+            span: *span,
+        },
+        _ => te.clone(),
+    }
+}
+
+fn type_expr_has_forall(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Forall { .. } => true,
+        cst::TypeExpr::Parens { ty, .. } | cst::TypeExpr::Kinded { ty, .. } => {
+            type_expr_has_forall(ty)
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            type_expr_has_forall(constructor) || type_expr_has_forall(arg)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_has_forall(from) || type_expr_has_forall(to)
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            constraints
+                .iter()
+                .any(|c| c.args.iter().any(type_expr_has_forall))
+                || type_expr_has_forall(ty)
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            fields.iter().any(|f| type_expr_has_forall(&f.ty))
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            fields.iter().any(|f| type_expr_has_forall(&f.ty))
+                || tail.as_ref().map_or(false, |t| type_expr_has_forall(t))
+        }
+        _ => false,
+    }
+}
+
+/// Structural equality of two `TypeExpr`s, modulo Parens wrappers.
+/// Doesn't handle alpha-renaming under foralls — adequate for the
+/// current `InstanceSigs` fixtures whose member sigs are
+/// monomorphic post-substitution.
+fn type_expr_alpha_eq(a: &cst::TypeExpr, b: &cst::TypeExpr) -> bool {
+    let a = peel_parens(a);
+    let b = peel_parens(b);
+    match (a, b) {
+        (
+            cst::TypeExpr::Var { name: n1, .. },
+            cst::TypeExpr::Var { name: n2, .. },
+        ) => n1.value.symbol() == n2.value.symbol(),
+        (
+            cst::TypeExpr::Constructor { name: n1, .. },
+            cst::TypeExpr::Constructor { name: n2, .. },
+        ) => {
+            let q1 = n1.to_qi();
+            let q2 = n2.to_qi();
+            q1.name == q2.name
+        }
+        (
+            cst::TypeExpr::App { constructor: c1, arg: a1, .. },
+            cst::TypeExpr::App { constructor: c2, arg: a2, .. },
+        ) => type_expr_alpha_eq(c1, c2) && type_expr_alpha_eq(a1, a2),
+        (
+            cst::TypeExpr::Function { from: f1, to: t1, .. },
+            cst::TypeExpr::Function { from: f2, to: t2, .. },
+        ) => type_expr_alpha_eq(f1, f2) && type_expr_alpha_eq(t1, t2),
+        (
+            cst::TypeExpr::StringLiteral { value: v1, .. },
+            cst::TypeExpr::StringLiteral { value: v2, .. },
+        ) => v1 == v2,
+        (
+            cst::TypeExpr::IntLiteral { value: v1, .. },
+            cst::TypeExpr::IntLiteral { value: v2, .. },
+        ) => v1 == v2,
+        (cst::TypeExpr::Wildcard { .. }, cst::TypeExpr::Wildcard { .. }) => true,
+        _ => false,
     }
 }
 
