@@ -177,6 +177,13 @@ pub enum ValidationErrorKind {
     /// constraint, which it then can't find — emitted as
     /// `NoInstanceFound` or `NonExhaustivePattern` upstream.
     NonExhaustiveGuardOnlyDecl(String),
+    /// A recursive (self- or mutually-) value decl without a type
+    /// signature whose body uses a class-method operator (`<>`,
+    /// `+`, etc.) on a parameter binder. Generalization would
+    /// need to introduce a constraint on a quantified var, which
+    /// the reference compiler rejects as
+    /// `CannotGeneralizeRecursiveFunction`.
+    CannotGeneralizeRecursiveFunction(String),
 }
 
 impl ValidationErrorKind {
@@ -240,6 +247,9 @@ impl ValidationErrorKind {
                 "CannotApplyExpressionOfTypeOnType"
             }
             Self::NonExhaustiveGuardOnlyDecl(_) => "NonExhaustivePattern",
+            Self::CannotGeneralizeRecursiveFunction(_) => {
+                "CannotGeneralizeRecursiveFunction"
+            }
         }
     }
 }
@@ -805,6 +815,12 @@ pub fn validate_module_with_class_fundeps(
     // `| otherwise` fallback) and no other unconditional equation
     // is non-exhaustive at the guard level.
     detect_non_exhaustive_guard_only_decl(&module.decls, &mut errors);
+
+    // Recursive sig-less value decls whose body uses a class-method
+    // operator on a parameter binder (e.g. `foo n x = x <> bar n x`):
+    // generalization can't introduce the required class constraint
+    // on the recursive function's quantified type-var.
+    detect_cannot_generalize_recursive_function(&module.decls, &mut errors);
 
     errors
 }
@@ -5959,6 +5975,430 @@ fn detect_deprecated_ffi_prime(
                 });
             }
         }
+    }
+}
+
+/// `foo n x = x <> bar n x` (mutually recursive with `bar`,
+/// no top-level signature): the body uses `<>` on parameter
+/// `x`, so generalization would need to introduce a `Semigroup`
+/// constraint on the recursive function's quantified type-var.
+/// Reference compiler reports as `CannotGeneralizeRecursiveFunction`.
+///
+/// Detection (CST-only heuristic):
+/// 1. Build local-value names + signed names + ref-graph from
+///    each Decl::Value's body (top-level only — no descent into
+///    where / let / case bodies, since those scopes have their
+///    own binders).
+/// 2. Run Tarjan SCC. A decl is recursive iff in an SCC with
+///    size > 1 OR it self-references.
+/// 3. Per-decl: collect its parameter-binder names. Walk the
+///    top-level body for `Op` with at least one operand that
+///    bottom-resolves to a Var of one of its parameter binders.
+///    If found and the decl is recursive + unsigned → emit.
+fn detect_cannot_generalize_recursive_function(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut local_values: HashSet<Symbol> = HashSet::new();
+    let mut signed: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        match d {
+            cst::Decl::Value { name, .. } => {
+                local_values.insert(name.value.symbol());
+            }
+            cst::Decl::TypeSignature { name, .. } => {
+                signed.insert(name.value.symbol());
+            }
+            _ => {}
+        }
+    }
+    if local_values.is_empty() {
+        return;
+    }
+    // Build per-decl ref set and (per-decl, per-equation) the set
+    // of parameter binder names. We aggregate across all equations
+    // for the same decl name.
+    let mut refs: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    let mut name_spans: HashMap<Symbol, Span> = HashMap::new();
+    let mut params_for: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    let mut bodies_for: HashMap<Symbol, Vec<&cst::GuardedExpr>> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Value { name, binders, guarded, .. } = d {
+            let n = name.value.symbol();
+            name_spans.entry(n).or_insert(name.span);
+            let mut seen: HashSet<Symbol> = HashSet::new();
+            let mut dummy_op = false;
+            walk_guarded_for_recur_check(
+                guarded,
+                &local_values,
+                &mut seen,
+                &mut dummy_op,
+            );
+            refs.entry(n).or_default().extend(seen);
+            // Collect parameter binder names.
+            let p_set = params_for.entry(n).or_default();
+            for b in binders {
+                collect_binder_var_names(b, p_set);
+            }
+            bodies_for.entry(n).or_default().push(guarded);
+        }
+    }
+    // SCC.
+    let nodes: Vec<Symbol> = refs.keys().copied().collect();
+    let mut idx_of: HashMap<Symbol, usize> = HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        idx_of.insert(*n, i);
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (n, succ) in &refs {
+        if let Some(&i) = idx_of.get(n) {
+            for s in succ {
+                if let Some(&j) = idx_of.get(s) {
+                    adj[i].push(j);
+                }
+            }
+        }
+    }
+    let sccs = tarjan_scc(&adj);
+    let mut recursive: HashSet<Symbol> = HashSet::new();
+    for scc in &sccs {
+        let size = scc.len();
+        for &i in scc {
+            let n = nodes[i];
+            let self_loop = adj[i].contains(&i);
+            if size > 1 || self_loop {
+                recursive.insert(n);
+            }
+        }
+    }
+    let mut emitted: HashSet<Symbol> = HashSet::new();
+    for n in &nodes {
+        if signed.contains(n) || !recursive.contains(n) {
+            continue;
+        }
+        let params = match params_for.get(n) {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        let bodies = match bodies_for.get(n) {
+            Some(bs) => bs,
+            None => continue,
+        };
+        let mut hit = false;
+        for body in bodies {
+            if guarded_has_param_op(body, params) {
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            continue;
+        }
+        if !emitted.insert(*n) {
+            continue;
+        }
+        let span = name_spans.get(n).copied().unwrap_or(crate::span::Span {
+            start: 0,
+            end: 0,
+        });
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::CannotGeneralizeRecursiveFunction(
+                resolve(*n),
+            ),
+        });
+    }
+}
+
+fn collect_binder_var_names(b: &cst::Binder, out: &mut HashSet<Symbol>) {
+    match b {
+        cst::Binder::Var { name, .. } => {
+            out.insert(name.value.symbol());
+        }
+        cst::Binder::Parens { binder, .. }
+        | cst::Binder::Typed { binder, .. } => {
+            collect_binder_var_names(binder, out);
+        }
+        cst::Binder::As { name, binder, .. } => {
+            out.insert(name.value.symbol());
+            collect_binder_var_names(binder, out);
+        }
+        cst::Binder::Constructor { args, .. } => {
+            for a in args {
+                collect_binder_var_names(a, out);
+            }
+        }
+        cst::Binder::Record { fields, .. } => {
+            for f in fields {
+                if let Some(b) = &f.binder {
+                    collect_binder_var_names(b, out);
+                }
+            }
+        }
+        cst::Binder::Array { elements, .. } => {
+            for e in elements {
+                collect_binder_var_names(e, out);
+            }
+        }
+        cst::Binder::Op { left, right, .. } => {
+            collect_binder_var_names(left, out);
+            collect_binder_var_names(right, out);
+        }
+        _ => {}
+    }
+}
+
+fn guarded_has_param_op(
+    g: &cst::GuardedExpr,
+    params: &HashSet<Symbol>,
+) -> bool {
+    match g {
+        cst::GuardedExpr::Unconditional(expr) => {
+            expr_has_param_op(expr, params)
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            guards.iter().any(|g| expr_has_param_op(&g.expr, params))
+        }
+    }
+}
+
+fn expr_has_param_op(e: &cst::Expr, params: &HashSet<Symbol>) -> bool {
+    match e {
+        cst::Expr::Op { left, right, .. } => {
+            let l = peel_expr_parens(left);
+            let r = peel_expr_parens(right);
+            let is_param_var = |e: &cst::Expr| {
+                if let cst::Expr::Var { name, .. } = e {
+                    let qi = name.to_qi();
+                    return qi.module.is_none() && params.contains(&qi.name);
+                }
+                false
+            };
+            // Flag iff at least one operand is a param-Var AND
+            // no operand is a primitive-type-pinning literal. A
+            // literal like `0.0` pins its operand's type to a
+            // concrete type (Number), eliminating the constraint
+            // generalization issue. `passes_MutRec`'s `g x = f
+            // (x / 0.0)` falls in this safe category.
+            if (is_param_var(l) || is_param_var(r))
+                && !is_pinning_literal(l)
+                && !is_pinning_literal(r)
+            {
+                return true;
+            }
+            expr_has_param_op(left, params) || expr_has_param_op(right, params)
+        }
+        cst::Expr::App { func, arg, .. } => {
+            expr_has_param_op(func, params) || expr_has_param_op(arg, params)
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => expr_has_param_op(expr, params),
+        cst::Expr::Lambda { body, .. } => expr_has_param_op(body, params),
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            expr_has_param_op(cond, params)
+                || expr_has_param_op(then_expr, params)
+                || expr_has_param_op(else_expr, params)
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            exprs.iter().any(|e| expr_has_param_op(e, params))
+                || alts
+                    .iter()
+                    .any(|a| guarded_has_param_op(&a.result, params))
+        }
+        cst::Expr::Record { fields, .. } => fields.iter().any(|f| {
+            f.value.as_ref().map_or(false, |v| expr_has_param_op(v, params))
+        }),
+        cst::Expr::Array { elements, .. } => {
+            elements.iter().any(|e| expr_has_param_op(e, params))
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            expr_has_param_op(expr, params)
+                || updates.iter().any(|u| expr_has_param_op(&u.value, params))
+        }
+        _ => false,
+    }
+}
+
+fn is_pinning_literal(e: &cst::Expr) -> bool {
+    match e {
+        cst::Expr::Literal { lit, .. } => matches!(
+            lit,
+            cst::Literal::Int(_)
+                | cst::Literal::Float(_)
+                | cst::Literal::String(_)
+                | cst::Literal::Char(_)
+                | cst::Literal::Boolean(_)
+        ),
+        cst::Expr::Negate { expr, .. } => is_pinning_literal(expr),
+        cst::Expr::Parens { expr, .. } => is_pinning_literal(expr),
+        _ => false,
+    }
+}
+
+fn peel_expr_parens(e: &cst::Expr) -> &cst::Expr {
+    let mut cur = e;
+    loop {
+        match cur {
+            cst::Expr::Parens { expr, .. }
+            | cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+            _ => return cur,
+        }
+    }
+}
+
+fn tarjan_scc(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = adj.len();
+    let mut idx = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut index_counter: usize = 0;
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    fn strong(
+        v: usize,
+        adj: &[Vec<usize>],
+        idx: &mut Vec<usize>,
+        low: &mut Vec<usize>,
+        on_stack: &mut Vec<bool>,
+        stack: &mut Vec<usize>,
+        index_counter: &mut usize,
+        sccs: &mut Vec<Vec<usize>>,
+    ) {
+        idx[v] = *index_counter;
+        low[v] = *index_counter;
+        *index_counter += 1;
+        stack.push(v);
+        on_stack[v] = true;
+        for &w in &adj[v] {
+            if idx[w] == usize::MAX {
+                strong(w, adj, idx, low, on_stack, stack, index_counter, sccs);
+                low[v] = low[v].min(low[w]);
+            } else if on_stack[w] {
+                low[v] = low[v].min(idx[w]);
+            }
+        }
+        if low[v] == idx[v] {
+            let mut comp: Vec<usize> = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack[w] = false;
+                comp.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            sccs.push(comp);
+        }
+    }
+
+    for v in 0..n {
+        if idx[v] == usize::MAX {
+            strong(
+                v,
+                adj,
+                &mut idx,
+                &mut low,
+                &mut on_stack,
+                &mut stack,
+                &mut index_counter,
+                &mut sccs,
+            );
+        }
+    }
+    sccs
+}
+
+fn walk_guarded_for_recur_check(
+    g: &cst::GuardedExpr,
+    local_values: &HashSet<Symbol>,
+    seen: &mut HashSet<Symbol>,
+    op_used: &mut bool,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(expr) => {
+            walk_expr_for_recur_check(expr, local_values, seen, op_used);
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            for gd in guards {
+                for p in &gd.patterns {
+                    if let cst::GuardPattern::Boolean(e) = p {
+                        walk_expr_for_recur_check(
+                            e,
+                            local_values,
+                            seen,
+                            op_used,
+                        );
+                    } else if let cst::GuardPattern::Pattern(_, e) = p {
+                        walk_expr_for_recur_check(
+                            e,
+                            local_values,
+                            seen,
+                            op_used,
+                        );
+                    }
+                }
+                walk_expr_for_recur_check(
+                    &gd.expr,
+                    local_values,
+                    seen,
+                    op_used,
+                );
+            }
+        }
+    }
+}
+
+fn walk_expr_for_recur_check(
+    e: &cst::Expr,
+    local_values: &HashSet<Symbol>,
+    seen: &mut HashSet<Symbol>,
+    op_used: &mut bool,
+) {
+    match e {
+        cst::Expr::Var { name, .. } => {
+            let qi = name.to_qi();
+            if qi.module.is_none() && local_values.contains(&qi.name) {
+                seen.insert(qi.name);
+            }
+        }
+        cst::Expr::Op { left, right, .. } => {
+            *op_used = true;
+            walk_expr_for_recur_check(left, local_values, seen, op_used);
+            walk_expr_for_recur_check(right, local_values, seen, op_used);
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_recur_check(func, local_values, seen, op_used);
+            walk_expr_for_recur_check(arg, local_values, seen, op_used);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_recur_check(expr, local_values, seen, op_used);
+        }
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_for_recur_check(body, local_values, seen, op_used);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_recur_check(cond, local_values, seen, op_used);
+            walk_expr_for_recur_check(then_expr, local_values, seen, op_used);
+            walk_expr_for_recur_check(else_expr, local_values, seen, op_used);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for ex in exprs {
+                walk_expr_for_recur_check(ex, local_values, seen, op_used);
+            }
+            for alt in alts {
+                walk_guarded_for_recur_check(
+                    &alt.result,
+                    local_values,
+                    seen,
+                    op_used,
+                );
+            }
+        }
+        _ => {}
     }
 }
 
