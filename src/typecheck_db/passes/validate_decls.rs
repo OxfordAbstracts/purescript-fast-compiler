@@ -196,6 +196,12 @@ pub enum ValidationErrorKind {
     /// b :: { field :: String }; b = a`. Reference compiler
     /// reports as `TypesDoNotUnify`.
     ValueDeclSigAliasMismatch(String),
+    /// A no-arg value decl whose body is a primitive literal
+    /// (Int / Number / String / Char / Boolean) whose type
+    /// doesn't match its declared signature. E.g.
+    /// `foo :: Number; foo = true`. Reference compiler reports
+    /// as `TypesDoNotUnify`.
+    LiteralBodySigMismatch(String),
 }
 
 impl ValidationErrorKind {
@@ -264,6 +270,7 @@ impl ValidationErrorKind {
             }
             Self::InstanceMemberSigMismatch(_) => "UnificationError",
             Self::ValueDeclSigAliasMismatch(_) => "UnificationError",
+            Self::LiteralBodySigMismatch(_) => "UnificationError",
         }
     }
 }
@@ -844,6 +851,10 @@ pub fn validate_module_with_class_fundeps(
     // `a :: T1; a = ...; b :: T2; b = a` where T1 and T2 are
     // structurally different concrete types.
     detect_value_decl_sig_alias_mismatch(&module.decls, &mut errors);
+
+    // `foo :: Number; foo = true` — body literal type clashes
+    // with the declared signature.
+    detect_literal_body_sig_mismatch(&module.decls, &mut errors);
 
     errors
 }
@@ -4938,6 +4949,154 @@ fn detect_value_decl_sig_alias_mismatch(
             });
         }
     }
+}
+
+/// `foo :: Number; foo = true` — body is a primitive literal
+/// whose primitive-type tag clashes with the declared sig's head
+/// constructor. Reference compiler reports as `TypesDoNotUnify`.
+fn detect_literal_body_sig_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Skip the entire check when the module declares any type
+    // alias whose name shadows a primitive (e.g. `type Number =
+    // Int`). The CST-level shadow rewrites `Number`-as-sig to mean
+    // something else, and we don't expand aliases here.
+    let mut local_alias_names: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { name, .. } = d {
+            local_alias_names.insert(name.value.symbol());
+        }
+    }
+    let mut sig_of: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            sig_of.insert(name.value.symbol(), ty);
+        }
+    }
+    if !sig_of.is_empty() {
+        for d in decls {
+            check_literal_body_decl(d, &sig_of, &local_alias_names, errors);
+        }
+    }
+    for d in decls {
+        if let cst::Decl::Instance { members, .. } = d {
+            let mut inst_sigs: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+            for memb in members {
+                if let cst::Decl::TypeSignature { name, ty, .. } = memb {
+                    inst_sigs.insert(name.value.symbol(), ty);
+                }
+            }
+            if inst_sigs.is_empty() {
+                continue;
+            }
+            for memb in members {
+                check_literal_body_decl(
+                    memb,
+                    &inst_sigs,
+                    &local_alias_names,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+fn check_literal_body_decl(
+    d: &cst::Decl,
+    sig_of: &HashMap<Symbol, &cst::TypeExpr>,
+    local_alias_names: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let cst::Decl::Value { name, binders, guarded, .. } = d else {
+        return;
+    };
+    if !binders.is_empty() {
+        return;
+    }
+    let cst::GuardedExpr::Unconditional(body) = guarded else {
+        return;
+    };
+    let n = name.value.symbol();
+    let Some(sig) = sig_of.get(&n) else {
+        return;
+    };
+    if type_expr_has_forall(sig)
+        || type_expr_has_wildcard(sig)
+        || type_expr_has_constraint(sig)
+    {
+        return;
+    }
+    // Skip when the sig's Constructor name shadows a local
+    // type-alias — `type Number = Int; z :: Number; z = 0` is
+    // valid through alias expansion which we don't perform here.
+    if let cst::TypeExpr::Constructor { name: con, .. } = peel_parens(sig) {
+        let qi = con.to_qi();
+        if qi.module.is_none() && local_alias_names.contains(&qi.name) {
+            return;
+        }
+    }
+    let inner = peel_expr_parens(body);
+    let lit_kind = match inner {
+        cst::Expr::Literal { lit, .. } => Some(literal_primitive_name(lit)),
+        cst::Expr::Negate { expr, .. } => match peel_expr_parens(expr) {
+            cst::Expr::Literal { lit, .. } => Some(literal_primitive_name(lit)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(lit_name) = lit_kind else {
+        return;
+    };
+    let sig_inner = peel_parens(sig);
+    let Some(sig_name) = primitive_con_name(sig_inner) else {
+        return;
+    };
+    if !primitives_compatible(lit_name, sig_name) {
+        errors.push(ValidationError {
+            span: name.span,
+            kind: ValidationErrorKind::LiteralBodySigMismatch(resolve(n)),
+        });
+    }
+}
+
+fn literal_primitive_name(lit: &cst::Literal) -> &'static str {
+    match lit {
+        cst::Literal::Int(_) => "Int",
+        cst::Literal::Float(_) => "Number",
+        cst::Literal::String(_) => "String",
+        cst::Literal::Char(_) => "Char",
+        cst::Literal::Boolean(_) => "Boolean",
+        cst::Literal::Array(_) => "Array",
+    }
+}
+
+fn primitive_con_name(te: &cst::TypeExpr) -> Option<&'static str> {
+    if let cst::TypeExpr::Constructor { name, .. } = te {
+        let qi = name.to_qi();
+        let n = resolve(qi.name);
+        match n.as_str() {
+            "Int" => Some("Int"),
+            "Number" => Some("Number"),
+            "String" => Some("String"),
+            "Char" => Some("Char"),
+            "Boolean" => Some("Boolean"),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn primitives_compatible(lit: &str, sig: &str) -> bool {
+    // Exact match always compatible.
+    if lit == sig {
+        return true;
+    }
+    // PureScript Int/Number numeric literals: an Int literal can
+    // sometimes flow to a polymorphic numeric position, but here
+    // sig is concrete. Different primitives → mismatch.
+    false
 }
 
 fn type_expr_has_constraint(te: &cst::TypeExpr) -> bool {

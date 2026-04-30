@@ -227,7 +227,7 @@ check_failing_build_unit!(f_InstanceChainBothUnknownAndMatch, "InstanceChainBoth
 check_failing_build_unit!(f_InstanceChainSkolemUnknownMatch, "InstanceChainSkolemUnknownMatch");
 check_failing_build_unit!(f_InstanceExport, "InstanceExport");
 check_failing_build_unit!(f_InstanceNamedWithoutSeparator, "InstanceNamedWithoutSeparator");
-check_failing_build_unit_ignored!(f_InstanceSigsBodyIncorrect, "InstanceSigsBodyIncorrect", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_InstanceSigsBodyIncorrect, "InstanceSigsBodyIncorrect");
 check_failing_build_unit!(f_InstanceSigsDifferentTypes, "InstanceSigsDifferentTypes");
 check_failing_build_unit!(f_InstanceSigsIncorrectType, "InstanceSigsIncorrectType");
 check_failing_build_unit!(f_InstanceSigsOrphanTypeDeclaration, "InstanceSigsOrphanTypeDeclaration");
