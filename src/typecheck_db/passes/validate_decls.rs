@@ -170,6 +170,13 @@ pub enum ValidationErrorKind {
     /// INVISIBLE (`f :: forall a. a -> a`). Reference compiler
     /// reports as `CannotApplyExpressionOfTypeOnType`.
     CannotApplyExpressionOfTypeOnType(String),
+    /// A value declaration whose every equation has only guarded
+    /// branches with no unconditional fallback (`| true = ...` /
+    /// `| otherwise = ...` / refutable-pattern-free guard). The
+    /// reference compiler reports this as needing a `Partial`
+    /// constraint, which it then can't find — emitted as
+    /// `NoInstanceFound` or `NonExhaustivePattern` upstream.
+    NonExhaustiveGuardOnlyDecl(String),
 }
 
 impl ValidationErrorKind {
@@ -232,6 +239,7 @@ impl ValidationErrorKind {
             Self::CannotApplyExpressionOfTypeOnType(_) => {
                 "CannotApplyExpressionOfTypeOnType"
             }
+            Self::NonExhaustiveGuardOnlyDecl(_) => "NonExhaustivePattern",
         }
     }
 }
@@ -791,6 +799,12 @@ pub fn validate_module_with_class_fundeps(
     // `f @Int` where `f`'s declared sig either has no forall or
     // has an INVISIBLE forall — VTA isn't allowed there.
     detect_visible_type_app_on_non_visible_forall(&module.decls, &mut errors);
+
+    // `f x | 1 <- x = x` and similar: a value decl whose every
+    // equation has only conditional guards (no `| true` /
+    // `| otherwise` fallback) and no other unconditional equation
+    // is non-exhaustive at the guard level.
+    detect_non_exhaustive_guard_only_decl(&module.decls, &mut errors);
 
     errors
 }
@@ -6070,6 +6084,174 @@ fn peel_parens_typeann(e: &cst::Expr) -> &cst::Expr {
             | cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
             _ => return cur,
         }
+    }
+}
+
+/// `f x | 1 <- x = x` — every equation of `f` has only guarded
+/// branches with no `| true` / `| otherwise` / pattern-only
+/// fallback. The function may not match every input, so the
+/// reference compiler treats it as non-exhaustive. Emit
+/// `NonExhaustiveGuardOnlyDecl` (codes as `NonExhaustivePattern`).
+///
+/// Skips decls whose top-level signature carries a `Partial =>`
+/// constraint — the user has explicitly opted out of
+/// exhaustiveness.
+fn detect_non_exhaustive_guard_only_decl(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Build local data-decl info: ctor → number-of-siblings. A
+    // pattern `C x` is irrefutable iff `C` is the only ctor of
+    // its parent. (We don't see imported types here; pattern
+    // guards involving imported single-ctor types fall through to
+    // upstream exhaustiveness checks.)
+    let mut ctor_sibling_count: HashMap<Symbol, usize> = HashMap::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data { constructors, .. } => {
+                let n = constructors.len();
+                for c in constructors {
+                    ctor_sibling_count.insert(c.name.value.symbol(), n);
+                }
+            }
+            cst::Decl::Newtype { constructor, .. } => {
+                ctor_sibling_count.insert(constructor.value.symbol(), 1);
+            }
+            _ => {}
+        }
+    }
+
+    let mut partial_decls: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            if type_has_partial(ty) {
+                partial_decls.insert(name.value.symbol());
+            }
+        }
+    }
+    let mut by_name: HashMap<Symbol, Vec<(&cst::GuardedExpr, Span)>> =
+        HashMap::new();
+    let mut name_spans: HashMap<Symbol, Span> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::Value { name, guarded, span, .. } = d {
+            let n = name.value.symbol();
+            name_spans.entry(n).or_insert(name.span);
+            by_name.entry(n).or_default().push((guarded, *span));
+        }
+    }
+    for (n, eqs) in by_name {
+        if partial_decls.contains(&n) {
+            continue;
+        }
+        let any_uncond = eqs
+            .iter()
+            .any(|(g, _)| guarded_has_fallback(g, &ctor_sibling_count));
+        if any_uncond {
+            continue;
+        }
+        let span = name_spans.get(&n).copied().unwrap_or_else(|| {
+            eqs.first().map(|(_, s)| *s).unwrap_or(crate::span::Span {
+                start: 0,
+                end: 0,
+            })
+        });
+        errors.push(ValidationError {
+            span,
+            kind: ValidationErrorKind::NonExhaustiveGuardOnlyDecl(resolve(n)),
+        });
+    }
+}
+
+/// True iff a `GuardedExpr` has at least one unconditional branch
+/// (Unconditional, or a `Guarded` with a `| true` / `| otherwise`
+/// / irrefutable-pattern fallback).
+fn guarded_has_fallback(
+    g: &cst::GuardedExpr,
+    ctor_sibling_count: &HashMap<Symbol, usize>,
+) -> bool {
+    match g {
+        cst::GuardedExpr::Unconditional(_) => true,
+        cst::GuardedExpr::Guarded(guards) => guards
+            .iter()
+            .any(|g| guard_is_uncond(g, ctor_sibling_count)),
+    }
+}
+
+fn guard_is_uncond(
+    g: &cst::Guard,
+    ctor_sibling_count: &HashMap<Symbol, usize>,
+) -> bool {
+    if g.patterns.len() != 1 {
+        return false;
+    }
+    match &g.patterns[0] {
+        cst::GuardPattern::Boolean(expr) => is_true_or_otherwise(expr),
+        cst::GuardPattern::Pattern(binder, _) => {
+            binder_is_irrefutable(binder, ctor_sibling_count)
+        }
+    }
+}
+
+fn is_true_or_otherwise(e: &cst::Expr) -> bool {
+    match e {
+        cst::Expr::Literal { lit: cst::Literal::Boolean(true), .. } => true,
+        cst::Expr::Var { name, .. } => {
+            let qi = name.to_qi();
+            resolve(qi.name) == "otherwise"
+        }
+        cst::Expr::Parens { expr, .. } => is_true_or_otherwise(expr),
+        _ => false,
+    }
+}
+
+fn binder_is_irrefutable(
+    b: &cst::Binder,
+    ctor_sibling_count: &HashMap<Symbol, usize>,
+) -> bool {
+    match b {
+        cst::Binder::Wildcard { .. } | cst::Binder::Var { .. } => true,
+        cst::Binder::Parens { binder, .. } => {
+            binder_is_irrefutable(binder, ctor_sibling_count)
+        }
+        cst::Binder::As { binder, .. } => {
+            binder_is_irrefutable(binder, ctor_sibling_count)
+        }
+        cst::Binder::Typed { binder, .. } => {
+            binder_is_irrefutable(binder, ctor_sibling_count)
+        }
+        cst::Binder::Record { fields, .. } => fields.iter().all(|f| {
+            f.binder
+                .as_ref()
+                .map_or(true, |b| binder_is_irrefutable(b, ctor_sibling_count))
+        }),
+        cst::Binder::Literal { .. } => false,
+        cst::Binder::Constructor { name, args, .. } => {
+            let qi = name.to_qi();
+            // Local single-ctor types: irrefutable. Multi-ctor or
+            // unknown (imported / undeclared): refutable.
+            let solo = qi.module.is_none()
+                && ctor_sibling_count.get(&qi.name).copied() == Some(1);
+            if !solo {
+                return false;
+            }
+            args.iter()
+                .all(|a| binder_is_irrefutable(a, ctor_sibling_count))
+        }
+        cst::Binder::Op { .. } | cst::Binder::Array { .. } => false,
+    }
+}
+
+fn type_has_partial(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            constraints.iter().any(|c| {
+                let qi = c.class.to_qi();
+                resolve(qi.name) == "Partial"
+            }) || type_has_partial(ty)
+        }
+        cst::TypeExpr::Forall { ty, .. } => type_has_partial(ty),
+        cst::TypeExpr::Parens { ty, .. } => type_has_partial(ty),
+        _ => false,
     }
 }
 

@@ -311,7 +311,14 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
 
     match expected {
         "TypesDoNotUnify" => has("UnificationError") || has("RecordLabelMismatch"),
-        "NoInstanceFound" => has("NoInstanceFound"),
+        "NoInstanceFound" => {
+            has("NoInstanceFound")
+                // Reference compiler routes non-exhaustive
+                // pattern errors through a Partial constraint
+                // (NoInstanceFound on `Partial`). Our exhaustiveness
+                // pass emits `NonExhaustivePattern` directly.
+                || has("NonExhaustivePattern")
+        }
         "ErrorParsingModule" => {
             has("LexError")
                 || has("SyntaxError")

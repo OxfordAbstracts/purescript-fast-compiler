@@ -21,7 +21,7 @@ check_failing_build_unit_ignored!(f_2542, "2542", "expected: UndefinedTypeVariab
 check_failing_build_unit!(f_2567, "2567");
 check_failing_build_unit!(f_2601, "2601");
 check_failing_build_unit!(f_2616, "2616");
-check_failing_build_unit_ignored!(f_2806, "2806", "expected: NoInstanceFound");
+check_failing_build_unit!(f_2806, "2806");
 check_failing_build_unit!(f_2874_forall, "2874-forall");
 check_failing_build_unit!(f_2874_forall2, "2874-forall2");
 check_failing_build_unit!(f_2874_wildcard, "2874-wildcard");
@@ -284,7 +284,7 @@ check_failing_build_unit!(f_NewtypeMultiCtor, "NewtypeMultiCtor");
 check_failing_build_unit!(f_NewtypeUnnamedInstance, "NewtypeUnnamedInstance");
 check_failing_build_unit!(f_NoInstanceMixedUnif, "NoInstanceMixedUnif");
 check_failing_build_unit!(f_NonAssociativeError, "NonAssociativeError");
-check_failing_build_unit_ignored!(f_NonExhaustivePatGuard, "NonExhaustivePatGuard", "expected: NoInstanceFound");
+check_failing_build_unit!(f_NonExhaustivePatGuard, "NonExhaustivePatGuard");
 check_failing_build_unit!(f_NullaryAbs, "NullaryAbs");
 check_failing_build_unit!(f_Object, "Object");
 check_failing_build_unit!(f_OperatorAliasNoExport, "OperatorAliasNoExport");
