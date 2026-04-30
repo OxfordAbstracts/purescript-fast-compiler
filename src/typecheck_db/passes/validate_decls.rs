@@ -5011,22 +5011,31 @@ fn check_literal_body_decl(
     let cst::Decl::Value { name, binders, guarded, .. } = d else {
         return;
     };
-    if !binders.is_empty() {
-        return;
-    }
     let cst::GuardedExpr::Unconditional(body) = guarded else {
         return;
     };
     let n = name.value.symbol();
-    let Some(sig) = sig_of.get(&n) else {
+    let Some(full_sig) = sig_of.get(&n) else {
         return;
     };
-    if type_expr_has_forall(sig)
-        || type_expr_has_wildcard(sig)
-        || type_expr_has_constraint(sig)
+    if type_expr_has_forall(full_sig)
+        || type_expr_has_wildcard(full_sig)
+        || type_expr_has_constraint(full_sig)
     {
         return;
     }
+    // Strip `binders.len()` arrows from the sig to get the
+    // expected return type for this equation.
+    let mut sig_cur: &cst::TypeExpr = full_sig;
+    for _ in 0..binders.len() {
+        sig_cur = peel_parens(sig_cur);
+        if let cst::TypeExpr::Function { to, .. } = sig_cur {
+            sig_cur = to;
+        } else {
+            return;
+        }
+    }
+    let sig = sig_cur;
     // Skip when the sig's Constructor name shadows a local
     // type-alias — `type Number = Int; z :: Number; z = 0` is
     // valid through alias expansion which we don't perform here.
