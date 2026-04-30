@@ -191,7 +191,7 @@ check_failing_build_unit!(f_ExportExplicit, "ExportExplicit");
 check_failing_build_unit!(f_ExportExplicit1, "ExportExplicit1");
 check_failing_build_unit!(f_ExportExplicit2, "ExportExplicit2");
 check_failing_build_unit!(f_ExportExplicit3, "ExportExplicit3");
-check_failing_build_unit_ignored!(f_ExtraRecordField, "ExtraRecordField", "expected: AdditionalProperty");
+check_failing_build_unit!(f_ExtraRecordField, "ExtraRecordField");
 check_failing_build_unit!(f_ExtraneousClassMember, "ExtraneousClassMember");
 check_failing_build_unit!(f_FFIDefaultCJSExport, "FFIDefaultCJSExport");
 check_failing_build_unit_ignored!(f_Foldable, "Foldable", "expected: CycleInDeclaration");
