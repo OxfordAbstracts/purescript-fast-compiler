@@ -370,11 +370,13 @@ pub fn check_module(
     let arity_env = build_arity_env(module, registry);
     let class_env = build_class_arity_env(module, registry);
     let param_kinds = build_param_kinds(module, registry);
+    let kind_sig_groups = build_kind_sig_groups(module);
     let mut errors: Vec<KindError> = Vec::new();
     let mut ctx = Ctx {
         arity_env: &arity_env,
         class_env: &class_env,
         param_kinds: &param_kinds,
+        kind_sig_groups: &kind_sig_groups,
         errors: &mut errors,
     };
 
@@ -407,6 +409,7 @@ pub fn check_module(
                     ctx.check_type(t);
                 }
                 ctx.check_known_hkt_class_instance(class_name, types, *span);
+                ctx.check_instance_head_kind_groups(class_name, types);
                 for m in members {
                     if let cst::Decl::TypeSignature { ty, .. } = m {
                         ctx.check_type(ty);
@@ -421,6 +424,7 @@ pub fn check_module(
                     ctx.check_type(t);
                 }
                 ctx.check_known_hkt_class_instance(class_name, types, *span);
+                ctx.check_instance_head_kind_groups(class_name, types);
             }
             cst::Decl::Value { binders, guarded, where_clause, .. } => {
                 // Walk every type-annotation inside the body /
@@ -445,6 +449,11 @@ struct Ctx<'a> {
     arity_env: &'a HashMap<Symbol, usize>,
     class_env: &'a HashMap<Symbol, usize>,
     param_kinds: &'a HashMap<Symbol, Vec<ParamKind>>,
+    /// For each type with a standalone polykinded sig (`data X ::
+    /// forall k. k -> k -> Type`), the i-th entry is the
+    /// forall-var name that the i-th arg position binds. None
+    /// means the position isn't a Var (concrete kind).
+    kind_sig_groups: &'a HashMap<Symbol, Vec<Option<Symbol>>>,
     errors: &'a mut Vec<KindError>,
 }
 
@@ -474,6 +483,42 @@ impl<'a> Ctx<'a> {
                 // Per-parameter kind annotations: when the head's
                 // type vars carry explicit kinds, verify each
                 // supplied arg's structural kind matches.
+                // Standalone-polykind group check: `data X ::
+                // forall k. k -> k -> Type; X Int "foo"` — both
+                // args bound to `k`, must share prim kind.
+                if let Some(groups) = self.kind_sig_groups.get(&sym) {
+                    use std::collections::HashMap as Map;
+                    let mut by_var: Map<Symbol, Vec<(usize, PrimKind)>> =
+                        Map::new();
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Some(Some(var)) = groups.get(i) {
+                            if let Some(pk) = arg_prim_kind(arg) {
+                                if pk != PrimKind::Other {
+                                    by_var.entry(*var).or_default().push((i, pk));
+                                }
+                            }
+                        }
+                    }
+                    for (_var, group_args) in &by_var {
+                        if group_args.len() < 2 {
+                            continue;
+                        }
+                        let first = group_args[0].1;
+                        for (i, pk) in &group_args[1..] {
+                            if *pk != first {
+                                self.errors.push(KindError {
+                                    span: args[*i].span(),
+                                    kind: KindErrorKind::KindsDoNotUnify {
+                                        head: resolve(sym),
+                                        expected: 0,
+                                        got: 0,
+                                    },
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
                 if let Some(params) = self.param_kinds.get(&sym) {
                     // Don't enforce arg-position kind checks for
                     // expressions inside Decl::Value bodies when
@@ -839,6 +884,51 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    fn check_instance_head_kind_groups(
+        &mut self,
+        class_name: &crate::names::Qualified<crate::names::ClassName>,
+        types: &[cst::TypeExpr],
+    ) {
+        if class_name.module.is_some() {
+            return;
+        }
+        let sym = class_name.name.symbol();
+        let groups = match self.kind_sig_groups.get(&sym) {
+            Some(g) => g.clone(),
+            None => return,
+        };
+        use std::collections::HashMap as Map;
+        let mut by_var: Map<Symbol, Vec<(usize, PrimKind)>> = Map::new();
+        for (i, arg) in types.iter().enumerate() {
+            if let Some(Some(var)) = groups.get(i) {
+                if let Some(pk) = arg_prim_kind(arg) {
+                    if pk != PrimKind::Other {
+                        by_var.entry(*var).or_default().push((i, pk));
+                    }
+                }
+            }
+        }
+        for (_var, group_args) in &by_var {
+            if group_args.len() < 2 {
+                continue;
+            }
+            let first = group_args[0].1;
+            for (i, pk) in &group_args[1..] {
+                if *pk != first {
+                    self.errors.push(KindError {
+                        span: types[*i].span(),
+                        kind: KindErrorKind::KindsDoNotUnify {
+                            head: resolve(sym),
+                            expected: 0,
+                            got: 0,
+                        },
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
     fn check_constraint(&mut self, c: &cst::Constraint) {
         // Recurse through args first so nested arity issues surface.
         for a in &c.args {
@@ -985,6 +1075,79 @@ fn walk_for_var_usage(
 /// Approximate kind arity from a kind type expression. Counts the
 /// number of `->` arrows at the top level. `Type` → 0, `Type -> Type`
 /// → 1, `(Type -> Type) -> Type` → 1.
+/// Walk every Data/Newtype/TypeAlias/Class declaration with a
+/// `kind_type: Some(...)` standalone kind signature. For each,
+/// parse the sig's outer `forall` + arrow chain to determine
+/// which forall-var each arg position binds to, and store the
+/// per-position group identifiers under the type's name.
+///
+/// Used at type-application sites to detect cases like
+/// `data Pair :: forall k. k -> k -> Type; type F = Pair Int "foo"`
+/// — both positions bind `k`, so the args must have matching
+/// primitive kind tags. `Int` is Type, `"foo"` is Symbol →
+/// mismatch.
+fn build_kind_sig_groups(
+    module: &cst::Module,
+) -> HashMap<Symbol, Vec<Option<Symbol>>> {
+    use std::collections::HashMap as Map;
+    let mut out: Map<Symbol, Vec<Option<Symbol>>> = Map::new();
+    for d in &module.decls {
+        let (name, kind_ty) = match d {
+            cst::Decl::Data { name, kind_type: Some(k), .. } => {
+                (name.value.symbol(), k.as_ref())
+            }
+            cst::Decl::Class { name, kind_type: Some(k), .. } => {
+                (name.value.symbol(), k.as_ref())
+            }
+            _ => continue,
+        };
+        let groups = parse_kind_sig_groups(kind_ty);
+        if !groups.is_empty() {
+            out.insert(name, groups);
+        }
+    }
+    out
+}
+
+/// Parse a kind signature `forall k1 k2. K1 -> K2 -> ...` into
+/// the per-arg-position forall-var-name (or None for non-Var
+/// kinds). Returns one entry per arrow in the kind sig (i.e.
+/// per arg position the type accepts).
+fn parse_kind_sig_groups(te: &cst::TypeExpr) -> Vec<Option<Symbol>> {
+    let mut cur = te;
+    let mut foralls: std::collections::HashSet<Symbol> =
+        std::collections::HashSet::new();
+    loop {
+        match cur {
+            cst::TypeExpr::Forall { vars, ty, .. } => {
+                for (v, _, _) in vars {
+                    foralls.insert(v.value.symbol());
+                }
+                cur = ty;
+            }
+            cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            _ => break,
+        }
+    }
+    let mut groups: Vec<Option<Symbol>> = Vec::new();
+    while let cst::TypeExpr::Function { from, to, .. } = cur {
+        let arg_var = match from.as_ref() {
+            cst::TypeExpr::Var { name, .. } => {
+                let s = name.value.symbol();
+                if foralls.contains(&s) {
+                    Some(s)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        groups.push(arg_var);
+        cur = to;
+    }
+    groups
+}
+
 fn arrow_count(te: &cst::TypeExpr) -> usize {
     match te {
         cst::TypeExpr::Function { to, .. } => 1 + arrow_count(to),
