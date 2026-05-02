@@ -382,7 +382,7 @@ check_failing_build_unit!(f_TypeError, "TypeError");
 check_failing_build_unit!(f_TypeOperatorAliasNoExport, "TypeOperatorAliasNoExport");
 check_failing_build_unit!(f_TypeSynonymCycle, "TypeSynonymCycle");
 check_failing_build_unit!(f_TypeSynonyms, "TypeSynonyms");
-check_failing_build_unit_ignored!(f_TypeSynonyms10, "TypeSynonyms10", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_TypeSynonyms10, "TypeSynonyms10");
 check_failing_build_unit!(f_TypeSynonyms4, "TypeSynonyms4");
 check_failing_build_unit!(f_TypeSynonyms5, "TypeSynonyms5");
 check_failing_build_unit!(f_TypeSynonyms7, "TypeSynonyms7");
