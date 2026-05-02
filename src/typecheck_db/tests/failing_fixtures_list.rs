@@ -345,9 +345,9 @@ check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign, "RoleDeclaratio
 check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign2, "RoleDeclarationArityMismatchForeign2");
 check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign3, "RoleDeclarationArityMismatchForeign3");
 check_failing_build_unit!(f_RoleDeclarationArityMismatchForeign4, "RoleDeclarationArityMismatchForeign4");
-check_failing_build_unit_ignored!(f_RowConstructors1, "RowConstructors1", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_RowConstructors1, "RowConstructors1");
 check_failing_build_unit!(f_RowConstructors2, "RowConstructors2");
-check_failing_build_unit_ignored!(f_RowConstructors3, "RowConstructors3", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_RowConstructors3, "RowConstructors3");
 check_failing_build_unit!(f_RowInInstanceNotDetermined0, "RowInInstanceNotDetermined0");
 check_failing_build_unit!(f_RowInInstanceNotDetermined1, "RowInInstanceNotDetermined1");
 check_failing_build_unit!(f_RowInInstanceNotDetermined2, "RowInInstanceNotDetermined2");

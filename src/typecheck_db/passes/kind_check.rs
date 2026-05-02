@@ -51,11 +51,25 @@ pub enum KindErrorKind {
 /// `Type -> Type` = 1, `(Type -> Type) -> Type` = 1, etc. Coarse but
 /// good enough to catch `Syn Int` when `Syn (a :: Type -> Type)` is
 /// the declared shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimKind {
+    Type,
+    Symbol,
+    Int,
+    Boolean,
+    Constraint,
+    /// Some other (e.g. `Row k`, polykinded `k`) — don't compare.
+    Other,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParamKind {
     /// Number of arrows the param expects. None = no kind annotation
     /// (treat as wildcard).
     arrows: Option<usize>,
+    /// Primitive kind tag of the output (after stripping arrows).
+    /// None when no annotation is available.
+    prim: Option<PrimKind>,
 }
 
 /// Build the param-kind environment for a module: every nominal type
@@ -89,14 +103,23 @@ fn build_param_kinds(
         };
         vars.iter()
             .zip(anns.iter())
-            .map(|(v, opt)| ParamKind {
-                arrows: match (opt.as_deref(), default_to_type) {
+            .map(|(v, opt)| {
+                let arrows = match (opt.as_deref(), default_to_type) {
                     (Some(te), _) => Some(arrow_count(te)),
                     (None, true) if hkt_vars.contains(v) => None,
                     (None, true) if poly_vars.contains(v) => None,
                     (None, true) => Some(0),
                     (None, false) => None,
-                },
+                };
+                // prim-kind tag: only trust EXPLICIT annotations.
+                // Default-to-Type would false-positive on locally-
+                // defined polykinded types (`data Proxy k =
+                // Proxy`) used at Symbol / Int positions.
+                let prim = match opt.as_deref() {
+                    Some(te) => prim_kind_of(te),
+                    None => None,
+                };
+                ParamKind { arrows, prim }
             })
             .collect()
     };
@@ -456,6 +479,30 @@ impl<'a> Ctx<'a> {
                                     }
                                 }
                             }
+                            // Primitive-kind tag check: when the
+                            // param has a known primitive kind
+                            // tag (e.g. `Type`) and the arg is a
+                            // literal of a different kind
+                            // (`Symbol`/`Int` literal), flag.
+                            if let Some(expected_prim) = p.prim {
+                                if expected_prim != PrimKind::Other {
+                                    if let Some(actual_prim) = arg_prim_kind(arg)
+                                    {
+                                        if actual_prim != PrimKind::Other
+                                            && actual_prim != expected_prim
+                                        {
+                                            self.errors.push(KindError {
+                                                span: arg.span(),
+                                                kind: KindErrorKind::KindsDoNotUnify {
+                                                    head: resolve(sym),
+                                                    expected: 0,
+                                                    got: 0,
+                                                },
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -758,6 +805,59 @@ fn arrow_count(te: &cst::TypeExpr) -> usize {
         cst::TypeExpr::Parens { ty, .. } => arrow_count(ty),
         cst::TypeExpr::Forall { ty, .. } => arrow_count(ty),
         _ => 0,
+    }
+}
+
+/// Strip arrows / forall / parens to find the kind's "output"
+/// portion, then classify it as a primitive kind tag.
+fn prim_kind_of(te: &cst::TypeExpr) -> Option<PrimKind> {
+    let mut cur = te;
+    loop {
+        match cur {
+            cst::TypeExpr::Function { to, .. } => cur = to,
+            cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            cst::TypeExpr::Forall { ty, .. } => cur = ty,
+            cst::TypeExpr::Constructor { name, .. } => {
+                let n = resolve(name.name.symbol());
+                return match n.as_str() {
+                    "Type" => Some(PrimKind::Type),
+                    "Symbol" => Some(PrimKind::Symbol),
+                    "Int" => Some(PrimKind::Int),
+                    "Boolean" => Some(PrimKind::Boolean),
+                    "Constraint" => Some(PrimKind::Constraint),
+                    _ => Some(PrimKind::Other),
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Classify an *argument* expression's primitive kind tag at
+/// type-application time. Returns `None` when the arg is a type
+/// variable, a hole, a wildcard, or anything we can't classify
+/// without full kind inference.
+fn arg_prim_kind(te: &cst::TypeExpr) -> Option<PrimKind> {
+    match te {
+        cst::TypeExpr::StringLiteral { .. } => Some(PrimKind::Symbol),
+        cst::TypeExpr::IntLiteral { .. } => Some(PrimKind::Int),
+        cst::TypeExpr::Function { .. } => Some(PrimKind::Type),
+        cst::TypeExpr::Constructor { name, .. } => {
+            let n = resolve(name.name.symbol());
+            match n.as_str() {
+                "Type" | "Constraint" | "Boolean" | "Symbol" | "Int" => {
+                    Some(PrimKind::Type)
+                }
+                "True" | "False" => Some(PrimKind::Boolean),
+                _ => None,
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => arg_prim_kind(ty),
+        cst::TypeExpr::App { constructor, .. } => arg_prim_kind(constructor),
+        cst::TypeExpr::Record { .. } | cst::TypeExpr::Row { .. } => {
+            Some(PrimKind::Type)
+        }
+        _ => None,
     }
 }
 
