@@ -371,12 +371,14 @@ pub fn check_module(
     let class_env = build_class_arity_env(module, registry);
     let param_kinds = build_param_kinds(module, registry);
     let kind_sig_groups = build_kind_sig_groups(module);
+    let kind_sig_param_arrows = build_kind_sig_param_arrows(module);
     let mut errors: Vec<KindError> = Vec::new();
     let mut ctx = Ctx {
         arity_env: &arity_env,
         class_env: &class_env,
         param_kinds: &param_kinds,
         kind_sig_groups: &kind_sig_groups,
+        kind_sig_param_arrows: &kind_sig_param_arrows,
         errors: &mut errors,
     };
 
@@ -454,6 +456,10 @@ struct Ctx<'a> {
     /// forall-var name that the i-th arg position binds. None
     /// means the position isn't a Var (concrete kind).
     kind_sig_groups: &'a HashMap<Symbol, Vec<Option<Symbol>>>,
+    /// For each type with a standalone polykind sig, the
+    /// per-arg-position arrow count (extracted from each function
+    /// position's kind in the sig).
+    kind_sig_param_arrows: &'a HashMap<Symbol, Vec<usize>>,
     errors: &'a mut Vec<KindError>,
 }
 
@@ -710,14 +716,52 @@ impl<'a> Ctx<'a> {
                     self.errors.push(KindError {
                         span,
                         kind: KindErrorKind::KindsDoNotUnify {
-                            head: class_str,
+                            head: class_str.clone(),
                             expected: expected_arrows,
                             got: actual_arrows,
                         },
                     });
+                    return;
+                }
+            }
+            // Beyond top-level arrows: when the head type has a
+            // standalone polykind sig (`data Foo :: (Type -> Type)
+            // -> Type`), check that its FIRST PARAM's kind matches
+            // what the class expects (Type for Functor/etc.).
+            // Catches `derive instance Foldable Foo` where Foo's
+            // first param is itself a `Type -> Type`.
+            if expected_arrows == 1 {
+                if let cst::TypeExpr::Constructor { name, .. } = arg {
+                    if name.module.is_none() {
+                        let sym = name.name.symbol();
+                        if let Some(first_param_arrows) =
+                            self.kind_sig_first_param_arrows(sym)
+                        {
+                            if first_param_arrows != 0 {
+                                self.errors.push(KindError {
+                                    span,
+                                    kind: KindErrorKind::KindsDoNotUnify {
+                                        head: class_str,
+                                        expected: 0,
+                                        got: first_param_arrows,
+                                    },
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// For a type with a standalone polykind sig, return the
+    /// arrow count of its FIRST param's kind. E.g. for
+    /// `data Foo :: (Type -> Type) -> Type`, returns Some(1)
+    /// (the first param is `Type -> Type`, which has 1 arrow).
+    /// `None` when no kind sig is available, or its shape isn't
+    /// the expected forall*. arrow chain.
+    fn kind_sig_first_param_arrows(&self, sym: Symbol) -> Option<usize> {
+        self.kind_sig_param_arrows.get(&sym)?.first().copied()
     }
 
     /// Constraint arity check: a class declared with N type params
@@ -1107,6 +1151,53 @@ fn build_kind_sig_groups(
         }
     }
     out
+}
+
+/// Per-param-position arrow count for each type with a
+/// standalone polykind sig. Used by
+/// `check_known_hkt_class_instance` to detect cases where a
+/// type's first param is itself a higher-kind (`Type -> Type`)
+/// being used in a single-arg HKT class context that wants
+/// `Type` there (`derive instance Foldable Foo` for
+/// `data Foo :: (Type -> Type) -> Type`).
+fn build_kind_sig_param_arrows(
+    module: &cst::Module,
+) -> HashMap<Symbol, Vec<usize>> {
+    use std::collections::HashMap as Map;
+    let mut out: Map<Symbol, Vec<usize>> = Map::new();
+    for d in &module.decls {
+        let (name, kind_ty) = match d {
+            cst::Decl::Data { name, kind_type: Some(k), .. } => {
+                (name.value.symbol(), k.as_ref())
+            }
+            cst::Decl::Class { name, kind_type: Some(k), .. } => {
+                (name.value.symbol(), k.as_ref())
+            }
+            _ => continue,
+        };
+        let arrows = parse_kind_sig_param_arrows(kind_ty);
+        if !arrows.is_empty() {
+            out.insert(name, arrows);
+        }
+    }
+    out
+}
+
+fn parse_kind_sig_param_arrows(te: &cst::TypeExpr) -> Vec<usize> {
+    let mut cur = te;
+    loop {
+        match cur {
+            cst::TypeExpr::Forall { ty, .. } => cur = ty,
+            cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            _ => break,
+        }
+    }
+    let mut arrows: Vec<usize> = Vec::new();
+    while let cst::TypeExpr::Function { from, to, .. } = cur {
+        arrows.push(arrow_count(from));
+        cur = to;
+    }
+    arrows
 }
 
 /// Parse a kind signature `forall k1 k2. K1 -> K2 -> ...` into
