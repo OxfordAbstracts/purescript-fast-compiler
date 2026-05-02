@@ -624,6 +624,200 @@ fn try_magic(
                 }
             }
         }
+        // `Prim.Symbol.Append left right result | left right -> result,
+        // right result -> left, left result -> right` — concatenation
+        // of two known symbols determines the third.
+        "Append" => {
+            if args.len() == 3 {
+                // Forward: left + right → result.
+                if let (Type::TypeString(l), Type::TypeString(r)) =
+                    (&args[0], &args[1])
+                {
+                    let mut s = l.clone();
+                    s.push_str(r);
+                    let expected = Type::TypeString(s);
+                    let snapshot = state.snapshot_bindings();
+                    if state.unify(&args[2], &expected).is_ok() {
+                        return MagicOutcome::Resolved(ResolvedDict {
+                            class: pending.constraint.class.clone(),
+                            instance_types: vec![
+                                args[0].clone(),
+                                args[1].clone(),
+                                expected,
+                            ],
+                            instance_idx: 0,
+                            context: Vec::new(),
+                        });
+                    }
+                    state.restore_bindings(snapshot);
+                    return MagicOutcome::Mismatch;
+                }
+                // Backward: known left + result → right (strip prefix).
+                if let (Type::TypeString(l), Type::TypeString(res)) =
+                    (&args[0], &args[2])
+                {
+                    if let Some(rhs) = res.strip_prefix(l.as_str()) {
+                        let expected = Type::TypeString(rhs.to_string());
+                        let snapshot = state.snapshot_bindings();
+                        if state.unify(&args[1], &expected).is_ok() {
+                            return MagicOutcome::Resolved(ResolvedDict {
+                                class: pending.constraint.class.clone(),
+                                instance_types: vec![
+                                    args[0].clone(),
+                                    expected,
+                                    args[2].clone(),
+                                ],
+                                instance_idx: 0,
+                                context: Vec::new(),
+                            });
+                        }
+                        state.restore_bindings(snapshot);
+                        return MagicOutcome::Mismatch;
+                    } else {
+                        return MagicOutcome::Mismatch;
+                    }
+                }
+                // Backward: known right + result → left (strip suffix).
+                if let (Type::TypeString(r), Type::TypeString(res)) =
+                    (&args[1], &args[2])
+                {
+                    if let Some(lhs) = res.strip_suffix(r.as_str()) {
+                        let expected = Type::TypeString(lhs.to_string());
+                        let snapshot = state.snapshot_bindings();
+                        if state.unify(&args[0], &expected).is_ok() {
+                            return MagicOutcome::Resolved(ResolvedDict {
+                                class: pending.constraint.class.clone(),
+                                instance_types: vec![
+                                    expected,
+                                    args[1].clone(),
+                                    args[2].clone(),
+                                ],
+                                instance_idx: 0,
+                                context: Vec::new(),
+                            });
+                        }
+                        state.restore_bindings(snapshot);
+                        return MagicOutcome::Mismatch;
+                    } else {
+                        return MagicOutcome::Mismatch;
+                    }
+                }
+            }
+        }
+        // `Prim.Symbol.Compare left right ordering | left right -> ordering`
+        // / `Prim.Int.Compare left right ordering | left right -> ordering`
+        // — concrete operands determine the resulting Ordering.
+        "Compare" => {
+            if args.len() == 3 {
+                let order = match (&args[0], &args[1]) {
+                    (Type::TypeString(l), Type::TypeString(r)) => {
+                        Some(l.cmp(r))
+                    }
+                    (Type::TypeInt(l), Type::TypeInt(r)) => Some(l.cmp(r)),
+                    _ => None,
+                };
+                if let Some(order) = order {
+                    use std::cmp::Ordering;
+                    let ord_name = match order {
+                        Ordering::Less => "LT",
+                        Ordering::Equal => "EQ",
+                        Ordering::Greater => "GT",
+                    };
+                    let expected = Type::Con(
+                        crate::typecheck_db::types::QName {
+                            module: Some("Prim.Ordering".into()),
+                            name: ord_name.into(),
+                        },
+                    );
+                    let snapshot = state.snapshot_bindings();
+                    if state
+                        .unify(&args[2], &expected)
+                        .or_else(|_| {
+                            state.unify(
+                                &args[2],
+                                &Type::Con(crate::typecheck_db::types::QName {
+                                    module: None,
+                                    name: ord_name.into(),
+                                }),
+                            )
+                        })
+                        .is_ok()
+                    {
+                        return MagicOutcome::Resolved(ResolvedDict {
+                            class: pending.constraint.class.clone(),
+                            instance_types: vec![
+                                args[0].clone(),
+                                args[1].clone(),
+                                expected,
+                            ],
+                            instance_idx: 0,
+                            context: Vec::new(),
+                        });
+                    }
+                    state.restore_bindings(snapshot);
+                    return MagicOutcome::Mismatch;
+                }
+            }
+        }
+        // `Prim.Symbol.Cons head tail sym | head tail -> sym, sym ->
+        // head tail` — concrete sym determines head/tail; concrete
+        // head + tail determines sym.
+        "Cons" => {
+            if args.len() == 3 {
+                // Forward: head + tail → sym.
+                if let (Type::TypeString(h), Type::TypeString(t)) =
+                    (&args[0], &args[1])
+                {
+                    if h.chars().count() == 1 {
+                        let mut s = h.clone();
+                        s.push_str(t);
+                        let expected = Type::TypeString(s);
+                        let snapshot = state.snapshot_bindings();
+                        if state.unify(&args[2], &expected).is_ok() {
+                            return MagicOutcome::Resolved(ResolvedDict {
+                                class: pending.constraint.class.clone(),
+                                instance_types: vec![
+                                    args[0].clone(),
+                                    args[1].clone(),
+                                    expected,
+                                ],
+                                instance_idx: 0,
+                                context: Vec::new(),
+                            });
+                        }
+                        state.restore_bindings(snapshot);
+                        return MagicOutcome::Mismatch;
+                    }
+                }
+                // Backward: known sym → head, tail.
+                if let Type::TypeString(s) = &args[2] {
+                    if let Some(first_char) = s.chars().next() {
+                        let head_str: String = first_char.to_string();
+                        let tail_str: String =
+                            s.chars().skip(1).collect();
+                        let head_ty = Type::TypeString(head_str);
+                        let tail_ty = Type::TypeString(tail_str);
+                        let snapshot = state.snapshot_bindings();
+                        if state.unify(&args[0], &head_ty).is_ok()
+                            && state.unify(&args[1], &tail_ty).is_ok()
+                        {
+                            return MagicOutcome::Resolved(ResolvedDict {
+                                class: pending.constraint.class.clone(),
+                                instance_types: vec![
+                                    head_ty,
+                                    tail_ty,
+                                    args[2].clone(),
+                                ],
+                                instance_idx: 0,
+                                context: Vec::new(),
+                            });
+                        }
+                        state.restore_bindings(snapshot);
+                        return MagicOutcome::Mismatch;
+                    }
+                }
+            }
+        }
         _ => {}
     }
     MagicOutcome::None
