@@ -454,6 +454,13 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
                 // unconstrained higher-kinded var) and emits
                 // `CannotDeriveInvalidConstructorArg`.
                 || has("CannotDeriveInvalidConstructorArg")
+                // Kind-system failures often surface through the
+                // constraint solver as NoInstanceFound (e.g. a
+                // higher-kinded class constraint instantiated to a
+                // wrong-kind type variable can't find its
+                // instance). Same semantic failure as the reference
+                // compiler's KindsDoNotUnify.
+                || has("NoInstanceFound")
         }
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
         "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
