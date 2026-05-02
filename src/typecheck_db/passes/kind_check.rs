@@ -422,6 +422,18 @@ pub fn check_module(
                 }
                 ctx.check_known_hkt_class_instance(class_name, types, *span);
             }
+            cst::Decl::Value { binders, guarded, where_clause, .. } => {
+                // Walk every type-annotation inside the body /
+                // binders / where-clause so kind-arity / prim-kind
+                // checks fire on `(x :: F)` or `(expr :: F a)`.
+                for b in binders {
+                    ctx.check_binder_types(b);
+                }
+                ctx.check_guarded_types(guarded);
+                for w in where_clause {
+                    ctx.check_let_binding_types(w);
+                }
+            }
             _ => {}
         }
     }
@@ -463,27 +475,39 @@ impl<'a> Ctx<'a> {
                 // type vars carry explicit kinds, verify each
                 // supplied arg's structural kind matches.
                 if let Some(params) = self.param_kinds.get(&sym) {
+                    // Don't enforce arg-position kind checks for
+                    // expressions inside Decl::Value bodies when
+                    // the param has NO explicit annotation —
+                    // locally-defined polykinded types like
+                    // `data Proxy a = Proxy` are commonly used
+                    // at non-Type kinds in expression-level
+                    // annotations.
                     for (i, arg) in args.iter().enumerate() {
                         if let Some(p) = params.get(i) {
-                            if let Some(expected_arrows) = p.arrows {
-                                if let Some(actual_arrows) = self.infer_arg_arrows(arg) {
-                                    if actual_arrows != expected_arrows {
-                                        self.errors.push(KindError {
-                                            span: arg.span(),
-                                            kind: KindErrorKind::KindsDoNotUnify {
-                                                head: resolve(sym),
-                                                expected: expected_arrows,
-                                                got: actual_arrows,
-                                            },
-                                        });
+                            // Restricted arrow check: only fire
+                            // when the param has a Some(prim) tag
+                            // — meaning the kind was explicitly
+                            // annotated. Without that the
+                            // default-to-Type can false-positive
+                            // on polykinded vars.
+                            if p.prim.is_some() {
+                                if let Some(expected_arrows) = p.arrows {
+                                    if let Some(actual_arrows) =
+                                        self.infer_arg_arrows(arg)
+                                    {
+                                        if actual_arrows != expected_arrows {
+                                            self.errors.push(KindError {
+                                                span: arg.span(),
+                                                kind: KindErrorKind::KindsDoNotUnify {
+                                                    head: resolve(sym),
+                                                    expected: expected_arrows,
+                                                    got: actual_arrows,
+                                                },
+                                            });
+                                        }
                                     }
                                 }
                             }
-                            // Primitive-kind tag check: when the
-                            // param has a known primitive kind
-                            // tag (e.g. `Type`) and the arg is a
-                            // literal of a different kind
-                            // (`Symbol`/`Int` literal), flag.
                             if let Some(expected_prim) = p.prim {
                                 if expected_prim != PrimKind::Other {
                                     if let Some(actual_prim) = arg_prim_kind(arg)
@@ -653,6 +677,168 @@ impl<'a> Ctx<'a> {
 
     /// Constraint arity check: a class declared with N type params
     /// must be applied with exactly N arguments.
+    fn check_binder_types(&mut self, b: &cst::Binder) {
+        match b {
+            cst::Binder::Typed { binder, ty, .. } => {
+                self.check_type(ty);
+                self.check_binder_types(binder);
+            }
+            cst::Binder::Parens { binder, .. }
+            | cst::Binder::As { binder, .. } => self.check_binder_types(binder),
+            cst::Binder::Constructor { args, .. } => {
+                for a in args {
+                    self.check_binder_types(a);
+                }
+            }
+            cst::Binder::Record { fields, .. } => {
+                for f in fields {
+                    if let Some(b) = &f.binder {
+                        self.check_binder_types(b);
+                    }
+                }
+            }
+            cst::Binder::Array { elements, .. } => {
+                for e in elements {
+                    self.check_binder_types(e);
+                }
+            }
+            cst::Binder::Op { left, right, .. } => {
+                self.check_binder_types(left);
+                self.check_binder_types(right);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_guarded_types(&mut self, g: &cst::GuardedExpr) {
+        match g {
+            cst::GuardedExpr::Unconditional(e) => self.check_expr_types(e),
+            cst::GuardedExpr::Guarded(guards) => {
+                for gd in guards {
+                    for p in &gd.patterns {
+                        match p {
+                            cst::GuardPattern::Boolean(e) => self.check_expr_types(e),
+                            cst::GuardPattern::Pattern(b, e) => {
+                                self.check_binder_types(b);
+                                self.check_expr_types(e);
+                            }
+                        }
+                    }
+                    self.check_expr_types(&gd.expr);
+                }
+            }
+        }
+    }
+
+    fn check_let_binding_types(&mut self, lb: &cst::LetBinding) {
+        match lb {
+            cst::LetBinding::Value { binder, expr, .. } => {
+                self.check_binder_types(binder);
+                self.check_expr_types(expr);
+            }
+            cst::LetBinding::Signature { ty, .. } => self.check_type(ty),
+        }
+    }
+
+    fn check_expr_types(&mut self, e: &cst::Expr) {
+        match e {
+            cst::Expr::TypeAnnotation { expr, ty, .. } => {
+                self.check_type(ty);
+                self.check_expr_types(expr);
+            }
+            cst::Expr::VisibleTypeApp { func, ty, .. } => {
+                self.check_type(ty);
+                self.check_expr_types(func);
+            }
+            cst::Expr::App { func, arg, .. } => {
+                self.check_expr_types(func);
+                self.check_expr_types(arg);
+            }
+            cst::Expr::Lambda { binders, body, .. } => {
+                for b in binders {
+                    self.check_binder_types(b);
+                }
+                self.check_expr_types(body);
+            }
+            cst::Expr::Op { left, right, .. } => {
+                self.check_expr_types(left);
+                self.check_expr_types(right);
+            }
+            cst::Expr::If { cond, then_expr, else_expr, .. } => {
+                self.check_expr_types(cond);
+                self.check_expr_types(then_expr);
+                self.check_expr_types(else_expr);
+            }
+            cst::Expr::Case { exprs, alts, .. } => {
+                for e in exprs {
+                    self.check_expr_types(e);
+                }
+                for alt in alts {
+                    for b in &alt.binders {
+                        self.check_binder_types(b);
+                    }
+                    self.check_guarded_types(&alt.result);
+                }
+            }
+            cst::Expr::Let { bindings, body, .. } => {
+                for lb in bindings {
+                    self.check_let_binding_types(lb);
+                }
+                self.check_expr_types(body);
+            }
+            cst::Expr::Do { statements, .. } => {
+                for s in statements {
+                    self.check_do_types(s);
+                }
+            }
+            cst::Expr::Ado { statements, result, .. } => {
+                for s in statements {
+                    self.check_do_types(s);
+                }
+                self.check_expr_types(result);
+            }
+            cst::Expr::Record { fields, .. } => {
+                for f in fields {
+                    if let Some(v) = &f.value {
+                        self.check_expr_types(v);
+                    }
+                }
+            }
+            cst::Expr::Array { elements, .. } => {
+                for el in elements {
+                    self.check_expr_types(el);
+                }
+            }
+            cst::Expr::RecordUpdate { expr, updates, .. } => {
+                self.check_expr_types(expr);
+                for u in updates {
+                    self.check_expr_types(&u.value);
+                }
+            }
+            cst::Expr::Parens { expr, .. } | cst::Expr::Negate { expr, .. } => {
+                self.check_expr_types(expr);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_do_types(&mut self, s: &cst::DoStatement) {
+        match s {
+            cst::DoStatement::Bind { binder, expr, .. } => {
+                self.check_binder_types(binder);
+                self.check_expr_types(expr);
+            }
+            cst::DoStatement::Discard { expr, .. } => {
+                self.check_expr_types(expr);
+            }
+            cst::DoStatement::Let { bindings, .. } => {
+                for lb in bindings {
+                    self.check_let_binding_types(lb);
+                }
+            }
+        }
+    }
+
     fn check_constraint(&mut self, c: &cst::Constraint) {
         // Recurse through args first so nested arity issues surface.
         for a in &c.args {
