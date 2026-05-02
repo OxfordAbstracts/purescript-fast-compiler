@@ -1,6 +1,6 @@
 check_failing_build_unit!(f_1071, "1071");
 check_failing_build_unit!(f_1169, "1169");
-check_failing_build_unit_ignored!(f_1175, "1175", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_1175, "1175");
 check_failing_build_unit!(f_1310, "1310");
 check_failing_build_unit!(f_1570, "1570");
 check_failing_build_unit!(f_1733, "1733");

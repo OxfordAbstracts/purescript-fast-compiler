@@ -4987,18 +4987,159 @@ fn detect_literal_body_sig_mismatch(
                     inst_sigs.insert(name.value.symbol(), ty);
                 }
             }
-            if inst_sigs.is_empty() {
-                continue;
-            }
             for memb in members {
-                check_literal_body_decl(
-                    memb,
-                    &inst_sigs,
-                    &local_alias_names,
+                if !inst_sigs.is_empty() {
+                    check_literal_body_decl(
+                        memb,
+                        &inst_sigs,
+                        &local_alias_names,
+                        errors,
+                    );
+                }
+                // Also walk the instance member body's
+                // where-clause for nested literal-body sig
+                // mismatches (`bar :: String; bar = 1`).
+                if let cst::Decl::Value { where_clause, guarded, .. } = memb {
+                    walk_where_for_literal_body_sig_mismatch(
+                        where_clause,
+                        &local_alias_names,
+                        errors,
+                    );
+                    walk_guarded_for_literal_body_sig_mismatch(
+                        guarded,
+                        &local_alias_names,
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+    // Top-level value decls' where-clauses + body let-bindings.
+    for d in decls {
+        if let cst::Decl::Value { where_clause, guarded, .. } = d {
+            walk_where_for_literal_body_sig_mismatch(
+                where_clause,
+                &local_alias_names,
+                errors,
+            );
+            walk_guarded_for_literal_body_sig_mismatch(
+                guarded,
+                &local_alias_names,
+                errors,
+            );
+        }
+    }
+}
+
+fn walk_where_for_literal_body_sig_mismatch(
+    bindings: &[cst::LetBinding],
+    local_alias_names: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut sigs: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
+    for lb in bindings {
+        if let cst::LetBinding::Signature { name, ty, .. } = lb {
+            sigs.insert(name.value.symbol(), ty);
+        }
+    }
+    if sigs.is_empty() {
+        return;
+    }
+    for lb in bindings {
+        if let cst::LetBinding::Value { binder, expr, .. } = lb {
+            if let cst::Binder::Var { name, span } = binder {
+                let n = name.value.symbol();
+                if let Some(sig) = sigs.get(&n) {
+                    let dummy = cst::Decl::Value {
+                        span: *span,
+                        name: name.clone(),
+                        binders: Vec::new(),
+                        guarded: cst::GuardedExpr::Unconditional(Box::new(
+                            expr.clone(),
+                        )),
+                        where_clause: Vec::new(),
+                        doc_comments: Vec::new(),
+                    };
+                    let mut local_sigs: HashMap<Symbol, &cst::TypeExpr> =
+                        HashMap::new();
+                    local_sigs.insert(n, *sig);
+                    check_literal_body_decl(
+                        &dummy,
+                        &local_sigs,
+                        local_alias_names,
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn walk_guarded_for_literal_body_sig_mismatch(
+    g: &cst::GuardedExpr,
+    local_alias_names: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_for_literal_body_sig_mismatch(e, local_alias_names, errors);
+        }
+        cst::GuardedExpr::Guarded(guards) => {
+            for gd in guards {
+                walk_expr_for_literal_body_sig_mismatch(
+                    &gd.expr,
+                    local_alias_names,
                     errors,
                 );
             }
         }
+    }
+}
+
+fn walk_expr_for_literal_body_sig_mismatch(
+    e: &cst::Expr,
+    local_alias_names: &HashSet<Symbol>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match e {
+        cst::Expr::Let { bindings, body, .. } => {
+            walk_where_for_literal_body_sig_mismatch(
+                bindings,
+                local_alias_names,
+                errors,
+            );
+            walk_expr_for_literal_body_sig_mismatch(body, local_alias_names, errors);
+        }
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_for_literal_body_sig_mismatch(body, local_alias_names, errors);
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_literal_body_sig_mismatch(func, local_alias_names, errors);
+            walk_expr_for_literal_body_sig_mismatch(arg, local_alias_names, errors);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::Negate { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. } => {
+            walk_expr_for_literal_body_sig_mismatch(expr, local_alias_names, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_literal_body_sig_mismatch(cond, local_alias_names, errors);
+            walk_expr_for_literal_body_sig_mismatch(then_expr, local_alias_names, errors);
+            walk_expr_for_literal_body_sig_mismatch(else_expr, local_alias_names, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_literal_body_sig_mismatch(e, local_alias_names, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_literal_body_sig_mismatch(
+                    &alt.result,
+                    local_alias_names,
+                    errors,
+                );
+            }
+        }
+        _ => {}
     }
 }
 
