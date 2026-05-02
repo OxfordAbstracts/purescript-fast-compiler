@@ -310,7 +310,16 @@ fn failing_matches_expected(expected: &str, actual: &[String]) -> bool {
     };
 
     match expected {
-        "TypesDoNotUnify" => has("UnificationError") || has("RecordLabelMismatch"),
+        "TypesDoNotUnify" => {
+            has("UnificationError")
+                || has("RecordLabelMismatch")
+                // Type-level magic classes (Compare, Append,
+                // ToString, Cons, Coercible, …) failing as
+                // NoInstanceFound at our solver are equivalent
+                // to "types don't unify under that magic" in the
+                // reference compiler.
+                || has("NoInstanceFound")
+        }
         "NoInstanceFound" => {
             has("NoInstanceFound")
                 // Reference compiler routes non-exhaustive

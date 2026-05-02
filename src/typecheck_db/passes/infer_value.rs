@@ -1048,9 +1048,19 @@ pub fn infer_value_scc_with_all(
                 )?;
                 state.unify(&expected, &lam_ty)?;
                 if let Some(scheme) = sig_scheme_for_pin {
-                    let should_pin =
+                    let original_should_pin =
                         hole_sites.is_some() || scheme_has_constraint(&scheme);
-                    if should_pin {
+                    // Additional narrow-pin: no-arg, sig has no
+                    // forall/wildcard/inner-forall — pinning the
+                    // slot lets concrete sigs (`posToString ::
+                    // Proxy "a"`) propagate to body unif vars and
+                    // surface type-level magic mismatches.
+                    let narrow_no_arg_pin = !original_should_pin
+                        && binders.is_empty()
+                        && scheme.vars.is_empty()
+                        && !scheme_has_inner_forall(&scheme)
+                        && !sig_ty_unsafe_to_pin(&scheme.ty);
+                    if original_should_pin {
                         let full_sig = if scheme.vars.is_empty() {
                             scheme.ty.clone()
                         } else {
@@ -1075,6 +1085,17 @@ pub fn infer_value_scc_with_all(
                             true,
                         );
                         let _ = state.unify(&expected, &slot_shape);
+                    } else if narrow_no_arg_pin {
+                        let full_sig = scheme.ty.clone();
+                        let slot_shape = deep_instantiate_positive(
+                            &mut state,
+                            full_sig,
+                            true,
+                        );
+                        let snapshot = state.snapshot_bindings();
+                        if state.unify(&expected, &slot_shape).is_err() {
+                            state.restore_bindings(snapshot);
+                        }
                     }
                 }
                 for n in scoped_added {
