@@ -362,7 +362,7 @@ check_failing_build_unit!(f_SkolemEscape, "SkolemEscape");
 check_failing_build_unit!(f_SkolemEscape2, "SkolemEscape2");
 check_failing_build_unit_ignored!(f_SkolemEscapeKinds, "SkolemEscapeKinds", "expected: EscapedSkolem");
 check_failing_build_unit!(f_StandaloneKindSignatures1, "StandaloneKindSignatures1");
-check_failing_build_unit_ignored!(f_StandaloneKindSignatures2, "StandaloneKindSignatures2", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_StandaloneKindSignatures2, "StandaloneKindSignatures2");
 check_failing_build_unit!(f_StandaloneKindSignatures3, "StandaloneKindSignatures3");
 check_failing_build_unit!(f_StandaloneKindSignatures4, "StandaloneKindSignatures4");
 check_failing_build_unit!(f_SuggestComposition, "SuggestComposition");

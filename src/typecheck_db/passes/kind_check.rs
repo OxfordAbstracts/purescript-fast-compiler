@@ -384,14 +384,24 @@ pub fn check_module(
 
     for d in &module.decls {
         match d {
-            cst::Decl::Data { constructors, .. } => {
+            cst::Decl::Data { name, type_vars, constructors, .. } => {
+                let outer_var_groups = ctx.outer_var_to_group(name, type_vars);
                 for c in constructors {
                     for f in &c.fields {
                         ctx.check_type(f);
+                        if let Some(g) = &outer_var_groups {
+                            ctx.check_field_var_group_consistency(f, g);
+                        }
                     }
                 }
             }
-            cst::Decl::Newtype { ty, .. } => ctx.check_type(ty),
+            cst::Decl::Newtype { name, type_vars, ty, .. } => {
+                ctx.check_type(ty);
+                let outer_var_groups = ctx.outer_var_to_group(name, type_vars);
+                if let Some(g) = &outer_var_groups {
+                    ctx.check_field_var_group_consistency(ty, g);
+                }
+            }
             cst::Decl::TypeAlias { ty, .. } => ctx.check_type(ty),
             cst::Decl::TypeSignature { ty, .. } => ctx.check_type(ty),
             cst::Decl::Foreign { ty, .. } => ctx.check_type(ty),
@@ -762,6 +772,123 @@ impl<'a> Ctx<'a> {
     /// the expected forall*. arrow chain.
     fn kind_sig_first_param_arrows(&self, sym: Symbol) -> Option<usize> {
         self.kind_sig_param_arrows.get(&sym)?.first().copied()
+    }
+
+    /// For a data/newtype `name` with a standalone polykind sig,
+    /// build a map: type-var-name → forall-var-name (the kind sig
+    /// var that the var binds to via position). For
+    /// `newtype Pair' :: forall k1 k2. k1 -> k2 -> Type;
+    /// newtype Pair' a b = …`: returns {a → k1, b → k2}.
+    fn outer_var_to_group(
+        &self,
+        name: &crate::cst::Spanned<crate::names::TypeName>,
+        type_vars: &[crate::cst::Spanned<crate::names::TypeVarName>],
+    ) -> Option<HashMap<Symbol, Symbol>> {
+        let groups = self.kind_sig_groups.get(&name.value.symbol())?;
+        let mut out: HashMap<Symbol, Symbol> = HashMap::new();
+        for (i, tv) in type_vars.iter().enumerate() {
+            if let Some(Some(forall_var)) = groups.get(i) {
+                out.insert(tv.value.symbol(), *forall_var);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Walk a constructor field type. For each `App` whose head
+    /// is a polykinded type with same-forall-var groups, check
+    /// that any args at the same group are vars whose surrounding
+    /// (outer) kind-sig forall-vars match. Detects `data Pair'
+    /// :: forall k1 k2. k1 -> k2 -> Type; newtype Pair' a b =
+    /// Pair' (Pair a b)` where Pair's two args are bound to the
+    /// same `k`, but `a` and `b` come from different outer
+    /// forall-vars.
+    fn check_field_var_group_consistency(
+        &mut self,
+        te: &cst::TypeExpr,
+        outer_var_groups: &HashMap<Symbol, Symbol>,
+    ) {
+        // Recurse first so nested apps get checked.
+        match te {
+            cst::TypeExpr::App { constructor, arg, .. } => {
+                self.check_field_var_group_consistency(constructor, outer_var_groups);
+                self.check_field_var_group_consistency(arg, outer_var_groups);
+            }
+            cst::TypeExpr::Function { from, to, .. } => {
+                self.check_field_var_group_consistency(from, outer_var_groups);
+                self.check_field_var_group_consistency(to, outer_var_groups);
+            }
+            cst::TypeExpr::Parens { ty, .. }
+            | cst::TypeExpr::Forall { ty, .. }
+            | cst::TypeExpr::Constrained { ty, .. }
+            | cst::TypeExpr::Kinded { ty, .. } => {
+                self.check_field_var_group_consistency(ty, outer_var_groups);
+            }
+            cst::TypeExpr::Record { fields, .. } => {
+                for f in fields {
+                    self.check_field_var_group_consistency(&f.ty, outer_var_groups);
+                }
+            }
+            cst::TypeExpr::Row { fields, tail, .. } => {
+                for f in fields {
+                    self.check_field_var_group_consistency(&f.ty, outer_var_groups);
+                }
+                if let Some(t) = tail {
+                    self.check_field_var_group_consistency(t, outer_var_groups);
+                }
+            }
+            _ => {}
+        }
+        // The actual group-consistency check at this App level.
+        let (head, args) = peel_app(te);
+        if let cst::TypeExpr::Constructor { name, .. } = head {
+            if name.module.is_some() {
+                return;
+            }
+            let sym = name.name.symbol();
+            let groups = match self.kind_sig_groups.get(&sym) {
+                Some(g) => g.clone(),
+                None => return,
+            };
+            use std::collections::HashMap as Map;
+            let mut by_group: Map<Symbol, Vec<(usize, Symbol)>> = Map::new();
+            for (i, arg) in args.iter().enumerate() {
+                if let Some(Some(group_var)) = groups.get(i) {
+                    if let cst::TypeExpr::Var { name: vn, .. } = arg {
+                        let var_sym = vn.value.symbol();
+                        if let Some(outer_group) = outer_var_groups.get(&var_sym)
+                        {
+                            by_group
+                                .entry(*group_var)
+                                .or_default()
+                                .push((i, *outer_group));
+                        }
+                    }
+                }
+            }
+            for (_g, members) in &by_group {
+                if members.len() < 2 {
+                    continue;
+                }
+                let first = members[0].1;
+                for (i, og) in &members[1..] {
+                    if *og != first {
+                        self.errors.push(KindError {
+                            span: args[*i].span(),
+                            kind: KindErrorKind::KindsDoNotUnify {
+                                head: resolve(sym),
+                                expected: 0,
+                                got: 0,
+                            },
+                        });
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Constraint arity check: a class declared with N type params
