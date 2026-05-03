@@ -836,6 +836,13 @@ pub fn validate_module_with_class_fundeps(
     // escape. Reference compiler reports as `EscapedSkolem`.
     detect_skolem_escape_via_rank2_kind(&module.decls, &mut errors);
 
+    // Polymorphic-proxy kind mismatch: `put (SProxy :: SProxy
+    // "apple")` where put has signature `forall proxy a. proxy a
+    // -> TProxy a` (a appears at both proxy-position and a
+    // Type-kinded position). The arg's literal forces a to be
+    // Symbol/Int kind, conflicting with the Type-kinded use site.
+    detect_polymorphic_proxy_kind_mismatch(&module.decls, &mut errors);
+
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
     // barrier creates a dictionary-construction cycle.
@@ -6826,6 +6833,322 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             cst::TypeExpr::Parens { ty, .. } => cur = ty,
             _ => return count,
         }
+    }
+}
+
+/// Detect kind mismatches when calling a polymorphic-proxy function:
+/// `put (SProxy :: SProxy "apple")` where put has signature
+/// `forall proxy a. proxy a -> TProxy a`. The same `a` appears at
+/// both `proxy a` (kind determined by proxy's expected kind) and
+/// `TProxy a` (where TProxy requires `t :: Type`). When the arg's
+/// type annotation `SProxy "apple"` forces a's kind to Symbol,
+/// the Type-kinded use site mismatches. Reference compiler reports
+/// as `KindsDoNotUnify`.
+fn detect_polymorphic_proxy_kind_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+    // Step 1: build a map of LOCAL data types whose first param has
+    // an explicit non-Type kind annotation (Symbol / Int / Boolean).
+    // E.g. `data SProxy (s :: Symbol) = SProxy` → SProxy : Symbol-
+    // kinded first param.
+    let mut nontype_param_data: Map<Symbol, &'static str> = Map::new();
+    let mut type_param_data: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::Data { name, type_var_kind_anns, .. } = d {
+            if let Some(Some(kt)) = type_var_kind_anns.first() {
+                let prim = prim_kind_name(kt);
+                match prim {
+                    Some("Symbol") | Some("Int") | Some("Boolean") => {
+                        nontype_param_data.insert(name.value.symbol(), prim.unwrap());
+                    }
+                    Some("Type") => {
+                        type_param_data.insert(name.value.symbol());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if nontype_param_data.is_empty() || type_param_data.is_empty() {
+        return;
+    }
+    // Step 2: build a map of LOCAL value sigs of shape
+    // `forall proxy a. proxy a -> TyApp1 ... a ...` where TyApp1
+    // contains a Type-param data type applied to `a`.
+    let mut polymorphic_proxies: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            if is_polymorphic_proxy_sig(ty, &type_param_data) {
+                polymorphic_proxies.insert(name.value.symbol());
+            }
+        }
+    }
+    if polymorphic_proxies.is_empty() {
+        return;
+    }
+    // Step 3: walk every value body for App(f, (C :: D Lit))
+    // where f is a polymorphic proxy and (C :: D Lit) has D in
+    // nontype_param_data and Lit is a primitive literal of matching
+    // kind.
+    for d in decls {
+        if let cst::Decl::Value { guarded, where_clause, .. } = d {
+            walk_guarded_polyproxy(
+                guarded,
+                &polymorphic_proxies,
+                &nontype_param_data,
+                errors,
+            );
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_polyproxy(
+                        expr,
+                        &polymorphic_proxies,
+                        &nontype_param_data,
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn prim_kind_name(ty: &cst::TypeExpr) -> Option<&'static str> {
+    let mut cur = ty;
+    loop {
+        match cur {
+            cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            cst::TypeExpr::Constructor { name, .. } => {
+                let n = resolve(name.name.symbol());
+                return match n.as_str() {
+                    "Type" => Some("Type"),
+                    "Symbol" => Some("Symbol"),
+                    "Int" => Some("Int"),
+                    "Boolean" => Some("Boolean"),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// True iff `ty` is `forall <vars>. proxy a -> R ... a ...` where
+/// `proxy` and `a` are forall-bound vars, and R is a local Type-
+/// parameterised data type applied to `a` directly.
+fn is_polymorphic_proxy_sig(
+    ty: &cst::TypeExpr,
+    type_param_data: &HashSet<Symbol>,
+) -> bool {
+    let cur = peel_paren_te_local(ty);
+    let cst::TypeExpr::Forall { vars, ty: body, .. } = cur else {
+        return false;
+    };
+    let bound: HashSet<Symbol> = vars.iter().map(|(n, _, _)| n.value.symbol()).collect();
+    if bound.len() < 2 {
+        return false;
+    }
+    let cst::TypeExpr::Function { from, to, .. } = peel_paren_te_local(body) else {
+        return false;
+    };
+    // Check `from` is `Var(proxy) Var(a)` where both are bound.
+    let cst::TypeExpr::App { constructor, arg, .. } = peel_paren_te_local(from) else {
+        return false;
+    };
+    let cst::TypeExpr::Var { name: proxy_n, .. } = peel_paren_te_local(constructor) else {
+        return false;
+    };
+    let cst::TypeExpr::Var { name: a_n, .. } = peel_paren_te_local(arg) else {
+        return false;
+    };
+    let a_sym = a_n.value.symbol();
+    if !bound.contains(&proxy_n.value.symbol()) || !bound.contains(&a_sym) {
+        return false;
+    }
+    // Check `to` contains an App spine ending in `Con(R) Var(a)`
+    // where R is in `type_param_data`.
+    type_expr_uses_var_in_type_param_position(to, a_sym, type_param_data)
+}
+
+fn type_expr_uses_var_in_type_param_position(
+    ty: &cst::TypeExpr,
+    var_sym: Symbol,
+    type_param_data: &HashSet<Symbol>,
+) -> bool {
+    let cur = peel_paren_te_local(ty);
+    if let cst::TypeExpr::App { constructor, arg, .. } = cur {
+        if let cst::TypeExpr::Constructor { name: ctor_name, .. } =
+            peel_paren_te_local(constructor)
+        {
+            if ctor_name.module.is_none()
+                && type_param_data.contains(&ctor_name.name.symbol())
+            {
+                if let cst::TypeExpr::Var { name: arg_n, .. } =
+                    peel_paren_te_local(arg)
+                {
+                    if arg_n.value.symbol() == var_sym {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Also recurse into nested apps.
+        if type_expr_uses_var_in_type_param_position(constructor, var_sym, type_param_data) {
+            return true;
+        }
+        if type_expr_uses_var_in_type_param_position(arg, var_sym, type_param_data) {
+            return true;
+        }
+    }
+    match cur {
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_uses_var_in_type_param_position(from, var_sym, type_param_data)
+                || type_expr_uses_var_in_type_param_position(to, var_sym, type_param_data)
+        }
+        cst::TypeExpr::Forall { ty, .. }
+        | cst::TypeExpr::Parens { ty, .. } => {
+            type_expr_uses_var_in_type_param_position(ty, var_sym, type_param_data)
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            type_expr_uses_var_in_type_param_position(ty, var_sym, type_param_data)
+        }
+        _ => false,
+    }
+}
+
+fn walk_guarded_polyproxy(
+    g: &cst::GuardedExpr,
+    polyproxies: &HashSet<Symbol>,
+    nontype_param_data: &std::collections::HashMap<Symbol, &'static str>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_polyproxy(e, polyproxies, nontype_param_data, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_polyproxy(e, polyproxies, nontype_param_data, errors);
+                        }
+                    }
+                }
+                walk_expr_polyproxy(&gd.expr, polyproxies, nontype_param_data, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_polyproxy(
+    expr: &cst::Expr,
+    polyproxies: &HashSet<Symbol>,
+    nontype_param_data: &std::collections::HashMap<Symbol, &'static str>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::Expr::App { func, arg, span } = expr {
+        // f's name?
+        let func_name = match peel_paren_expr(func) {
+            cst::Expr::Var { name, .. } if name.module.is_none() => {
+                Some(name.name.symbol())
+            }
+            _ => None,
+        };
+        if let Some(fname) = func_name {
+            if polyproxies.contains(&fname) {
+                // Check arg is `(C :: D Lit)` with D in nontype_param_data.
+                let arg_peeled = peel_paren_expr(arg);
+                if let cst::Expr::TypeAnnotation { ty: ann, .. } = arg_peeled {
+                    if let Some(_kind) = annotation_forces_nontype_kind(ann, nontype_param_data) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::KindsDoNotUnify(
+                                resolve(fname),
+                            ),
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+        walk_expr_polyproxy(func, polyproxies, nontype_param_data, errors);
+        walk_expr_polyproxy(arg, polyproxies, nontype_param_data, errors);
+        return;
+    }
+    match expr {
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_polyproxy(body, polyproxies, nontype_param_data, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_polyproxy(cond, polyproxies, nontype_param_data, errors);
+            walk_expr_polyproxy(then_expr, polyproxies, nontype_param_data, errors);
+            walk_expr_polyproxy(else_expr, polyproxies, nontype_param_data, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_polyproxy(e, polyproxies, nontype_param_data, errors);
+            }
+            for alt in alts {
+                walk_guarded_polyproxy(&alt.result, polyproxies, nontype_param_data, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_polyproxy(expr, polyproxies, nontype_param_data, errors);
+                }
+            }
+            walk_expr_polyproxy(body, polyproxies, nontype_param_data, errors);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_polyproxy(expr, polyproxies, nontype_param_data, errors);
+        }
+        _ => {}
+    }
+}
+
+fn peel_paren_expr(e: &cst::Expr) -> &cst::Expr {
+    let mut cur = e;
+    while let cst::Expr::Parens { expr, .. } = cur {
+        cur = expr;
+    }
+    cur
+}
+
+/// True iff `ann` is `D Lit` where D is a nontype-param data type
+/// AND Lit is a primitive literal of matching kind. Returns the
+/// kind name on match.
+fn annotation_forces_nontype_kind(
+    ann: &cst::TypeExpr,
+    nontype_param_data: &std::collections::HashMap<Symbol, &'static str>,
+) -> Option<&'static str> {
+    let cur = peel_paren_te_local(ann);
+    let cst::TypeExpr::App { constructor, arg, .. } = cur else {
+        return None;
+    };
+    let cst::TypeExpr::Constructor { name, .. } = peel_paren_te_local(constructor) else {
+        return None;
+    };
+    if name.module.is_some() {
+        return None;
+    }
+    let kind = nontype_param_data.get(&name.name.symbol())?;
+    // Check arg is a primitive literal of matching kind.
+    let arg_peeled = peel_paren_te_local(arg);
+    let arg_kind = match arg_peeled {
+        cst::TypeExpr::StringLiteral { .. } => "Symbol",
+        cst::TypeExpr::IntLiteral { .. } => "Int",
+        _ => return None,
+    };
+    if &arg_kind == kind {
+        Some(kind)
+    } else {
+        None
     }
 }
 

@@ -26,7 +26,7 @@ check_failing_build_unit!(f_2874_forall, "2874-forall");
 check_failing_build_unit!(f_2874_forall2, "2874-forall2");
 check_failing_build_unit!(f_2874_wildcard, "2874-wildcard");
 check_failing_build_unit!(f_2947, "2947");
-check_failing_build_unit_ignored!(f_3077, "3077", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_3077, "3077");
 check_failing_build_unit!(f_3132, "3132");
 check_failing_build_unit!(f_3275_BindingGroupErrorPos, "3275-BindingGroupErrorPos");
 check_failing_build_unit!(f_3275_DataBindingGroupErrorPos, "3275-DataBindingGroupErrorPos");
