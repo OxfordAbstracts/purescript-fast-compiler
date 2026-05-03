@@ -236,6 +236,11 @@ pub enum ValidationErrorKind {
     /// the rank-2 quantifier escape. Reference compiler reports as
     /// `EscapedSkolem`.
     EscapedSkolem(String),
+    /// An infinite type: `go :: Array _ -> Int; go xs = go [xs]`
+    /// where the recursive call wraps the parameter in an extra
+    /// constructor, forcing the wildcard to satisfy `_ = Array _`.
+    /// Reference compiler reports as `InfiniteType`.
+    InfiniteType(String),
 }
 
 impl ValidationErrorKind {
@@ -315,6 +320,7 @@ impl ValidationErrorKind {
                 "VisibleQuantificationCheckFailureInType"
             }
             Self::EscapedSkolem(_) => "EscapedSkolem",
+            Self::InfiniteType(_) => "InfiniteType",
         }
     }
 }
@@ -842,6 +848,11 @@ pub fn validate_module_with_class_fundeps(
     // Type-kinded position). The arg's literal forces a to be
     // Symbol/Int kind, conflicting with the Type-kinded use site.
     detect_polymorphic_proxy_kind_mismatch(&module.decls, &mut errors);
+
+    // Recursive-wrap infinite type: `go :: Array _ -> Int; go xs =
+    // go [xs]` where the recursive call wraps the parameter in an
+    // additional Array, forcing the wildcard to be infinite.
+    detect_recursive_wildcard_wrap(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6833,6 +6844,131 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             cst::TypeExpr::Parens { ty, .. } => cur = ty,
             _ => return count,
         }
+    }
+}
+
+/// Detect infinite-type via recursive wildcard wrap:
+/// `go :: Array _ -> Int; go xs = go [xs]` — the recursive call
+/// wraps the binder in an additional Array, forcing the wildcard
+/// to satisfy `_ = Array _`. Reference compiler reports as
+/// `InfiniteType`.
+fn detect_recursive_wildcard_wrap(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        if let cst::Decl::Value { where_clause, .. } = d {
+            check_let_block_for_wildcard_wrap(where_clause, errors);
+        }
+    }
+}
+
+fn check_let_block_for_wildcard_wrap(
+    bindings: &[cst::LetBinding],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+    // Build per-binding-name: sig_has_wildcard.
+    let mut sig_has_wildcard: Map<Symbol, ()> = Map::new();
+    for b in bindings {
+        if let cst::LetBinding::Signature { name, ty, .. } = b {
+            if type_has_wildcard(ty) {
+                sig_has_wildcard.insert(name.value.symbol(), ());
+            }
+        }
+    }
+    if sig_has_wildcard.is_empty() {
+        return;
+    }
+    for b in bindings {
+        if let cst::LetBinding::Value { binder, expr, span } = b {
+            let name = match peel_paren_binder(binder) {
+                cst::Binder::Var { name, .. } => name.value.symbol(),
+                _ => continue,
+            };
+            if !sig_has_wildcard.contains_key(&name) {
+                continue;
+            }
+            // Multi-equation `go xs = go [xs]` becomes
+            // `LetBinding::Value { binder: Var(go), expr:
+            // Lambda([Var(xs)], App(Var(go), Array([Var(xs)]))) }`.
+            // Inspect the lambda body for a recursive call wrapping
+            // the binder in an Array literal.
+            let cst::Expr::Lambda { binders, body, .. } = expr else {
+                continue;
+            };
+            let bound_names: HashSet<Symbol> = binders
+                .iter()
+                .filter_map(|b| match peel_paren_binder(b) {
+                    cst::Binder::Var { name, .. } => Some(name.value.symbol()),
+                    _ => None,
+                })
+                .collect();
+            if has_recursive_array_wrap(body, name, &bound_names) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::InfiniteType(resolve(name)),
+                });
+            }
+        }
+    }
+}
+
+/// Returns true if `expr` is a recursive call to `func_name` whose
+/// argument wraps a binder in an Array literal.
+fn has_recursive_array_wrap(
+    expr: &cst::Expr,
+    func_name: Symbol,
+    binder_names: &HashSet<Symbol>,
+) -> bool {
+    let cur = match expr {
+        cst::Expr::Parens { expr, .. } => expr,
+        other => other,
+    };
+    if let cst::Expr::App { func, arg, .. } = cur {
+        // Check if func is the recursive call.
+        if let cst::Expr::Var { name, .. } = peel_paren_expr(func) {
+            if name.module.is_none() && name.name.symbol() == func_name {
+                // Check if arg is an Array literal containing a binder.
+                if let cst::Expr::Array { elements, .. } = peel_paren_expr(arg) {
+                    for e in elements {
+                        if let cst::Expr::Var { name, .. } = peel_paren_expr(e) {
+                            if name.module.is_none()
+                                && binder_names.contains(&name.name.symbol())
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn type_has_wildcard(ty: &cst::TypeExpr) -> bool {
+    match ty {
+        cst::TypeExpr::Wildcard { .. } => true,
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            type_has_wildcard(constructor) || type_has_wildcard(arg)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_has_wildcard(from) || type_has_wildcard(to)
+        }
+        cst::TypeExpr::Forall { ty, .. } => type_has_wildcard(ty),
+        cst::TypeExpr::Constrained { ty, .. } => type_has_wildcard(ty),
+        cst::TypeExpr::Parens { ty, .. } => type_has_wildcard(ty),
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            type_has_wildcard(ty) || type_has_wildcard(kind)
+        }
+        cst::TypeExpr::Record { fields, .. } | cst::TypeExpr::Row { fields, .. } => {
+            fields.iter().any(|f| type_has_wildcard(&f.ty))
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            type_has_wildcard(left) || type_has_wildcard(right)
+        }
+        _ => false,
     }
 }
 
