@@ -760,6 +760,13 @@ pub fn validate_module_with_class_fundeps(
     // Reference compiler reports `InvalidDoBind` / `InvalidDoLet`.
     detect_invalid_do_terminal(&module.decls, &mut errors);
 
+    // Flat record update field whose value is itself a record-update
+    // section: `outer { a = { b = 42 } }` sets `a` to the section
+    // `{ b = 42 }` (function type), which can't unify with whatever
+    // record type `a` was declared as. Reference compiler reports as
+    // `TypesDoNotUnify`.
+    detect_record_update_section_as_value(&module.decls, &mut errors);
+
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
     // barrier creates a dictionary-construction cycle.
@@ -6462,6 +6469,200 @@ fn walk_expr_for_invalid_do(
             walk_expr_for_invalid_do(func, errors);
             walk_expr_for_invalid_do(left, errors);
             walk_expr_for_invalid_do(right, errors);
+        }
+        _ => {}
+    }
+}
+
+/// `outer { a = { b = 42 } }` — a flat update field's value is
+/// itself a record-update section. The section's type is a function
+/// `forall r. { b :: ?, ... | r } -> { b :: ?, ... | r }`, but `a`'s
+/// declared type is a record. Function vs record can't unify.
+/// Reference compiler reports as `TypesDoNotUnify`.
+fn detect_record_update_section_as_value(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::Value { guarded, where_clause, .. } => {
+                walk_guarded_for_section(guarded, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { expr, .. } = b {
+                        walk_expr_for_section(expr, errors);
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_record_update_section_as_value(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True if `expr` is a Record literal where every field has
+/// `is_update == true` AND `is_nested == false` (i.e. the user wrote
+/// `{ field = value, ... }` with no nesting).
+fn is_record_update_section(expr: &cst::Expr) -> bool {
+    let mut cur = expr;
+    loop {
+        match cur {
+            cst::Expr::Parens { expr, .. } => cur = expr,
+            cst::Expr::Record { fields, .. } => {
+                return !fields.is_empty()
+                    && fields.iter().all(|f| f.is_update && !f.is_nested);
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn walk_guarded_for_section(
+    g: &cst::GuardedExpr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => walk_expr_for_section(e, errors),
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_section(e, errors);
+                        }
+                    }
+                }
+                walk_expr_for_section(&gd.expr, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_section(
+    expr: &cst::Expr,
+    errors: &mut Vec<ValidationError>,
+) {
+    // Two parser shapes can carry an update:
+    //   - `Expr::App { func, arg: Expr::Record { fields with is_update } }`
+    //     for explicit `r { f = v }`
+    //   - `Expr::RecordUpdate { expr, updates }` (legacy)
+    // Inspect each update field's value for a record-update section.
+    let check_field = |span: crate::span::Span, value: &cst::Expr,
+                        is_nested: bool,
+                        errors: &mut Vec<ValidationError>| {
+        if !is_nested && is_record_update_section(value) {
+            errors.push(ValidationError {
+                span,
+                kind: ValidationErrorKind::LiteralBodySigMismatch(String::new()),
+            });
+        }
+    };
+    match expr {
+        cst::Expr::App { func, arg, span } => {
+            // `r { f = v }` shape
+            if let cst::Expr::Record { fields, .. } = arg.as_ref() {
+                if !fields.is_empty()
+                    && fields.iter().all(|f| f.is_update)
+                {
+                    for f in fields {
+                        if let Some(v) = &f.value {
+                            check_field(*span, v, f.is_nested, errors);
+                            walk_expr_for_section(v, errors);
+                        }
+                    }
+                    walk_expr_for_section(func, errors);
+                    return;
+                }
+            }
+            walk_expr_for_section(func, errors);
+            walk_expr_for_section(arg, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, span } => {
+            walk_expr_for_section(expr, errors);
+            for u in updates {
+                check_field(*span, &u.value, false, errors);
+                walk_expr_for_section(&u.value, errors);
+            }
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_section(func, errors);
+        }
+        cst::Expr::Lambda { body, .. } => walk_expr_for_section(body, errors),
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_section(left, errors);
+            walk_expr_for_section(right, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_section(cond, errors);
+            walk_expr_for_section(then_expr, errors);
+            walk_expr_for_section(else_expr, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_section(e, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_section(&alt.result, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_section(expr, errors);
+                }
+            }
+            walk_expr_for_section(body, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_section(expr, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_section(expr, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_for_section(result, errors);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_section(v, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_section(expr, errors);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_section(expr, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_section(e, errors);
+            }
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_section(name, errors);
+            walk_expr_for_section(pattern, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_section(func, errors);
+            walk_expr_for_section(left, errors);
+            walk_expr_for_section(right, errors);
         }
         _ => {}
     }
