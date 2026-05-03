@@ -218,6 +218,12 @@ pub enum ValidationErrorKind {
     /// which the reference compiler rejects as
     /// `QuantificationCheckFailureInType`.
     QuantificationCheckFailureInType(String),
+    /// Row labels supplied don't match the expected row in a
+    /// kind annotation. E.g. `data P :: R (x, y) -> Type` applied
+    /// to `Z :: forall r. R (z | r)` — Z's open row label `z`
+    /// isn't in P's expected closed row `{x, y}`. Reference
+    /// compiler reports as `KindsDoNotUnify`.
+    KindsDoNotUnify(String),
 }
 
 impl ValidationErrorKind {
@@ -292,6 +298,7 @@ impl ValidationErrorKind {
             Self::QuantificationCheckFailureInType(_) => {
                 "QuantificationCheckFailureInType"
             }
+            Self::KindsDoNotUnify(_) => "KindsDoNotUnify",
         }
     }
 }
@@ -785,6 +792,13 @@ pub fn validate_module_with_class_fundeps(
     // implicit kind variable not bound by any visible quantifier —
     // rejected as `QuantificationCheckFailureInType`.
     detect_polykinded_rank2_in_ctor(&module.decls, &mut errors);
+
+    // Row-in-kind label mismatch: `data P :: R (x, y) -> Type`
+    // applied to `Z :: forall r. R (z | r)` where the open-row
+    // labels of Z aren't a subset of the closed-row labels of P's
+    // expected param. Reference compiler reports as
+    // `KindsDoNotUnify`.
+    detect_row_kind_label_mismatch(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6504,6 +6518,215 @@ fn walk_expr_for_invalid_do(
 /// compiler: the inner `a`'s kind isn't determined by anything in
 /// scope, so the implicit kind quantifier would have to wrap the
 /// rank-2 forall, which the reference compiler rejects.
+/// Detect kind mismatches at the level of row labels. Specifically:
+/// `data P :: R (x :: Type, y :: Type) -> Type; ... type T = P Z` where
+/// Z's kind is `forall r. R (z :: Type | r)` — Z's open-row label `z`
+/// isn't in P's expected closed `{x, y}`. Reference compiler reports
+/// as `KindsDoNotUnify`.
+///
+/// CST-only: requires both sides to be locally declared with explicit
+/// kind annotations whose row structure we can extract. Skipped for
+/// imported types (we don't have their kinds in the registry).
+fn detect_row_kind_label_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+    // Step 1: collect each LOCAL type's "output row info":
+    //   - its first-arg-position expected row labels (closed if no
+    //     tail) — for `data P :: R (a, b) -> Type` style,
+    //   - its OUTPUT kind row labels (open or closed) — for foreign
+    //     import data Z :: forall r. R (z | r)`.
+    #[derive(Debug)]
+    struct RowInfo {
+        head: Symbol,         // R, Row, etc.
+        labels: Vec<Symbol>,
+        closed: bool,
+    }
+    // first_param_row[t]: the expected row at t's first arg position.
+    let mut first_param_row: Map<Symbol, RowInfo> = Map::new();
+    // output_row[t]: the row of t's output kind (after stripping all
+    // visible foralls and arrow args).
+    let mut output_row: Map<Symbol, RowInfo> = Map::new();
+    for d in decls {
+        match d {
+            cst::Decl::Data {
+                name,
+                kind_sig: cst::KindSigSource::Data,
+                kind_type: Some(kt),
+                ..
+            } => {
+                // Standalone `data P :: K` form. K = arg1 -> ... -> Type.
+                // Extract first arg's row info.
+                if let Some(info) = extract_first_param_row(kt) {
+                    first_param_row.insert(name.value.symbol(), info);
+                }
+            }
+            cst::Decl::ForeignData { name, kind, .. } => {
+                if let Some(info) = extract_output_row(kind) {
+                    output_row.insert(name.value.symbol(), info);
+                }
+            }
+            _ => {}
+        }
+    }
+    if first_param_row.is_empty() || output_row.is_empty() {
+        return;
+    }
+    // Step 2: walk every type expression and look for `f a`
+    // applications where f is in `first_param_row` and a is in
+    // `output_row`. Compare row labels.
+    let mut visit = |ty: &cst::TypeExpr, errors: &mut Vec<ValidationError>| {
+        check_row_kind_app(ty, &first_param_row, &output_row, errors);
+    };
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { ty, .. } => visit(ty, errors),
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        visit(f, errors);
+                    }
+                }
+            }
+            cst::Decl::Newtype { ty, .. } => visit(ty, errors),
+            cst::Decl::TypeSignature { ty, .. } => visit(ty, errors),
+            cst::Decl::Foreign { ty, .. } => visit(ty, errors),
+            cst::Decl::ForeignData { kind, .. } => visit(kind, errors),
+            _ => {}
+        }
+    }
+
+    /// Walk every App-spine within `ty` looking for f-a pairs that
+    /// belong to the local row-aware type set.
+    fn check_row_kind_app(
+        ty: &cst::TypeExpr,
+        first_param_row: &Map<Symbol, RowInfo>,
+        output_row: &Map<Symbol, RowInfo>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        match ty {
+            cst::TypeExpr::App { constructor, arg, span, .. } => {
+                if let cst::TypeExpr::Constructor { name: f_name, .. } = peel_paren_te(constructor) {
+                    if f_name.module.is_none() {
+                        if let cst::TypeExpr::Constructor { name: a_name, .. } = peel_paren_te(arg) {
+                            if a_name.module.is_none() {
+                                if let (Some(p_row), Some(a_row)) = (
+                                    first_param_row.get(&f_name.name.symbol()),
+                                    output_row.get(&a_name.name.symbol()),
+                                ) {
+                                    // Heads must match for a row-vs-row comparison.
+                                    if p_row.head == a_row.head {
+                                        for lbl in &a_row.labels {
+                                            if !p_row.labels.iter().any(|x| x == lbl) {
+                                                errors.push(ValidationError {
+                                                    span: *span,
+                                                    kind: ValidationErrorKind::KindsDoNotUnify(
+                                                        resolve(*lbl),
+                                                    ),
+                                                });
+                                                return;
+                                            }
+                                        }
+                                        // Closed-vs-closed must match exactly.
+                                        if p_row.closed && a_row.closed {
+                                            for lbl in &p_row.labels {
+                                                if !a_row.labels.iter().any(|x| x == lbl) {
+                                                    errors.push(ValidationError {
+                                                        span: *span,
+                                                        kind: ValidationErrorKind::KindsDoNotUnify(
+                                                            resolve(*lbl),
+                                                        ),
+                                                    });
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                check_row_kind_app(constructor, first_param_row, output_row, errors);
+                check_row_kind_app(arg, first_param_row, output_row, errors);
+            }
+            cst::TypeExpr::Function { from, to, .. } => {
+                check_row_kind_app(from, first_param_row, output_row, errors);
+                check_row_kind_app(to, first_param_row, output_row, errors);
+            }
+            cst::TypeExpr::Forall { ty, .. } => {
+                check_row_kind_app(ty, first_param_row, output_row, errors);
+            }
+            cst::TypeExpr::Constrained { ty, .. } => {
+                check_row_kind_app(ty, first_param_row, output_row, errors);
+            }
+            cst::TypeExpr::Parens { ty, .. } => {
+                check_row_kind_app(ty, first_param_row, output_row, errors);
+            }
+            cst::TypeExpr::Kinded { ty, kind, .. } => {
+                check_row_kind_app(ty, first_param_row, output_row, errors);
+                check_row_kind_app(kind, first_param_row, output_row, errors);
+            }
+            cst::TypeExpr::Record { fields, .. } | cst::TypeExpr::Row { fields, .. } => {
+                for f in fields {
+                    check_row_kind_app(&f.ty, first_param_row, output_row, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Peel arrows/foralls from `K = T1 -> T2 -> ... -> Output` and
+    /// extract the FIRST arg's row info. The arg shape we recognize
+    /// is `App(Con(R), Row { fields, tail })`.
+    fn extract_first_param_row(kind: &cst::TypeExpr) -> Option<RowInfo> {
+        let mut cur = kind;
+        loop {
+            match peel_paren_te(cur) {
+                cst::TypeExpr::Forall { ty, .. } => cur = ty,
+                cst::TypeExpr::Function { from, .. } => return row_info_of(from),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Peel foralls from a type expr and extract the output row info.
+    /// The output shape we recognize is `App(Con(R), Row { fields,
+    /// tail })`.
+    fn extract_output_row(kind: &cst::TypeExpr) -> Option<RowInfo> {
+        let mut cur = kind;
+        loop {
+            match peel_paren_te(cur) {
+                cst::TypeExpr::Forall { ty, .. } => cur = ty,
+                cst::TypeExpr::Function { to, .. } => cur = to,
+                other => return row_info_of(other),
+            }
+        }
+    }
+
+    /// If `ty` is `App(Con(R), Row { fields, tail })`, return RowInfo.
+    fn row_info_of(ty: &cst::TypeExpr) -> Option<RowInfo> {
+        let cur = peel_paren_te(ty);
+        let cst::TypeExpr::App { constructor, arg, .. } = cur else {
+            return None;
+        };
+        let cst::TypeExpr::Constructor { name: head_name, .. } = peel_paren_te(constructor) else {
+            return None;
+        };
+        let cst::TypeExpr::Row { fields, tail, .. } = peel_paren_te(arg) else {
+            return None;
+        };
+        let labels: Vec<Symbol> =
+            fields.iter().map(|f| f.label.value.symbol()).collect();
+        Some(RowInfo {
+            head: head_name.name.symbol(),
+            labels,
+            closed: tail.is_none(),
+        })
+    }
+}
+
 fn detect_polykinded_rank2_in_ctor(
     decls: &[cst::Decl],
     errors: &mut Vec<ValidationError>,
