@@ -212,6 +212,88 @@ fn build_param_kinds(
     // only arities, so imported types contribute no annotations —
     // their App-sites won't trigger an annotation-based check.
     let _ = registry;
+
+    // Back-propagation pass: for each type alias body that's
+    // `F X` where F has explicit kind annotations on its first
+    // param and X is a local data type with NO annotation on its
+    // first param, infer that X's "kind" must match F's first
+    // param kind. If F expects `Type -> Type`, X must be `Type ->
+    // Type`, which means X's a has kind `Type`.
+    //
+    // Catches `data F (a :: Type -> Type) = F; data A a = A (B
+    // a); type B a = F A`: B's body is `F A`, so A's first param
+    // must be Type. Then `type X = A "bad"` (Symbol arg) flags.
+    let aliases: Vec<&cst::TypeExpr> = module
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let cst::Decl::TypeAlias { ty, .. } = d {
+                Some(ty)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for body in &aliases {
+        // Body must be App(Constructor F, Constructor A) where
+        // F is local with explicit kind on its first param and A
+        // is local data with unannotated first param.
+        let cst::TypeExpr::App { constructor, arg, .. } = body else {
+            continue;
+        };
+        let cst::TypeExpr::Constructor { name: f_name, .. } =
+            constructor.as_ref()
+        else {
+            continue;
+        };
+        if f_name.module.is_some() {
+            continue;
+        }
+        let cst::TypeExpr::Constructor { name: a_name, .. } = arg.as_ref()
+        else {
+            continue;
+        };
+        if a_name.module.is_some() {
+            continue;
+        }
+        let f_sym = f_name.name.symbol();
+        let a_sym = a_name.name.symbol();
+        let f_first_arrows = match env.get(&f_sym).and_then(|p| p.first()) {
+            Some(p) => p.arrows,
+            None => None,
+        };
+        let f_first_prim = match env.get(&f_sym).and_then(|p| p.first()) {
+            Some(p) => p.prim,
+            None => None,
+        };
+        let f_first_arrows = match f_first_arrows {
+            Some(a) => a,
+            None => continue,
+        };
+        // F's expected arg kind: arrow_count = arrows of F's first
+        // param. So A must have arrows-1 worth of arrows itself
+        // (if F expects Type -> Type, A must be Type -> Type
+        // so A's first param has arrows=0).
+        if f_first_arrows == 0 {
+            continue; // F doesn't take a higher-kind arg
+        }
+        // Get A's first-param entry; update prim when not already
+        // set. arrows might already be Some(0) from the
+        // default-to-Type pass; we still want to install the prim
+        // tag so the prim-kind check fires.
+        if let Some(a_params) = env.get_mut(&a_sym) {
+            if let Some(a_first) = a_params.first_mut() {
+                if a_first.prim.is_none() {
+                    a_first.arrows = Some(f_first_arrows - 1);
+                    a_first.prim = match f_first_prim {
+                        Some(PrimKind::Other) | None => None,
+                        Some(p) => Some(p),
+                    };
+                }
+            }
+        }
+    }
+
     env
 }
 
