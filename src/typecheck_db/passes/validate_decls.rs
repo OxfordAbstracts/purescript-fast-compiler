@@ -230,6 +230,12 @@ pub enum ValidationErrorKind {
     /// can't visibly bind all of them. Reference compiler reports
     /// as `VisibleQuantificationCheckFailureInType`.
     VisibleQuantificationCheckFailureInType(String),
+    /// Skolem escape via rank-2 kind annotation. `type T = Proxy A`
+    /// where `data A (a :: forall k. k -> Type) = A` — using A
+    /// unapplied as an argument to a Type-expecting position lets
+    /// the rank-2 quantifier escape. Reference compiler reports as
+    /// `EscapedSkolem`.
+    EscapedSkolem(String),
 }
 
 impl ValidationErrorKind {
@@ -308,6 +314,7 @@ impl ValidationErrorKind {
             Self::VisibleQuantificationCheckFailureInType(_) => {
                 "VisibleQuantificationCheckFailureInType"
             }
+            Self::EscapedSkolem(_) => "EscapedSkolem",
         }
     }
 }
@@ -821,6 +828,13 @@ pub fn validate_module_with_class_fundeps(
     // where X is a foreign-import-data with 2+ forall-bound kind
     // variables. The annotation can't visibly bind all of them.
     detect_visible_quant_kind_ann(&module.decls, &mut errors);
+
+    // Skolem escape via rank-2 kind: `type B = Proxy A` where A
+    // has a rank-2 kind annotation on its param (`data A
+    // (a :: forall k. k -> Type) = A`). Using A unapplied as an
+    // arg to Proxy (which expects Type) lets the rank-2 quantifier
+    // escape. Reference compiler reports as `EscapedSkolem`.
+    detect_skolem_escape_via_rank2_kind(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6812,6 +6826,126 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             cst::TypeExpr::Parens { ty, .. } => cur = ty,
             _ => return count,
         }
+    }
+}
+
+/// Detect skolem escape via rank-2 kind annotation. `data A (a ::
+/// forall k. k -> Type) = A` declares A with a rank-2-kinded
+/// parameter. Using A unapplied as an arg to a Type-expecting
+/// constructor (like `Proxy A`) lets the rank-2 quantifier escape.
+/// Reference compiler reports as `EscapedSkolem`.
+fn detect_skolem_escape_via_rank2_kind(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashSet as Set;
+    // Step 1: identify local data types whose first type-var has
+    // a rank-2 kind annotation (kind contains `forall`).
+    let mut rank2_param_types: Set<Symbol> = Set::new();
+    for d in decls {
+        if let cst::Decl::Data { name, type_var_kind_anns, .. } = d {
+            if type_var_kind_anns.iter().any(|opt| {
+                opt.as_ref()
+                    .map(|kt| has_forall(kt))
+                    .unwrap_or(false)
+            }) {
+                rank2_param_types.insert(name.value.symbol());
+            }
+        }
+    }
+    if rank2_param_types.is_empty() {
+        return;
+    }
+    // Step 2: walk every type expression and find App spines
+    // where the rank-2-paramed type appears UNAPPLIED as an arg.
+    // For a type `Proxy A` (App(Proxy, A)), A is the arg.
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { ty, span, .. } => {
+                walk_for_unapplied_rank2(ty, &rank2_param_types, *span, errors);
+            }
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        walk_for_unapplied_rank2(f, &rank2_param_types, c.name.span, errors);
+                    }
+                }
+            }
+            cst::Decl::Newtype { ty, span, .. } => {
+                walk_for_unapplied_rank2(ty, &rank2_param_types, *span, errors);
+            }
+            cst::Decl::TypeSignature { ty, span, .. } => {
+                walk_for_unapplied_rank2(ty, &rank2_param_types, *span, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn has_forall(ty: &cst::TypeExpr) -> bool {
+    match ty {
+        cst::TypeExpr::Forall { .. } => true,
+        cst::TypeExpr::Parens { ty, .. } => has_forall(ty),
+        cst::TypeExpr::Function { from, to, .. } => has_forall(from) || has_forall(to),
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            has_forall(constructor) || has_forall(arg)
+        }
+        _ => false,
+    }
+}
+
+fn walk_for_unapplied_rank2(
+    ty: &cst::TypeExpr,
+    rank2_types: &std::collections::HashSet<Symbol>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::TypeExpr::App { constructor, arg, .. } = ty {
+        // Check the arg position: is it a bare Constructor of a
+        // rank2-paramed type?
+        let arg_peeled = peel_paren_te_local(arg);
+        if let cst::TypeExpr::Constructor { name, .. } = arg_peeled {
+            if name.module.is_none() && rank2_types.contains(&name.name.symbol()) {
+                errors.push(ValidationError {
+                    span,
+                    kind: ValidationErrorKind::EscapedSkolem(
+                        resolve(name.name.symbol()),
+                    ),
+                });
+            }
+        }
+        walk_for_unapplied_rank2(constructor, rank2_types, span, errors);
+        walk_for_unapplied_rank2(arg, rank2_types, span, errors);
+        return;
+    }
+    match ty {
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_for_unapplied_rank2(from, rank2_types, span, errors);
+            walk_for_unapplied_rank2(to, rank2_types, span, errors);
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            walk_for_unapplied_rank2(ty, rank2_types, span, errors);
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            walk_for_unapplied_rank2(ty, rank2_types, span, errors);
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            walk_for_unapplied_rank2(ty, rank2_types, span, errors);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_for_unapplied_rank2(ty, rank2_types, span, errors);
+            walk_for_unapplied_rank2(kind, rank2_types, span, errors);
+        }
+        cst::TypeExpr::Record { fields, .. } | cst::TypeExpr::Row { fields, .. } => {
+            for f in fields {
+                walk_for_unapplied_rank2(&f.ty, rank2_types, span, errors);
+            }
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_for_unapplied_rank2(left, rank2_types, span, errors);
+            walk_for_unapplied_rank2(right, rank2_types, span, errors);
+        }
+        _ => {}
     }
 }
 
