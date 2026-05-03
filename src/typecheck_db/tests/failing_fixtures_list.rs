@@ -159,7 +159,7 @@ check_failing_build_unit!(f_DeclConflictTypeType, "DeclConflictTypeType");
 check_failing_build_unit!(f_DeprecatedFFICommonJSModule, "DeprecatedFFICommonJSModule");
 check_failing_build_unit!(f_DeprecatedFFIPrime, "DeprecatedFFIPrime");
 check_failing_build_unit!(f_DeriveInstanceRecordAlias, "DeriveInstanceRecordAlias");
-check_failing_build_unit_ignored!(f_DiffKindsSameName, "DiffKindsSameName", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_DiffKindsSameName, "DiffKindsSameName");
 check_failing_build_unit!(f_Do, "Do");
 check_failing_build_unit!(f_DoNotSuggestComposition, "DoNotSuggestComposition");
 check_failing_build_unit!(f_DoNotSuggestComposition2, "DoNotSuggestComposition2");

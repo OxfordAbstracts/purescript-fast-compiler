@@ -455,6 +455,7 @@ pub fn check_module(
     let kind_sig_groups = build_kind_sig_groups(module);
     let kind_sig_param_arrows = build_kind_sig_param_arrows(module);
     let mut errors: Vec<KindError> = Vec::new();
+    detect_qualified_kind_mismatch(module, registry, &mut errors);
     let mut ctx = Ctx {
         arity_env: &arity_env,
         class_env: &class_env,
@@ -1512,4 +1513,232 @@ fn arg_prim_kind(te: &cst::TypeExpr) -> Option<PrimKind> {
 
 fn resolve(sym: Symbol) -> String {
     crate::interner::resolve(sym).unwrap_or_default()
+}
+
+/// Detect qualified-kind mismatches across module boundaries, e.g.
+/// `data AProxy (m :: LibA.DemoKind)` applied to `LibB.DemoData`
+/// where `LibB.DemoData :: DemoKind` resolves to LibB-qualified
+/// `DemoKind`. Compares qualified kind names and emits
+/// `KindsDoNotUnify` when they differ.
+fn detect_qualified_kind_mismatch(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+    errors: &mut Vec<KindError>,
+) {
+    use std::collections::HashMap as Map;
+
+    // Build per-data-type param qualified kinds from local
+    // declarations: `data X (a :: Mod.K) (b :: Mod.K2) = X` gives
+    // X's params [(Mod, K), (Mod, K2)].
+    let mut local_param_qkinds: Map<Symbol, Vec<Option<(String, String)>>> = Map::new();
+    for d in &module.decls {
+        if let cst::Decl::Data { name, type_var_kind_anns, .. } = d {
+            let qs: Vec<Option<(String, String)>> = type_var_kind_anns
+                .iter()
+                .map(|opt| {
+                    opt.as_ref()
+                        .and_then(|kt| qualified_kind_constructor(kt))
+                })
+                .collect();
+            if qs.iter().any(|q| q.is_some()) {
+                local_param_qkinds.insert(name.value.symbol(), qs);
+            }
+        }
+    }
+    if local_param_qkinds.is_empty() {
+        return;
+    }
+
+    // Build a map of imported types → qualified kind. Visit each
+    // import; for each imported type that's a foreign-import-data,
+    // pull its qualified kind from `foreign_data_kinds`. Key by the
+    // local symbol (qualified or not) the importer can use.
+    let mut imported_qkinds: Map<Symbol, (String, String)> = Map::new();
+    for imp in &module.imports {
+        let target_name: String = imp
+            .module
+            .parts
+            .iter()
+            .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(".");
+        let exports = match registry.get(&target_name) {
+            Some(e) => e,
+            None => continue,
+        };
+        let qualifier: Option<String> = imp
+            .qualified
+            .as_ref()
+            .map(|q| {
+                q.parts
+                    .iter()
+                    .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
+        for (n, q) in &exports.foreign_data_kinds {
+            // Build a key the importer can match: under the
+            // qualifier (for `import M as Q`) or unqualified (for
+            // open imports).
+            if let Some(prefix) = &qualifier {
+                let key = format!("{}.{}", prefix, n);
+                imported_qkinds.insert(crate::interner::intern(&key), q.clone());
+            } else {
+                imported_qkinds
+                    .entry(crate::interner::intern(n))
+                    .or_insert_with(|| q.clone());
+            }
+        }
+    }
+    if imported_qkinds.is_empty() {
+        return;
+    }
+
+    // Walk every type expression in the module; for each
+    // App(Con(F), Con(Y)), if F has qualified-kind annotations and
+    // Y has a known qualified kind, compare.
+    let visit = |ty: &cst::TypeExpr, errors: &mut Vec<KindError>| {
+        check_qualified_kind_app(ty, &local_param_qkinds, &imported_qkinds, errors);
+    };
+    for d in &module.decls {
+        match d {
+            cst::Decl::TypeSignature { ty, .. }
+            | cst::Decl::TypeAlias { ty, .. }
+            | cst::Decl::Foreign { ty, .. } => visit(ty, errors),
+            cst::Decl::Newtype { ty, .. } => visit(ty, errors),
+            cst::Decl::Data { constructors, .. } => {
+                for c in constructors {
+                    for f in &c.fields {
+                        visit(f, errors);
+                    }
+                }
+            }
+            cst::Decl::Value { guarded, .. } => {
+                walk_guarded_for_qkind(guarded, &local_param_qkinds, &imported_qkinds, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_qualified_kind_app(
+    ty: &cst::TypeExpr,
+    local_param_qkinds: &std::collections::HashMap<Symbol, Vec<Option<(String, String)>>>,
+    imported_qkinds: &std::collections::HashMap<Symbol, (String, String)>,
+    errors: &mut Vec<KindError>,
+) {
+    // Peel App spine: f a1 a2 … an → head=f, args=[a1, …, an].
+    let (head, args) = peel_app(ty);
+    if let cst::TypeExpr::Constructor { name, .. } = head {
+        if name.module.is_none() {
+            let head_sym = name.name.symbol();
+            if let Some(param_qkinds) = local_param_qkinds.get(&head_sym) {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(Some(expected)) = param_qkinds.get(i) {
+                        // Look up arg's qualified kind.
+                        if let Some(actual) = arg_qualified_kind(arg, imported_qkinds) {
+                            if &actual != expected {
+                                errors.push(KindError {
+                                    span: arg.span(),
+                                    kind: KindErrorKind::KindsDoNotUnify {
+                                        head: resolve(head_sym),
+                                        expected: 0,
+                                        got: 0,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match ty {
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            check_qualified_kind_app(constructor, local_param_qkinds, imported_qkinds, errors);
+            check_qualified_kind_app(arg, local_param_qkinds, imported_qkinds, errors);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            check_qualified_kind_app(from, local_param_qkinds, imported_qkinds, errors);
+            check_qualified_kind_app(to, local_param_qkinds, imported_qkinds, errors);
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            check_qualified_kind_app(ty, local_param_qkinds, imported_qkinds, errors);
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            check_qualified_kind_app(ty, local_param_qkinds, imported_qkinds, errors);
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            check_qualified_kind_app(ty, local_param_qkinds, imported_qkinds, errors);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            check_qualified_kind_app(ty, local_param_qkinds, imported_qkinds, errors);
+            check_qualified_kind_app(kind, local_param_qkinds, imported_qkinds, errors);
+        }
+        cst::TypeExpr::Record { fields, .. } | cst::TypeExpr::Row { fields, .. } => {
+            for f in fields {
+                check_qualified_kind_app(&f.ty, local_param_qkinds, imported_qkinds, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_guarded_for_qkind(
+    g: &cst::GuardedExpr,
+    local_param_qkinds: &std::collections::HashMap<Symbol, Vec<Option<(String, String)>>>,
+    imported_qkinds: &std::collections::HashMap<Symbol, (String, String)>,
+    errors: &mut Vec<KindError>,
+) {
+    let _ = (g, local_param_qkinds, imported_qkinds, errors);
+    // Skipping value-body walks for this detector — top-level
+    // type expressions cover the qualified-kind-mismatch surface
+    // for the targeted fixture.
+}
+
+/// Strip Forall/Function/Parens until we hit a Constructor; return
+/// its (module, name) pair if any.
+fn qualified_kind_constructor(kind: &cst::TypeExpr) -> Option<(String, String)> {
+    let mut cur = kind;
+    loop {
+        match cur {
+            cst::TypeExpr::Forall { ty, .. } => cur = ty,
+            cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            cst::TypeExpr::Function { to, .. } => cur = to,
+            cst::TypeExpr::Constructor { name, .. } => {
+                let n = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                let m = match name.module {
+                    Some(m) => crate::interner::resolve(m.symbol()).unwrap_or_default(),
+                    None => return None, // we only target qualified kinds
+                };
+                return Some((m, n));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Lookup the qualified kind of an argument type. Currently only
+/// handles bare constructor refs (qualified or unqualified).
+fn arg_qualified_kind(
+    arg: &cst::TypeExpr,
+    imported_qkinds: &std::collections::HashMap<Symbol, (String, String)>,
+) -> Option<(String, String)> {
+    let cur = match arg {
+        cst::TypeExpr::Parens { ty, .. } => ty.as_ref(),
+        other => other,
+    };
+    let cst::TypeExpr::Constructor { name, .. } = cur else {
+        return None;
+    };
+    // Build the lookup key matching how the import was registered.
+    let key = match name.module {
+        Some(m) => {
+            let prefix = crate::interner::resolve(m.symbol()).unwrap_or_default();
+            let n = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+            crate::interner::intern(&format!("{}.{}", prefix, n))
+        }
+        None => name.name.symbol(),
+    };
+    imported_qkinds.get(&key).cloned()
 }

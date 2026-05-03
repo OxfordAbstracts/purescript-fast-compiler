@@ -135,6 +135,17 @@ pub struct ModuleExports {
     /// Defining module for each exported data constructor.
     #[serde(default)]
     pub ctor_origins: HashMap<String, String>,
+
+    /// For each `foreign import data X :: K` (and `data X` with no
+    /// constructors used as a kind), the QUALIFIED name of K's
+    /// "head" type when K is a Constructor. Stored as
+    /// `(module, name)` so the importer can compare across modules
+    /// even when the kind constructor was unqualified at the
+    /// declaration site (in which case `module` is the declaring
+    /// module). Used to detect kind mismatches like
+    /// `LibA.DemoKind` vs `LibB.DemoKind`.
+    #[serde(default)]
+    pub foreign_data_kinds: HashMap<String, (String, String)>,
 }
 
 /// In-process cache of every compiled module's export surface,
@@ -421,6 +432,38 @@ pub fn distill_exports(
     let mut value_fixities_all: HashMap<String, FixityDecl> = HashMap::new();
     let mut type_fixities_all: HashMap<String, FixityDecl> = HashMap::new();
     let mut class_methods: HashMap<String, Vec<String>> = HashMap::new();
+    let mut foreign_data_kinds_all: HashMap<String, (String, String)> = HashMap::new();
+
+    // Pre-collect locally-declared type-like names so we can
+    // canonicalize unqualified Constructor refs in foreign-data
+    // kind annotations to (this_module, name).
+    let self_module: String = module
+        .name
+        .value
+        .parts
+        .iter()
+        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+        .collect::<Vec<_>>()
+        .join(".");
+    let mut local_type_names: HashSet<String> = HashSet::new();
+    for d in &module.decls {
+        match d {
+            Decl::Data { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::TypeAlias { name, .. }
+            | Decl::ForeignData { name, .. } => {
+                local_type_names.insert(
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                );
+            }
+            Decl::Class { name, .. } => {
+                local_type_names.insert(
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                );
+            }
+            _ => {}
+        }
+    }
 
     for d in &module.decls {
         match d {
@@ -465,13 +508,20 @@ pub fn distill_exports(
                     .collect();
                 class_methods.insert(n, method_names);
             }
-            Decl::ForeignData { name, .. } => {
+            Decl::ForeignData { name, kind, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 // Arity unknown without kind checking; 0 is a safe
                 // default — the type_arities entry is primarily
                 // used by importers as "this name is a type",
                 // not for over-application detection.
-                type_arities_all.insert(n, 0);
+                type_arities_all.insert(n.clone(), 0);
+                // Track the qualified head of the kind annotation
+                // when it's a single Constructor reference. Used by
+                // cross-module kind comparison to detect
+                // `LibA.DemoKind` vs `LibB.DemoKind` mismatches.
+                if let Some((m, k)) = qualified_kind_head(kind, &self_module, &local_type_names) {
+                    foreign_data_kinds_all.insert(n, (m, k));
+                }
             }
             Decl::Fixity { associativity, precedence, target, operator, is_type, .. } => {
                 let op = crate::typecheck_db::util::resolve_symbol(operator.value.symbol());
@@ -580,6 +630,7 @@ pub fn distill_exports(
                     .entry(name)
                     .or_insert_with(|| self_module_name.clone());
             }
+            out.foreign_data_kinds = foreign_data_kinds_all.clone();
             // Make operators importable under their own name by
             // cross-referencing their fixity's target's scheme.
             // `import M (<<<)` parses as `Import::Value("<<<")`;
@@ -638,6 +689,10 @@ pub fn distill_exports(
                             out.type_aliases.insert(name.clone(), alias.clone());
                             out.type_origins
                                 .insert(name.clone(), self_module_name.clone());
+                        }
+                        if let Some(kind_q) = foreign_data_kinds_all.get(&name) {
+                            out.foreign_data_kinds
+                                .insert(name.clone(), kind_q.clone());
                         }
                         if newtypes_all.contains(&name) {
                             out.newtypes.insert(name.clone());
@@ -943,6 +998,42 @@ pub fn expand_module_reexports(
                     .unwrap_or_else(|| target_name.clone());
                 out.type_origins.entry(k.clone()).or_insert(origin);
             }
+        }
+    }
+}
+
+/// Walk a kind type expression's "head" Constructor (after stripping
+/// Forall/Function/Parens) and return its qualified module + name.
+/// If the constructor was unqualified at declaration site AND the
+/// name is locally declared, qualify with `self_module`.
+fn qualified_kind_head(
+    kind: &crate::cst::TypeExpr,
+    self_module: &str,
+    local_type_names: &HashSet<String>,
+) -> Option<(String, String)> {
+    let mut cur = kind;
+    loop {
+        match cur {
+            crate::cst::TypeExpr::Forall { ty, .. }
+            | crate::cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            crate::cst::TypeExpr::Function { to, .. } => cur = to,
+            crate::cst::TypeExpr::Constructor { name, .. } => {
+                let n = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+                let m = match name.module {
+                    Some(m) => crate::typecheck_db::util::resolve_symbol(m.symbol()),
+                    None => {
+                        if local_type_names.contains(&n) {
+                            self_module.to_string()
+                        } else {
+                            // Imported reference: we can't canonicalize
+                            // without the import alias map; bail.
+                            return None;
+                        }
+                    }
+                };
+                return Some((m, n));
+            }
+            _ => return None,
         }
     }
 }
