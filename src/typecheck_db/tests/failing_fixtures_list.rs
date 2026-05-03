@@ -133,7 +133,7 @@ check_failing_build_unit!(f_CompareInt7, "CompareInt7");
 check_failing_build_unit!(f_CompareInt8, "CompareInt8");
 check_failing_build_unit!(f_CompareInt9, "CompareInt9");
 check_failing_build_unit!(f_ConflictingExports, "ConflictingExports");
-check_failing_build_unit_ignored!(f_ConflictingImports, "ConflictingImports", "expected: ScopeConflict");
+check_failing_build_unit!(f_ConflictingImports, "ConflictingImports");
 check_failing_build_unit!(f_ConflictingImports2, "ConflictingImports2");
 check_failing_build_unit!(f_ConflictingQualifiedImports, "ConflictingQualifiedImports");
 check_failing_build_unit!(f_ConflictingQualifiedImports2, "ConflictingQualifiedImports2");

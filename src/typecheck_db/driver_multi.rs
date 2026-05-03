@@ -254,12 +254,12 @@ fn check_one_module(
     detect_unknown_kind_refs_registry(module, registry, &mut validation_errors);
     detect_unknown_type_refs_registry(module, registry, &mut validation_errors);
 
-    // Use-site ScopeConflict (open + open) — disabled, too eager.
-    // Origin tracking is imperfect across long re-export chains
-    // (e.g. Prelude's `on` appears with multiple origins through
-    // different sub-modules), causing false positives on modules
-    // that import many Data.* siblings.
-    let _ = detect_use_site_scope_conflict;
+    // Use-site ScopeConflict (open + open). Re-export chains
+    // through Prelude are deduped via value_origins, so importing
+    // both Prelude and Data.Function doesn't false-positive on
+    // shared re-exports. Only fires when a referenced name has
+    // distinct ORIGIN modules in scope through open imports.
+    detect_use_site_scope_conflict(module, registry, &mut import_errors);
 
     // NonAssociativeError on imported operators: the in-pass
     // detector inside validate_decls only knows local fixities.
@@ -2199,9 +2199,16 @@ fn detect_use_site_scope_conflict(
     errors: &mut Vec<crate::typecheck_db::passes::imports::ImportError>,
 ) {
     use crate::typecheck_db::passes::imports::{ImportError, ImportErrorKind};
-    // Collect per-name: origins from open imports + whether any
-    // explicit-list import pins it (to a single origin).
-    let mut open_origins: std::collections::HashMap<
+    // For each name, collect (origin_module, target_module) pairs
+    // where target = the imported module, origin = the module the
+    // value was originally declared in (== target if directly
+    // declared; != target if re-exported).
+    // To avoid false positives on re-export chains where Prelude's
+    // `module Data.Function` clause incorrectly leaks unfiltered
+    // re-exports, we only flag a conflict when at least TWO
+    // distinct DIRECT (target == origin) imports contribute the
+    // same name.
+    let mut open_direct: std::collections::HashMap<
         String,
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
@@ -2217,19 +2224,33 @@ fn detect_use_site_scope_conflict(
             .get(&target_name)
             .or_else(|| prims.get(&target_name));
         let Some(exports) = exports else { continue };
-        match &imp.imports {
-            None => {
-                for (n, _) in &exports.values {
-                    let origin = exports
-                        .value_origins
-                        .get(n)
-                        .cloned()
-                        .unwrap_or_else(|| target_name.clone());
-                    open_origins
+        let mut walk_open = |hide: Option<&std::collections::HashSet<String>>,
+                              open_direct: &mut std::collections::HashMap<
+                                  String,
+                                  std::collections::HashSet<String>,
+                              >| {
+            for (n, _) in &exports.values {
+                if let Some(h) = hide {
+                    if h.contains(n) {
+                        continue;
+                    }
+                }
+                let origin = exports
+                    .value_origins
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_else(|| target_name.clone());
+                if origin == target_name {
+                    open_direct
                         .entry(n.clone())
                         .or_default()
                         .insert(origin);
                 }
+            }
+        };
+        match &imp.imports {
+            None => {
+                walk_open(None, &mut open_direct);
             }
             Some(crate::cst::ImportList::Hiding(items)) => {
                 let mut hide_v: std::collections::HashSet<String> =
@@ -2241,20 +2262,7 @@ fn detect_use_site_scope_conflict(
                         ));
                     }
                 }
-                for (n, _) in &exports.values {
-                    if hide_v.contains(n) {
-                        continue;
-                    }
-                    let origin = exports
-                        .value_origins
-                        .get(n)
-                        .cloned()
-                        .unwrap_or_else(|| target_name.clone());
-                    open_origins
-                        .entry(n.clone())
-                        .or_default()
-                        .insert(origin);
-                }
+                walk_open(Some(&hide_v), &mut open_direct);
             }
             Some(crate::cst::ImportList::Explicit(items)) => {
                 for item in items {
@@ -2267,12 +2275,29 @@ fn detect_use_site_scope_conflict(
             }
         }
     }
-    // Names that remain ambiguous: 2+ origins from open imports,
-    // not pinned by any explicit list.
-    let ambiguous: std::collections::HashSet<String> = open_origins
+    // Names that remain ambiguous: 2+ DIRECT origins from open
+    // imports, not pinned by any explicit list, and not locally
+    // defined (a local definition shadows the imports).
+    let mut local_value_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        match d {
+            cst::Decl::Value { name, .. }
+            | cst::Decl::Foreign { name, .. } => {
+                local_value_names.insert(
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                );
+            }
+            _ => {}
+        }
+    }
+    let ambiguous: std::collections::HashSet<String> = open_direct
         .into_iter()
         .filter_map(|(n, origins)| {
-            if origins.len() >= 2 && !explicit_pinned.contains(&n) {
+            if origins.len() >= 2
+                && !explicit_pinned.contains(&n)
+                && !local_value_names.contains(&n)
+            {
                 Some(n)
             } else {
                 None
