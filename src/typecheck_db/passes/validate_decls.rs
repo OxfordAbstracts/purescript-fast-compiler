@@ -210,6 +210,14 @@ pub enum ValidationErrorKind {
     /// do block must be an expression — `do let x = 1` alone is
     /// invalid. Reference compiler reports as `InvalidDoLet`.
     InvalidDoLet,
+    /// A data constructor field of shape `forall a. F a` where
+    /// `F` is locally polykinded (declared `data F a = …` with
+    /// `a` not used in any constructor field, hence its kind is
+    /// implicitly polymorphic). The kind of the inner `a` would
+    /// have to be implicitly quantified at the field level,
+    /// which the reference compiler rejects as
+    /// `QuantificationCheckFailureInType`.
+    QuantificationCheckFailureInType(String),
 }
 
 impl ValidationErrorKind {
@@ -281,6 +289,9 @@ impl ValidationErrorKind {
             Self::LiteralBodySigMismatch(_) => "UnificationError",
             Self::InvalidDoBind => "InvalidDoBind",
             Self::InvalidDoLet => "InvalidDoLet",
+            Self::QuantificationCheckFailureInType(_) => {
+                "QuantificationCheckFailureInType"
+            }
         }
     }
 }
@@ -766,6 +777,14 @@ pub fn validate_module_with_class_fundeps(
     // record type `a` was declared as. Reference compiler reports as
     // `TypesDoNotUnify`.
     detect_record_update_section_as_value(&module.decls, &mut errors);
+
+    // `data X = X (forall a. P a)` where `P` is a LOCAL polykinded
+    // data type (its parameter doesn't appear in any constructor
+    // field). The reference compiler infers `P :: forall k. k ->
+    // Type`, which means the inner `a`'s kind would have to be an
+    // implicit kind variable not bound by any visible quantifier —
+    // rejected as `QuantificationCheckFailureInType`.
+    detect_polykinded_rank2_in_ctor(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6479,6 +6498,176 @@ fn walk_expr_for_invalid_do(
 /// `forall r. { b :: ?, ... | r } -> { b :: ?, ... | r }`, but `a`'s
 /// declared type is a record. Function vs record can't unify.
 /// Reference compiler reports as `TypesDoNotUnify`.
+/// Detect `data X = X (forall a. F a)` where F is a LOCAL polykinded
+/// data type (its parameter is unused in any ctor field). This
+/// matches `QuantificationCheckFailureInType` from the reference
+/// compiler: the inner `a`'s kind isn't determined by anything in
+/// scope, so the implicit kind quantifier would have to wrap the
+/// rank-2 forall, which the reference compiler rejects.
+fn detect_polykinded_rank2_in_ctor(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    // Step 1: identify each LOCAL data type's polykinded var
+    // positions. A `data D v1 v2 … = ctor1 fields1 | …` is
+    // polykinded at position i iff `vi` doesn't appear in ANY
+    // constructor field's type expression. Skip data types with
+    // an explicit standalone kind sig (those have a known kind).
+    let mut polykinded_local_types: HashMap<Symbol, HashSet<usize>> = HashMap::new();
+    let mut has_standalone_sig: HashSet<Symbol> = HashSet::new();
+    for d in decls {
+        if let cst::Decl::Data { name, kind_sig, .. } = d {
+            if !matches!(kind_sig, cst::KindSigSource::None) {
+                has_standalone_sig.insert(name.value.symbol());
+            }
+        }
+    }
+    for d in decls {
+        let cst::Decl::Data { name, type_vars, constructors, .. } = d else {
+            continue;
+        };
+        if has_standalone_sig.contains(&name.value.symbol()) {
+            continue;
+        }
+        let mut polykinded: HashSet<usize> = HashSet::new();
+        for (i, var) in type_vars.iter().enumerate() {
+            let var_sym = var.value.symbol();
+            let used = constructors.iter().any(|c| {
+                c.fields.iter().any(|f| type_expr_uses_var(f, var_sym))
+            });
+            if !used {
+                polykinded.insert(i);
+            }
+        }
+        if !polykinded.is_empty() {
+            polykinded_local_types.insert(name.value.symbol(), polykinded);
+        }
+    }
+    if polykinded_local_types.is_empty() {
+        return;
+    }
+    // Step 2: walk each Decl::Data's ctor field types looking for
+    // `Forall { vars: [a], ty: App(Con(F), Var(a)) }` where F is
+    // local polykinded at the position `a` is supplied.
+    for d in decls {
+        let cst::Decl::Data { constructors, span, .. } = d else {
+            continue;
+        };
+        for c in constructors {
+            for f in &c.fields {
+                if let Some(bad_var) = polykinded_rank2_violation(f, &polykinded_local_types) {
+                    errors.push(ValidationError {
+                        span: *span,
+                        kind: ValidationErrorKind::QuantificationCheckFailureInType(
+                            resolve(bad_var),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// True if `ty` mentions a type variable named `var`.
+fn type_expr_uses_var(ty: &cst::TypeExpr, var: Symbol) -> bool {
+    match ty {
+        cst::TypeExpr::Var { name, .. } => name.value.symbol() == var,
+        cst::TypeExpr::Constructor { .. } => false,
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            type_expr_uses_var(constructor, var) || type_expr_uses_var(arg, var)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_uses_var(from, var) || type_expr_uses_var(to, var)
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            // shadow check: inner forall might rebind the same name
+            if vars.iter().any(|(n, _, _)| n.value.symbol() == var) {
+                return false;
+            }
+            type_expr_uses_var(ty, var)
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            constraints.iter().any(|c| {
+                c.args.iter().any(|a| type_expr_uses_var(a, var))
+            }) || type_expr_uses_var(ty, var)
+        }
+        cst::TypeExpr::Record { fields, .. } | cst::TypeExpr::Row { fields, .. } => {
+            fields.iter().any(|tf| type_expr_uses_var(&tf.ty, var))
+        }
+        cst::TypeExpr::Parens { ty, .. } => type_expr_uses_var(ty, var),
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            type_expr_uses_var(ty, var) || type_expr_uses_var(kind, var)
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            type_expr_uses_var(left, var) || type_expr_uses_var(right, var)
+        }
+        _ => false,
+    }
+}
+
+/// If `ty` is `forall a. F a` (or `forall a b … . F a` etc.) where F
+/// is a local polykinded data type AND `a` is supplied at a
+/// polykinded position, return `a`'s symbol.
+fn polykinded_rank2_violation(
+    ty: &cst::TypeExpr,
+    polykinded_local_types: &HashMap<Symbol, HashSet<usize>>,
+) -> Option<Symbol> {
+    let mut cur = ty;
+    while let cst::TypeExpr::Parens { ty, .. } = cur {
+        cur = ty;
+    }
+    let cst::TypeExpr::Forall { vars, ty: body, .. } = cur else {
+        return None;
+    };
+    // Only fire on simple `forall a. F a` shapes — single var,
+    // body is App(Con(F), Var(a)). Multi-var foralls likely
+    // constrain through other positions.
+    if vars.len() != 1 {
+        return None;
+    }
+    let bound_var = vars[0].0.value.symbol();
+    // Body: peel App spine: F a1 a2 … an → head=F, args=[a1, …, an].
+    let (head, args) = peel_app_te(body);
+    let cst::TypeExpr::Constructor { name, .. } = head else {
+        return None;
+    };
+    if name.module.is_some() {
+        return None;
+    }
+    let polykinded_positions =
+        polykinded_local_types.get(&name.name.symbol())?;
+    for (i, arg) in args.iter().enumerate() {
+        if !polykinded_positions.contains(&i) {
+            continue;
+        }
+        if let cst::TypeExpr::Var { name, .. } = peel_paren_te(arg) {
+            if name.value.symbol() == bound_var {
+                return Some(bound_var);
+            }
+        }
+    }
+    None
+}
+
+fn peel_app_te(ty: &cst::TypeExpr) -> (&cst::TypeExpr, Vec<&cst::TypeExpr>) {
+    let mut args: Vec<&cst::TypeExpr> = Vec::new();
+    let mut cur = ty;
+    while let cst::TypeExpr::App { constructor, arg, .. } = cur {
+        args.push(arg);
+        cur = constructor;
+    }
+    args.reverse();
+    (cur, args)
+}
+
+fn peel_paren_te(ty: &cst::TypeExpr) -> &cst::TypeExpr {
+    let mut cur = ty;
+    while let cst::TypeExpr::Parens { ty, .. } = cur {
+        cur = ty;
+    }
+    cur
+}
+
 fn detect_record_update_section_as_value(
     decls: &[cst::Decl],
     errors: &mut Vec<ValidationError>,

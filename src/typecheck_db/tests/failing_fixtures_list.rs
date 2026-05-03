@@ -328,7 +328,7 @@ check_failing_build_unit!(f_QualifiedAliasShadow, "QualifiedAliasShadow");
 check_failing_build_unit!(f_QualifiedOperators, "QualifiedOperators");
 check_failing_build_unit!(f_QualifiedOperators2, "QualifiedOperators2");
 check_failing_build_unit_ignored!(f_QuantificationCheckFailure, "QuantificationCheckFailure", "expected: QuantificationCheckFailureInKind");
-check_failing_build_unit_ignored!(f_QuantificationCheckFailure2, "QuantificationCheckFailure2", "expected: QuantificationCheckFailureInType");
+check_failing_build_unit!(f_QuantificationCheckFailure2, "QuantificationCheckFailure2");
 check_failing_build_unit_ignored!(f_QuantificationCheckFailure3, "QuantificationCheckFailure3", "expected: VisibleQuantificationCheckFailureInType");
 check_failing_build_unit!(f_QuantifiedKind, "QuantifiedKind");
 check_failing_build_unit!(f_Rank2Types, "Rank2Types");
