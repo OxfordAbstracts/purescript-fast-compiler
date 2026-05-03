@@ -224,6 +224,12 @@ pub enum ValidationErrorKind {
     /// isn't in P's expected closed row `{x, y}`. Reference
     /// compiler reports as `KindsDoNotUnify`.
     KindsDoNotUnify(String),
+    /// Visible kind quantification failure: a type alias body
+    /// applies a kind annotation to a foreign-import-data type
+    /// whose kind has multiple forall-bound vars. The annotation
+    /// can't visibly bind all of them. Reference compiler reports
+    /// as `VisibleQuantificationCheckFailureInType`.
+    VisibleQuantificationCheckFailureInType(String),
 }
 
 impl ValidationErrorKind {
@@ -299,6 +305,9 @@ impl ValidationErrorKind {
                 "QuantificationCheckFailureInType"
             }
             Self::KindsDoNotUnify(_) => "KindsDoNotUnify",
+            Self::VisibleQuantificationCheckFailureInType(_) => {
+                "VisibleQuantificationCheckFailureInType"
+            }
         }
     }
 }
@@ -807,6 +816,11 @@ pub fn validate_module_with_class_fundeps(
     // from the inner scope, making the inner vars unbound.
     // Reference compiler reports as `UndefinedTypeVariable`.
     detect_scoped_var_via_alias(&module.decls, &mut errors);
+
+    // Visible-quantification kind annotation: `type T = (X :: K)`
+    // where X is a foreign-import-data with 2+ forall-bound kind
+    // variables. The annotation can't visibly bind all of them.
+    detect_visible_quant_kind_ann(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6732,6 +6746,72 @@ fn detect_row_kind_label_mismatch(
             labels,
             closed: tail.is_none(),
         })
+    }
+}
+
+/// Detect `type T ... = (X :: K)` where X is a foreign-import-data
+/// declaration whose kind has 2+ forall-bound kind variables. The
+/// annotation can't visibly bind all of them. Reference compiler
+/// reports as `VisibleQuantificationCheckFailureInType`.
+fn detect_visible_quant_kind_ann(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+    // Map: foreign-import-data name → number of forall vars in its
+    // kind annotation. Counts only top-level forall (visible).
+    let mut multi_forall_foreign_data: Map<Symbol, usize> = Map::new();
+    for d in decls {
+        if let cst::Decl::ForeignData { name, kind, .. } = d {
+            let n = count_top_forall_vars(kind);
+            if n >= 2 {
+                multi_forall_foreign_data.insert(name.value.symbol(), n);
+            }
+        }
+    }
+    if multi_forall_foreign_data.is_empty() {
+        return;
+    }
+    for d in decls {
+        if let cst::Decl::TypeAlias { ty, span, .. } = d {
+            // Body must be a Kinded TypeExpr.
+            let peeled = peel_paren_te_local(ty);
+            let cst::TypeExpr::Kinded { ty: inner, .. } = peeled else {
+                continue;
+            };
+            // Inner must be a single Constructor of one of our
+            // multi-forall foreign-data types.
+            let cur = peel_paren_te_local(inner);
+            let cst::TypeExpr::Constructor { name, .. } = cur else {
+                continue;
+            };
+            if name.module.is_some() {
+                continue;
+            }
+            if multi_forall_foreign_data.contains_key(&name.name.symbol()) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::VisibleQuantificationCheckFailureInType(
+                        resolve(name.name.symbol()),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
+    let mut count = 0;
+    let mut cur = ty;
+    loop {
+        match cur {
+            cst::TypeExpr::Forall { vars, ty, .. } => {
+                count += vars.len();
+                cur = ty;
+            }
+            cst::TypeExpr::Parens { ty, .. } => cur = ty,
+            _ => return count,
+        }
     }
 }
 
