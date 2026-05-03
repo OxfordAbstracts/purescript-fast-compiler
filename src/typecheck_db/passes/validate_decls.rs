@@ -9210,7 +9210,7 @@ fn detect_instance_method_caf_cycle(
         }
     }
     for d in decls {
-        let cst::Decl::Instance { class_name, members, .. } = d else {
+        let cst::Decl::Instance { class_name, members, constraints, .. } = d else {
             continue;
         };
         let cqi = class_name.to_qi();
@@ -9222,23 +9222,44 @@ fn detect_instance_method_caf_cycle(
         let Some(methods) = class_methods.get(&cqi.name) else {
             continue;
         };
+        // Whether this instance has a constraint with the SAME class
+        // as the instance head. If so, sibling method references in
+        // method bodies could legitimately come through that
+        // constraint's dictionary (e.g. `instance Eq a => Eq (Array
+        // a) where eq = eqArrayImpl eq`). If not, sibling references
+        // MUST come from the current dict — a CAF cycle.
+        let has_same_class_constraint = constraints.iter().any(|c| {
+            let qi = c.class.to_qi();
+            qi.module.is_none() && qi.name == cqi.name
+        });
         for m in members {
             if let cst::Decl::Value { name, binders, guarded, span, .. } = m {
                 if !binders.is_empty() {
                     continue;
                 }
-                // Only flag DIRECT renames: `g = f` where `f` is
-                // a sibling method of the same class, with NO
-                // application around it. Partially-applied forms
-                // (`size = fold (const _) 0.0`,
-                // `sequence = traverse identity`) are valid
-                // eta-reductions and not cyclic at the value level.
                 let body = match guarded {
                     cst::GuardedExpr::Unconditional(e) => e.as_ref(),
                     _ => continue,
                 };
+                // Direct rename `g = f` always flags.
                 if let Some(sym) = direct_var_ref(body) {
                     if methods.contains(&sym) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::CycleInDeclaration(vec![
+                                resolve(name.value.symbol()),
+                            ]),
+                        });
+                        continue;
+                    }
+                }
+                // Partially-applied sibling reference (`size = fold
+                // f z`) only flags when the instance has NO same-class
+                // constraint to dispatch through.
+                if !has_same_class_constraint {
+                    let mut found: Option<Symbol> = None;
+                    walk_expr_for_caf_method_ref(body, methods, &mut found);
+                    if let Some(_sym) = found {
                         errors.push(ValidationError {
                             span: *span,
                             kind: ValidationErrorKind::CycleInDeclaration(vec![
@@ -9295,7 +9316,6 @@ fn walk_guarded_for_caf_method_ref(
     }
 }
 
-#[allow(dead_code)]
 fn walk_expr_for_caf_method_ref(
     expr: &cst::Expr,
     methods: &HashSet<Symbol>,

@@ -190,7 +190,7 @@ check_failing_build_unit!(f_ExportExplicit3, "ExportExplicit3");
 check_failing_build_unit!(f_ExtraRecordField, "ExtraRecordField");
 check_failing_build_unit!(f_ExtraneousClassMember, "ExtraneousClassMember");
 check_failing_build_unit!(f_FFIDefaultCJSExport, "FFIDefaultCJSExport");
-check_failing_build_unit_ignored!(f_Foldable, "Foldable", "expected: CycleInDeclaration");
+check_failing_build_unit!(f_Foldable, "Foldable");
 check_failing_build_unit!(f_FoldableInstance1, "FoldableInstance1");
 check_failing_build_unit!(f_FoldableInstance10, "FoldableInstance10");
 check_failing_build_unit!(f_FoldableInstance2, "FoldableInstance2");
