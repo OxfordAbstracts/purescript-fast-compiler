@@ -327,7 +327,7 @@ check_failing_build_unit!(f_ProgrammableTypeErrorsTypeString, "ProgrammableTypeE
 check_failing_build_unit!(f_QualifiedAliasShadow, "QualifiedAliasShadow");
 check_failing_build_unit!(f_QualifiedOperators, "QualifiedOperators");
 check_failing_build_unit!(f_QualifiedOperators2, "QualifiedOperators2");
-check_failing_build_unit_ignored!(f_QuantificationCheckFailure, "QuantificationCheckFailure", "expected: QuantificationCheckFailureInKind");
+check_failing_build_unit!(f_QuantificationCheckFailure, "QuantificationCheckFailure");
 check_failing_build_unit!(f_QuantificationCheckFailure2, "QuantificationCheckFailure2");
 check_failing_build_unit!(f_QuantificationCheckFailure3, "QuantificationCheckFailure3");
 check_failing_build_unit!(f_QuantifiedKind, "QuantifiedKind");

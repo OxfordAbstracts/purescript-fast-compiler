@@ -241,6 +241,12 @@ pub enum ValidationErrorKind {
     /// constructor, forcing the wildcard to satisfy `_ = Array _`.
     /// Reference compiler reports as `InfiniteType`.
     InfiniteType(String),
+    /// Standalone kind sig with unannotated forall var at a
+    /// position whose expected kind is itself an applied type,
+    /// requiring ill-ordered implicit kind generalization.
+    /// Reference compiler reports as
+    /// `QuantificationCheckFailureInKind`.
+    QuantificationCheckFailureInKind(String),
 }
 
 impl ValidationErrorKind {
@@ -321,6 +327,9 @@ impl ValidationErrorKind {
             }
             Self::EscapedSkolem(_) => "EscapedSkolem",
             Self::InfiniteType(_) => "InfiniteType",
+            Self::QuantificationCheckFailureInKind(_) => {
+                "QuantificationCheckFailureInKind"
+            }
         }
     }
 }
@@ -853,6 +862,14 @@ pub fn validate_module_with_class_fundeps(
     // go [xs]` where the recursive call wraps the parameter in an
     // additional Array, forcing the wildcard to be infinite.
     detect_recursive_wildcard_wrap(&module.decls, &mut errors);
+
+    // Quantification-check failure in kind: standalone kind sig
+    // with unannotated forall var used at a position whose
+    // expected kind is itself an applied type (depends on other
+    // vars). E.g. `data T :: forall ... d. Relate b d -> Type`
+    // where Relate's 2nd arg expects `Proxy b'`. d's kind would
+    // need implicit generalization referencing another forall var.
+    detect_quant_check_failure_in_kind(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6845,6 +6862,187 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             _ => return count,
         }
     }
+}
+
+/// Detect QuantificationCheckFailureInKind:
+/// `data T :: forall (a :: Type) (b :: a) (c :: a) d. Relate b d
+/// -> Type` where `d` is unannotated and used at Relate's 2nd
+/// position whose expected kind is `Proxy b'` (a complex applied
+/// type). Implicit kind generalization for `d` would need to
+/// introduce a kind variable BEFORE the explicit forall, but that
+/// kind variable depends on `a` (which is bound in the explicit
+/// forall) — ill-ordered.
+fn detect_quant_check_failure_in_kind(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+
+    // Build per-data-type's per-arg "expected kind shape": is it
+    // `App(_, _)` (complex), or just bare Var/Constructor (simple)?
+    // From standalone kind sigs, we extract each arrow's input.
+    let mut kind_arg_shapes: Map<Symbol, Vec<KindArgShape>> = Map::new();
+    for d in decls {
+        let (name, kind_type) = match d {
+            cst::Decl::Data {
+                name,
+                kind_sig: cst::KindSigSource::Data,
+                kind_type: Some(kt),
+                ..
+            } => (name, kt.as_ref()),
+            cst::Decl::ForeignData { name, kind, .. } => (name, kind),
+            _ => continue,
+        };
+        let shapes = extract_arg_shapes(kind_type);
+        if !shapes.is_empty() {
+            kind_arg_shapes.insert(name.value.symbol(), shapes);
+        }
+    }
+    if kind_arg_shapes.is_empty() {
+        return;
+    }
+    // Walk each standalone data kind sig with unannotated forall
+    // vars; for each, find applications where an unannotated var
+    // is supplied to a complex-kind position.
+    for d in decls {
+        if let cst::Decl::Data {
+            name,
+            kind_sig: cst::KindSigSource::Data,
+            kind_type: Some(kt),
+            span,
+            ..
+        } = d
+        {
+            let unann = unannotated_top_forall_vars(kt);
+            if unann.is_empty() {
+                continue;
+            }
+            if check_app_at_complex_position(kt, &unann, &kind_arg_shapes) {
+                errors.push(ValidationError {
+                    span: *span,
+                    kind: ValidationErrorKind::QuantificationCheckFailureInKind(
+                        resolve(name.value.symbol()),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum KindArgShape {
+    /// Bare type variable like `k`, or a primitive constructor
+    /// like `Type`.
+    Simple,
+    /// An applied type (`Proxy b`) — complex kind.
+    Complex,
+}
+
+/// Walk a kind type expression's arrow chain and return the shape
+/// of each function-arg input.
+fn extract_arg_shapes(kind: &cst::TypeExpr) -> Vec<KindArgShape> {
+    let mut out = Vec::new();
+    let mut cur = kind;
+    loop {
+        let peeled = peel_paren_te_local(cur);
+        match peeled {
+            cst::TypeExpr::Forall { ty, .. } => cur = ty,
+            cst::TypeExpr::Function { from, to, .. } => {
+                let from_peeled = peel_paren_te_local(from);
+                let shape = match from_peeled {
+                    cst::TypeExpr::App { .. } => KindArgShape::Complex,
+                    cst::TypeExpr::Var { .. } | cst::TypeExpr::Constructor { .. } => {
+                        KindArgShape::Simple
+                    }
+                    _ => KindArgShape::Simple,
+                };
+                out.push(shape);
+                cur = to;
+            }
+            _ => return out,
+        }
+    }
+}
+
+/// Collect names of forall vars in the OUTER (top-level) forall of
+/// the kind sig that have NO kind annotation.
+fn unannotated_top_forall_vars(kind: &cst::TypeExpr) -> HashSet<Symbol> {
+    let mut out = HashSet::new();
+    let cur = peel_paren_te_local(kind);
+    if let cst::TypeExpr::Forall { vars, .. } = cur {
+        for (n, _, ann) in vars {
+            if ann.is_none() {
+                out.insert(n.value.symbol());
+            }
+        }
+    }
+    out
+}
+
+/// Walk `kind` looking for App spines where an unannotated forall
+/// var appears as an arg at a "complex" kind position of a known
+/// constructor (per `kind_arg_shapes`).
+fn check_app_at_complex_position(
+    kind: &cst::TypeExpr,
+    unannotated: &HashSet<Symbol>,
+    kind_arg_shapes: &std::collections::HashMap<Symbol, Vec<KindArgShape>>,
+) -> bool {
+    fn check_te(
+        ty: &cst::TypeExpr,
+        unannotated: &HashSet<Symbol>,
+        kind_arg_shapes: &std::collections::HashMap<Symbol, Vec<KindArgShape>>,
+    ) -> bool {
+        let cur = peel_paren_te_local(ty);
+        match cur {
+            cst::TypeExpr::App { .. } => {
+                // Peel App spine.
+                let mut args: Vec<&cst::TypeExpr> = Vec::new();
+                let mut tip = cur;
+                while let cst::TypeExpr::App { constructor, arg, .. } = tip {
+                    args.push(arg);
+                    tip = constructor;
+                }
+                args.reverse();
+                if let cst::TypeExpr::Constructor { name, .. } = peel_paren_te_local(tip) {
+                    if name.module.is_none() {
+                        if let Some(shapes) = kind_arg_shapes.get(&name.name.symbol()) {
+                            for (i, arg) in args.iter().enumerate() {
+                                if let Some(KindArgShape::Complex) = shapes.get(i) {
+                                    let arg_peeled = peel_paren_te_local(arg);
+                                    if let cst::TypeExpr::Var { name: vn, .. } = arg_peeled {
+                                        if unannotated.contains(&vn.value.symbol()) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for arg in &args {
+                    if check_te(arg, unannotated, kind_arg_shapes) {
+                        return true;
+                    }
+                }
+            }
+            cst::TypeExpr::Function { from, to, .. } => {
+                if check_te(from, unannotated, kind_arg_shapes) {
+                    return true;
+                }
+                if check_te(to, unannotated, kind_arg_shapes) {
+                    return true;
+                }
+            }
+            cst::TypeExpr::Forall { ty, .. } => {
+                if check_te(ty, unannotated, kind_arg_shapes) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+    check_te(kind, unannotated, kind_arg_shapes)
 }
 
 /// Detect infinite-type via recursive wildcard wrap:
