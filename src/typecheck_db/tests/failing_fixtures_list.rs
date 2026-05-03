@@ -160,11 +160,7 @@ check_failing_build_unit!(f_DeprecatedFFICommonJSModule, "DeprecatedFFICommonJSM
 check_failing_build_unit!(f_DeprecatedFFIPrime, "DeprecatedFFIPrime");
 check_failing_build_unit!(f_DeriveInstanceRecordAlias, "DeriveInstanceRecordAlias");
 check_failing_build_unit_ignored!(f_DiffKindsSameName, "DiffKindsSameName", "expected: KindsDoNotUnify");
-check_failing_build_unit_ignored!(
-    f_Do,
-    "Do",
-    "panic: parser invariant violated — last statement of a Do block must be Discard, got Let"
-);
+check_failing_build_unit!(f_Do, "Do");
 check_failing_build_unit!(f_DoNotSuggestComposition, "DoNotSuggestComposition");
 check_failing_build_unit!(f_DoNotSuggestComposition2, "DoNotSuggestComposition2");
 check_failing_build_unit!(f_DuplicateDeclarationsInLet, "DuplicateDeclarationsInLet");

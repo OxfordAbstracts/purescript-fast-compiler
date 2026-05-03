@@ -202,6 +202,14 @@ pub enum ValidationErrorKind {
     /// `foo :: Number; foo = true`. Reference compiler reports
     /// as `TypesDoNotUnify`.
     LiteralBodySigMismatch(String),
+    /// A `do`-block ending in a `<-` bind. The last statement of
+    /// a do block must be an expression — `do x <- y` alone is
+    /// invalid. Reference compiler reports as `InvalidDoBind`.
+    InvalidDoBind,
+    /// A `do`-block ending in a `let`. The last statement of a
+    /// do block must be an expression — `do let x = 1` alone is
+    /// invalid. Reference compiler reports as `InvalidDoLet`.
+    InvalidDoLet,
 }
 
 impl ValidationErrorKind {
@@ -271,6 +279,8 @@ impl ValidationErrorKind {
             Self::InstanceMemberSigMismatch(_) => "UnificationError",
             Self::ValueDeclSigAliasMismatch(_) => "UnificationError",
             Self::LiteralBodySigMismatch(_) => "UnificationError",
+            Self::InvalidDoBind => "InvalidDoBind",
+            Self::InvalidDoLet => "InvalidDoLet",
         }
     }
 }
@@ -745,6 +755,10 @@ pub fn validate_module_with_class_fundeps(
 
     // Direct self-referential let bindings (`let x = x in ...`).
     detect_let_self_cycle(&module.decls, &mut errors);
+
+    // `do`-block whose final statement is a `<-` bind or `let`.
+    // Reference compiler reports `InvalidDoBind` / `InvalidDoLet`.
+    detect_invalid_do_terminal(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6272,6 +6286,182 @@ fn walk_expr_for_let_self_cycle(
             walk_expr_for_let_self_cycle(func, errors);
             walk_expr_for_let_self_cycle(left, errors);
             walk_expr_for_let_self_cycle(right, errors);
+        }
+        _ => {}
+    }
+}
+
+/// `do`-block whose final statement is a `<-` bind (`InvalidDoBind`)
+/// or a `let` (`InvalidDoLet`). Walks every Decl::Value body + its
+/// where-clause + instance-method bodies for nested do-blocks.
+fn detect_invalid_do_terminal(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    for d in decls {
+        match d {
+            cst::Decl::Value { guarded, where_clause, .. } => {
+                walk_guarded_for_invalid_do(guarded, errors);
+                for b in where_clause {
+                    if let cst::LetBinding::Value { expr, .. } = b {
+                        walk_expr_for_invalid_do(expr, errors);
+                    }
+                }
+            }
+            cst::Decl::Instance { members, .. } => {
+                detect_invalid_do_terminal(members, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_guarded_for_invalid_do(
+    g: &cst::GuardedExpr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => walk_expr_for_invalid_do(e, errors),
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_for_invalid_do(e, errors);
+                        }
+                    }
+                }
+                walk_expr_for_invalid_do(&gd.expr, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_invalid_do(
+    expr: &cst::Expr,
+    errors: &mut Vec<ValidationError>,
+) {
+    match expr {
+        cst::Expr::Do { span, statements, .. } => {
+            if let Some(last) = statements.last() {
+                match last {
+                    cst::DoStatement::Bind { .. } => {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::InvalidDoBind,
+                        });
+                    }
+                    cst::DoStatement::Let { .. } => {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::InvalidDoLet,
+                        });
+                    }
+                    cst::DoStatement::Discard { .. } => {}
+                }
+            }
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_invalid_do(expr, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_invalid_do(expr, errors);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cst::Expr::Ado { statements, result, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_for_invalid_do(expr, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_for_invalid_do(expr, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            walk_expr_for_invalid_do(result, errors);
+        }
+        cst::Expr::App { func, arg, .. } => {
+            walk_expr_for_invalid_do(func, errors);
+            walk_expr_for_invalid_do(arg, errors);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            walk_expr_for_invalid_do(func, errors);
+        }
+        cst::Expr::Lambda { body, .. } => walk_expr_for_invalid_do(body, errors),
+        cst::Expr::Op { left, right, .. } => {
+            walk_expr_for_invalid_do(left, errors);
+            walk_expr_for_invalid_do(right, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_for_invalid_do(cond, errors);
+            walk_expr_for_invalid_do(then_expr, errors);
+            walk_expr_for_invalid_do(else_expr, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_for_invalid_do(e, errors);
+            }
+            for alt in alts {
+                walk_guarded_for_invalid_do(&alt.result, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_for_invalid_do(expr, errors);
+                }
+            }
+            walk_expr_for_invalid_do(body, errors);
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_for_invalid_do(v, errors);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            walk_expr_for_invalid_do(expr, errors);
+        }
+        cst::Expr::RecordUpdate { expr, updates, .. } => {
+            walk_expr_for_invalid_do(expr, errors);
+            for u in updates {
+                walk_expr_for_invalid_do(&u.value, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_for_invalid_do(expr, errors);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                walk_expr_for_invalid_do(e, errors);
+            }
+        }
+        cst::Expr::AsPattern { name, pattern, .. } => {
+            walk_expr_for_invalid_do(name, errors);
+            walk_expr_for_invalid_do(pattern, errors);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            walk_expr_for_invalid_do(func, errors);
+            walk_expr_for_invalid_do(left, errors);
+            walk_expr_for_invalid_do(right, errors);
         }
         _ => {}
     }

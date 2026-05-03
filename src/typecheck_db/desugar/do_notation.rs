@@ -71,19 +71,25 @@ fn rewrite_node(e: Expr) -> Expr {
 
 fn desugar_do(span: Span, module: Option<ModuleQualifier>, statements: Vec<DoStatement>) -> Expr {
     // Every `do`-block the parser emits is non-empty and ends with a
-    // `Discard` (the result expression). Any other shape is a parser
-    // invariant violation — panic immediately so the break is easy to
-    // locate rather than surfacing a garbled AST downstream.
+    // `Discard` (the result expression). Any other shape is a USER
+    // error (`InvalidDoBind` / `InvalidDoLet`) — preserve the original
+    // `Expr::Do` so inference can produce a real diagnostic instead
+    // of panicking here.
     assert!(
         !statements.is_empty(),
         "parser invariant violated: Do block with zero statements at {span:?}",
     );
+    let last_is_discard = matches!(
+        statements.last(),
+        Some(DoStatement::Discard { .. }),
+    );
+    if !last_is_discard {
+        return Expr::Do { span, module, statements };
+    }
     let mut it = statements.into_iter().rev();
     let mut acc: Expr = match it.next().expect("at least one statement, checked above") {
         DoStatement::Discard { expr, .. } => expr,
-        other => unreachable!(
-            "parser invariant violated: last statement of a Do block must be Discard, got {other:?} at {span:?}",
-        ),
+        _ => unreachable!("guarded above"),
     };
     for s in it {
         acc = wrap_do_stmt(module, s, acc);
