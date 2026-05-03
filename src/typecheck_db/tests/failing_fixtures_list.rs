@@ -314,7 +314,7 @@ check_failing_build_unit!(f_PASTrumpsKDNU5, "PASTrumpsKDNU5");
 check_failing_build_unit!(f_PASTrumpsKDNU6, "PASTrumpsKDNU6");
 check_failing_build_unit!(f_PASTrumpsKDNU7, "PASTrumpsKDNU7");
 check_failing_build_unit!(f_PolykindInstanceOverlapping, "PolykindInstanceOverlapping");
-check_failing_build_unit_ignored!(f_PolykindInstantiatedInstance, "PolykindInstantiatedInstance", "expected: KindsDoNotUnify");
+check_failing_build_unit!(f_PolykindInstantiatedInstance, "PolykindInstantiatedInstance");
 check_failing_build_unit!(f_PolykindInstantiation, "PolykindInstantiation");
 check_failing_build_unit!(f_PolykindUnnamedInstanceOverlapping, "PolykindUnnamedInstanceOverlapping");
 check_failing_build_unit!(f_PossiblyInfiniteCoercibleInstance, "PossiblyInfiniteCoercibleInstance");

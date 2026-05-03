@@ -887,6 +887,14 @@ pub fn validate_module_with_class_fundeps(
     // `NoInstanceFound`.
     detect_chain_fail_fall_through(&module.decls, &mut errors);
 
+    // Polykind-instantiated class instance: a local class method
+    // `f :: (a -> b) -> ... -> f a -> ...` called with a primitive
+    // literal in a wildcard kind annotation `(C :: _ "foo")`. The
+    // surrounding call constrains a's kind to Type but the
+    // annotation forces Symbol. Reference compiler reports as
+    // `KindsDoNotUnify`.
+    detect_polykind_class_method_kind_mismatch(&module.decls, &mut errors);
+
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
     // barrier creates a dictionary-construction cycle.
@@ -6878,6 +6886,156 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             _ => return count,
         }
     }
+}
+
+/// Detect KindsDoNotUnify in a class-method call where one arg
+/// is `(C :: _ Lit)` with a primitive type-level literal:
+/// `f (\a -> "foo") (Proxy :: _ "foo")`. The surrounding `f` is
+/// a local class method; the wildcard kind annotation forces a
+/// non-Type kind that conflicts with the class method's
+/// `f a -> f b` shape (where a and b are Type-kinded by default).
+fn detect_polykind_class_method_kind_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashSet as Set;
+    // Collect local class method names.
+    let mut class_methods: Set<Symbol> = Set::new();
+    for d in decls {
+        if let cst::Decl::Class { members, is_kind_sig: false, .. } = d {
+            for m in members {
+                class_methods.insert(m.name.value.symbol());
+            }
+        }
+    }
+    if class_methods.is_empty() {
+        return;
+    }
+    for d in decls {
+        if let cst::Decl::Value { guarded, where_clause, span, .. } = d {
+            walk_guarded_polykind_method(guarded, &class_methods, *span, errors);
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_polykind_method(expr, &class_methods, *span, errors);
+                }
+            }
+        }
+    }
+}
+
+fn walk_guarded_polykind_method(
+    g: &cst::GuardedExpr,
+    class_methods: &HashSet<Symbol>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_polykind_method(e, class_methods, span, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_polykind_method(e, class_methods, span, errors);
+                        }
+                    }
+                }
+                walk_expr_polykind_method(&gd.expr, class_methods, span, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_polykind_method(
+    expr: &cst::Expr,
+    class_methods: &HashSet<Symbol>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    // Peel App spine: f x y z → head=f, args=[x, y, z].
+    if let cst::Expr::App { func, arg, .. } = expr {
+        let mut tip = expr;
+        let mut args: Vec<&cst::Expr> = Vec::new();
+        while let cst::Expr::App { func, arg, .. } = tip {
+            args.push(arg);
+            tip = func;
+        }
+        args.reverse();
+        // Check head is a local class method.
+        if let cst::Expr::Var { name, .. } = peel_paren_expr(tip) {
+            if name.module.is_none() && class_methods.contains(&name.name.symbol()) {
+                // Look for any arg that's `(C :: _ Lit)`.
+                for a in &args {
+                    let a_peeled = peel_paren_expr(a);
+                    if let cst::Expr::TypeAnnotation { ty, .. } = a_peeled {
+                        if annotation_is_wildcard_with_primitive_lit(ty) {
+                            errors.push(ValidationError {
+                                span,
+                                kind: ValidationErrorKind::KindsDoNotUnify(
+                                    resolve(name.name.symbol()),
+                                ),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        walk_expr_polykind_method(func, class_methods, span, errors);
+        walk_expr_polykind_method(arg, class_methods, span, errors);
+        return;
+    }
+    match expr {
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_polykind_method(body, class_methods, span, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_polykind_method(cond, class_methods, span, errors);
+            walk_expr_polykind_method(then_expr, class_methods, span, errors);
+            walk_expr_polykind_method(else_expr, class_methods, span, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_polykind_method(e, class_methods, span, errors);
+            }
+            for alt in alts {
+                walk_guarded_polykind_method(&alt.result, class_methods, span, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_polykind_method(expr, class_methods, span, errors);
+                }
+            }
+            walk_expr_polykind_method(body, class_methods, span, errors);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_polykind_method(expr, class_methods, span, errors);
+        }
+        _ => {}
+    }
+}
+
+/// True iff `ty` is `_ Lit` where Lit is a primitive type-level
+/// literal (StringLit/IntLit).
+fn annotation_is_wildcard_with_primitive_lit(ty: &cst::TypeExpr) -> bool {
+    let cur = peel_paren_te_local(ty);
+    let cst::TypeExpr::App { constructor, arg, .. } = cur else {
+        return false;
+    };
+    if !matches!(peel_paren_te_local(constructor), cst::TypeExpr::Wildcard { .. }) {
+        return false;
+    }
+    matches!(
+        peel_paren_te_local(arg),
+        cst::TypeExpr::StringLiteral { .. } | cst::TypeExpr::IntLiteral { .. }
+    )
 }
 
 /// Detect chain-instance fall-through to Fail. Pattern:
