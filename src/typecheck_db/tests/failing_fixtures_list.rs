@@ -35,8 +35,8 @@ check_failing_build_unit!(f_3335_TypeOpAssociativityError, "3335-TypeOpAssociati
 check_failing_build_unit!(f_3405, "3405");
 check_failing_build_unit!(f_3453, "3453");
 check_failing_build_unit!(f_3510, "3510");
-check_failing_build_unit_ignored!(f_3531_2, "3531-2", "expected: NoInstanceFound");
-check_failing_build_unit_ignored!(f_3531_3, "3531-3", "expected: NoInstanceFound");
+check_failing_build_unit!(f_3531_2, "3531-2");
+check_failing_build_unit!(f_3531_3, "3531-3");
 check_failing_build_unit!(f_3531_4, "3531-4");
 check_failing_build_unit!(f_3531_5, "3531-5");
 check_failing_build_unit!(f_3531_6, "3531-6");

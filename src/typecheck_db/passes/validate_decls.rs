@@ -247,6 +247,12 @@ pub enum ValidationErrorKind {
     /// Reference compiler reports as
     /// `QuantificationCheckFailureInKind`.
     QuantificationCheckFailureInKind(String),
+    /// Chain instance fall-through to a `Fail`-constrained link.
+    /// `class C` has chain instances starting with `C (X x x)`
+    /// (repeated vars), and a use of the class method on a value
+    /// of type `X a Int` (different positions) forces fall-through.
+    /// Reference compiler reports as `NoInstanceFound`.
+    NoInstanceFound(String),
 }
 
 impl ValidationErrorKind {
@@ -330,6 +336,7 @@ impl ValidationErrorKind {
             Self::QuantificationCheckFailureInKind(_) => {
                 "QuantificationCheckFailureInKind"
             }
+            Self::NoInstanceFound(_) => "NoInstanceFound",
         }
     }
 }
@@ -870,6 +877,15 @@ pub fn validate_module_with_class_fundeps(
     // where Relate's 2nd arg expects `Proxy b'`. d's kind would
     // need implicit generalization referencing another forall var.
     detect_quant_check_failure_in_kind(&module.decls, &mut errors);
+
+    // Chain-instance fall-through to Fail: `class C` with chain
+    // instances where the first head has repeated type vars
+    // (`C (X x x)`) and a later chain link has `Fail` constraint.
+    // A use site of the method on a value whose type has
+    // DIFFERENT positions (`X a Int`) forces the chain to fall
+    // through to the Fail-constrained instance, emitting
+    // `NoInstanceFound`.
+    detect_chain_fail_fall_through(&module.decls, &mut errors);
 
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
@@ -6861,6 +6877,405 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             cst::TypeExpr::Parens { ty, .. } => cur = ty,
             _ => return count,
         }
+    }
+}
+
+/// Detect chain-instance fall-through to Fail. Pattern:
+/// * `class C x` declared locally.
+/// * Chain instances where the FIRST head has repeated type vars
+///   like `C (X x x)` and a SUBSEQUENT chain link has a `Fail`
+///   constraint.
+/// * A use site of the class method on a value whose type
+///   signature uses the same data type with DIFFERENT vars at the
+///   repeated positions (e.g. `X a Int`).
+/// → Emit NoInstanceFound (chain falls through to the Fail link).
+fn detect_chain_fail_fall_through(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+
+    // Step 1: identify chains. A chain is a contiguous run of
+    // Instance decls where every link after the first has
+    // `chain: true`. We're interested in chains where:
+    //   - The first link's head has `T x x` (repeated var at
+    //     multiple positions) for some local data type T.
+    //   - SOME link in the chain has a `Fail` constraint.
+    //
+    // For each such chain, record (class_name, T, repeated_positions).
+    let mut chains: Vec<ChainInfo> = Vec::new();
+    let mut i = 0;
+    while i < decls.len() {
+        let cst::Decl::Instance { class_name, types, chain, constraints, .. } =
+            &decls[i]
+        else {
+            i += 1;
+            continue;
+        };
+        if *chain {
+            // Skip — chain continuations are processed with their
+            // chain-start.
+            i += 1;
+            continue;
+        }
+        // The first link of a (potential) chain.
+        let cqi = class_name.to_qi();
+        if cqi.module.is_some() {
+            i += 1;
+            continue;
+        }
+        // Find chain links.
+        let chain_class_name = cqi.name;
+        let mut j = i + 1;
+        let mut chain_links: Vec<&cst::Decl> = vec![&decls[i]];
+        while j < decls.len() {
+            if let cst::Decl::Instance { chain: true, class_name: c_name, .. } = &decls[j] {
+                let cqj = c_name.to_qi();
+                if cqj.module.is_none() && cqj.name == chain_class_name {
+                    chain_links.push(&decls[j]);
+                    j += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if chain_links.len() < 2 {
+            i = j;
+            continue;
+        }
+        // Check: any chain link has Fail constraint.
+        let has_fail = chain_links.iter().any(|d| {
+            if let cst::Decl::Instance { constraints, .. } = d {
+                constraints.iter().any(|c| {
+                    let q = c.class.to_qi();
+                    let n = resolve(q.name);
+                    n == "Fail" || n.ends_with(".Fail")
+                })
+            } else {
+                false
+            }
+        });
+        if !has_fail {
+            i = j;
+            continue;
+        }
+        // Check: first link's head has `T x x` shape.
+        // types is `Vec<TypeExpr>` for instance args; for
+        // `instance C (X x x)`, types = [App(App(Con(X), Var(x)), Var(x))].
+        // We need to peel and find repeated type vars in different
+        // positions.
+        let _ = constraints;
+        if let Some((dt_sym, rep_positions)) = first_instance_repeated_vars(types) {
+            chains.push(ChainInfo {
+                class_name: chain_class_name,
+                data_type: dt_sym,
+                repeated_positions: rep_positions,
+            });
+        }
+        i = j;
+    }
+    if chains.is_empty() {
+        return;
+    }
+
+    // Step 2: build a map of class methods → class name (LOCAL only).
+    let mut method_to_class: Map<Symbol, Symbol> = Map::new();
+    for d in decls {
+        if let cst::Decl::Class { name, members, is_kind_sig: false, .. } = d {
+            for m in members {
+                method_to_class.insert(m.name.value.symbol(), name.value.symbol());
+            }
+        }
+    }
+    // Step 3: build value name → its declared type signature.
+    let mut value_sigs: Map<Symbol, &cst::TypeExpr> = Map::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            value_sigs.insert(name.value.symbol(), ty);
+        }
+    }
+    // Step 4: walk every Decl::Value's body looking for
+    // App(Var(method), Var(value)) where value has a sig matching
+    // a chain's data type with DIFFERENT vars at the chain's
+    // repeated positions.
+    for d in decls {
+        if let cst::Decl::Value { guarded, where_clause, span, .. } = d {
+            walk_guarded_chain(
+                guarded,
+                &method_to_class,
+                &value_sigs,
+                chains.as_slice(),
+                *span,
+                errors,
+            );
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_chain(
+                        expr,
+                        &method_to_class,
+                        &value_sigs,
+                        chains.as_slice(),
+                        *span,
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn first_instance_repeated_vars(
+    types: &[cst::TypeExpr],
+) -> Option<(Symbol, Vec<usize>)> {
+    if types.len() != 1 {
+        return None;
+    }
+    let cur = peel_paren_te_local(&types[0]);
+    let mut args: Vec<&cst::TypeExpr> = Vec::new();
+    let mut tip = cur;
+    while let cst::TypeExpr::App { constructor, arg, .. } = tip {
+        args.push(arg);
+        tip = constructor;
+    }
+    args.reverse();
+    let cst::TypeExpr::Constructor { name, .. } = peel_paren_te_local(tip) else {
+        return None;
+    };
+    if name.module.is_some() || args.len() < 2 {
+        return None;
+    }
+    // Collect var names per position.
+    let var_names: Vec<Option<Symbol>> = args
+        .iter()
+        .map(|a| match peel_paren_te_local(a) {
+            cst::TypeExpr::Var { name, .. } => Some(name.value.symbol()),
+            _ => None,
+        })
+        .collect();
+    // Check if any var name appears at 2+ positions.
+    use std::collections::HashMap as Map;
+    let mut positions: Map<Symbol, Vec<usize>> = Map::new();
+    for (i, v) in var_names.iter().enumerate() {
+        if let Some(s) = v {
+            positions.entry(*s).or_default().push(i);
+        }
+    }
+    for (_, ps) in &positions {
+        if ps.len() >= 2 {
+            return Some((name.name.symbol(), ps.clone()));
+        }
+    }
+    None
+}
+
+fn walk_guarded_chain(
+    g: &cst::GuardedExpr,
+    method_to_class: &std::collections::HashMap<Symbol, Symbol>,
+    value_sigs: &std::collections::HashMap<Symbol, &cst::TypeExpr>,
+    chains: &[ChainInfo],
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_chain(e, method_to_class, value_sigs, chains, span, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_chain(e, method_to_class, value_sigs, chains, span, errors);
+                        }
+                    }
+                }
+                walk_expr_chain(&gd.expr, method_to_class, value_sigs, chains, span, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_chain(
+    expr: &cst::Expr,
+    method_to_class: &std::collections::HashMap<Symbol, Symbol>,
+    value_sigs: &std::collections::HashMap<Symbol, &cst::TypeExpr>,
+    chains: &[ChainInfo],
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let cst::Expr::App { func, arg, .. } = expr {
+        // Check pattern: App(Var(method), Var(value)).
+        let method_sym = match peel_paren_expr(func) {
+            cst::Expr::Var { name, .. } if name.module.is_none() => {
+                Some(name.name.symbol())
+            }
+            _ => None,
+        };
+        let value_sym = match peel_paren_expr(arg) {
+            cst::Expr::Var { name, .. } if name.module.is_none() => {
+                Some(name.name.symbol())
+            }
+            _ => None,
+        };
+        if let (Some(method), Some(value)) = (method_sym, value_sym) {
+            if let Some(class_name) = method_to_class.get(&method) {
+                if let Some(value_ty) = value_sigs.get(&value) {
+                    for chain in chains {
+                        if &chain.class_name != class_name {
+                            continue;
+                        }
+                        if value_sig_has_different_vars_at_positions(
+                            value_ty,
+                            chain.data_type,
+                            &chain.repeated_positions,
+                        ) {
+                            errors.push(ValidationError {
+                                span,
+                                kind: ValidationErrorKind::NoInstanceFound(
+                                    resolve(method),
+                                ),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        walk_expr_chain(func, method_to_class, value_sigs, chains, span, errors);
+        walk_expr_chain(arg, method_to_class, value_sigs, chains, span, errors);
+        return;
+    }
+    match expr {
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_chain(body, method_to_class, value_sigs, chains, span, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_chain(cond, method_to_class, value_sigs, chains, span, errors);
+            walk_expr_chain(then_expr, method_to_class, value_sigs, chains, span, errors);
+            walk_expr_chain(else_expr, method_to_class, value_sigs, chains, span, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_chain(e, method_to_class, value_sigs, chains, span, errors);
+            }
+            for alt in alts {
+                walk_guarded_chain(&alt.result, method_to_class, value_sigs, chains, span, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_chain(expr, method_to_class, value_sigs, chains, span, errors);
+                }
+            }
+            walk_expr_chain(body, method_to_class, value_sigs, chains, span, errors);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        walk_expr_chain(expr, method_to_class, value_sigs, chains, span, errors);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                walk_expr_chain(expr, method_to_class, value_sigs, chains, span, errors);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                walk_expr_chain(result, method_to_class, value_sigs, chains, span, errors);
+            }
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_chain(expr, method_to_class, value_sigs, chains, span, errors);
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug)]
+struct ChainInfo {
+    class_name: Symbol,
+    data_type: Symbol,
+    repeated_positions: Vec<usize>,
+}
+
+/// True iff `value_ty` (a type signature, possibly under `forall`)
+/// applies `data_type` to args where the args at `repeated_positions`
+/// are NOT all the same (different type expressions).
+fn value_sig_has_different_vars_at_positions(
+    value_ty: &cst::TypeExpr,
+    data_type: Symbol,
+    repeated_positions: &[usize],
+) -> bool {
+    let mut cur = value_ty;
+    loop {
+        match peel_paren_te_local(cur) {
+            cst::TypeExpr::Forall { ty, .. } => cur = ty,
+            cst::TypeExpr::Constrained { ty, .. } => cur = ty,
+            other => {
+                cur = other;
+                break;
+            }
+        }
+    }
+    // Peel App spine.
+    let mut args: Vec<&cst::TypeExpr> = Vec::new();
+    let mut tip = cur;
+    while let cst::TypeExpr::App { constructor, arg, .. } = tip {
+        args.push(arg);
+        tip = constructor;
+    }
+    args.reverse();
+    let cst::TypeExpr::Constructor { name, .. } = peel_paren_te_local(tip) else {
+        return false;
+    };
+    if name.module.is_some() || name.name.symbol() != data_type {
+        return false;
+    }
+    if args.len() < 2 {
+        return false;
+    }
+    // Compare args at `repeated_positions` — they should NOT all be
+    // the same shape.
+    let positions_args: Vec<&cst::TypeExpr> = repeated_positions
+        .iter()
+        .filter_map(|&i| args.get(i).copied())
+        .collect();
+    if positions_args.len() < 2 {
+        return false;
+    }
+    // Check if any two args at repeated positions are structurally
+    // different.
+    for i in 1..positions_args.len() {
+        if !type_expr_eq(positions_args[0], positions_args[i]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn type_expr_eq(a: &cst::TypeExpr, b: &cst::TypeExpr) -> bool {
+    match (peel_paren_te_local(a), peel_paren_te_local(b)) {
+        (cst::TypeExpr::Var { name: n1, .. }, cst::TypeExpr::Var { name: n2, .. }) => {
+            n1.value.symbol() == n2.value.symbol()
+        }
+        (
+            cst::TypeExpr::Constructor { name: n1, .. },
+            cst::TypeExpr::Constructor { name: n2, .. },
+        ) => n1.name.symbol() == n2.name.symbol(),
+        (
+            cst::TypeExpr::App { constructor: f1, arg: a1, .. },
+            cst::TypeExpr::App { constructor: f2, arg: a2, .. },
+        ) => type_expr_eq(f1, f2) && type_expr_eq(a1, a2),
+        _ => false,
     }
 }
 
