@@ -800,6 +800,14 @@ pub fn validate_module_with_class_fundeps(
     // `KindsDoNotUnify`.
     detect_row_kind_label_mismatch(&module.decls, &mut errors);
 
+    // ScopedTypeVariables-via-alias: `foo :: T` (where T is a type
+    // alias whose body has explicit forall) followed by an inner
+    // where/let signature with type vars that aren't in the inner
+    // sig's own explicit forall. The outer alias hides the forall
+    // from the inner scope, making the inner vars unbound.
+    // Reference compiler reports as `UndefinedTypeVariable`.
+    detect_scoped_var_via_alias(&module.decls, &mut errors);
+
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
     // barrier creates a dictionary-construction cycle.
@@ -6724,6 +6732,141 @@ fn detect_row_kind_label_mismatch(
             labels,
             closed: tail.is_none(),
         })
+    }
+}
+
+/// Detect ScopedTypeVariable issues hidden by aliases:
+/// `foo :: T; foo = bar where bar :: Array a` where `T = forall a.
+/// Array a` (alias whose body has explicit forall). The inner `a`
+/// in `bar :: Array a` should refer to outer scoped `a`, but the
+/// outer's forall is hidden behind the alias. Reference compiler
+/// reports as `UndefinedTypeVariable`.
+fn detect_scoped_var_via_alias(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+    let mut alias_has_forall: Map<Symbol, bool> = Map::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { name, ty, .. } = d {
+            let body_has_forall = matches!(
+                peel_paren_te_local(ty),
+                cst::TypeExpr::Forall { .. }
+            );
+            if body_has_forall {
+                alias_has_forall.insert(name.value.symbol(), true);
+            }
+        }
+    }
+    if alias_has_forall.is_empty() {
+        return;
+    }
+    let mut alias_sig_value: Map<Symbol, ()> = Map::new();
+    for d in decls {
+        if let cst::Decl::TypeSignature { name, ty, .. } = d {
+            let peeled = peel_paren_te_local(ty);
+            if let cst::TypeExpr::Constructor { name: alias_name, .. } = peeled {
+                if alias_name.module.is_none()
+                    && alias_has_forall.contains_key(&alias_name.name.symbol())
+                {
+                    alias_sig_value.insert(name.value.symbol(), ());
+                }
+            }
+        }
+    }
+    if alias_sig_value.is_empty() {
+        return;
+    }
+    for d in decls {
+        if let cst::Decl::Value { name, where_clause, .. } = d {
+            if alias_sig_value.contains_key(&name.value.symbol()) {
+                for b in where_clause {
+                    if let cst::LetBinding::Signature { ty, span, .. } = b {
+                        let unbound = collect_unbound_type_vars(ty);
+                        for v in unbound {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::UndefinedTypeVariable(
+                                    resolve(v),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn peel_paren_te_local(ty: &cst::TypeExpr) -> &cst::TypeExpr {
+    let mut cur = ty;
+    while let cst::TypeExpr::Parens { ty, .. } = cur {
+        cur = ty;
+    }
+    cur
+}
+
+fn collect_unbound_type_vars(ty: &cst::TypeExpr) -> Vec<Symbol> {
+    let mut out: Vec<Symbol> = Vec::new();
+    let mut bound: HashSet<Symbol> = HashSet::new();
+    walk_unbound(ty, &mut bound, &mut out);
+    out
+}
+
+fn walk_unbound(
+    ty: &cst::TypeExpr,
+    bound: &mut HashSet<Symbol>,
+    out: &mut Vec<Symbol>,
+) {
+    match ty {
+        cst::TypeExpr::Var { name, .. } => {
+            let sym = name.value.symbol();
+            if !bound.contains(&sym) && !out.iter().any(|s| *s == sym) {
+                out.push(sym);
+            }
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            let added: Vec<Symbol> = vars
+                .iter()
+                .map(|(n, _, _)| n.value.symbol())
+                .filter(|s| bound.insert(*s))
+                .collect();
+            walk_unbound(ty, bound, out);
+            for s in added {
+                bound.remove(&s);
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_unbound(constructor, bound, out);
+            walk_unbound(arg, bound, out);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_unbound(from, bound, out);
+            walk_unbound(to, bound, out);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for a in &c.args {
+                    walk_unbound(a, bound, out);
+                }
+            }
+            walk_unbound(ty, bound, out);
+        }
+        cst::TypeExpr::Parens { ty, .. } => walk_unbound(ty, bound, out),
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_unbound(ty, bound, out);
+            walk_unbound(kind, bound, out);
+        }
+        cst::TypeExpr::Record { fields, .. } | cst::TypeExpr::Row { fields, .. } => {
+            for f in fields {
+                walk_unbound(&f.ty, bound, out);
+            }
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_unbound(left, bound, out);
+            walk_unbound(right, bound, out);
+        }
+        _ => {}
     }
 }
 

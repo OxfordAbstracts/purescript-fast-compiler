@@ -17,7 +17,7 @@ check_failing_build_unit!(f_2378, "2378");
 check_failing_build_unit!(f_2379, "2379");
 check_failing_build_unit!(f_2434, "2434");
 check_failing_build_unit_ignored!(f_2534, "2534", "expected: InfiniteType");
-check_failing_build_unit_ignored!(f_2542, "2542", "expected: UndefinedTypeVariable");
+check_failing_build_unit!(f_2542, "2542");
 check_failing_build_unit!(f_2567, "2567");
 check_failing_build_unit!(f_2601, "2601");
 check_failing_build_unit!(f_2616, "2616");
