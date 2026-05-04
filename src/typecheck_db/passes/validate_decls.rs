@@ -895,6 +895,14 @@ pub fn validate_module_with_class_fundeps(
     // `KindsDoNotUnify`.
     detect_polykind_class_method_kind_mismatch(&module.decls, &mut errors);
 
+    // Nested update setting a row-parameterized field to a
+    // primitive literal: `state { context { fields = "Not a
+    // record" } }` where some local type alias declares
+    // `... fields :: { | row_param }, ...`. The field expects a
+    // record but is assigned a string. Reference compiler reports
+    // as `TypesDoNotUnify`.
+    detect_nested_update_row_field_mismatch(&module.decls, &mut errors);
+
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
     // barrier creates a dictionary-construction cycle.
@@ -6886,6 +6894,241 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             _ => return count,
         }
     }
+}
+
+/// Detect nested record update assigning a primitive literal to a
+/// field whose declared type (per a local type alias) is
+/// `{ | row_param }` — a record with a row variable as tail. Such
+/// fields expect record values; assigning a string/int/bool fails.
+/// Reference compiler reports as `TypesDoNotUnify`.
+fn detect_nested_update_row_field_mismatch(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashSet as Set;
+    // Step 1: collect field names whose declared type in some
+    // local type alias is `{ | row_param }` (record with bare type
+    // var as tail). These fields expect a record value.
+    let mut row_param_field_names: Set<Symbol> = Set::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { type_vars, ty, .. } = d {
+            let var_set: HashSet<Symbol> = type_vars
+                .iter()
+                .map(|v| v.value.symbol())
+                .collect();
+            collect_row_param_fields(ty, &var_set, &mut row_param_field_names);
+        }
+    }
+    if row_param_field_names.is_empty() {
+        return;
+    }
+    // Step 2: walk Decl::Value bodies for nested updates whose
+    // leaf assigns a primitive literal to a row-param field.
+    for d in decls {
+        if let cst::Decl::Value { guarded, where_clause, span, .. } = d {
+            walk_guarded_row_field(guarded, &row_param_field_names, *span, errors);
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_row_field(expr, &row_param_field_names, *span, errors);
+                }
+            }
+        }
+    }
+}
+
+fn collect_row_param_fields(
+    ty: &cst::TypeExpr,
+    type_vars: &HashSet<Symbol>,
+    out: &mut HashSet<Symbol>,
+) {
+    let cur = peel_paren_te_local(ty);
+    match cur {
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                // Field type `{ | row_var }` is parsed as
+                // `Row { fields: [], tail: Some(Var(row_var)),
+                // is_record: true }`.
+                let field_ty = peel_paren_te_local(&f.ty);
+                if let cst::TypeExpr::Row {
+                    fields: inner_fields,
+                    tail: Some(tail),
+                    is_record: true,
+                    ..
+                } = field_ty
+                {
+                    if inner_fields.is_empty() {
+                        if let cst::TypeExpr::Var { name, .. } = peel_paren_te_local(tail) {
+                            if type_vars.contains(&name.value.symbol()) {
+                                out.insert(f.label.value.symbol());
+                            }
+                        }
+                    }
+                }
+                collect_row_param_fields(&f.ty, type_vars, out);
+            }
+        }
+        cst::TypeExpr::Row { fields, .. } => {
+            for f in fields {
+                collect_row_param_fields(&f.ty, type_vars, out);
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            collect_row_param_fields(constructor, type_vars, out);
+            collect_row_param_fields(arg, type_vars, out);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            collect_row_param_fields(from, type_vars, out);
+            collect_row_param_fields(to, type_vars, out);
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            collect_row_param_fields(ty, type_vars, out);
+        }
+        cst::TypeExpr::Constrained { ty, .. } => {
+            collect_row_param_fields(ty, type_vars, out);
+        }
+        _ => {}
+    }
+}
+
+fn walk_guarded_row_field(
+    g: &cst::GuardedExpr,
+    row_field_names: &HashSet<Symbol>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            walk_expr_row_field(e, row_field_names, span, errors);
+        }
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            walk_expr_row_field(e, row_field_names, span, errors);
+                        }
+                    }
+                }
+                walk_expr_row_field(&gd.expr, row_field_names, span, errors);
+            }
+        }
+    }
+}
+
+fn walk_expr_row_field(
+    expr: &cst::Expr,
+    row_field_names: &HashSet<Symbol>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    // Look for App(_, Record { fields with is_update }).
+    if let cst::Expr::App { func, arg, .. } = expr {
+        if let cst::Expr::Record { fields, .. } = peel_paren_expr(arg) {
+            if !fields.is_empty() && fields.iter().all(|f| f.is_update) {
+                walk_record_update_for_row_field(fields, row_field_names, span, errors);
+            }
+        }
+        walk_expr_row_field(func, row_field_names, span, errors);
+        walk_expr_row_field(arg, row_field_names, span, errors);
+        return;
+    }
+    if let cst::Expr::RecordUpdate { updates, .. } = expr {
+        for u in updates {
+            walk_expr_row_field(&u.value, row_field_names, span, errors);
+        }
+        return;
+    }
+    match expr {
+        cst::Expr::Lambda { body, .. } => {
+            walk_expr_row_field(body, row_field_names, span, errors);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            walk_expr_row_field(cond, row_field_names, span, errors);
+            walk_expr_row_field(then_expr, row_field_names, span, errors);
+            walk_expr_row_field(else_expr, row_field_names, span, errors);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                walk_expr_row_field(e, row_field_names, span, errors);
+            }
+            for alt in alts {
+                walk_guarded_row_field(&alt.result, row_field_names, span, errors);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    walk_expr_row_field(expr, row_field_names, span, errors);
+                }
+            }
+            walk_expr_row_field(body, row_field_names, span, errors);
+        }
+        cst::Expr::Parens { expr, .. }
+        | cst::Expr::TypeAnnotation { expr, .. }
+        | cst::Expr::Negate { expr, .. } => {
+            walk_expr_row_field(expr, row_field_names, span, errors);
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    walk_expr_row_field(v, row_field_names, span, errors);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk update fields. For each update field, recurse into the
+/// nested update structure. If we find a leaf assignment
+/// `row_field_name = primitive_literal`, emit error.
+fn walk_record_update_for_row_field(
+    fields: &[cst::RecordField],
+    row_field_names: &HashSet<Symbol>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    for f in fields {
+        // For nested case (is_nested=true), recurse into the value
+        // as another update record.
+        if f.is_nested {
+            if let Some(cst::Expr::Record { fields: inner, .. }) = f.value.as_ref() {
+                walk_record_update_for_row_field(inner, row_field_names, span, errors);
+            }
+            continue;
+        }
+        // For flat case (is_nested=false): if the field name is a
+        // row-param field AND value is primitive literal, emit.
+        if row_field_names.contains(&f.label.value.symbol()) {
+            if let Some(value) = &f.value {
+                if is_primitive_literal_value(value) {
+                    errors.push(ValidationError {
+                        span,
+                        kind: ValidationErrorKind::LiteralBodySigMismatch(
+                            resolve(f.label.value.symbol()),
+                        ),
+                    });
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn is_primitive_literal_value(expr: &cst::Expr) -> bool {
+    let cur = peel_paren_expr(expr);
+    matches!(
+        cur,
+        cst::Expr::Literal {
+            lit: crate::cst::Literal::String(_)
+                | crate::cst::Literal::Int(_)
+                | crate::cst::Literal::Float(_)
+                | crate::cst::Literal::Boolean(_)
+                | crate::cst::Literal::Char(_),
+            ..
+        }
+    )
 }
 
 /// Detect KindsDoNotUnify in a class-method call where one arg

@@ -262,7 +262,7 @@ check_failing_build_unit!(f_MultipleValueOpFixities, "MultipleValueOpFixities");
 check_failing_build_unit!(f_MutRec, "MutRec");
 check_failing_build_unit!(f_MutRec2, "MutRec2");
 check_failing_build_unit!(f_NestedRecordLabelOnTypeError, "NestedRecordLabelOnTypeError");
-check_failing_build_unit_ignored!(f_NestedRecordUpdateAliasWrongType, "NestedRecordUpdateAliasWrongType", "expected: TypesDoNotUnify");
+check_failing_build_unit!(f_NestedRecordUpdateAliasWrongType, "NestedRecordUpdateAliasWrongType");
 check_failing_build_unit!(f_NestedRecordUpdateFlatInModify, "NestedRecordUpdateFlatInModify");
 check_failing_build_unit!(f_NestedRecordUpdateFlatMismatch, "NestedRecordUpdateFlatMismatch");
 check_failing_build_unit!(f_NestedRecordUpdateFlatVsNested, "NestedRecordUpdateFlatVsNested");
