@@ -6,6 +6,7 @@
 //! decl-level locals introduced by lambdas / let / where bindings.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::typecheck_db::types::{AliasMap, QName, Scheme, Type};
 use crate::typecheck_db::unify::UnifyState;
@@ -13,7 +14,11 @@ use crate::typecheck_db::unify::UnifyState;
 #[derive(Debug, Clone, Default)]
 pub struct Env {
     /// Qualified top-level schemes (values, constructors, class methods).
-    pub top_level: HashMap<QName, Scheme>,
+    /// `Arc`-shared so the import path can bind a single scheme under
+    /// multiple `QName` keys (qualifier + origin) with one
+    /// `Arc::clone` per key instead of a deep `Scheme::clone`. Reads
+    /// deref through to `&Scheme` so existing callers don't change.
+    pub top_level: HashMap<QName, Arc<Scheme>>,
     /// Unqualified local bindings introduced by lambdas, case binders, etc.
     /// Monomorphic: lambda/pattern binders are not let-polymorphic.
     pub locals: Vec<HashMap<String, Type>>,
@@ -70,6 +75,13 @@ impl Env {
     }
 
     pub fn bind_scheme(&mut self, name: QName, scheme: Scheme) {
+        self.top_level.insert(name, Arc::new(scheme));
+    }
+
+    /// Like `bind_scheme` but accepts a pre-`Arc`-wrapped scheme so
+    /// the import path can share a single allocation across the
+    /// qualifier-keyed and origin-keyed bindings.
+    pub fn bind_scheme_arc(&mut self, name: QName, scheme: Arc<Scheme>) {
         self.top_level.insert(name, scheme);
     }
 
@@ -119,7 +131,7 @@ impl Env {
             .top_level
             .get(&QName { module: None, name: name.to_string() })
         {
-            return Lookup::Scheme(s);
+            return Lookup::Scheme(s.as_ref());
         }
         Lookup::Missing
     }
@@ -132,12 +144,13 @@ impl Env {
     /// hides that import and shadows it with a local `apply`.
     pub fn lookup_qualified(&self, q: &QName) -> Option<&Scheme> {
         if let Some(s) = self.top_level.get(q) {
-            return Some(s);
+            return Some(s.as_ref());
         }
         if q.module.is_some() {
             return self
                 .top_level
-                .get(&QName { module: None, name: q.name.clone() });
+                .get(&QName { module: None, name: q.name.clone() })
+                .map(|s| s.as_ref());
         }
         None
     }
@@ -156,7 +169,7 @@ impl Env {
         // vars are `Type::Var`, and any residual Unif there would be a bug.
         // Still, conservatively fold them in.
         for scheme in self.top_level.values() {
-            out.extend(state.free_unif_vars(&scheme.ty));
+            out.extend(state.free_unif_vars(&scheme.as_ref().ty));
         }
         // Same reasoning for local schemes.
         for scope in &self.local_schemes {

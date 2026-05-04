@@ -32,7 +32,7 @@ stacker = "0.1"
 mimalloc = { version = "0.1", default-features = false }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bincode = "1"
 zstd = "0.13"
@@ -49,3 +49,7 @@ proptest = "1.4"
 regex = "1"
 tempfile = "3.27.0"
 wait-timeout = "0.2.1"
+
+[[bench]]
+name = "typecheck_db_packages"
+harness = false

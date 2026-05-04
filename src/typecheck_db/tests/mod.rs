@@ -35,3 +35,4 @@ mod failing_fixtures;
 mod hole_fixtures;
 mod passing_fixtures;
 mod prelude;
+mod all_packages;

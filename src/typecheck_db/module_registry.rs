@@ -61,7 +61,12 @@ pub struct FixityDecl {
 pub struct ModuleExports {
     /// Top-level values (functions + non-method constants) plus
     /// class methods. Keyed by the local value name.
-    pub values: HashMap<String, Scheme>,
+    /// `Arc`-shared so importers can `Arc::clone` into their `Env`
+    /// instead of doing a deep `Scheme::clone` per imported name.
+    /// Each importer of, say, Prelude binds 200+ values under two
+    /// keys; before this the whole `Type` tree was being cloned
+    /// twice per scheme per importer.
+    pub values: HashMap<String, std::sync::Arc<Scheme>>,
 
     /// Every constructor declared in this module, keyed by the
     /// constructor's local name. Includes newtype constructors.
@@ -119,7 +124,7 @@ pub struct ModuleExports {
     /// any additional `(origin, name) → scheme` pair so the
     /// importer can still bind all distinct origin keys.
     #[serde(default)]
-    pub qualified_values: HashMap<(String, String), Scheme>,
+    pub qualified_values: HashMap<(String, String), std::sync::Arc<Scheme>>,
 
     /// Defining module for each exported class — same shape and
     /// semantics as `value_origins`, used by ExportConflict to
@@ -334,7 +339,7 @@ pub fn distill_exports(
     // the CST). Signature entries lose to inferred schemes when
     // both exist, since a `foo :: T` + `foo = body` pair should
     // export the inferred type, not the raw annotation.
-    let mut scheme_by_name: HashMap<String, Scheme> = HashMap::new();
+    let mut scheme_by_name: HashMap<String, std::sync::Arc<Scheme>> = HashMap::new();
     for d in &module.decls {
         match d {
             Decl::Class { name, type_vars, members, .. } => {
@@ -379,7 +384,7 @@ pub fn distill_exports(
                     all_vars.extend(method_vars);
                     scheme_by_name.insert(
                         method_name,
-                        Scheme { vars: all_vars, ty: constrained },
+                        std::sync::Arc::new(Scheme { vars: all_vars, ty: constrained }),
                     );
                 }
             }
@@ -397,7 +402,7 @@ pub fn distill_exports(
                     }
                     other => (Vec::new(), other),
                 };
-                scheme_by_name.insert(n, Scheme { vars, ty: body });
+                scheme_by_name.insert(n, std::sync::Arc::new(Scheme { vars, ty: body }));
             }
             Decl::TypeSignature { name, ty, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
@@ -413,13 +418,15 @@ pub fn distill_exports(
                     }
                     other => (Vec::new(), other),
                 };
-                scheme_by_name.entry(n).or_insert(Scheme { vars, ty: body });
+                scheme_by_name
+                    .entry(n)
+                    .or_insert_with(|| std::sync::Arc::new(Scheme { vars, ty: body }));
             }
             _ => {}
         }
     }
     for s in schemes {
-        scheme_by_name.insert(s.name.clone(), s.scheme.clone());
+        scheme_by_name.insert(s.name.clone(), std::sync::Arc::new(s.scheme.clone()));
     }
 
     // Walk decls once to extract everything the checker doesn't
@@ -645,7 +652,10 @@ pub fn distill_exports(
                     // Tuple as /\`): the target is a ctor, not a
                     // value. Synthesize its ctor scheme so the
                     // operator is importable as a value too.
-                    out.values.insert(op.clone(), crate::typecheck_db::passes::imports::synth_ctor_scheme(info));
+                    out.values.insert(
+                        op.clone(),
+                        std::sync::Arc::new(crate::typecheck_db::passes::imports::synth_ctor_scheme(info)),
+                    );
                     out.value_origins.insert(op.clone(), self_module_name.clone());
                 }
             }
@@ -668,7 +678,10 @@ pub fn distill_exports(
                                 out.values.insert(name.clone(), s.clone());
                                 out.value_origins.insert(name.clone(), self_module_name.clone());
                             } else if let Some(info) = ctor_info.get(&fx.target_name) {
-                                out.values.insert(name.clone(), crate::typecheck_db::passes::imports::synth_ctor_scheme(info));
+                                out.values.insert(
+                                    name.clone(),
+                                    std::sync::Arc::new(crate::typecheck_db::passes::imports::synth_ctor_scheme(info)),
+                                );
                                 out.value_origins
                                     .insert(name.clone(), self_module_name.clone());
                             }

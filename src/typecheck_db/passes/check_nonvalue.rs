@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::cst;
 use crate::typecheck_db::ir::Decl;
 use crate::typecheck_db::driver::{CacheOutcome, DriverError, TypecheckDb};
+use crate::typecheck_db::driver_multi::phase_timing;
 use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::passes::exhaustiveness::CtorInfo;
 use crate::typecheck_db::passes::instance_index::{ClassInfo, FunDep};
@@ -175,18 +176,36 @@ pub mod check_data {
         // structural content rather than from the decl's source span
         // (some spans are broken — e.g. class bodies come back as
         // `15..0`, which would make distinct classes hash-collide).
-        let shape = compute(decl, type_ops);
-        let shape_bytes = bincode::serialize(&shape).expect("shape serialization");
-        let source_hash = hash_bytes(&shape_bytes);
+        let shape = {
+            let _s = phase_timing::Scope::new("3a_compute_data");
+            compute(decl, type_ops)
+        };
+        let shape_bytes = {
+            let _s = phase_timing::Scope::new("3b_serialize_data");
+            bincode::serialize(&shape).expect("shape serialization")
+        };
+        let source_hash = {
+            let _s = phase_timing::Scope::new("3c_hash_data");
+            hash_bytes(&shape_bytes)
+        };
         let key = PassKey::new(module, decl_key, PASS_NAME);
         let input_hash =
             input_hash_with_deps(PASS_NAME, PASS_VERSION, source_hash, dep_hashes);
-        if let Some((cached, _)) = db.get_cached::<DataShape>(&key, input_hash)? {
-            let oh = hash_shape_with_deps(&cached, dep_hashes);
-            return Ok((cached, oh, CacheOutcome::Hit));
+        {
+            let _s = phase_timing::Scope::new("3d_get_cached_data");
+            if let Some((cached, _)) = db.get_cached::<DataShape>(&key, input_hash)? {
+                let oh = hash_shape_with_deps(&cached, dep_hashes);
+                return Ok((cached, oh, CacheOutcome::Hit));
+            }
         }
-        db.put_with_debug(&key, input_hash, &shape, decl_debug)?;
-        let oh = hash_shape_with_deps(&shape, dep_hashes);
+        {
+            let _s = phase_timing::Scope::new("3e_put_data");
+            db.put_with_debug(&key, input_hash, &shape, decl_debug)?;
+        }
+        let oh = {
+            let _s = phase_timing::Scope::new("3f_output_hash_data");
+            hash_shape_with_deps(&shape, dep_hashes)
+        };
         Ok((shape, oh, CacheOutcome::Miss))
     }
 

@@ -917,7 +917,7 @@ pub fn infer_value_scc_with_all(
                 let candidate = env
                     .top_level
                     .get(&QName { module: None, name: name.clone() })
-                    .cloned();
+                    .map(|arc| arc.as_ref().clone());
                 match candidate {
                     Some(s) if scheme_has_inner_forall(&s) => Some(s),
                     _ => None,
@@ -1659,7 +1659,10 @@ fn infer_constructor(
             // Try unqualified too for the common case where the caller
             // seeded constructors without a module prefix.
             Some(_) => None,
-            None => env.top_level.get(&QName::unqualified(name_str.clone())),
+            None => env
+                .top_level
+                .get(&QName::unqualified(name_str.clone()))
+                .map(|arc| arc.as_ref()),
         })
         .ok_or_else(|| InferError::UnboundConstructor(format!("{}", q)))?;
     Ok(instantiate(state, scheme))
@@ -1921,7 +1924,10 @@ fn bind_constructor_pattern(
         .lookup_qualified(&q)
         .or_else(|| match &q.module {
             Some(_) => None,
-            None => env.top_level.get(&QName::unqualified(name_str.clone())),
+            None => env
+                .top_level
+                .get(&QName::unqualified(name_str.clone()))
+                .map(|arc| arc.as_ref()),
         })
         .ok_or_else(|| InferError::UnboundConstructor(format!("{}", q)))?;
 
@@ -2876,7 +2882,7 @@ fn sig_param_types(
     let scheme = env
         .top_level
         .get(&QName { module: None, name: name.to_string() })
-        .cloned()?;
+        .map(|arc| arc.as_ref().clone())?;
     let mono = instantiate_sig_as_monotype(state, Type::Forall(
         scheme
             .vars

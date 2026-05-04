@@ -194,13 +194,100 @@ pub fn check_many_modules_with_db(
         report.errors.push(MultiModuleError::CycleInModules(cycle));
     }
 
-    for idx in order {
-        let input = &modules[idx];
+    let trace = std::env::var_os("TYPECHECK_DB_TRACE").is_some();
+    for (i, idx) in order.iter().enumerate() {
+        let input = &modules[*idx];
+        if trace {
+            eprintln!(
+                "[typecheck_db] [{i}/{}] checking {}",
+                order.len(),
+                input.name,
+            );
+        }
         let result = check_one_module(db, input, &mut report.registry);
         report.results.push(result);
     }
 
+    if std::env::var_os("TYPECHECK_DB_TIMING").is_some() {
+        phase_timing::dump();
+    }
+
     report
+}
+
+// ---------------------------------------------------------------------------
+// Per-phase timing.
+//
+// Opt-in (`TYPECHECK_DB_TIMING=1`). Wrap each pass inside `check_one_module`
+// with a `phase_timing::Scope`; the scope accumulates per-pass totals into a
+// process-wide table. After the multi-module run finishes the totals are
+// printed sorted descending so the dominant phase is obvious without
+// per-iteration noise. Zero-overhead when the env var is unset (no
+// `Instant::now()` and no env-var lookup, both cached behind a `OnceLock`).
+// ---------------------------------------------------------------------------
+
+pub mod phase_timing {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    fn enabled() -> bool {
+        // Cache the env-var lookup in a `OnceLock<bool>` so the
+        // per-phase `Scope::new` call doesn't syscall through
+        // `std::env::var_os` on every entry.
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var_os("TYPECHECK_DB_TIMING").is_some())
+    }
+
+    fn table() -> &'static Mutex<HashMap<&'static str, Duration>> {
+        static T: OnceLock<Mutex<HashMap<&'static str, Duration>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn record(name: &'static str, dur: Duration) {
+        let mut t = table().lock().expect("phase_timing table");
+        *t.entry(name).or_default() += dur;
+    }
+
+    pub fn dump() {
+        let t = table().lock().expect("phase_timing table");
+        let mut entries: Vec<_> = t.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1));
+        let total: Duration = entries.iter().map(|(_, d)| **d).sum();
+        eprintln!("[typecheck_db] phase totals (across all modules):");
+        for (name, dur) in &entries {
+            let pct = if total.is_zero() {
+                0.0
+            } else {
+                100.0 * dur.as_secs_f64() / total.as_secs_f64()
+            };
+            eprintln!("  {:>7.2?}  {:>5.1}%  {}", dur, pct, name);
+        }
+        eprintln!("  {:>7.2?}  100.0%  TOTAL", total);
+    }
+
+    pub struct Scope {
+        name: &'static str,
+        start: Option<Instant>,
+    }
+
+    impl Scope {
+        pub fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                start: enabled().then(Instant::now),
+            }
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if let Some(start) = self.start {
+                record(self.name, start.elapsed());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +466,14 @@ fn check_one_module(
         m
     };
 
+    // Pre-resolve the module's imports once. The per-reference
+    // dep-resolver helpers used to walk and re-resolve
+    // `module.imports` on every reference hit, which on a 90-module
+    // bench was visibly hot (each call allocated a fresh
+    // `Vec<String>` + `String::join`). Built before phase 3 so
+    // every dep collector that follows can read the cached vectors.
+    let imports_lookup = ImportLookup::build(module);
+
     // 3) Run per-decl cached check passes for every non-value decl.
     //    Each pass produces a structural `Shape` + an `output_hash`.
     //    The hashes feed into the value-SCC dep tracking below, so
@@ -425,7 +520,7 @@ fn check_one_module(
         let dep_hashes = collect_nonvalue_dep_hashes(
             d,
             &name,
-            module,
+            &imports_lookup,
             registry,
             &local_type_hashes,
             &local_class_hashes,
@@ -824,7 +919,7 @@ fn check_one_module(
                         resolve_value_dep(
                             r,
                             &name,
-                            module,
+                            &imports_lookup,
                             registry,
                             &name_to_idx,
                             &scc_member_set,
@@ -846,7 +941,7 @@ fn check_one_module(
                                     class_mod,
                                     class_name,
                                     &name,
-                                    module,
+                                    &imports_lookup,
                                     registry,
                                     &local_class_hashes,
                                     &local_instance_hashes_by_class,
@@ -859,7 +954,7 @@ fn check_one_module(
                     NameKind::Type => resolve_type_dep(
                         r,
                         &name,
-                        module,
+                        &imports_lookup,
                         registry,
                         &local_type_hashes,
                         &mut dep_output_hashes,
@@ -868,7 +963,7 @@ fn check_one_module(
                     NameKind::Constructor => resolve_ctor_dep(
                         r,
                         &name,
-                        module,
+                        &imports_lookup,
                         registry,
                         &local_ctor_parent_hash,
                         &mut dep_output_hashes,
@@ -878,7 +973,7 @@ fn check_one_module(
                         resolve_class_dep(
                             r,
                             &name,
-                            module,
+                            &imports_lookup,
                             registry,
                             &local_class_hashes,
                             &local_instance_hashes_by_class,
@@ -889,7 +984,7 @@ fn check_one_module(
                     NameKind::Op | NameKind::TypeOp => resolve_fixity_dep(
                         r,
                         &name,
-                        module,
+                        &imports_lookup,
                         registry,
                         &local_fixity_hashes,
                         &mut dep_output_hashes,
@@ -1095,13 +1190,13 @@ fn check_one_module(
                 let class_method_scheme = env
                     .top_level
                     .get(&crate::typecheck_db::types::QName::unqualified(&method_name))
-                    .cloned()
+                    .map(|arc| arc.as_ref().clone())
                     .or_else(|| {
                         for imp in &module.imports {
                             let imp_name = join_module_name(&imp.module);
                             if let Some(exports) = registry.get(&imp_name) {
                                 if let Some(s) = exports.values.get(&method_name) {
-                                    return Some(s.clone());
+                                    return Some(s.as_ref().clone());
                                 }
                             }
                         }
@@ -1182,7 +1277,9 @@ fn check_one_module(
                 // instance-specialised one for the duration of body
                 // inference.
                 let key = crate::typecheck_db::types::QName::unqualified(&method_name);
-                let saved_scheme = env.top_level.insert(key.clone(), synthesized_sig);
+                let saved_scheme = env
+                    .top_level
+                    .insert(key.clone(), std::sync::Arc::new(synthesized_sig));
                 let was_signed = env.local_signed.insert(method_name.clone());
                 let saved_hole_sites =
                     env.local_signed_hole_sites.remove(&method_name);
@@ -1601,7 +1698,7 @@ fn check_one_module(
             String,
             String,
             String,
-            crate::typecheck_db::types::Scheme,
+            std::sync::Arc<crate::typecheck_db::types::Scheme>,
         )> = Vec::new();
         for (op, fx) in &exports.value_fixities {
             if fx.target_module.is_some() {
@@ -1630,7 +1727,7 @@ fn check_one_module(
                     // constructor under its origin module —
                     // downstream `Expr::Constructor(origin.Tuple)`
                     // then resolves.
-                    let scheme = source
+                    let scheme: Option<std::sync::Arc<crate::typecheck_db::types::Scheme>> = source
                         .values
                         .get(&fx.target_name)
                         .cloned()
@@ -1638,7 +1735,9 @@ fn check_one_module(
                             source
                                 .ctors
                                 .get(&fx.target_name)
-                                .map(|info| crate::typecheck_db::passes::imports::synth_ctor_scheme(info))
+                                .map(|info| std::sync::Arc::new(
+                                    crate::typecheck_db::passes::imports::synth_ctor_scheme(info)
+                                ))
                         });
                     if let Some(s) = scheme {
                         value_inserts.push((
@@ -1830,7 +1929,7 @@ fn detect_cross_module_instance_overlaps(
     // Build a fingerprint set for local instances so we can ask
     // "is THIS instance from local CST?" without walking every
     // time.
-    let local_keys: std::collections::HashSet<(String, usize, String)> =
+    let local_keys: std::collections::HashSet<(String, usize, u64)> =
         local_instances
             .iter()
             .map(|i| (i.class.name.clone(), i.types.len(), instance_fingerprint(i)))
@@ -1907,48 +2006,86 @@ fn detect_cross_module_instance_overlaps(
     for cls in fundep_classes {
         by_class.remove(&cls);
     }
-    let mut already_emitted_for_class: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     for (class_name, list) in by_class {
         let n = list.len();
-        for i in 0..n {
+        if n < 2 {
+            continue;
+        }
+        // Pre-compute per-instance data once. Each prior version
+        // recomputed `instance_fingerprint` (formerly a `Debug`-format
+        // string) up to five times per pair — at O(n²) pairs that
+        // turned this detector into ~50% of total typecheck time.
+        // Fingerprint is a u64 structural hash now (collision
+        // probability 1/2⁶⁴; a hypothetical collision would only
+        // suppress a single overlap diagnostic — never a typechecker
+        // correctness regression).
+        let fingerprints: Vec<u64> =
+            list.iter().map(|inst| instance_fingerprint(inst)).collect();
+        let local_flags: Vec<bool> = list
+            .iter()
+            .zip(fingerprints.iter())
+            .map(|(inst, fp)| {
+                local_keys.contains(&(
+                    inst.class.name.clone(),
+                    inst.types.len(),
+                    *fp,
+                ))
+            })
+            .collect();
+        // Pre-compute the head-constructor key vector once per
+        // instance. Comparing keys before calling
+        // `instances_heads_unify` filters out the dominant case —
+        // two instances at different concrete heads (e.g. `Show
+        // Int` vs `Show String`) can't unify, so we skip the
+        // allocation-heavy unification entirely.
+        let head_keys: Vec<Vec<Option<String>>> =
+            list.iter().map(|inst| instance_head_keys(inst)).collect();
+        // Whether we've already emitted an overlap for THIS class.
+        // The reference compiler's diagnostic is class-level (one
+        // per class), so once we've found one pair we can stop
+        // scanning the rest — that's an O(n²) → O(n) early-exit
+        // when overlaps exist.
+        let mut emitted = false;
+        'outer: for i in 0..n {
+            if emitted {
+                break;
+            }
+            let a = list[i];
+            let a_local = local_flags[i];
+            let a_fp = fingerprints[i];
+            let a_keys = &head_keys[i];
             for j in (i + 1)..n {
-                let a = list[i];
                 let b = list[j];
                 if a.types.len() != b.types.len() {
                     continue;
                 }
-                let a_local = local_keys.contains(&(
-                    a.class.name.clone(),
-                    a.types.len(),
-                    instance_fingerprint(a),
-                ));
-                let b_local = local_keys.contains(&(
-                    b.class.name.clone(),
-                    b.types.len(),
-                    instance_fingerprint(b),
-                ));
-                if a_local && b_local {
+                if a_local && local_flags[j] {
                     continue;
                 }
                 // Skip identical-head pairs — those are usually
                 // the same instance arriving twice through a
                 // re-export chain.
-                if instance_fingerprint(a) == instance_fingerprint(b) {
+                if a_fp == fingerprints[j] {
+                    continue;
+                }
+                // Cheap head-key pre-filter (see comment on
+                // `head_keys_could_match`). Skips the dominant
+                // case before any allocation.
+                if !head_keys_could_match(a_keys, &head_keys[j]) {
                     continue;
                 }
                 if instances_heads_unify(a, b) {
-                    if already_emitted_for_class.insert(class_name.clone()) {
-                        validation_errors.push(
-                            crate::typecheck_db::passes::validate_decls::ValidationError {
-                                span: crate::span::Span { start: 0, end: 0 },
-                                kind: crate::typecheck_db::passes::validate_decls
-                                    ::ValidationErrorKind::OverlappingInstances(
-                                        class_name.clone(),
-                                    ),
-                            },
-                        );
-                    }
+                    validation_errors.push(
+                        crate::typecheck_db::passes::validate_decls::ValidationError {
+                            span: crate::span::Span { start: 0, end: 0 },
+                            kind: crate::typecheck_db::passes::validate_decls
+                                ::ValidationErrorKind::OverlappingInstances(
+                                    class_name.clone(),
+                                ),
+                        },
+                    );
+                    emitted = true;
+                    break 'outer;
                 }
             }
         }
@@ -1957,12 +2094,59 @@ fn detect_cross_module_instance_overlaps(
 
 fn instance_fingerprint(
     i: &crate::typecheck_db::passes::instance_index::Instance,
-) -> String {
-    // A stable string of the instance's head types — enough to
-    // distinguish different heads without comparing internal unif
-    // ids (instances at this stage carry only Var / Con / App /
-    // Fun / etc., no unifs).
-    format!("{:?}", i.types)
+) -> u64 {
+    // Structural u64 hash of the instance's head types. Replaced
+    // an earlier `format!("{:?}", …)` Debug-string fingerprint
+    // because that allocated per call and dominated the
+    // `detect_cross_module_instance_overlaps` loop. Collision
+    // risk is 1/2⁶⁴, and a hypothetical collision merely
+    // suppresses one overlap diagnostic — never a typechecker
+    // correctness regression.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    i.types.hash(&mut h);
+    h.finish()
+}
+
+/// Cheap pre-filter for `detect_cross_module_instance_overlaps`:
+/// extract the head-constructor name of every type in the instance
+/// head, defaulting to `None` for type-variable heads (which can
+/// unify with anything). Two instances whose head-key vectors
+/// disagree on any concrete position can't possibly unify, so we
+/// skip the expensive `instances_heads_unify` call.
+fn instance_head_keys(
+    i: &crate::typecheck_db::passes::instance_index::Instance,
+) -> Vec<Option<String>> {
+    use crate::typecheck_db::types::Type;
+    fn key_of(t: &Type) -> Option<String> {
+        match t {
+            Type::Con(qn) => Some(qn.name.clone()),
+            Type::App(f, _) => key_of(f),
+            Type::Fun(_, _) => Some("->".to_string()),
+            // Var / Forall / Constrained / Record / Row / Hole /
+            // Wildcard / TypeString / TypeInt / Kinded / Unif /
+            // Skolem all unify (or might unify) with anything in
+            // the head position. Treat as wildcard.
+            _ => None,
+        }
+    }
+    i.types.iter().map(key_of).collect()
+}
+
+/// Two instance heads can't possibly unify if their head-keys
+/// disagree on any concrete position. Vars (`None`) are wildcards.
+fn head_keys_could_match(
+    a: &[Option<String>],
+    b: &[Option<String>],
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    })
 }
 
 fn instances_heads_unify(
@@ -3025,26 +3209,56 @@ fn build_imported_class_arity(
     out
 }
 
+/// Pre-computed import view for one module. Built once per
+/// `check_one_module` call and passed through `resolve_*_dep`
+/// helpers so per-reference lookups don't re-resolve every
+/// import's `Symbol` parts on every call. The original walk
+/// allocated a fresh `Vec<String>` and `String::join(".")` per
+/// import per reference, which on a 90-module bench was visibly
+/// hot.
+struct ImportLookup {
+    /// Target module names of every unqualified `import M`. Order
+    /// preserved so first-match-wins semantics match the prior
+    /// behaviour.
+    unqualified_targets: Vec<String>,
+    /// Target module names of every import (qualified or not), in
+    /// source order. Used by edges that need to enumerate every
+    /// in-scope import (e.g. instance dispatch).
+    all_targets: Vec<String>,
+    /// `import M as Q` → `Q` → `M`. First-import-wins on
+    /// duplicate aliases (matching prior fold-then-find loop).
+    alias_to_target: std::collections::HashMap<String, String>,
+}
+
+impl ImportLookup {
+    fn build(module: &cst::Module) -> Self {
+        let mut unqualified_targets: Vec<String> = Vec::with_capacity(module.imports.len());
+        let mut all_targets: Vec<String> = Vec::with_capacity(module.imports.len());
+        let mut alias_to_target: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(module.imports.len());
+        for imp in &module.imports {
+            let target = join_module_name(&imp.module);
+            all_targets.push(target.clone());
+            match &imp.qualified {
+                None => unqualified_targets.push(target),
+                Some(q) => {
+                    let alias = join_module_name(q);
+                    alias_to_target.entry(alias).or_insert(target);
+                }
+            }
+        }
+        Self { unqualified_targets, all_targets, alias_to_target }
+    }
+}
+
 fn lookup_unqualified_import(
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     name: &str,
 ) -> Option<(String, OutputHash)> {
-    for imp in &module.imports {
-        // Only unqualified imports (no `as Q`) contribute unqualified
-        // names to the importer's env.
-        if imp.qualified.is_some() {
-            continue;
-        }
-        let target = imp
-            .module
-            .parts
-            .iter()
-            .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
-            .collect::<Vec<_>>()
-            .join(".");
-        if let Some(oh) = registry.scheme_hash(&target, name) {
-            return Some((target, oh));
+    for target in &imports.unqualified_targets {
+        if let Some(oh) = registry.scheme_hash(target, name) {
+            return Some((target.clone(), oh));
         }
     }
     None
@@ -3052,28 +3266,8 @@ fn lookup_unqualified_import(
 
 /// Map a qualified-import alias (`Q` from `import M as Q`) to its
 /// canonical module name.
-fn canonical_module_for_alias(module: &cst::Module, alias: &str) -> Option<String> {
-    for imp in &module.imports {
-        if let Some(q) = &imp.qualified {
-            let alias_str = q
-                .parts
-                .iter()
-                .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
-                .collect::<Vec<_>>()
-                .join(".");
-            if alias_str == alias {
-                return Some(
-                    imp.module
-                        .parts
-                        .iter()
-                        .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
-                        .collect::<Vec<_>>()
-                        .join("."),
-                );
-            }
-        }
-    }
-    None
+fn canonical_module_for_alias(imports: &ImportLookup, alias: &str) -> Option<String> {
+    imports.alias_to_target.get(alias).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -3086,10 +3280,11 @@ fn canonical_module_for_alias(module: &cst::Module, alias: &str) -> Option<Strin
 // be resolved (e.g. Prim types, wildcards) is silently skipped —
 // inference either handles it on its own or surfaces an unbound error.
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_value_dep(
     r: &crate::typecheck_db::passes::names::Reference,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     name_to_idx: &HashMap<String, usize>,
     scc_member_set: &HashSet<usize>,
@@ -3114,13 +3309,13 @@ fn resolve_value_dep(
                 return;
             }
             if let Some((dep_mod, oh)) =
-                lookup_unqualified_import(module, registry, nm)
+                lookup_unqualified_import(imports, registry, nm)
             {
                 push_dep(out, seen, &dep_mod, nm, oh);
             }
         }
         (Some(alias), nm) => {
-            if let Some(dep_mod) = canonical_module_for_alias(module, alias) {
+            if let Some(dep_mod) = canonical_module_for_alias(imports, alias) {
                 if let Some(oh) = registry.scheme_hash(&dep_mod, nm) {
                     push_dep(out, seen, &dep_mod, nm, oh);
                 }
@@ -3137,7 +3332,7 @@ fn add_class_method_deps(
     class_mod: &str,
     class_name: &str,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     local_class_hashes: &HashMap<String, OutputHash>,
     local_instance_hashes_by_class: &HashMap<String, Vec<(String, OutputHash)>>,
@@ -3160,11 +3355,10 @@ fn add_class_method_deps(
             push_dep(out, seen, self_module, decl_key, *oh);
         }
     }
-    for imp in &module.imports {
-        let dep_mod = join_module_name(&imp.module);
-        for inst_key in registry.instances_of_class(&dep_mod, class_name) {
-            if let Some(oh) = registry.nonvalue_hash(&dep_mod, "i", inst_key) {
-                push_dep(out, seen, &dep_mod, inst_key, oh);
+    for dep_mod in &imports.all_targets {
+        for inst_key in registry.instances_of_class(dep_mod, class_name) {
+            if let Some(oh) = registry.nonvalue_hash(dep_mod, "i", inst_key) {
+                push_dep(out, seen, dep_mod, inst_key, oh);
             }
         }
     }
@@ -3179,7 +3373,7 @@ fn add_class_method_deps(
 fn collect_nonvalue_dep_hashes(
     decl: &crate::typecheck_db::ir::Decl,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     local_type_hashes: &HashMap<String, OutputHash>,
     local_class_hashes: &HashMap<String, OutputHash>,
@@ -3199,7 +3393,7 @@ fn collect_nonvalue_dep_hashes(
             NameKind::Value => resolve_value_dep(
                 r,
                 self_module,
-                module,
+                imports,
                 registry,
                 &empty_name_to_idx,
                 &empty_scc,
@@ -3211,7 +3405,7 @@ fn collect_nonvalue_dep_hashes(
             NameKind::Type => resolve_type_dep(
                 r,
                 self_module,
-                module,
+                imports,
                 registry,
                 local_type_hashes,
                 &mut out,
@@ -3220,7 +3414,7 @@ fn collect_nonvalue_dep_hashes(
             NameKind::Constructor => resolve_ctor_dep(
                 r,
                 self_module,
-                module,
+                imports,
                 registry,
                 local_ctor_parent_hash,
                 &mut out,
@@ -3229,7 +3423,7 @@ fn collect_nonvalue_dep_hashes(
             NameKind::Class => resolve_class_dep(
                 r,
                 self_module,
-                module,
+                imports,
                 registry,
                 local_class_hashes,
                 &empty_instance_by_class,
@@ -3239,7 +3433,7 @@ fn collect_nonvalue_dep_hashes(
             NameKind::Op | NameKind::TypeOp => resolve_fixity_dep(
                 r,
                 self_module,
-                module,
+                imports,
                 registry,
                 local_fixity_hashes,
                 &mut out,
@@ -3253,7 +3447,7 @@ fn collect_nonvalue_dep_hashes(
 fn resolve_type_dep(
     r: &crate::typecheck_db::passes::names::Reference,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     local_type_hashes: &HashMap<String, OutputHash>,
     out: &mut Vec<(String, String, OutputHash)>,
@@ -3269,17 +3463,13 @@ fn resolve_type_dep(
                 push_dep(out, seen, self_module, &format!("type:{nm}"), *oh);
                 return;
             }
-            for imp in &module.imports {
-                if imp.qualified.is_some() {
-                    continue;
-                }
-                let dep_mod = join_module_name(&imp.module);
+            for dep_mod in &imports.unqualified_targets {
                 for kp in &type_prefixes {
-                    if let Some(oh) = registry.nonvalue_hash(&dep_mod, kp, nm) {
+                    if let Some(oh) = registry.nonvalue_hash(dep_mod, kp, nm) {
                         push_dep(
                             out,
                             seen,
-                            &dep_mod,
+                            dep_mod,
                             &format!("type:{nm}"),
                             oh,
                         );
@@ -3289,7 +3479,7 @@ fn resolve_type_dep(
             }
         }
         (Some(alias), nm) => {
-            if let Some(dep_mod) = canonical_module_for_alias(module, alias) {
+            if let Some(dep_mod) = canonical_module_for_alias(imports, alias) {
                 for kp in &type_prefixes {
                     if let Some(oh) = registry.nonvalue_hash(&dep_mod, kp, nm) {
                         push_dep(
@@ -3310,7 +3500,7 @@ fn resolve_type_dep(
 fn resolve_ctor_dep(
     r: &crate::typecheck_db::passes::names::Reference,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     local_ctor_parent_hash: &HashMap<String, OutputHash>,
     out: &mut Vec<(String, String, OutputHash)>,
@@ -3326,19 +3516,15 @@ fn resolve_ctor_dep(
                 push_dep(out, seen, self_module, &format!("ctor:{nm}"), *oh);
                 return;
             }
-            for imp in &module.imports {
-                if imp.qualified.is_some() {
-                    continue;
-                }
-                let dep_mod = join_module_name(&imp.module);
-                if let Some(oh) = cross_module_ctor_hash(&dep_mod, nm, registry) {
-                    push_dep(out, seen, &dep_mod, &format!("ctor:{nm}"), oh);
+            for dep_mod in &imports.unqualified_targets {
+                if let Some(oh) = cross_module_ctor_hash(dep_mod, nm, registry) {
+                    push_dep(out, seen, dep_mod, &format!("ctor:{nm}"), oh);
                     return;
                 }
             }
         }
         (Some(alias), nm) => {
-            if let Some(dep_mod) = canonical_module_for_alias(module, alias) {
+            if let Some(dep_mod) = canonical_module_for_alias(imports, alias) {
                 if let Some(oh) = cross_module_ctor_hash(&dep_mod, nm, registry) {
                     push_dep(out, seen, &dep_mod, &format!("ctor:{nm}"), oh);
                 }
@@ -3367,7 +3553,7 @@ fn cross_module_ctor_hash(
 fn resolve_class_dep(
     r: &crate::typecheck_db::passes::names::Reference,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     local_class_hashes: &HashMap<String, OutputHash>,
     local_instance_hashes_by_class: &HashMap<String, Vec<(String, OutputHash)>>,
@@ -3381,13 +3567,9 @@ fn resolve_class_dep(
             } else {
                 // Walk imports to find which module exports this class.
                 let mut found: Option<String> = None;
-                for imp in &module.imports {
-                    if imp.qualified.is_some() {
-                        continue;
-                    }
-                    let dep_mod = join_module_name(&imp.module);
-                    if registry.nonvalue_hash(&dep_mod, "c", nm).is_some() {
-                        found = Some(dep_mod);
+                for dep_mod in &imports.unqualified_targets {
+                    if registry.nonvalue_hash(dep_mod, "c", nm).is_some() {
+                        found = Some(dep_mod.clone());
                         break;
                     }
                 }
@@ -3397,7 +3579,7 @@ fn resolve_class_dep(
                 }
             }
         }
-        (Some(alias), nm) => match canonical_module_for_alias(module, alias) {
+        (Some(alias), nm) => match canonical_module_for_alias(imports, alias) {
             Some(dep_mod) => (dep_mod, nm.clone()),
             None => return,
         },
@@ -3421,11 +3603,10 @@ fn resolve_class_dep(
             push_dep(out, seen, self_module, decl_key, *oh);
         }
     }
-    for imp in &module.imports {
-        let dep_mod = join_module_name(&imp.module);
-        for inst_key in registry.instances_of_class(&dep_mod, &class_name) {
-            if let Some(oh) = registry.nonvalue_hash(&dep_mod, "i", inst_key) {
-                push_dep(out, seen, &dep_mod, inst_key, oh);
+    for dep_mod in &imports.all_targets {
+        for inst_key in registry.instances_of_class(dep_mod, &class_name) {
+            if let Some(oh) = registry.nonvalue_hash(dep_mod, "i", inst_key) {
+                push_dep(out, seen, dep_mod, inst_key, oh);
             }
         }
     }
@@ -3434,7 +3615,7 @@ fn resolve_class_dep(
 fn resolve_fixity_dep(
     r: &crate::typecheck_db::passes::names::Reference,
     self_module: &str,
-    module: &cst::Module,
+    imports: &ImportLookup,
     registry: &ModuleRegistry,
     local_fixity_hashes: &HashMap<String, OutputHash>,
     out: &mut Vec<(String, String, OutputHash)>,
@@ -3446,16 +3627,12 @@ fn resolve_fixity_dep(
                 push_dep(out, seen, self_module, &format!("fixity:{op}"), *oh);
                 return;
             }
-            for imp in &module.imports {
-                if imp.qualified.is_some() {
-                    continue;
-                }
-                let dep_mod = join_module_name(&imp.module);
-                if let Some(oh) = registry.nonvalue_hash(&dep_mod, "f", op) {
+            for dep_mod in &imports.unqualified_targets {
+                if let Some(oh) = registry.nonvalue_hash(dep_mod, "f", op) {
                     push_dep(
                         out,
                         seen,
-                        &dep_mod,
+                        dep_mod,
                         &format!("fixity:{op}"),
                         oh,
                     );
@@ -3464,7 +3641,7 @@ fn resolve_fixity_dep(
             }
         }
         (Some(alias), op) => {
-            if let Some(dep_mod) = canonical_module_for_alias(module, alias) {
+            if let Some(dep_mod) = canonical_module_for_alias(imports, alias) {
                 if let Some(oh) = registry.nonvalue_hash(&dep_mod, "f", op) {
                     push_dep(
                         out,

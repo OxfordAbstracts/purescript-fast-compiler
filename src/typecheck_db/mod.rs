@@ -19,6 +19,7 @@ pub mod module_registry;
 pub mod prim;
 pub mod driver_multi;
 pub mod passes;
+pub mod test_support;
 
 #[cfg(test)]
 mod tests;

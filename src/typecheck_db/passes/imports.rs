@@ -388,26 +388,24 @@ fn import_all_except(
     // module was imported unqualified through a re-exporter.
     for (name, scheme) in &target.values {
         let is_hidden = hidden.values.contains(name.as_str());
-        // Hiding removes the unqualified-in-this-module binding
-        // (`(None|alias, name)`) but NOT the origin-qualified
-        // binding (`(Some("Data.Semiring"), name)`). The
-        // origin-qualified key is what rebracket-time operator
-        // lowering looks up when `+` has been canonicalized to
-        // `Data.Semiring.add`; without it, `import Prelude
-        // hiding (add)` would cascade into every use of `+`
-        // failing to resolve.
-        if !is_hidden {
-            let key = QName { module: qualifier.clone(), name: name.clone() };
-            env.bind_scheme(key, scheme.clone());
-        }
+        // `target.values` already stores `Arc<Scheme>`. Each
+        // binding is a pure `Arc::clone` (one atomic increment), no
+        // deep `Scheme::clone` and no fresh heap allocation. Each
+        // importer of Prelude binds 200+ values under two keys each
+        // — that's ~400 atomic increments per Prelude importer
+        // instead of ~400 deep `Type` tree clones.
         let origin = target
             .value_origins
             .get(name)
             .cloned()
             .unwrap_or_else(|| target_name.to_string());
-        env.bind_scheme(
+        if !is_hidden {
+            let key = QName { module: qualifier.clone(), name: name.clone() };
+            env.bind_scheme_arc(key, std::sync::Arc::clone(scheme));
+        }
+        env.bind_scheme_arc(
             QName { module: Some(origin), name: name.clone() },
-            scheme.clone(),
+            std::sync::Arc::clone(scheme),
         );
     }
     // Also bind every extra origin-qualified scheme the
@@ -416,9 +414,9 @@ fn import_all_except(
     // entry was won by `Control.Apply.apply`. Origin-qualified
     // bindings ignore `hidden` for the same reason as above.
     for ((origin, name), scheme) in &target.qualified_values {
-        env.bind_scheme(
+        env.bind_scheme_arc(
             QName { module: Some(origin.clone()), name: name.clone() },
-            scheme.clone(),
+            std::sync::Arc::clone(scheme),
         );
     }
     // Data constructors: synthesize each one's value scheme
@@ -431,14 +429,14 @@ fn import_all_except(
         if hidden.ctors.contains(ctor_name.as_str()) {
             continue;
         }
-        let scheme = synth_ctor_scheme(info);
+        let arc = std::sync::Arc::new(synth_ctor_scheme(info));
         let key = QName { module: qualifier.clone(), name: ctor_name.clone() };
-        env.bind_scheme(key, scheme.clone());
+        env.bind_scheme_arc(key, std::sync::Arc::clone(&arc));
         let origin_key = QName {
             module: Some(target_name.to_string()),
             name: ctor_name.clone(),
         };
-        env.bind_scheme(origin_key, scheme);
+        env.bind_scheme_arc(origin_key, arc);
     }
     // Instances + class info: always propagated.
     merge_instances_and_classes(target, ix);
@@ -460,7 +458,7 @@ fn apply_explicit(
             match target.values.get(&name) {
                 Some(scheme) => {
                     let key = QName { module: qualifier.clone(), name: name.clone() };
-                    env.bind_scheme(key, scheme.clone());
+                    env.bind_scheme_arc(key, std::sync::Arc::clone(scheme));
                     // Also bind under the origin module's qualified
                     // key so a rebracketer-produced `Var("A.foo")`
                     // can resolve even when `foo` was imported
@@ -473,12 +471,12 @@ fn apply_explicit(
                         .get(&name)
                         .cloned()
                         .unwrap_or_else(|| target_name.to_string());
-                    env.bind_scheme(
+                    env.bind_scheme_arc(
                         QName {
                             module: Some(origin),
                             name: name.clone(),
                         },
-                        scheme.clone(),
+                        std::sync::Arc::clone(scheme),
                     );
                     // If this Value-import is actually an operator
                     // alias (e.g. `import M ((==))` where `==` aliases
@@ -488,12 +486,12 @@ fn apply_explicit(
                     // target must be resolvable.
                     if let Some(fx) = target.value_fixities.get(&name) {
                         if let Some(target_scheme) = target.values.get(&fx.target_name) {
-                            env.bind_scheme(
+                            env.bind_scheme_arc(
                                 QName {
                                     module: qualifier.clone(),
                                     name: fx.target_name.clone(),
                                 },
-                                target_scheme.clone(),
+                                std::sync::Arc::clone(target_scheme),
                             );
                             // Mirror under the fixity's own
                             // origin-module (may differ from
@@ -503,12 +501,12 @@ fn apply_explicit(
                                 .target_module
                                 .clone()
                                 .unwrap_or_else(|| target_name.to_string());
-                            env.bind_scheme(
+                            env.bind_scheme_arc(
                                 QName {
                                     module: Some(fixity_origin),
                                     name: fx.target_name.clone(),
                                 },
-                                target_scheme.clone(),
+                                std::sync::Arc::clone(target_scheme),
                             );
                         }
                         // Constructor-operator alias: `infixr 6
@@ -519,19 +517,19 @@ fn apply_explicit(
                         // rebracketed `a /\ b` → `Constructor
                         // A.Tuple` resolves.
                         if let Some(info) = target.ctors.get(&fx.target_name) {
-                            let ctor_scheme = synth_ctor_scheme(info);
-                            env.bind_scheme(
+                            let ctor_scheme = std::sync::Arc::new(synth_ctor_scheme(info));
+                            env.bind_scheme_arc(
                                 QName {
                                     module: qualifier.clone(),
                                     name: fx.target_name.clone(),
                                 },
-                                ctor_scheme.clone(),
+                                std::sync::Arc::clone(&ctor_scheme),
                             );
                             let fixity_origin = fx
                                 .target_module
                                 .clone()
                                 .unwrap_or_else(|| target_name.to_string());
-                            env.bind_scheme(
+                            env.bind_scheme_arc(
                                 QName {
                                     module: Some(fixity_origin),
                                     name: fx.target_name.clone(),
@@ -551,19 +549,19 @@ fn apply_explicit(
                                 .qualified_values
                                 .get(&(origin.clone(), fx.target_name.clone()))
                             {
-                                env.bind_scheme(
+                                env.bind_scheme_arc(
                                     QName {
                                         module: qualifier.clone(),
                                         name: fx.target_name.clone(),
                                     },
-                                    scheme.clone(),
+                                    std::sync::Arc::clone(scheme),
                                 );
-                                env.bind_scheme(
+                                env.bind_scheme_arc(
                                     QName {
                                         module: Some(origin),
                                         name: fx.target_name.clone(),
                                     },
-                                    scheme.clone(),
+                                    std::sync::Arc::clone(scheme),
                                 );
                             }
                         }
@@ -790,7 +788,7 @@ mod tests {
     fn registry_with_foo() -> ModuleRegistry {
         let mut r = ModuleRegistry::new();
         let mut exp = ModuleExports::default();
-        exp.values.insert("foo".into(), Scheme::mono(int_ty()));
+        exp.values.insert("foo".into(), std::sync::Arc::new(Scheme::mono(int_ty())));
         r.insert("Data.Foo", exp);
         r
     }
@@ -883,8 +881,8 @@ mod tests {
         // Register a module with both foo + bar.
         let mut r = ModuleRegistry::new();
         let mut exp = ModuleExports::default();
-        exp.values.insert("foo".into(), Scheme::mono(int_ty()));
-        exp.values.insert("bar".into(), Scheme::mono(int_ty()));
+        exp.values.insert("foo".into(), std::sync::Arc::new(Scheme::mono(int_ty())));
+        exp.values.insert("bar".into(), std::sync::Arc::new(Scheme::mono(int_ty())));
         r.insert("Data.Mix", exp);
         let module = parse_mod("module M where\nimport Data.Mix hiding (bar)\n");
         let (env, _ix, errs) = build_env_from_imports(&module, &r);
@@ -925,7 +923,7 @@ mod tests {
         // PureScript: even `import M (foo)` pulls in M's instances.
         let mut r = ModuleRegistry::new();
         let mut exp = ModuleExports::default();
-        exp.values.insert("foo".into(), Scheme::mono(int_ty()));
+        exp.values.insert("foo".into(), std::sync::Arc::new(Scheme::mono(int_ty())));
         exp.instances.push(Instance {
             class: QName::unqualified("Eq"),
             types: vec![int_ty()],
