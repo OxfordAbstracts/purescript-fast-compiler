@@ -85,11 +85,7 @@ check_build_unit!(passes_ArrayType, "ArrayType");
 check_build_unit!(passes_Auto, "Auto");
 check_build_unit!(passes_AutoPrelude, "AutoPrelude");
 check_build_unit!(passes_AutoPrelude2, "AutoPrelude2");
-check_build_unit_ignored!(
-    passes_BigFunction,
-    "BigFunction",
-    "perf: 20s timeout — ~135 multi-equation pattern-guard cases need constraint-solver optimisation"
-);
+check_build_unit!(passes_BigFunction, "BigFunction");
 check_build_unit!(passes_BindersInFunctions, "BindersInFunctions");
 check_build_unit!(passes_BindingGroups, "BindingGroups");
 check_build_unit!(passes_BlockString, "BlockString");
@@ -322,11 +318,7 @@ check_build_unit!(passes_RowInInstanceHeadDetermined, "RowInInstanceHeadDetermin
 check_build_unit!(passes_RowLacks, "RowLacks");
 check_build_unit!(passes_RowNub, "RowNub");
 check_build_unit!(passes_RowPolyInstanceContext, "RowPolyInstanceContext");
-check_build_unit_ignored!(
-    passes_RowUnion,
-    "RowUnion",
-    "F2 regression: sig pin pulls Row aliases through Record-headed instance heads, surfacing a Row-vs-Record unify mismatch the unifier doesn't bridge"
-);
+check_build_unit!(passes_RowUnion, "RowUnion");
 check_build_unit!(passes_RowsInInstanceContext, "RowsInInstanceContext");
 check_build_unit!(passes_RowsInKinds, "RowsInKinds");
 check_build_unit!(passes_RowsInKinds2, "RowsInKinds2");

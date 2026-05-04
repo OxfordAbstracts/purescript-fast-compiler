@@ -609,6 +609,17 @@ impl UnifyState {
             }
             (Type::Record(f1, t1), Type::Record(f2, t2)) => unify_fields(self, f1, t1, f2, t2),
             (Type::Row(f1, t1), Type::Row(f2, t2)) => unify_fields(self, f1, t1, f2, t2),
+            // Row ↔ Record bridging: a `Row` at the type level
+            // and a `Record` at the value level can both represent
+            // the same labeled-field shape. This arises when an F2
+            // signature pin pulls a Row alias through a Record-
+            // headed instance head — the unifier sees `Row` on
+            // one side and `Record` on the other but the actual
+            // shape is identical. Unify field-wise.
+            (Type::Row(f1, t1), Type::Record(f2, t2))
+            | (Type::Record(f1, t1), Type::Row(f2, t2)) => {
+                unify_fields(self, f1, t1, f2, t2)
+            }
             // `Record r` (parsed as `App(Con("Record"), r)`) is
             // equivalent to `{ | r }` — an open record whose
             // tail is `r`. Unify as `Record([], Some(r))` so
