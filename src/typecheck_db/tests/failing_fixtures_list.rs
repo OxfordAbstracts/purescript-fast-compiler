@@ -408,4 +408,4 @@ check_failing_build_unit!(f_UnsupportedRoleDeclarationTypeSynonym, "UnsupportedR
 check_failing_build_unit!(f_UnsupportedTypeInKind, "UnsupportedTypeInKind");
 check_failing_build_unit!(f_VisibleTypeApplications1, "VisibleTypeApplications1");
 check_failing_build_unit!(f_VisibleTypeApplications2, "VisibleTypeApplications2");
-check_failing_build_unit_ignored!(f_WhereBindingChainAmbiguity, "WhereBindingChainAmbiguity", "expected: NoInstanceFound");
+check_failing_build_unit!(f_WhereBindingChainAmbiguity, "WhereBindingChainAmbiguity");

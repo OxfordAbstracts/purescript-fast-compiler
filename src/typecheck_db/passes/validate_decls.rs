@@ -903,6 +903,13 @@ pub fn validate_module_with_class_fundeps(
     // as `TypesDoNotUnify`.
     detect_nested_update_row_field_mismatch(&module.decls, &mut errors);
 
+    // Recursive chain ambiguity in where-binding: `go :: forall
+    // i. C i => ... -> ...` recursively calls itself with
+    // `Proxy (Cons i)` annotation, where C has a chain instance
+    // `C x => C (Cons x)`. The recursive constraint can't be
+    // discharged, leading to NoInstanceFound.
+    detect_where_binding_chain_ambiguity(&module.decls, &mut errors);
+
     // Instance method CAF cycle: a 0-binder method body that
     // references another method of the same class without a lambda
     // barrier creates a dictionary-construction cycle.
@@ -6894,6 +6901,289 @@ fn count_top_forall_vars(ty: &cst::TypeExpr) -> usize {
             _ => return count,
         }
     }
+}
+
+/// Detect chain ambiguity in a where-binding's recursive call:
+/// `go :: forall i. C i => Proxy i -> ...` and the body recursively
+/// calls `go (Proxy :: Proxy (Cons i)) ...` where C has a chain
+/// instance `C x => C (Cons x)` (recursive on Cons). The
+/// recursive constraint can't be discharged at inference time,
+/// leading to `NoInstanceFound`.
+fn detect_where_binding_chain_ambiguity(
+    decls: &[cst::Decl],
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashSet as Set;
+    // Step 1: identify recursive chain instances. For each chain
+    // class, collect the constructor heads `Cons` such that
+    // `C x => C (Cons x)` exists in the chain.
+    let mut recursive_chain_cons: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    for d in decls {
+        let cst::Decl::Instance { class_name, types, constraints, .. } = d else {
+            continue;
+        };
+        let cqi = class_name.to_qi();
+        if cqi.module.is_some() {
+            continue;
+        }
+        // Check if instance head is `C (Cons x)` and constraint
+        // includes `C x` for the same x.
+        if types.len() != 1 {
+            continue;
+        }
+        let head = peel_paren_te_local(&types[0]);
+        let cst::TypeExpr::App { constructor, arg, .. } = head else {
+            continue;
+        };
+        let cst::TypeExpr::Constructor { name: cons_name, .. } =
+            peel_paren_te_local(constructor)
+        else {
+            continue;
+        };
+        if cons_name.module.is_some() {
+            continue;
+        }
+        let cst::TypeExpr::Var { name: var_name, .. } = peel_paren_te_local(arg)
+        else {
+            continue;
+        };
+        let var_sym = var_name.value.symbol();
+        // Constraint includes `C var` for same var.
+        let has_recursive_constraint = constraints.iter().any(|c| {
+            let c_qi = c.class.to_qi();
+            if c_qi.module.is_some() || c_qi.name != cqi.name {
+                return false;
+            }
+            c.args.len() == 1
+                && match peel_paren_te_local(&c.args[0]) {
+                    cst::TypeExpr::Var { name, .. } => {
+                        name.value.symbol() == var_sym
+                    }
+                    _ => false,
+                }
+        });
+        if has_recursive_constraint {
+            recursive_chain_cons
+                .entry(cqi.name)
+                .or_default()
+                .insert(cons_name.name.symbol());
+        }
+    }
+    if recursive_chain_cons.is_empty() {
+        return;
+    }
+    // Step 2: walk Decl::Value where-clauses for bindings with
+    // sig `forall i. C i => ...` whose body recursively calls
+    // itself with `Proxy (Cons _)` annotation.
+    for d in decls {
+        if let cst::Decl::Value { where_clause, span, .. } = d {
+            check_where_chain_ambiguity(
+                where_clause,
+                &recursive_chain_cons,
+                *span,
+                errors,
+            );
+        }
+    }
+}
+
+fn check_where_chain_ambiguity(
+    bindings: &[cst::LetBinding],
+    recursive_chain_cons: &HashMap<Symbol, HashSet<Symbol>>,
+    span: Span,
+    errors: &mut Vec<ValidationError>,
+) {
+    use std::collections::HashMap as Map;
+    // Build per-name sig info: which binding has `C i` constraint.
+    let mut sigs_with_constraint: Map<Symbol, Symbol> = Map::new(); // name -> class
+    for b in bindings {
+        if let cst::LetBinding::Signature { name, ty, .. } = b {
+            if let Some(cls) = single_constraint_class_var(ty) {
+                if recursive_chain_cons.contains_key(&cls) {
+                    sigs_with_constraint.insert(name.value.symbol(), cls);
+                }
+            }
+        }
+    }
+    if sigs_with_constraint.is_empty() {
+        return;
+    }
+    // For each value binding whose name is in sigs_with_constraint,
+    // walk the body for `name (Proxy :: Proxy (Cons _))` patterns.
+    for b in bindings {
+        if let cst::LetBinding::Value { binder, expr, .. } = b {
+            let name = match peel_paren_binder(binder) {
+                cst::Binder::Var { name, .. } => name.value.symbol(),
+                _ => continue,
+            };
+            let Some(cls) = sigs_with_constraint.get(&name) else {
+                continue;
+            };
+            let cons_set = match recursive_chain_cons.get(cls) {
+                Some(s) => s,
+                None => continue,
+            };
+            if recursive_call_with_proxy_cons(expr, name, cons_set) {
+                errors.push(ValidationError {
+                    span,
+                    kind: ValidationErrorKind::NoInstanceFound(resolve(name)),
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// True iff `ty` is `forall <vars>. C <single_var> => ...` where
+/// C is a single-arg class. Returns the class name if matched.
+fn single_constraint_class_var(ty: &cst::TypeExpr) -> Option<Symbol> {
+    let cur = peel_paren_te_local(ty);
+    let cst::TypeExpr::Forall { ty, .. } = cur else {
+        return None;
+    };
+    let body = peel_paren_te_local(ty);
+    let cst::TypeExpr::Constrained { constraints, .. } = body else {
+        return None;
+    };
+    if constraints.len() != 1 {
+        return None;
+    }
+    let c = &constraints[0];
+    if c.args.len() != 1 {
+        return None;
+    }
+    let qi = c.class.to_qi();
+    if qi.module.is_some() {
+        return None;
+    }
+    if matches!(peel_paren_te_local(&c.args[0]), cst::TypeExpr::Var { .. }) {
+        Some(qi.name)
+    } else {
+        None
+    }
+}
+
+/// True if `expr` contains a recursive call `name (Proxy :: Proxy
+/// (Cons _))` where Cons is in `cons_set`.
+fn recursive_call_with_proxy_cons(
+    expr: &cst::Expr,
+    name: Symbol,
+    cons_set: &HashSet<Symbol>,
+) -> bool {
+    let cur = peel_paren_expr(expr);
+    if let cst::Expr::App { func, arg, .. } = cur {
+        // Peel App spine.
+        let mut tip = cur;
+        let mut args: Vec<&cst::Expr> = Vec::new();
+        while let cst::Expr::App { func, arg, .. } = tip {
+            args.push(arg);
+            tip = func;
+        }
+        args.reverse();
+        if let cst::Expr::Var { name: f_name, .. } = peel_paren_expr(tip) {
+            if f_name.module.is_none() && f_name.name.symbol() == name {
+                // Check any arg is `(Proxy :: Proxy (Cons _))`.
+                for a in &args {
+                    if proxy_annotation_with_cons(a, cons_set) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if recursive_call_with_proxy_cons(func, name, cons_set) {
+            return true;
+        }
+        if recursive_call_with_proxy_cons(arg, name, cons_set) {
+            return true;
+        }
+    }
+    match cur {
+        cst::Expr::Lambda { body, .. } => {
+            recursive_call_with_proxy_cons(body, name, cons_set)
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            recursive_call_with_proxy_cons(cond, name, cons_set)
+                || recursive_call_with_proxy_cons(then_expr, name, cons_set)
+                || recursive_call_with_proxy_cons(else_expr, name, cons_set)
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            exprs
+                .iter()
+                .any(|e| recursive_call_with_proxy_cons(e, name, cons_set))
+                || alts.iter().any(|alt| {
+                    walk_guarded_proxy_cons(&alt.result, name, cons_set)
+                })
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            bindings.iter().any(|b| {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    recursive_call_with_proxy_cons(expr, name, cons_set)
+                } else {
+                    false
+                }
+            }) || recursive_call_with_proxy_cons(body, name, cons_set)
+        }
+        cst::Expr::TypeAnnotation { expr, .. } | cst::Expr::Negate { expr, .. } => {
+            recursive_call_with_proxy_cons(expr, name, cons_set)
+        }
+        _ => false,
+    }
+}
+
+fn walk_guarded_proxy_cons(
+    g: &cst::GuardedExpr,
+    name: Symbol,
+    cons_set: &HashSet<Symbol>,
+) -> bool {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => {
+            recursive_call_with_proxy_cons(e, name, cons_set)
+        }
+        cst::GuardedExpr::Guarded(gs) => gs.iter().any(|gd| {
+            gd.patterns.iter().any(|p| {
+                let e = match p {
+                    cst::GuardPattern::Pattern(_, e) => e,
+                    cst::GuardPattern::Boolean(e) => e,
+                };
+                recursive_call_with_proxy_cons(e, name, cons_set)
+            }) || recursive_call_with_proxy_cons(&gd.expr, name, cons_set)
+        }),
+    }
+}
+
+/// True iff `expr` is `(Proxy :: Proxy (Cons _))` for some Cons
+/// in `cons_set`.
+fn proxy_annotation_with_cons(
+    expr: &cst::Expr,
+    cons_set: &HashSet<Symbol>,
+) -> bool {
+    let cur = peel_paren_expr(expr);
+    let cst::Expr::TypeAnnotation { ty, .. } = cur else {
+        return false;
+    };
+    // Annotation: `Proxy (Cons _)`. Peel.
+    let ann = peel_paren_te_local(ty);
+    let cst::TypeExpr::App { constructor, arg, .. } = ann else {
+        return false;
+    };
+    // First constructor must be Proxy (any module).
+    if let cst::TypeExpr::Constructor { name: pn, .. } = peel_paren_te_local(constructor) {
+        let n = resolve(pn.name.symbol());
+        if n != "Proxy" {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    // arg must be `(Cons _)` where Cons is in cons_set.
+    let arg_peeled = peel_paren_te_local(arg);
+    let cst::TypeExpr::App { constructor: inner_c, .. } = arg_peeled else {
+        return false;
+    };
+    let cst::TypeExpr::Constructor { name: cn, .. } = peel_paren_te_local(inner_c) else {
+        return false;
+    };
+    cn.module.is_none() && cons_set.contains(&cn.name.symbol())
 }
 
 /// Detect nested record update assigning a primitive literal to a
