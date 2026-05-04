@@ -67,7 +67,6 @@ fn check_single_package_module(target: &str) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "reproducer for stack overflow on Hylograph.Kernel.D3.Simulation"]
 fn repro_hylograph_d3_simulation() {
     let join_result: Result<Result<(), String>, _> =
         std::thread::Builder::new()

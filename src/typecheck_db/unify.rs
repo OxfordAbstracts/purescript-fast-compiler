@@ -139,6 +139,10 @@ pub struct UnifyState {
     /// shape (the reference compiler reports holes with rigid
     /// `Var("r")`, not `!s0`).
     skolem_names: std::collections::HashMap<u32, String>,
+    /// Recursion guard for `unify`. Set in the top-level call;
+    /// any deeper call that would push past 1024 frames bails out
+    /// with `Mismatch` rather than blow the stack.
+    unify_depth: usize,
 }
 
 impl UnifyState {
@@ -153,6 +157,7 @@ impl UnifyState {
             current_decl: None,
             givens: Vec::new(),
             skolem_names: std::collections::HashMap::new(),
+            unify_depth: 0,
         }
     }
 
@@ -415,52 +420,101 @@ impl UnifyState {
 
     /// Fully resolve a type by following bindings. Idempotent.
     pub fn zonk(&self, ty: &Type) -> Type {
+        self.zonk_depth(ty, 0)
+    }
+
+    fn zonk_depth(&self, ty: &Type, depth: usize) -> Type {
+        if depth > 4096 {
+            // Cycle in unif bindings: a unif var ultimately
+            // resolves through a chain that loops back to itself
+            // via structural types whose occurs_in didn't fire.
+            // Treat as opaque to break the loop — downstream
+            // mismatch will be reported as Mismatch instead of
+            // crashing the process.
+            return ty.clone();
+        }
         match ty {
             Type::Unif(id) => match self.probe(*id) {
-                Some(bound) => self.zonk(&bound.clone()),
+                Some(bound) => self.zonk_depth(&bound.clone(), depth + 1),
                 None => ty.clone(),
             },
-            Type::App(f, a) => Type::app(self.zonk(f), self.zonk(a)),
-            Type::Fun(a, b) => Type::Fun(Box::new(self.zonk(a)), Box::new(self.zonk(b))),
+            Type::App(f, a) => Type::app(
+                self.zonk_depth(f, depth + 1),
+                self.zonk_depth(a, depth + 1),
+            ),
+            Type::Fun(a, b) => Type::Fun(
+                Box::new(self.zonk_depth(a, depth + 1)),
+                Box::new(self.zonk_depth(b, depth + 1)),
+            ),
             Type::Forall(vars, body) => {
                 let vars = vars
                     .iter()
-                    .map(|(n, v, k)| (n.clone(), *v, k.as_ref().map(|k| Box::new(self.zonk(k)))))
+                    .map(|(n, v, k)| {
+                        (
+                            n.clone(),
+                            *v,
+                            k.as_ref().map(|k| Box::new(self.zonk_depth(k, depth + 1))),
+                        )
+                    })
                     .collect();
-                Type::Forall(vars, Box::new(self.zonk(body)))
+                Type::Forall(vars, Box::new(self.zonk_depth(body, depth + 1)))
             }
             Type::Constrained(cs, body) => {
                 let cs = cs
                     .iter()
                     .map(|c| Constraint {
                         class: c.class.clone(),
-                        args: c.args.iter().map(|a| self.zonk(a)).collect(),
+                        args: c.args.iter().map(|a| self.zonk_depth(a, depth + 1)).collect(),
                     })
                     .collect();
-                Type::Constrained(cs, Box::new(self.zonk(body)))
+                Type::Constrained(cs, Box::new(self.zonk_depth(body, depth + 1)))
             }
             Type::Record(fields, tail) => {
-                let fs = fields.iter().map(|(l, t)| (l.clone(), self.zonk(t))).collect();
-                let t = tail.as_ref().map(|t| Box::new(self.zonk(t)));
+                let fs = fields
+                    .iter()
+                    .map(|(l, t)| (l.clone(), self.zonk_depth(t, depth + 1)))
+                    .collect();
+                let t = tail
+                    .as_ref()
+                    .map(|t| Box::new(self.zonk_depth(t, depth + 1)));
                 Type::Record(fs, t)
             }
             Type::Row(fields, tail) => {
-                let fs = fields.iter().map(|(l, t)| (l.clone(), self.zonk(t))).collect();
-                let t = tail.as_ref().map(|t| Box::new(self.zonk(t)));
+                let fs = fields
+                    .iter()
+                    .map(|(l, t)| (l.clone(), self.zonk_depth(t, depth + 1)))
+                    .collect();
+                let t = tail
+                    .as_ref()
+                    .map(|t| Box::new(self.zonk_depth(t, depth + 1)));
                 Type::Row(fs, t)
             }
-            Type::Kinded(t, k) => {
-                Type::Kinded(Box::new(self.zonk(t)), Box::new(self.zonk(k)))
-            }
+            Type::Kinded(t, k) => Type::Kinded(
+                Box::new(self.zonk_depth(t, depth + 1)),
+                Box::new(self.zonk_depth(k, depth + 1)),
+            ),
             _ => ty.clone(),
         }
     }
 
     /// Unify two types, updating `self` with any new bindings.
     pub fn unify(&mut self, a: &Type, b: &Type) -> Result<(), UnifyError> {
-        let a = self.zonk(a);
-        let b = self.zonk(b);
-        self.unify_inner(&a, &b)
+        // Recursion guard against pathological row patterns where a
+        // mutual chain of fresh tails would unfold forever (e.g. the
+        // Hylograph SimNode/SimulationNode nested rows where two
+        // SimulationNode-headed records share a polymorphic tail
+        // and each reduction round produces a same-shape mismatch).
+        // 1024 is well past any legitimate user nesting.
+        self.unify_depth += 1;
+        let result = if self.unify_depth > 1024 {
+            Err(UnifyError::Mismatch(a.clone(), b.clone()))
+        } else {
+            let a = self.zonk(a);
+            let b = self.zonk(b);
+            self.unify_inner(&a, &b)
+        };
+        self.unify_depth -= 1;
+        result
     }
 
     fn unify_inner(&mut self, a: &Type, b: &Type) -> Result<(), UnifyError> {
@@ -469,6 +523,21 @@ impl UnifyState {
             (Type::Unif(id), other) | (other, Type::Unif(id)) => self.bind_var(*id, other),
             (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
             (Type::Con(c1), Type::Con(c2)) if c1 == c2 => Ok(()),
+            // Lenient module-qualifier comparison: `Core.ForceHandle`
+            // (qualified through an `import M as Core` alias) and
+            // `ForceHandle` (unqualified, referring to the same
+            // imported type) refer to the same underlying type. We
+            // unify whenever the names match AND one side has no
+            // module qualifier OR both have the same module string.
+            // We deliberately stay strict when both sides carry
+            // DIFFERENT explicit qualifiers (e.g. `LibA.DemoKind`
+            // vs `LibB.DemoKind`) — that's a real mismatch.
+            (Type::Con(c1), Type::Con(c2))
+                if c1.name == c2.name
+                    && (c1.module.is_none() || c2.module.is_none()) =>
+            {
+                Ok(())
+            }
             // Skolems are rigid — they unify only with themselves.
             // A skolem-vs-anything-else mismatch is exactly how
             // rank-2 violations get rejected: a lambda `\\n -> n + 1`
@@ -781,6 +850,35 @@ fn unify_fields(
         (false, true) => absorb_extras(state, t2, only1, t1.clone()),
         (true, false) => absorb_extras(state, t1, only2, t2.clone()),
         (false, false) => {
+            // If both tails point to the same unif var AND each
+            // side has extras the other doesn't, the row would
+            // need to contain itself — type mismatch. Detect this
+            // up-front; without it `unify {a :: Int | r}
+            // {b :: Int | r}` recurses forever as fresh tails are
+            // re-introduced and each round produces the same
+            // mismatch. Reference compiler reports as
+            // `TypesDoNotUnify` (UnificationError) so we use
+            // Mismatch rather than Infinite here.
+            //
+            // Generalise: detect when the unify is structurally
+            // self-referential — even if t1 and t2 are
+            // *different* unif vars, if zonking each produces the
+            // SAME type whose tail is one of those unifs (i.e.
+            // the binding chain has merged through earlier
+            // unifications), the next iteration will produce the
+            // same shape and recurse forever.
+            if let (Some(a), Some(b)) = (t1.as_deref(), t2.as_deref()) {
+                let za = state.zonk(a);
+                let zb = state.zonk(b);
+                if let (Type::Unif(i), Type::Unif(j)) = (&za, &zb) {
+                    if i == j {
+                        return Err(UnifyError::Mismatch(
+                            Type::Record(only1.clone(), t1.clone()),
+                            Type::Record(only2.clone(), t2.clone()),
+                        ));
+                    }
+                }
+            }
             let fresh = state.fresh();
             absorb_extras(state, t1, only2, Some(Box::new(fresh.clone())))?;
             absorb_extras(state, t2, only1, Some(Box::new(fresh)))
