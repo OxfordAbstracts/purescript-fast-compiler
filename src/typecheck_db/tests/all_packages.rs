@@ -227,7 +227,7 @@ fn repro_pmock_perf() {
 
 /// Reproducer for the Deku.DOM 26-second hot module.
 #[test]
-#[ignore = "Deku.DOM hits a 26s slow path — track here while triaging"]
+#[ignore = "Deku.DOM closure is still 35s; module itself is 5s. Track here while triaging."]
 fn repro_deku_dom_perf() {
     let join_result: Result<Result<(), String>, _> =
         std::thread::Builder::new()

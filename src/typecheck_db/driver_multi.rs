@@ -1957,6 +1957,35 @@ fn check_one_module(
     // that only imports `Effect.Console` still needs
     // `instance bindEffect` from `Effect`).
     let prim_map = crate::typecheck_db::prim::prim_exports();
+    // Build a fingerprint set of instances we already have so the
+    // dedup check is O(1) per candidate instead of O(n). On
+    // import-heavy modules (Deku.DOM aggregates ~6800 instances
+    // across 40 Attr.* re-exports) the prior `iter().any(|i| i ==
+    // inst)` was visibly quadratic and dominated wall time after
+    // the cross-module overlap detector got fixed.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let inst_fingerprint = |inst: &crate::typecheck_db::passes::instance_index::Instance| -> u64 {
+        let mut h = DefaultHasher::new();
+        inst.class.name.hash(&mut h);
+        if let Some(ref m) = inst.class.module {
+            m.hash(&mut h);
+        }
+        inst.types.hash(&mut h);
+        inst.context.len().hash(&mut h);
+        for c in &inst.context {
+            c.class.name.hash(&mut h);
+            c.args.hash(&mut h);
+        }
+        inst.vars.hash(&mut h);
+        inst.chained.hash(&mut h);
+        h.finish()
+    };
+    let mut existing: std::collections::HashSet<u64> = exports
+        .instances
+        .iter()
+        .map(&inst_fingerprint)
+        .collect();
     for imp in &module.imports {
         let imp_name = join_module_name(&imp.module);
         let source = match registry.get(&imp_name) {
@@ -1967,7 +1996,8 @@ fn check_one_module(
             },
         };
         for inst in &source.instances {
-            if !exports.instances.iter().any(|i| i == inst) {
+            let fp = inst_fingerprint(inst);
+            if existing.insert(fp) {
                 exports.instances.push(inst.clone());
             }
         }
