@@ -468,7 +468,64 @@ fn check_one_module(
             );
         }
     }
-
+    // Populate type_ops from imported modules' cross-module type fixities.
+    // Only includes operators where the target is in a DIFFERENT module than
+    // the operator's defining module (e.g. `/\` → Tuple: operator in
+    // Data.Tuple.Nested, target in Data.Tuple). This fixes annotation mismatches
+    // like `a /\ b` (Con("/\")) vs inferred `Tuple a b` (Con("Tuple")).
+    //
+    // Same-module aliases (e.g. `#>` → Cons, both in Test.PMock.Cons) are
+    // excluded: their target_module == the exporting module name. Including
+    // them would change instance head representations and break performance
+    // optimizations that rely on consistent type operator representation.
+    for imp in &module.imports {
+        let mod_name = imp
+            .module
+            .parts
+            .iter()
+            .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Some(exports) = registry.get(&mod_name) {
+            if exports.type_fixities.is_empty() {
+                continue;
+            }
+            for (op_name, decl) in &exports.type_fixities {
+                // Only add cross-module aliases (target in a different module).
+                // target_module == None means the target was imported (not local)
+                // so it's always cross-module. target_module == Some(mod_name)
+                // means the target is defined in the same module as the operator.
+                let is_cross_module = decl
+                    .target_module
+                    .as_deref()
+                    .map(|tm| tm != mod_name.as_str())
+                    .unwrap_or(true);
+                if !is_cross_module {
+                    continue;
+                }
+                let imported = match &imp.imports {
+                    None => true,
+                    Some(cst::ImportList::Hiding(list)) => {
+                        !list.iter().any(|item| matches!(item,
+                            cst::Import::TypeOp(n)
+                            if crate::typecheck_db::util::resolve_symbol(n.value.symbol()) == *op_name))
+                    }
+                    Some(cst::ImportList::Explicit(list)) => {
+                        list.iter().any(|item| matches!(item,
+                            cst::Import::TypeOp(n)
+                            if crate::typecheck_db::util::resolve_symbol(n.value.symbol()) == *op_name))
+                    }
+                };
+                if imported {
+                    let target = crate::typecheck_db::types::QName {
+                        module: decl.target_module.clone(),
+                        name: decl.target_name.clone(),
+                    };
+                    type_ops.entry((None, op_name.clone())).or_insert(target);
+                }
+            }
+        }
+    }
     // Build a consolidated alias map: local `type Foo = …` decls
     // plus every imported module's exported aliases. Passed into
     // inference / class-method binding so aliases like
