@@ -1108,11 +1108,18 @@ fn detect_invalid_instance_heads(
                     // so we conservatively allow it.
                     match peel_parens(body) {
                         cst::TypeExpr::Record { .. } => true,
+                        // `{ fields | r }` with non-empty fields is concrete/partial → record-headed.
+                        // `{ | r }` (no fields) is just `Record r` — NOT record-headed.
                         cst::TypeExpr::Row {
                             is_record: true,
+                            fields,
                             tail: Some(t),
                             ..
-                        } if matches!(peel_parens(t), cst::TypeExpr::Var { .. }) => true,
+                        } if !fields.is_empty()
+                            && matches!(peel_parens(t), cst::TypeExpr::Var { .. }) =>
+                        {
+                            true
+                        }
                         _ => walk_to_record_alias(body, alias_body, seen),
                     }
                 } else {
@@ -1135,16 +1142,23 @@ fn detect_invalid_instance_heads(
         match peel_parens(te) {
             cst::TypeExpr::Wildcard { .. } => !allow_top_wildcard,
             // Bare record literal `{}` / `{ x :: Int }` — not a named
-            // type. `{ … | r }` (Row with `is_record: true`) is
-            // record-headed only when the tail is a bare type var
-            // (open record); applied tails are conservatively
-            // allowed since they may resolve to a closed row.
+            // type. Always invalid regardless of fundeps.
             cst::TypeExpr::Record { .. } => true,
+            // `{ fields | r }` with non-empty fields: partially
+            // concrete open record → invalid unless determined.
+            // `{ | r }` (no fields): equivalent to `Record r`, a
+            // type-constructor application to a variable → VALID,
+            // never flag it.
             cst::TypeExpr::Row {
                 is_record: true,
+                fields,
                 tail: Some(t),
                 ..
-            } if matches!(peel_parens(t), cst::TypeExpr::Var { .. }) => true,
+            } if !fields.is_empty()
+                && matches!(peel_parens(t), cst::TypeExpr::Var { .. }) =>
+            {
+                true
+            }
             other => {
                 if has_wildcard(other) {
                     return true;
@@ -2221,13 +2235,17 @@ fn detect_transitive_export_errors(
     // Either as \/` in `Data.Either.Nested` aliases an imported
     // `Either`, which is a legitimate re-export.
     let mut local_types: HashSet<Symbol> = HashSet::new();
+    let mut local_type_aliases: HashSet<Symbol> = HashSet::new();
     for d in &module.decls {
         match d {
             cst::Decl::Data { name, .. }
             | cst::Decl::Newtype { name, .. }
-            | cst::Decl::TypeAlias { name, .. }
             | cst::Decl::ForeignData { name, .. } => {
                 local_types.insert(name.value.symbol());
+            }
+            cst::Decl::TypeAlias { name, .. } => {
+                local_types.insert(name.value.symbol());
+                local_type_aliases.insert(name.value.symbol());
             }
             _ => {}
         }
@@ -2451,17 +2469,24 @@ fn detect_transitive_export_errors(
         }
 
         // Helper: walk a TypeExpr and emit a TransitiveExportError on
-        // `owner_sym` if the body references a local-but-unexported
-        // type / class.
-        let mut check_ty_refs = |
+        // `owner_sym` if the body references a local-but-unexported type.
+        // `skip_aliases`: type aliases are transparent in value sigs (the
+        // inferred/exported type has them expanded), so skip them for values.
+        // For exported type alias bodies and data ctor fields, aliases are
+        // NOT transparent (the surface form is part of the module interface).
+        let mut check_ty_refs_inner = |
             owner_sym: Symbol,
             owner_span: Span,
             ty: &cst::TypeExpr,
+            skip_aliases: bool,
             errors: &mut Vec<ValidationError>,
             reported: &mut HashSet<Symbol>,
         | {
             collect_type_refs(ty, &mut |name: Symbol, _is_class| {
                 if !local_types.contains(&name) {
+                    return;
+                }
+                if skip_aliases && local_type_aliases.contains(&name) {
                     return;
                 }
                 if exported_types.contains(&name) {
@@ -2480,21 +2505,19 @@ fn detect_transitive_export_errors(
 
         let mut reported_decl: HashSet<Symbol> = HashSet::new();
 
-        // Exported value with type referring to a non-exported local type.
-        for v in &exported_values {
-            if let Some(ty) = value_decl_ty.get(v) {
-                let span = value_decl_span.get(v).copied()
-                    .unwrap_or(crate::span::Span::new(0, 0));
-                check_ty_refs(*v, span, ty, errors, &mut reported_decl);
-            }
-        }
+        // NOTE: We do NOT check exported value type signatures here.
+        // In PureScript, TransitiveExportError fires for EXPORTED TYPE
+        // DECLARATIONS (alias bodies, data ctor fields) — not for value
+        // type annotations. A value can be exported even if its type
+        // references unexported types (opaque types are intentional).
 
         // Exported alias with body referring to a non-exported local type.
+        // Alias bodies are part of the module interface — aliases not transparent here.
         for t in &exported_types {
             if let Some(body) = alias_decl_body.get(t) {
                 let span = alias_decl_span.get(t).copied()
                     .unwrap_or(crate::span::Span::new(0, 0));
-                check_ty_refs(*t, span, body, errors, &mut reported_decl);
+                check_ty_refs_inner(*t, span, body, false, errors, &mut reported_decl);
             }
         }
 
@@ -2513,7 +2536,7 @@ fn detect_transitive_export_errors(
                     let span = data_decl_span.get(&parent).copied()
                         .unwrap_or(crate::span::Span::new(0, 0));
                     for f in fields {
-                        check_ty_refs(parent, span, f, errors, &mut reported_decl);
+                        check_ty_refs_inner(parent, span, f, false, errors, &mut reported_decl);
                     }
                 }
             }
@@ -2523,20 +2546,20 @@ fn detect_transitive_export_errors(
                 let span = data_decl_span.get(t).copied()
                     .unwrap_or(crate::span::Span::new(0, 0));
                 for ann in anns {
-                    check_ty_refs(*t, span, ann, errors, &mut reported_decl);
+                    check_ty_refs_inner(*t, span, ann, false, errors, &mut reported_decl);
                 }
             }
             if let Some(anns) = newtype_decl_kind_anns.get(t) {
                 let span = newtype_decl_span.get(t).copied()
                     .unwrap_or(crate::span::Span::new(0, 0));
                 for ann in anns {
-                    check_ty_refs(*t, span, ann, errors, &mut reported_decl);
+                    check_ty_refs_inner(*t, span, ann, false, errors, &mut reported_decl);
                 }
             }
             if let Some(body) = newtype_decl_field.get(t) {
                 let span = newtype_decl_span.get(t).copied()
                     .unwrap_or(crate::span::Span::new(0, 0));
-                check_ty_refs(*t, span, body, errors, &mut reported_decl);
+                check_ty_refs_inner(*t, span, body, false, errors, &mut reported_decl);
             }
         }
 
@@ -3468,8 +3491,16 @@ fn walk_partial_apps(
         cst::TypeExpr::Parens { ty, .. } => {
             walk_partial_apps(ty, alias_arity, errors, reported);
         }
-        cst::TypeExpr::TypeOp { left, right, .. } => {
-            walk_partial_apps(left, alias_arity, errors, reported);
+        cst::TypeExpr::TypeOp { left, op, right, .. } => {
+            // `r1 + r2` desugars to "set r2 as the open row tail of r1".
+            // A partially-applied row synonym on the left (1-arg short)
+            // is valid because `+` provides that missing tail argument.
+            let op_name = crate::typecheck_db::util::resolve_symbol(op.value.name.symbol());
+            if op_name == "+" {
+                walk_partial_apps_allow_one_short(left, alias_arity, errors, reported);
+            } else {
+                walk_partial_apps(left, alias_arity, errors, reported);
+            }
             walk_partial_apps(right, alias_arity, errors, reported);
         }
         cst::TypeExpr::Kinded { ty, kind, .. } => {
@@ -3485,6 +3516,58 @@ fn walk_partial_apps(
             walk_partial_apps(ty, alias_arity, errors, reported);
         }
         _ => {}
+    }
+}
+
+/// Like `walk_partial_apps` but allows a synonym to be applied to
+/// exactly `arity - 1` arguments at the top level. Used for the left
+/// operand of the `+` row-extension operator, where `+` itself
+/// provides the missing row-tail argument.
+fn walk_partial_apps_allow_one_short(
+    te: &cst::TypeExpr,
+    alias_arity: &HashMap<Symbol, usize>,
+    errors: &mut Vec<ValidationError>,
+    reported: &mut HashSet<(Symbol, usize)>,
+) {
+    match te {
+        cst::TypeExpr::App { span, .. } => {
+            let (head, args) = peel_app_chain(te);
+            let mut head_is_alias = false;
+            if let cst::TypeExpr::Constructor { name, .. } = head {
+                if name.module.is_none() {
+                    let sym = name.name.symbol();
+                    if let Some(&n) = alias_arity.get(&sym) {
+                        head_is_alias = true;
+                        // allow arity - 1 (the `+` provides the last arg)
+                        if args.len() + 1 < n {
+                            if reported.insert((sym, span.start)) {
+                                errors.push(ValidationError {
+                                    span: *span,
+                                    kind: ValidationErrorKind::PartiallyAppliedSynonym(
+                                        resolve(sym),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if !head_is_alias {
+                for a in &args {
+                    walk_partial_apps(a, alias_arity, errors, reported);
+                }
+            }
+        }
+        // A bare Constructor with arity 1 is OK on the left of `+`
+        // (it's arity-1, applied with 0 args, which is 1 short).
+        cst::TypeExpr::Constructor { .. } => {
+            // allowed — `+` provides the missing 1 arg
+        }
+        // Parenthesized: recurse with allowance
+        cst::TypeExpr::Parens { ty, .. } => {
+            walk_partial_apps_allow_one_short(ty, alias_arity, errors, reported);
+        }
+        _ => walk_partial_apps(te, alias_arity, errors, reported),
     }
 }
 
@@ -11016,19 +11099,27 @@ fn detect_instance_method_caf_cycle(
                         continue;
                     }
                 }
-                // Partially-applied sibling reference (`size = fold
-                // f z`) only flags when the instance has NO same-class
-                // constraint to dispatch through.
+                // Cross-method head reference: `size = fold (...) 0.0`
+                // where the HEAD of the body's App chain IS a sibling
+                // method. The sibling is immediately called at dictionary
+                // construction time (partial application in JS). Only
+                // fire when there's no same-class constraint (which would
+                // mean `fold` comes from the constraint, not the dict).
+                // Note: `exl = linearPropagation exl exl` is OK because
+                // `linearPropagation` is the head (external), and `exl`
+                // appears only in argument position — the closure captures
+                // it lazily.
                 if !has_same_class_constraint {
-                    let mut found: Option<Symbol> = None;
-                    walk_expr_for_caf_method_ref(body, methods, &mut found);
-                    if let Some(_sym) = found {
-                        errors.push(ValidationError {
-                            span: *span,
-                            kind: ValidationErrorKind::CycleInDeclaration(vec![
-                                resolve(name.value.symbol()),
-                            ]),
-                        });
+                    let head = peel_app_head_for_method_ref(body);
+                    if let Some(sym) = head {
+                        if methods.contains(&sym) {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::CycleInDeclaration(vec![
+                                    resolve(name.value.symbol()),
+                                ]),
+                            });
+                        }
                     }
                 }
             }
@@ -11045,6 +11136,25 @@ fn direct_var_ref(expr: &cst::Expr) -> Option<crate::interner::Symbol> {
         match cur {
             cst::Expr::Parens { expr, .. } => cur = expr,
             cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+            cst::Expr::Var { name, .. } if name.module.is_none() => {
+                return Some(name.name.symbol());
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Peel Parens/TypeAnnotation/App to find the unqualified Var head of
+/// an expression's App chain. Returns `Some(sym)` if the outermost
+/// function position is a bare variable, `None` otherwise.
+fn peel_app_head_for_method_ref(expr: &cst::Expr) -> Option<crate::interner::Symbol> {
+    let mut cur = expr;
+    loop {
+        match cur {
+            cst::Expr::Parens { expr, .. } => cur = expr,
+            cst::Expr::TypeAnnotation { expr, .. } => cur = expr,
+            cst::Expr::App { func, .. } => cur = func,
+            cst::Expr::VisibleTypeApp { func, .. } => cur = func,
             cst::Expr::Var { name, .. } if name.module.is_none() => {
                 return Some(name.name.symbol());
             }

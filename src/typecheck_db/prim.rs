@@ -251,23 +251,11 @@ fn prim_rowlist() -> ModuleExports {
     let mut e = ModuleExports::default();
     // type RowList k :: Type — represented as arity-1 type.
     e.type_arities.insert("RowList".into(), 1);
-    // Type-level constructors Cons, Nil on RowList.
-    e.data_constructors.insert(
-        "RowList".into(),
-        vec!["Cons".into(), "Nil".into()],
-    );
-    e.ctors.insert(
-        "Nil".into(),
-        CtorInfo { parent_type: "RowList".into(), type_vars: vec!["k".into()], fields: vec![] },
-    );
-    e.ctors.insert(
-        "Cons".into(),
-        CtorInfo {
-            parent_type: "RowList".into(),
-            type_vars: vec!["k".into()],
-            fields: vec![],
-        },
-    );
+    // Cons :: forall k. Symbol -> k -> RowList k -> RowList k (arity 3)
+    // Nil  :: forall k. RowList k  (arity 0)
+    // These are standalone type-level data types, not constructors of RowList.
+    e.type_arities.insert("Cons".into(), 3);
+    e.type_arities.insert("Nil".into(), 0);
     // class RowToList row list | row -> list
     e.classes.insert(
         "RowToList".into(),

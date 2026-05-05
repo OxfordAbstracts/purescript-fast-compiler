@@ -2975,6 +2975,8 @@ fn detect_unknown_kind_refs_registry(
             }
         }
     }
+    // `(->)` is the built-in function-type constructor; it's always valid.
+    known.insert("->".to_string());
     for imp in &module.imports {
         let target = join_module_name(&imp.module);
         let exports: Option<&ModuleExports> = registry
@@ -3178,6 +3180,8 @@ fn detect_unknown_type_refs_registry(
             }
         }
     }
+    // `(->)` is the built-in function-type constructor; always valid.
+    known.insert("->".to_string());
     // Collect type-level operator names too — some grammars emit
     // ops in Constructor position post-desugar, and even if not,
     // we don't want a use-site `(~>)` that's an operator-aliased

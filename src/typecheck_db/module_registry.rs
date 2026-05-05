@@ -517,11 +517,8 @@ pub fn distill_exports(
             }
             Decl::ForeignData { name, kind, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-                // Arity unknown without kind checking; 0 is a safe
-                // default — the type_arities entry is primarily
-                // used by importers as "this name is a type",
-                // not for over-application detection.
-                type_arities_all.insert(n.clone(), 0);
+                // Derive arity from the kind annotation (arrow count).
+                type_arities_all.insert(n.clone(), count_kind_arrows(kind));
                 // Track the qualified head of the kind annotation
                 // when it's a single Constructor reference. Used by
                 // cross-module kind comparison to detect
@@ -886,11 +883,11 @@ pub fn expand_module_reexports(
                 continue;
             }
 
-            // Find which import target this `module X` clause
-            // refers to: either an `import M as X` aliased as
-            // `re_exported_name`, or the raw target `import
-            // re_exported_name`.
-            let mut target_module: Option<String> = None;
+            // Find which import targets this `module X` clause
+            // refers to. Multiple imports may share the same alias
+            // (e.g. `import A.Foo (Foo) as Exports` + `import A.Bar
+            // (Bar) as Exports`), so collect ALL matching targets.
+            let mut target_modules: Vec<String> = Vec::new();
             for imp in &module.imports {
                 let imp_target: String = imp
                     .module
@@ -900,8 +897,8 @@ pub fn expand_module_reexports(
                     .collect::<Vec<_>>()
                     .join(".");
                 if imp_target == re_exported_name {
-                    target_module = Some(imp_target);
-                    break;
+                    target_modules.push(imp_target);
+                    continue;
                 }
                 if let Some(alias) = &imp.qualified {
                     let alias_str: String = alias
@@ -911,105 +908,92 @@ pub fn expand_module_reexports(
                         .collect::<Vec<_>>()
                         .join(".");
                     if alias_str == re_exported_name {
-                        target_module = Some(imp_target);
-                        break;
+                        target_modules.push(imp_target);
                     }
                 }
             }
-            let Some(target_name) = target_module else {
+            if target_modules.is_empty() {
                 continue;
-            };
-            // Re-export target may be a user module (in the
-            // registry) OR a Prim submodule (not in the registry,
-            // built from `prim::prim_exports`). Safe.Coerce relies
-            // on the latter when it writes `module Prim.Coerce`.
+            }
             let prim_map = crate::typecheck_db::prim::prim_exports();
-            let target_exports = match registry.get(&target_name) {
-                Some(t) => t,
-                None => match prim_map.get(&target_name) {
+            for target_name in &target_modules {
+                // Re-export target may be a user module (in the
+                // registry) OR a Prim submodule (not in the registry,
+                // built from `prim::prim_exports`). Safe.Coerce relies
+                // on the latter when it writes `module Prim.Coerce`.
+                let target_exports = match registry.get(target_name) {
                     Some(t) => t,
-                    None => continue,
-                },
-            };
+                    None => match prim_map.get(target_name.as_str()) {
+                        Some(t) => t,
+                        None => continue,
+                    },
+                };
 
-            // Merge everything from the target. The target's items
-            // become re-exported under this module — but the value
-            // origin stays pointed at the *original* defining
-            // module (follow the chain: if target has a recorded
-            // origin, keep it; else fall back to the target itself).
-            // When multiple re-exports contribute distinct
-            // schemes under the same simple name, the primary
-            // `values` map keeps the first (preserving existing
-            // behavior) and the `qualified_values` map records
-            // the rest so importers can still bind every origin
-            // key.
-            for (k, v) in &target_exports.values {
-                let origin = target_exports
-                    .value_origins
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_else(|| target_name.clone());
-                out.qualified_values
-                    .entry((origin.clone(), k.clone()))
-                    .or_insert_with(|| v.clone());
-                out.values.entry(k.clone()).or_insert_with(|| v.clone());
-                out.value_origins.entry(k.clone()).or_insert(origin);
-            }
-            for (key, scheme) in &target_exports.qualified_values {
-                out.qualified_values
-                    .entry(key.clone())
-                    .or_insert_with(|| scheme.clone());
-            }
-            for (k, v) in &target_exports.ctors {
-                out.ctors.entry(k.clone()).or_insert_with(|| v.clone());
-                let origin = target_exports
-                    .ctor_origins
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_else(|| target_name.clone());
-                out.ctor_origins.entry(k.clone()).or_insert(origin);
-            }
-            for (k, v) in &target_exports.data_constructors {
-                out.data_constructors.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for (k, v) in &target_exports.type_aliases {
-                out.type_aliases.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for (k, v) in &target_exports.classes {
-                out.classes.entry(k.clone()).or_insert_with(|| v.clone());
-                let origin = target_exports
-                    .class_origins
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_else(|| target_name.clone());
-                out.class_origins.entry(k.clone()).or_insert(origin);
-            }
-            // Instances are global — already carried via the
-            // importer's own `instances` field, but re-exporting
-            // them again is harmless and matches PureScript
-            // semantics.
-            for inst in &target_exports.instances {
-                if !out.instances.iter().any(|i| i == inst) {
-                    out.instances.push(inst.clone());
+                // Merge everything from the target.
+                for (k, v) in &target_exports.values {
+                    let origin = target_exports
+                        .value_origins
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.clone());
+                    out.qualified_values
+                        .entry((origin.clone(), k.clone()))
+                        .or_insert_with(|| v.clone());
+                    out.values.entry(k.clone()).or_insert_with(|| v.clone());
+                    out.value_origins.entry(k.clone()).or_insert(origin);
                 }
-            }
-            for (k, v) in &target_exports.value_fixities {
-                out.value_fixities.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for (k, v) in &target_exports.type_fixities {
-                out.type_fixities.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for n in &target_exports.newtypes {
-                out.newtypes.insert(n.clone());
-            }
-            for (k, v) in &target_exports.type_arities {
-                out.type_arities.entry(k.clone()).or_insert(*v);
-                let origin = target_exports
-                    .type_origins
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_else(|| target_name.clone());
-                out.type_origins.entry(k.clone()).or_insert(origin);
+                for (key, scheme) in &target_exports.qualified_values {
+                    out.qualified_values
+                        .entry(key.clone())
+                        .or_insert_with(|| scheme.clone());
+                }
+                for (k, v) in &target_exports.ctors {
+                    out.ctors.entry(k.clone()).or_insert_with(|| v.clone());
+                    let origin = target_exports
+                        .ctor_origins
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.clone());
+                    out.ctor_origins.entry(k.clone()).or_insert(origin);
+                }
+                for (k, v) in &target_exports.data_constructors {
+                    out.data_constructors.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                for (k, v) in &target_exports.type_aliases {
+                    out.type_aliases.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                for (k, v) in &target_exports.classes {
+                    out.classes.entry(k.clone()).or_insert_with(|| v.clone());
+                    let origin = target_exports
+                        .class_origins
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.clone());
+                    out.class_origins.entry(k.clone()).or_insert(origin);
+                }
+                for inst in &target_exports.instances {
+                    if !out.instances.iter().any(|i| i == inst) {
+                        out.instances.push(inst.clone());
+                    }
+                }
+                for (k, v) in &target_exports.value_fixities {
+                    out.value_fixities.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                for (k, v) in &target_exports.type_fixities {
+                    out.type_fixities.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                for n in &target_exports.newtypes {
+                    out.newtypes.insert(n.clone());
+                }
+                for (k, v) in &target_exports.type_arities {
+                    out.type_arities.entry(k.clone()).or_insert(*v);
+                    let origin = target_exports
+                        .type_origins
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_else(|| target_name.clone());
+                    out.type_origins.entry(k.clone()).or_insert(origin);
+                }
             }
         }
     }
@@ -1019,6 +1003,15 @@ pub fn expand_module_reexports(
 /// Forall/Function/Parens) and return its qualified module + name.
 /// If the constructor was unqualified at declaration site AND the
 /// name is locally declared, qualify with `self_module`.
+fn count_kind_arrows(te: &crate::cst::TypeExpr) -> usize {
+    match te {
+        crate::cst::TypeExpr::Function { to, .. } => 1 + count_kind_arrows(to),
+        crate::cst::TypeExpr::Parens { ty, .. } => count_kind_arrows(ty),
+        crate::cst::TypeExpr::Forall { ty, .. } => count_kind_arrows(ty),
+        _ => 0,
+    }
+}
+
 fn qualified_kind_head(
     kind: &crate::cst::TypeExpr,
     self_module: &str,

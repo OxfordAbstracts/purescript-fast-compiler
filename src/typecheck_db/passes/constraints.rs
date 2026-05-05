@@ -813,7 +813,58 @@ fn try_magic(
         // `Prim.Symbol.Cons head tail sym | head tail -> sym, sym ->
         // head tail` — concrete sym determines head/tail; concrete
         // head + tail determines sym.
+        // `Prim.Row.Cons label a tail row | label tail -> a row,
+        // label row -> a tail` — when label is a known TypeString
+        // and row is a concrete Row, look up the field and unify.
         "Cons" => {
+            if args.len() == 4 {
+                // Row.Cons: label, field-type, tail-row, full-row.
+                // Only fires when label is a known TypeString AND
+                // full-row is a concrete Row — otherwise falls
+                // through to the normal Deferred path (Row.Cons has
+                // no user instances, so candidates is empty).
+                if let Type::TypeString(lbl) = &args[0] {
+                    let lbl = lbl.clone();
+                    let a1 = args[1].clone();
+                    let a2 = args[2].clone();
+                    let row = args[3].clone();
+                    if let Type::Row(ref fields, ref row_tail) = row {
+                        if let Some(idx) =
+                            fields.iter().position(|(l, _)| *l == lbl)
+                        {
+                            let field_ty = fields[idx].1.clone();
+                            let remaining: Vec<(String, Type)> = fields
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| *i != idx)
+                                .map(|(_, f)| f.clone())
+                                .collect();
+                            let tail_ty =
+                                Type::Row(remaining, row_tail.clone());
+                            let snapshot = state.snapshot_bindings();
+                            if state.unify(&a1, &field_ty).is_ok()
+                                && state.unify(&a2, &tail_ty).is_ok()
+                            {
+                                return MagicOutcome::Resolved(ResolvedDict {
+                                    class: pending.constraint.class.clone(),
+                                    instance_types: vec![
+                                        args[0].clone(),
+                                        field_ty,
+                                        tail_ty,
+                                        row,
+                                    ],
+                                    instance_idx: 0,
+                                    context: Vec::new(),
+                                });
+                            }
+                            state.restore_bindings(snapshot);
+                            // Unification failed — fall through to
+                            // defer (return None below).
+                        }
+                        // Label absent or open row — fall through.
+                    }
+                }
+            }
             if args.len() == 3 {
                 // Forward: head + tail → sym.
                 if let (Type::TypeString(h), Type::TypeString(t)) =

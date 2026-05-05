@@ -530,8 +530,26 @@ fn run_all_packages_check() -> Result<(), String> {
         }
     }
     if !failures.is_empty() {
-        eprintln!("\nFirst 40 failing modules:");
-        for f in failures.iter().take(40) {
+        // detailed per-error-kind counts within each category
+        let mut detail_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for f in &failures {
+            for r in &f.reasons {
+                let key = r.split('(').next().unwrap_or(r).trim().to_string();
+                *detail_counts.entry(key).or_default() += 1;
+            }
+        }
+        let mut sorted_detail: Vec<_> = detail_counts.iter().collect();
+        sorted_detail.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("\nDetailed error breakdown:");
+        for (kind, count) in &sorted_detail {
+            eprintln!("  {:>4} {}", count, kind);
+        }
+        let limit = std::env::var("ALL_PACKAGES_SHOW").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(40);
+        eprintln!("\nFirst {} failing modules:", limit);
+        for f in failures.iter().take(limit) {
             eprintln!("  {}: {}", f.name, f.reasons.join("; "));
         }
     }

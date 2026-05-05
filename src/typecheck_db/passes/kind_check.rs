@@ -417,6 +417,13 @@ fn build_class_arity_env(
     registry: &ModuleRegistry,
 ) -> HashMap<Symbol, usize> {
     let mut env: HashMap<Symbol, usize> = HashMap::new();
+    // Track which names have conflicting arities across imports so we
+    // can drop them — a name like "Cons" may refer to Prim.Row.Cons
+    // (4 params) or Prim.Symbol.Cons (3 params); looking it up by
+    // unqualified name would produce spurious KindsDoNotUnify errors
+    // for qualified uses like `Row.Cons`.
+    let mut conflicted: std::collections::HashSet<Symbol> =
+        std::collections::HashSet::new();
 
     for imp in &module.imports {
         let name = imp
@@ -429,9 +436,20 @@ fn build_class_arity_env(
         if let Some(exports) = registry.get(&name) {
             for (cname, info) in &exports.classes {
                 let sym = crate::interner::intern(cname);
-                env.insert(sym, info.type_vars.len());
+                let arity = info.type_vars.len();
+                if let Some(&existing) = env.get(&sym) {
+                    if existing != arity {
+                        conflicted.insert(sym);
+                    }
+                } else {
+                    env.insert(sym, arity);
+                }
             }
         }
+    }
+
+    for sym in &conflicted {
+        env.remove(sym);
     }
 
     for d in &module.decls {
@@ -1189,8 +1207,11 @@ impl<'a> Ctx<'a> {
             self.check_type(a);
         }
         if c.class.module.is_some() {
-            // Imported class — we still want to check arity if we have
-            // it in the env (build_class_arity_env collected those).
+            // Qualified class (e.g. `Row.Cons`): looking up by the
+            // unqualified name would match a DIFFERENT same-named class
+            // (e.g. `Symbol.Cons` with 3 params vs `Row.Cons` with 4).
+            // Skip the unqualified arity check for qualified refs.
+            return;
         }
         if let Some(&expected) = self.class_env.get(&c.class.name.symbol()) {
             if c.args.len() != expected {

@@ -290,6 +290,36 @@ pub fn expand_aliases(ty: Type, aliases: &AliasMap) -> Type {
     current
 }
 
+/// True when `ty` structurally contains `Con(name)` (module
+/// qualifier ignored). Used by `expand_once` to detect
+/// self-referential aliases — an alias whose body mentions
+/// its own name would expand indefinitely (exponentially for
+/// branching rows like `Style.Evaluated`).
+fn body_mentions_name(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Con(qn) => qn.name == name,
+        Type::App(f, a) | Type::Fun(f, a) => {
+            body_mentions_name(f, name) || body_mentions_name(a, name)
+        }
+        Type::Row(fs, tail) | Type::Record(fs, tail) => {
+            fs.iter().any(|(_, t)| body_mentions_name(t, name))
+                || tail
+                    .as_ref()
+                    .map_or(false, |t| body_mentions_name(t, name))
+        }
+        Type::Forall(_, b) => body_mentions_name(b, name),
+        Type::Kinded(t, k) => {
+            body_mentions_name(t, name) || body_mentions_name(k, name)
+        }
+        Type::Constrained(cs, b) => {
+            cs.iter()
+                .any(|c| c.args.iter().any(|a| body_mentions_name(a, name)))
+                || body_mentions_name(b, name)
+        }
+        _ => false,
+    }
+}
+
 fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
     // Collect the Con head + its App spine so we can try to
     // match the whole applied form against an alias. Anything
@@ -306,7 +336,16 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
             // fixtures. Saturated covers the overwhelming common
             // case (`type SynString = String`, `type Fn a = a ->
             // a`).
-            if vars.len() == args.len() {
+            if vars.len() == args.len()
+                // Skip self-referential aliases: if the body
+                // mentions the alias name (Con("X") inside alias
+                // "X"), expanding it would produce a type that
+                // again contains Con("X"), causing exponential
+                // blow-up across MAX_EXPANSIONS iterations.
+                // Leaving the Con unexpanded is safe — the type
+                // stays opaque but well-formed.
+                && !body_mentions_name(body, &qn.name)
+            {
                 let mut subst: std::collections::HashMap<String, Type> =
                     std::collections::HashMap::with_capacity(vars.len());
                 for (v, a) in vars.iter().zip(args.iter()) {
