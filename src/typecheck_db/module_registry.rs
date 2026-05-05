@@ -505,7 +505,14 @@ pub fn distill_exports(
 
     for d in &module.decls {
         match d {
-            Decl::Data { name, type_vars, constructors, .. } => {
+            Decl::Data { name, type_vars, constructors, is_role_decl, kind_sig, .. } => {
+                // Skip role declarations and standalone kind signatures —
+                // they share the type name but have empty type_vars/ctors
+                // and would overwrite the real declaration's arity and
+                // constructor list if processed.
+                if *is_role_decl || !matches!(kind_sig, crate::cst::KindSigSource::None) {
+                    continue;
+                }
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let ctor_names: Vec<String> = constructors
                     .iter()
