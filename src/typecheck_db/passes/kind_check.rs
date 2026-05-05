@@ -354,6 +354,25 @@ fn build_arity_env(
             .map(|p| crate::interner::resolve(*p).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(".");
+        // Prim.TypeError is not in the main registry but defines Doc/Text/
+        // Beside/Above/Quote/QuoteLabel. Add their arities explicitly when
+        // a module imports from Prim.TypeError.
+        if name == "Prim.TypeError" {
+            for (tname, arity) in &[
+                ("Doc", 0usize),
+                ("Text", 1),
+                ("Beside", 2),
+                ("Above", 2),
+                ("Quote", 1),
+                ("QuoteLabel", 1),
+            ] {
+                let sym = crate::interner::intern(tname);
+                if !local_aliases.contains(&sym) {
+                    env.insert(sym, *arity);
+                }
+            }
+            continue;
+        }
         if let Some(exports) = registry.get(&name) {
             for (tname, arity) in &exports.type_arities {
                 let sym = crate::interner::intern(tname);

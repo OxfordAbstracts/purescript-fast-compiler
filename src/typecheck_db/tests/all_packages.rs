@@ -515,18 +515,32 @@ fn run_all_packages_check() -> Result<(), String> {
 
     let failing = failures.len();
     let passing = total.saturating_sub(failing);
-    eprintln!("=== typecheck_db package-set summary ===");
-    eprintln!("modules processed: {total}");
-    eprintln!("passing:           {passing}");
-    eprintln!("failing:           {failing}");
-    eprintln!("driver errors:     {}", driver_errors.len());
-    eprintln!("total wall time:   {:.2?}", started.elapsed());
+    // Write summary to a file so it can be captured outside of test harness.
+    let dump_path = std::env::var("ALL_PACKAGES_DUMP_FILE")
+        .unwrap_or_else(|_| "/tmp/all_packages_summary.txt".to_string());
+    let mut dump_file = std::fs::File::create(&dump_path)
+        .ok();
+    macro_rules! out {
+        ($($arg:tt)*) => {
+            eprintln!($($arg)*);
+            if let Some(ref mut f) = dump_file {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        };
+    }
+    out!("=== typecheck_db package-set summary ===");
+    out!("modules processed: {total}");
+    out!("passing:           {passing}");
+    out!("failing:           {failing}");
+    out!("driver errors:     {}", driver_errors.len());
+    out!("total wall time:   {:.2?}", started.elapsed());
     if !error_counts.is_empty() {
         let mut sorted_counts: Vec<_> = error_counts.iter().collect();
         sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
-        eprintln!("\nError distribution:");
+        out!("\nError distribution:");
         for (kind, count) in &sorted_counts {
-            eprintln!("  {:>4} {}", count, kind);
+            out!("  {:>4} {}", count, kind);
         }
     }
     if !failures.is_empty() {
@@ -541,16 +555,16 @@ fn run_all_packages_check() -> Result<(), String> {
         }
         let mut sorted_detail: Vec<_> = detail_counts.iter().collect();
         sorted_detail.sort_by(|a, b| b.1.cmp(a.1));
-        eprintln!("\nDetailed error breakdown:");
+        out!("\nDetailed error breakdown:");
         for (kind, count) in &sorted_detail {
-            eprintln!("  {:>4} {}", count, kind);
+            out!("  {:>4} {}", count, kind);
         }
         let limit = std::env::var("ALL_PACKAGES_SHOW").ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(40);
-        eprintln!("\nFirst {} failing modules:", limit);
+        out!("\nFirst {} failing modules:", limit);
         for f in failures.iter().take(limit) {
-            eprintln!("  {}: {}", f.name, f.reasons.join("; "));
+            out!("  {}: {}", f.name, f.reasons.join("; "));
         }
     }
 

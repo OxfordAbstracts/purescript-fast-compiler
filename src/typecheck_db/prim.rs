@@ -319,11 +319,14 @@ fn prim_typeerror() -> ModuleExports {
         "Warn".into(),
         ClassInfo { type_vars: vec!["doc".into()], fundeps: vec![], superclasses: vec![] },
     );
-    // Doc type + constructors. No fields — these are used at
-    // type level and never constructed at value level.
-    for name in ["Doc", "Text", "Beside", "Above", "Quote", "QuoteLabel"] {
-        e.type_arities.insert(name.into(), 0);
-    }
+    // Doc/TypeError type-level constructors. Arities match the
+    // PureScript spec: Doc=0, Text/Quote/QuoteLabel=1, Beside/Above=2.
+    e.type_arities.insert("Doc".into(), 0);
+    e.type_arities.insert("Text".into(), 1);       // Text :: Symbol -> Doc
+    e.type_arities.insert("Quote".into(), 1);      // Quote :: Type -> Doc
+    e.type_arities.insert("QuoteLabel".into(), 1); // QuoteLabel :: Symbol -> Doc
+    e.type_arities.insert("Beside".into(), 2);     // Beside :: Doc -> Doc -> Doc
+    e.type_arities.insert("Above".into(), 2);      // Above :: Doc -> Doc -> Doc
     e
 }
 
