@@ -332,6 +332,7 @@ pub fn distill_exports(
     class_info: &HashMap<String, ClassInfo>,
     ctor_info: &HashMap<String, CtorInfo>,
     alias_map: &crate::typecheck_db::types::AliasMap,
+    type_ops: &crate::typecheck_db::types::TypeOpMap,
 ) -> ModuleExports {
     use crate::cst::{DataMembers, Export};
 
@@ -346,10 +347,9 @@ pub fn distill_exports(
     // the CST). Signature entries lose to inferred schemes when
     // both exist, since a `foo :: T` + `foo = body` pair should
     // export the inferred type, not the raw annotation.
-    let type_ops_default = crate::typecheck_db::types::TypeOpMap::default();
     let conv = |ty: &crate::cst::TypeExpr| -> Type {
         crate::typecheck_db::types::expand_aliases(
-            crate::typecheck_db::types::convert_type_expr(ty, &type_ops_default),
+            crate::typecheck_db::types::convert_type_expr(ty, type_ops),
             alias_map,
         )
     };
@@ -1247,7 +1247,7 @@ mod tests {
             mono_scheme("foo", int_ty()),
             mono_scheme("bar", int_ty()),
         ];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &Default::default());
         assert!(exports.values.contains_key("foo"));
         assert!(exports.values.contains_key("bar"));
     }
@@ -1268,7 +1268,7 @@ mod tests {
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new(), &Default::default());
         assert!(exports.ctors.contains_key("Nothing"));
         assert!(exports.ctors.contains_key("Just"));
         assert_eq!(
@@ -1301,7 +1301,7 @@ instance Eq Int where
             chained: false,
         };
         let exports =
-            distill_exports(&m, &[], std::slice::from_ref(&instance), &classes, &HashMap::new(), &HashMap::new());
+            distill_exports(&m, &[], std::slice::from_ref(&instance), &classes, &HashMap::new(), &HashMap::new(), &Default::default());
         assert!(exports.classes.contains_key("Eq"));
         assert_eq!(exports.instances.len(), 1);
     }
@@ -1323,7 +1323,7 @@ bar = 2
             mono_scheme("foo", int_ty()),
             mono_scheme("bar", int_ty()),
         ];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &Default::default());
         assert!(exports.values.contains_key("foo"));
         assert!(
             !exports.values.contains_key("bar"),
@@ -1354,7 +1354,7 @@ data Maybe a = Nothing | Just a
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new(), &Default::default());
         assert!(exports.data_constructors.contains_key("Maybe"));
         // No ctors exported since no (..)
         assert!(exports.ctors.is_empty(), "got: {:?}", exports.ctors);
@@ -1381,7 +1381,7 @@ data Maybe a = Nothing | Just a
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new(), &Default::default());
         assert!(exports.ctors.contains_key("Nothing"));
         assert!(exports.ctors.contains_key("Just"));
     }
@@ -1407,7 +1407,7 @@ data Maybe a = Nothing | Just a
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new(), &Default::default());
         assert!(exports.ctors.contains_key("Just"));
         assert!(!exports.ctors.contains_key("Nothing"));
     }
@@ -1447,7 +1447,7 @@ class Eq a where
             constraint_dicts: HashMap::new(),
             hole_diagnostics: vec![],
         }];
-        let exports = distill_exports(&m, &schemes, &[], &classes, &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &classes, &HashMap::new(), &HashMap::new(), &Default::default());
         assert!(exports.classes.contains_key("Eq"));
         assert!(
             exports.values.contains_key("eq"),
@@ -1462,7 +1462,7 @@ class Eq a where
             mono_scheme("foo", int_ty()),
             mono_scheme("private", int_ty()),
         ];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &Default::default());
         assert!(exports.values.contains_key("foo"));
         assert!(!exports.values.contains_key("private"));
     }
@@ -1494,6 +1494,7 @@ instance Eq Int where
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &Default::default(),
         );
         assert_eq!(exports.instances.len(), 1);
     }
@@ -1522,7 +1523,7 @@ infixl 6 add as +
             constraint_dicts: HashMap::new(),
             hole_diagnostics: vec![],
         }];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &Default::default());
         assert!(exports.values.contains_key("add"));
         assert!(exports.value_fixities.contains_key("+"));
     }

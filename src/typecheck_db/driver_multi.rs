@@ -1632,6 +1632,7 @@ fn check_one_module(
         &local_classes,
         &ctor_details,
         &alias_map,
+        &type_ops,
     );
     crate::typecheck_db::module_registry::expand_module_reexports(
         &mut exports,
