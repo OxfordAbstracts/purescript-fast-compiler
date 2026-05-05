@@ -346,6 +346,13 @@ fn build_arity_env(
     }
 
     // 1) Imports — only direct imports contribute to scope.
+    // We do this in two passes so Prim sub-module arities (which aren't in
+    // the registry) always win over any conflicting arity from a normal
+    // import of the same unqualified name. For example, `Web.DOM` re-exports
+    // `Text` with arity 0 (a DOM node), while `Prim.TypeError` exports
+    // `Text` with arity 1; processing Prim.TypeError last ensures the
+    // correct arity survives.
+    let mut prim_submodule_imports: Vec<String> = Vec::new();
     for imp in &module.imports {
         let name = imp
             .module
@@ -354,23 +361,9 @@ fn build_arity_env(
             .map(|p| crate::interner::resolve(*p).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(".");
-        // Prim.TypeError is not in the main registry but defines Doc/Text/
-        // Beside/Above/Quote/QuoteLabel. Add their arities explicitly when
-        // a module imports from Prim.TypeError.
-        if name == "Prim.TypeError" {
-            for (tname, arity) in &[
-                ("Doc", 0usize),
-                ("Text", 1),
-                ("Beside", 2),
-                ("Above", 2),
-                ("Quote", 1),
-                ("QuoteLabel", 1),
-            ] {
-                let sym = crate::interner::intern(tname);
-                if !local_aliases.contains(&sym) {
-                    env.insert(sym, *arity);
-                }
-            }
+        // Defer Prim sub-module imports to the second pass.
+        if name.starts_with("Prim.") {
+            prim_submodule_imports.push(name);
             continue;
         }
         if let Some(exports) = registry.get(&name) {
@@ -390,6 +383,30 @@ fn build_arity_env(
                 env.insert(sym, *arity);
             }
         }
+    }
+    // Second pass: Prim sub-modules. These are not in the main registry.
+    // Prim.TypeError defines Doc/Text/Beside/Above/Quote/QuoteLabel.
+    // Processing them last ensures their arities overwrite any conflicting
+    // arity from a regular import (e.g. Web.DOM re-exports Text :: Type).
+    for name in &prim_submodule_imports {
+        if name == "Prim.TypeError" {
+            for (tname, arity) in &[
+                ("Doc", 0usize),
+                ("Text", 1),
+                ("Beside", 2),
+                ("Above", 2),
+                ("Quote", 1),
+                ("QuoteLabel", 1),
+            ] {
+                let sym = crate::interner::intern(tname);
+                if !local_aliases.contains(&sym) {
+                    env.insert(sym, *arity);
+                }
+            }
+        }
+        // Other Prim.* sub-modules (Prim.Row, Prim.Coerce, etc.) are
+        // implicitly covered by prim_arities() or don't export nominal
+        // type constructors that need arity tracking here.
     }
 
     // 2) Local nominal decls win — but skip type aliases.
