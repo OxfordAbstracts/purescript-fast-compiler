@@ -195,6 +195,14 @@ pub fn check_many_modules_with_db(
     }
 
     let trace = std::env::var_os("TYPECHECK_DB_TRACE").is_some();
+    // Timing trace prints each module's elapsed time. Useful for
+    // finding hot/slow modules in big package sweeps. Cheap when
+    // unset (one Instant::now per module).
+    let timing_trace = std::env::var_os("TYPECHECK_DB_PER_MODULE_TIMING").is_some();
+    let slow_threshold_ms: u128 = std::env::var("TYPECHECK_DB_SLOW_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
     for (i, idx) in order.iter().enumerate() {
         let input = &modules[*idx];
         if trace {
@@ -204,7 +212,17 @@ pub fn check_many_modules_with_db(
                 input.name,
             );
         }
+        let started = std::time::Instant::now();
         let result = check_one_module(db, input, &mut report.registry);
+        let elapsed_ms = started.elapsed().as_millis();
+        if timing_trace || elapsed_ms >= slow_threshold_ms {
+            eprintln!(
+                "[typecheck_db] [{i}/{}] {} {} ms",
+                order.len(),
+                input.name,
+                elapsed_ms,
+            );
+        }
         report.results.push(result);
     }
 
@@ -301,10 +319,26 @@ fn check_one_module(
 ) -> ModuleCheckResult {
     let name = input.name.clone();
     let module = &input.module;
+    // Slow-module phase trace: when a module exceeds 5s overall,
+    // dump a per-phase breakdown of where the time went. Off by
+    // default; set TYPECHECK_DB_PROFILE_SLOW=1 to enable.
+    let profile_slow = std::env::var_os("TYPECHECK_DB_PROFILE_SLOW").is_some();
+    let phase_total = std::time::Instant::now();
+    let mut phase_log: Vec<(String, std::time::Duration)> = Vec::new();
+    macro_rules! phase {
+        ($label:expr, $body:expr) => {{
+            let _t = std::time::Instant::now();
+            let _r = $body;
+            if profile_slow {
+                phase_log.push(($label.to_string(), _t.elapsed()));
+            }
+            _r
+        }};
+    }
 
     // 1) Pull imports into an Env + InstanceIndex.
     let (mut env, mut instance_index, mut import_errors) =
-        build_env_from_imports(module, registry);
+        phase!("1.build_env_from_imports", build_env_from_imports(module, registry));
 
     // 1b) Structural validation (duplicates, orphans, fixity conflicts,
     //     duplicate type arguments). Pure traversal over the CST plus
@@ -374,27 +408,31 @@ fn check_one_module(
     // 1c) Kind-arity check. Catches over-application of type
     //     constructors and arity mismatches in class constraints.
     //     Reads the registry for imported types/classes.
-    let kind_errors =
-        crate::typecheck_db::passes::kind_check::check_module(module, registry);
+    let kind_errors = phase!("1c.kind_check",
+        crate::typecheck_db::passes::kind_check::check_module(module, registry));
 
     // 1d) Coercible-related checks: role validation + forbidden
     //     user-written Coercible instances. CST-only — doesn't need
     //     the registry.
-    let coercible_errors =
-        crate::typecheck_db::passes::coercible_check::check_module(module);
+    let coercible_errors = phase!("1d.coercible_check",
+        crate::typecheck_db::passes::coercible_check::check_module(module));
 
     // 2) Desugar the module as a whole, then lower cst → ir so
     //    every downstream pass consumes an `ir::Decl` that has no
     //    residual operator nodes (Op / OpParens / BacktickApp).
-    let ctx = build_desugar_context(module, registry);
-    let desugared_cst: Vec<cst::Decl> = desugar_module(module.decls.clone(), &ctx);
-    let desugared: Vec<crate::typecheck_db::ir::Decl> = desugared_cst
-        .into_iter()
-        .map(crate::typecheck_db::ir::lower_decl)
-        .collect::<Result<_, _>>()
-        .unwrap_or_else(|e| {
-            panic!("cst → ir lowering failed in {}: {e:?}", name)
-        });
+    let ctx = phase!("2.build_desugar_context",
+        build_desugar_context(module, registry));
+    let desugared_cst: Vec<cst::Decl> = phase!("2.desugar_module",
+        desugar_module(module.decls.clone(), &ctx));
+    let desugared: Vec<crate::typecheck_db::ir::Decl> = phase!("2.lower_decl", {
+        desugared_cst
+            .into_iter()
+            .map(crate::typecheck_db::ir::lower_decl)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|e| {
+                panic!("cst → ir lowering failed in {}: {e:?}", name)
+            })
+    });
 
     // Type-level operator map: every `infixr N type Target as op`
     // decl in this module (and every imported module) becomes an
@@ -873,7 +911,14 @@ fn check_one_module(
         })
         .collect();
 
+    let scc_loop_started = std::time::Instant::now();
+    let mut scc_dep_resolve_total: std::time::Duration = std::time::Duration::ZERO;
+    let mut scc_post_total: std::time::Duration = std::time::Duration::ZERO;
+    let mut scc_full_iter_total: std::time::Duration = std::time::Duration::ZERO;
+    let mut scc_iter_count: usize = 0;
     for scc in &sccs {
+        let scc_iter_started = std::time::Instant::now();
+        scc_iter_count += 1;
         // SCC decl source = concatenated source-slices in sorted
         // name order, so adding / removing / reordering decls inside
         // the SCC produces a deterministic hash.
@@ -1000,6 +1045,8 @@ fn check_one_module(
             .map(|&i| &desugared[value_idxs[i]])
             .collect();
 
+        scc_dep_resolve_total += scc_iter_started.elapsed();
+        let cache_t = std::time::Instant::now();
         // Try the cache first.
         let cached = try_get_cached(
             db,
@@ -1011,12 +1058,21 @@ fn check_one_module(
             &mut env,
         )
         .expect("typecheck_db get_cached");
+        scc_post_total += cache_t.elapsed();
 
         let (schemes, outcome, scheme_oh) = match cached {
             Some((schemes, scheme_oh)) => (schemes, CacheOutcome::Hit, Some(scheme_oh)),
             None => {
                 // Run fresh inference for this SCC.
-                match infer_value_scc_with_all(
+                let scc_started = std::time::Instant::now();
+                let scc_label = scc_decl_refs.iter().find_map(|d| {
+                    if let crate::typecheck_db::ir::Decl::Value { name, .. } = d {
+                        Some(crate::typecheck_db::util::resolve_symbol(name.value.symbol()))
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| "?".to_string());
+                let result = match infer_value_scc_with_all(
                     &type_ops,
                     &mut env,
                     &scc_decl_refs,
@@ -1041,7 +1097,15 @@ fn check_one_module(
                         inference_error.get_or_insert(e);
                         (Vec::new(), CacheOutcome::Miss, None)
                     }
+                };
+                let scc_elapsed = scc_started.elapsed();
+                if profile_slow {
+                    phase_log.push((
+                        format!("4.scc:{} ({}m)", scc_label, scc_decl_refs.len()),
+                        scc_elapsed,
+                    ));
                 }
+                result
             }
         };
 
@@ -1078,6 +1142,7 @@ fn check_one_module(
             }
         }
         all_schemes.extend(schemes);
+        scc_full_iter_total += scc_iter_started.elapsed();
     }
 
     // Type-check instance method bodies. The class method's full
@@ -1100,6 +1165,7 @@ fn check_one_module(
     // surfacing, hole reporting, validation) treats them the same as
     // ordinary value decls.
     let mut instance_method_schemes: Vec<InferredScheme> = Vec::new();
+    let inst_method_started = std::time::Instant::now();
     for d in non_value_decls.iter() {
         if let crate::typecheck_db::ir::Decl::Instance {
             class_name,
@@ -1294,6 +1360,7 @@ fn check_one_module(
                     .locals
                     .last_mut()
                     .and_then(|s| s.remove(&method_name));
+                let inst_t = std::time::Instant::now();
                 let inference = infer_value_scc_with_all(
                     &type_ops,
                     &mut env,
@@ -1302,6 +1369,14 @@ fn check_one_module(
                     &ctor_details,
                     &instance_index,
                 );
+                let inst_elapsed = inst_t.elapsed();
+                if profile_slow && inst_elapsed >= std::time::Duration::from_millis(50) {
+                    let class_str = crate::typecheck_db::util::resolve_symbol(class_qi.name);
+                    phase_log.push((
+                        format!("4b.inst:{}.{}", class_str, method_name),
+                        inst_elapsed,
+                    ));
+                }
                 // Restore env state regardless of inference outcome.
                 if let Some(s) = saved_scheme {
                     env.top_level.insert(key.clone(), s);
@@ -1326,6 +1401,12 @@ fn check_one_module(
         }
     }
     let _ = non_value_decls;
+    if profile_slow {
+        let dur = inst_method_started.elapsed();
+        if dur >= std::time::Duration::from_millis(50) {
+            phase_log.push(("4b.instance_method_bodies".to_string(), dur));
+        }
+    }
 
     // 5) Aggregate per-decl diagnostics. Instance-method-body
     // schemes flow through the same channel as value-decl schemes
@@ -1800,6 +1881,31 @@ fn check_one_module(
     }
     registry.insert(name.clone(), exports);
 
+    if profile_slow {
+        let scc_total = scc_loop_started.elapsed();
+        if scc_total >= std::time::Duration::from_millis(50) {
+            phase_log.push((
+                format!("4.scc_loop_TOTAL ({}sccs)", scc_iter_count),
+                scc_total,
+            ));
+            phase_log.push(("4.scc_dep_resolve_TOTAL".to_string(), scc_dep_resolve_total));
+            phase_log.push(("4.scc_cache_lookup_TOTAL".to_string(), scc_post_total));
+            phase_log.push(("4.scc_full_iter_TOTAL".to_string(), scc_full_iter_total));
+            // Anything between scc_full_iter end and scc_loop end is
+            // outside this loop — but more importantly, what's
+            // missing within the loop is captured here.
+        }
+    }
+    if profile_slow && phase_total.elapsed() >= std::time::Duration::from_secs(5) {
+        let total_ms = phase_total.elapsed().as_millis();
+        eprintln!("=== profile [{}] total {}ms ===", name, total_ms);
+        let mut entries = phase_log.clone();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        for (label, dur) in entries.iter().take(40) {
+            let pct = (dur.as_millis() as f64 / total_ms as f64) * 100.0;
+            eprintln!("  {:>6}ms  {:>5.1}%  {}", dur.as_millis(), pct, label);
+        }
+    }
     ModuleCheckResult {
         name,
         schemes: all_schemes,

@@ -66,6 +66,213 @@ fn check_single_package_module(target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Print a list of failing modules, one per line, to stderr. Used
+/// during gap-closing work to find which packages are broken
+/// without running the full all_packages_typecheck (which uses
+/// >10GB memory for the per-result aggregation across 4800+
+/// modules). Run with:
+///   cargo test --release --lib all_packages_failing_modules \
+///     -- --ignored --nocapture
+#[test]
+#[ignore = "diagnostic helper — prints failing modules; not a pass/fail test"]
+fn all_packages_failing_modules() {
+    let join_result: Result<Result<(), String>, _> =
+        std::thread::Builder::new()
+            .name("all_packages_failing".into())
+            .stack_size(512 * 1024 * 1024)
+            .spawn(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    run_all_packages_failing_summary,
+                ));
+                std::panic::set_hook(previous);
+                match outcome {
+                    Ok(res) => res,
+                    Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+                }
+            })
+            .expect("spawn fixture-check thread")
+            .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "worker thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("all_packages_failing_modules: {msg}");
+    }
+}
+
+/// Streamlined acceptance summary. Doesn't accumulate per-result
+/// reasons — just prints the (module, error_kind) pair as soon as
+/// it's known. Memory stays bounded.
+fn run_all_packages_failing_summary() -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let files = gather_package_src_sources();
+    if files.is_empty() {
+        return Err(format!(
+            "no .purs files found under {}/packages/*/src",
+            FIXTURES_ROOT,
+        ));
+    }
+    eprintln!("Discovered {} files in {:.2?}", files.len(), started.elapsed());
+    let mut parsed: Vec<ModuleInput> = Vec::with_capacity(files.len());
+    let mut seen_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for file in &files {
+        let src = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("failed to read {}: {e}", file.display())),
+        };
+        let module = match parse(&src) {
+            Ok(m) => m,
+            Err(e) => return Err(format!("parse error in {}: {e:?}", file.display())),
+        };
+        let name = module_name_of(&module);
+        if seen_names.insert(name.clone()) {
+            parsed.push(ModuleInput::new(name, src, module));
+        }
+    }
+    let total = parsed.len();
+    eprintln!("Parsed {} modules in {:.2?}", total, started.elapsed());
+    let report = check_many_modules(parsed);
+    eprintln!(
+        "Multi-module check completed in {:.2?}",
+        started.elapsed(),
+    );
+    for e in &report.errors {
+        eprintln!("DRIVER_ERROR: {e:?}");
+    }
+    let mut failing = 0;
+    for result in &report.results {
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some(ve) = result.validation_errors.first() {
+            reasons.push(format!("validation:{:?}", ve.kind));
+        }
+        if let Some(ke) = result.kind_errors.first() {
+            reasons.push(format!("kind:{:?}", ke.kind));
+        }
+        if let Some(ce) = result.coercible_errors.first() {
+            reasons.push(format!("coercible:{:?}", ce.kind));
+        }
+        if let Some(err) = &result.inference_error {
+            reasons.push(format!("infer:{err:?}"));
+        }
+        if let Some(ie) = result.import_errors.first() {
+            reasons.push(format!("import:{:?}", ie.kind));
+        }
+        if let Some(ce) = result.constraint_errors.first() {
+            reasons.push(format!("constraint:{:?}", ce.kind));
+        }
+        if !reasons.is_empty() {
+            failing += 1;
+            eprintln!("FAIL: {} | {}", result.name, reasons.join(" ; "));
+        }
+    }
+    eprintln!("=== summary: {}/{} failing in {:.2?} ===", failing, total, started.elapsed());
+    Ok(())
+}
+
+/// Reproducer for the Test.PMock 17-second hot module. Drops to a
+/// fast iteration loop. Includes a 5-second wall-clock budget that
+/// will fail the test if perf regresses.
+#[test]
+fn repro_pmock_perf() {
+    let join_result: Result<Result<(), String>, _> =
+        std::thread::Builder::new()
+            .name("repro_pmock".into())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        let started = std::time::Instant::now();
+                        let res = check_single_package_module("Test.PMock");
+                        let elapsed = started.elapsed();
+                        if let Err(msg) = res {
+                            return Err(msg);
+                        }
+                        if elapsed > std::time::Duration::from_secs(5) {
+                            return Err(format!(
+                                "Test.PMock took {:?} — exceeds 5s budget",
+                                elapsed,
+                            ));
+                        }
+                        Ok(())
+                    },
+                ));
+                std::panic::set_hook(previous);
+                match outcome {
+                    Ok(res) => res,
+                    Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+                }
+            })
+            .expect("spawn repro thread")
+            .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_pmock_perf: {msg}");
+    }
+}
+
+/// Reproducer for the Deku.DOM 26-second hot module.
+#[test]
+#[ignore = "Deku.DOM hits a 26s slow path — track here while triaging"]
+fn repro_deku_dom_perf() {
+    let join_result: Result<Result<(), String>, _> =
+        std::thread::Builder::new()
+            .name("repro_deku_dom".into())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        let started = std::time::Instant::now();
+                        let res = check_single_package_module("Deku.DOM");
+                        let elapsed = started.elapsed();
+                        if let Err(msg) = res {
+                            return Err(msg);
+                        }
+                        if elapsed > std::time::Duration::from_secs(10) {
+                            return Err(format!(
+                                "Deku.DOM took {:?} — exceeds 10s budget",
+                                elapsed,
+                            ));
+                        }
+                        Ok(())
+                    },
+                ));
+                std::panic::set_hook(previous);
+                match outcome {
+                    Ok(res) => res,
+                    Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+                }
+            })
+            .expect("spawn repro thread")
+            .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_deku_dom_perf: {msg}");
+    }
+}
+
 #[test]
 fn repro_hylograph_d3_simulation() {
     let join_result: Result<Result<(), String>, _> =
