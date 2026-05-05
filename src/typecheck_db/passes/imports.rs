@@ -258,16 +258,10 @@ fn detect_local_explicit_import_conflicts(
                 crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
                 *span,
             ),
-            cst::Decl::Value { name, span, .. } => (
-                Ns::Value,
-                crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
-                *span,
-            ),
-            cst::Decl::Foreign { name, span, .. } => (
-                Ns::Value,
-                crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
-                *span,
-            ),
+            // Value declarations shadow explicit imports silently in
+            // PureScript — the local definition wins. Only type and class
+            // declarations cause ScopeConflict when they collide with an
+            // explicit import. Skip value / foreign decls here.
             _ => continue,
         };
         if let Some(src) = imported.get(&(ns, decl_name.clone())) {

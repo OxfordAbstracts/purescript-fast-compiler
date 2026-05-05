@@ -348,6 +348,8 @@ fn check_one_module(
     //     `infixr type NaturalTransformation as ~>` in Prelude).
     let imported_alias_arity =
         build_imported_alias_arity(module, registry);
+    let imported_poly_kind_set =
+        build_imported_poly_kind_set(module, registry);
     let imported_class_arity =
         build_imported_class_arity(module, registry);
     let imported_class_fundeps =
@@ -356,6 +358,7 @@ fn check_one_module(
         crate::typecheck_db::passes::validate_decls::validate_module_with_class_fundeps(
             module,
             &imported_alias_arity,
+            &imported_poly_kind_set,
             &imported_class_arity,
             &imported_class_fundeps,
         );
@@ -487,6 +490,24 @@ fn check_one_module(
                 m.insert(n, (vars, body));
             }
         }
+        // Names of locally-declared data/newtype/class/foreign-data
+        // declarations. Imported type aliases with the same name must
+        // NOT be added to alias_map — the local concrete type wins and
+        // alias-expanding an `Eq Phylogeny` instance to `Eq Record(…)`
+        // would produce spurious OverlappingInstances false positives.
+        let local_concrete_names: std::collections::HashSet<String> = module
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                cst::Decl::Data { name, .. }
+                | cst::Decl::Newtype { name, .. }
+                | cst::Decl::ForeignData { name, .. } => Some(
+                    crate::typecheck_db::util::resolve_symbol(name.value.symbol()),
+                ),
+                _ => None,
+            })
+            .collect();
+
         // Every directly-imported module's aliases. Deeper
         // transitive aliases already land here because
         // `expand_module_reexports` merges them into each
@@ -496,6 +517,11 @@ fn check_one_module(
             let imp_name = join_module_name(&imp.module);
             if let Some(e) = registry.get(&imp_name) {
                 for (k, a) in &e.type_aliases {
+                    // Skip aliases whose unqualified name collides
+                    // with a locally-defined concrete type.
+                    if local_concrete_names.contains(k.as_str()) {
+                        continue;
+                    }
                     m.entry(k.clone())
                         .or_insert_with(|| (a.type_vars.clone(), a.body.clone()));
                 }
@@ -840,9 +866,29 @@ fn check_one_module(
     } else {
         None
     };
+    // Names defined locally in this module as data types, newtypes, type
+    // aliases, or foreign data. A local instance `Show (Product a b)` where
+    // `Product` is locally defined must NOT be treated as overlapping with an
+    // imported `Show (Product f g)` from a different module, even though both
+    // use the same unqualified name. We pass this set so the detector can
+    // tighten the unifier for local-type heads.
+    let local_defined_type_names: std::collections::HashSet<String> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            cst::Decl::Data { name, kind_sig: cst::KindSigSource::None, .. }
+            | cst::Decl::Newtype { name, .. }
+            | cst::Decl::ForeignData { name, .. }
+            | cst::Decl::TypeAlias { name, .. } => {
+                Some(crate::typecheck_db::util::resolve_symbol(name.value.symbol()))
+            }
+            _ => None,
+        })
+        .collect();
     detect_cross_module_instance_overlaps(
         &instance_index,
         &local_instances,
+        &local_defined_type_names,
         &mut validation_errors,
     );
     if let Some(t) = overlap_started {
@@ -1528,6 +1574,7 @@ fn check_one_module(
         &local_instances,
         &local_classes,
         &ctor_details,
+        &alias_map,
     );
     crate::typecheck_db::module_registry::expand_module_reexports(
         &mut exports,
@@ -1598,8 +1645,16 @@ fn check_one_module(
                     .qualified
                     .as_ref()
                     .map(|q| join_module_name(q));
-                let matches_clause = imp_target == clause_name
-                    || alias_str.as_deref() == Some(clause_name);
+                // `import M as Q` is qualified-only: it doesn't bring M's
+                // names into unqualified scope, so it cannot contribute to
+                // a `module M` re-export clause. Only match when the alias
+                // name itself IS the clause name (meaning the export clause
+                // is `module Q`).
+                let matches_clause = if imp.qualified.is_some() {
+                    alias_str.as_deref() == Some(clause_name)
+                } else {
+                    imp_target == clause_name
+                };
                 if !matches_clause {
                     continue;
                 }
@@ -1866,6 +1921,22 @@ fn check_one_module(
             .iter()
             .map(|imp| join_module_name(&imp.module))
             .collect();
+        // Build alias → real-module map from this module's imports,
+        // e.g. `import Control.Semigroupoid as S` → `"S" → "Control.Semigroupoid"`.
+        let alias_to_real: std::collections::HashMap<String, String> = module
+            .imports
+            .iter()
+            .filter_map(|imp| {
+                let alias = imp.qualified.as_ref()?;
+                let alias_str: String = alias
+                    .parts
+                    .iter()
+                    .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Some((alias_str, join_module_name(&imp.module)))
+            })
+            .collect();
         let mut inserts: Vec<(String, String, FixityDecl)> = Vec::new();
         // Each entry: (op_alias, target_name, origin_module, scheme).
         let mut value_inserts: Vec<(
@@ -1875,10 +1946,38 @@ fn check_one_module(
             std::sync::Arc<crate::typecheck_db::types::Scheme>,
         )> = Vec::new();
         for (op, fx) in &exports.value_fixities {
-            if fx.target_module.is_some() {
-                continue;
+            // Skip fixities whose target_module is already a real
+            // module name (resolved in the local-target branch above).
+            // Allow fixities where target_module is a module alias
+            // (e.g. `S` for `Control.Semigroupoid`) — those need
+            // resolution below.
+            if let Some(ref tm) = fx.target_module {
+                let is_alias = alias_to_real.contains_key(tm);
+                let is_real = registry.contains(tm)
+                    || prim_map_rs.contains_key(tm.as_str());
+                if is_real && !is_alias {
+                    continue;
+                }
+                if !is_alias {
+                    // Unknown module — skip.
+                    continue;
+                }
             }
-            for imp_name in &import_targets {
+            // If the fixity target has a module alias (e.g. `S.compose`
+            // where `S` is `Control.Semigroupoid`), search only the
+            // resolved alias target; otherwise search all imports.
+            let resolved_target_mod: Option<String> = fx
+                .target_module
+                .as_ref()
+                .and_then(|tm| alias_to_real.get(tm))
+                .cloned();
+            let search_targets: Box<dyn Iterator<Item = &String>> =
+                if let Some(ref rt) = resolved_target_mod {
+                    Box::new(std::iter::once(rt))
+                } else {
+                    Box::new(import_targets.iter())
+                };
+            for imp_name in search_targets {
                 let source = match registry.get(imp_name) {
                     Some(s) => Some(s),
                     None => prim_map_rs.get(imp_name),
@@ -2155,6 +2254,7 @@ fn compute_sccs(
 fn detect_cross_module_instance_overlaps(
     ix: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     local_instances: &[crate::typecheck_db::passes::instance_index::Instance],
+    local_defined_type_names: &std::collections::HashSet<String>,
     validation_errors: &mut Vec<
         crate::typecheck_db::passes::validate_decls::ValidationError,
     >,
@@ -2327,7 +2427,7 @@ fn detect_cross_module_instance_overlaps(
                 if !head_keys_could_match(a_keys, &head_keys[j]) {
                     continue;
                 }
-                if instances_heads_unify(a, b) {
+                if instances_heads_unify(a, b, local_defined_type_names) {
                     validation_errors.push(
                         crate::typecheck_db::passes::validate_decls::ValidationError {
                             span: crate::span::Span { start: 0, end: 0 },
@@ -2405,26 +2505,66 @@ fn head_keys_could_match(
 fn instances_heads_unify(
     a: &crate::typecheck_db::passes::instance_index::Instance,
     b: &crate::typecheck_db::passes::instance_index::Instance,
+    local_defined_type_names: &std::collections::HashSet<String>,
 ) -> bool {
     use crate::typecheck_db::generalize::apply_var_subst;
+    use crate::typecheck_db::types::Type;
     use crate::typecheck_db::unify::UnifyState;
     if a.types.len() != b.types.len() {
         return false;
     }
+    // Before the full unification, check for type-constructor head mismatches
+    // that the lenient unifier would otherwise accept. Specifically: if `a`
+    // (the LOCAL instance) refers to a locally-defined type `Con(None, X)`
+    // and `b` (the imported instance) refers to a different module's `X` via
+    // `Con(Some(m), X)`, they are DIFFERENT types and cannot overlap.
+    // Returns true when the LOCAL instance's type head uses a locally-defined
+    // constructor `X` (Con(None, X) where X ∈ local_names) against the
+    // IMPORTED instance's head. Since locally-defined types are unique to the
+    // current module, the imported instance cannot legitimately refer to the
+    // same type regardless of the imported instance's module qualifier.
+    fn locally_defined_con_mismatch(
+        ta: &Type,
+        tb: &Type,
+        local_names: &std::collections::HashSet<String>,
+    ) -> bool {
+        match (ta, tb) {
+            (Type::Con(qa), Type::Con(qb)) => {
+                // `ta` is from the LOCAL instance; `tb` from the IMPORTED.
+                // If `ta`'s name is locally defined in the current module,
+                // the two instances refer to different types — block overlap.
+                qa.name == qb.name
+                    && qa.module.is_none()
+                    && local_names.contains(&qa.name)
+            }
+            (Type::App(fa, aa), Type::App(fb, ab)) => {
+                locally_defined_con_mismatch(fa, fb, local_names)
+                    || locally_defined_con_mismatch(aa, ab, local_names)
+            }
+            (Type::Fun(fa, ra), Type::Fun(fb, rb)) => {
+                locally_defined_con_mismatch(fa, fb, local_names)
+                    || locally_defined_con_mismatch(ra, rb, local_names)
+            }
+            _ => false,
+        }
+    }
     let mut state = UnifyState::new();
-    let mut subst_a: std::collections::HashMap<String, crate::typecheck_db::types::Type> =
+    let mut subst_a: std::collections::HashMap<String, Type> =
         std::collections::HashMap::new();
     for v in &a.vars {
         subst_a.insert(v.clone(), state.fresh());
     }
     let head_a: Vec<_> = a.types.iter().map(|t| apply_var_subst(t, &subst_a)).collect();
-    let mut subst_b: std::collections::HashMap<String, crate::typecheck_db::types::Type> =
+    let mut subst_b: std::collections::HashMap<String, Type> =
         std::collections::HashMap::new();
     for v in &b.vars {
         subst_b.insert(v.clone(), state.fresh());
     }
     let head_b: Vec<_> = b.types.iter().map(|t| apply_var_subst(t, &subst_b)).collect();
     for (ta, tb) in head_a.iter().zip(head_b.iter()) {
+        if locally_defined_con_mismatch(ta, tb, local_defined_type_names) {
+            return false;
+        }
         if state.unify(ta, tb).is_err() {
             return false;
         }
@@ -2448,12 +2588,169 @@ fn build_imported_alias_arity(
             Some(e) => e,
             None => continue,
         };
-        for (alias_name, alias) in &exports.type_aliases {
-            out.insert(intern(alias_name), alias.type_vars.len());
+        match &imp.imports {
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                // Only insert type aliases and type operators explicitly named.
+                let named_types: std::collections::HashSet<String> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        crate::cst::Import::Type(tn, _) => {
+                            Some(crate::typecheck_db::util::resolve_symbol(tn.value.symbol()))
+                        }
+                        crate::cst::Import::TypeOp(tn) => {
+                            Some(crate::typecheck_db::util::resolve_symbol(tn.value.symbol()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for name in &named_types {
+                    if let Some(alias) = exports.type_aliases.get(name) {
+                        out.insert(intern(name), alias.type_vars.len());
+                    }
+                    // Type operator explicitly imported
+                    if let Some(fix) = exports.type_fixities.get(name) {
+                        if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
+                            out.insert(intern(name), alias.type_vars.len());
+                        }
+                    }
+                }
+            }
+            Some(crate::cst::ImportList::Hiding(hidden)) => {
+                let hidden_types: std::collections::HashSet<String> = hidden
+                    .iter()
+                    .filter_map(|item| match item {
+                        crate::cst::Import::Type(tn, _) => {
+                            Some(crate::typecheck_db::util::resolve_symbol(tn.value.symbol()))
+                        }
+                        crate::cst::Import::TypeOp(tn) => {
+                            Some(crate::typecheck_db::util::resolve_symbol(tn.value.symbol()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (alias_name, alias) in &exports.type_aliases {
+                    if !hidden_types.contains(alias_name) {
+                        out.insert(intern(alias_name), alias.type_vars.len());
+                    }
+                }
+                for (op_name, fix) in &exports.type_fixities {
+                    if !hidden_types.contains(op_name) {
+                        if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
+                            out.insert(intern(op_name), alias.type_vars.len());
+                        }
+                    }
+                }
+            }
+            None => {
+                for (alias_name, alias) in &exports.type_aliases {
+                    out.insert(intern(alias_name), alias.type_vars.len());
+                }
+                for (op_name, fix) in &exports.type_fixities {
+                    if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
+                        out.insert(intern(op_name), alias.type_vars.len());
+                    }
+                }
+            }
         }
-        for (op_name, fix) in &exports.type_fixities {
-            if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
-                out.insert(intern(op_name), alias.type_vars.len());
+    }
+    out
+}
+
+/// Builds the set of imported POLYKINDED alias names (interned symbols).
+/// A polykinded alias has a standalone kind signature whose outermost form
+/// is `forall …`.  Such aliases are valid to use with zero explicit type
+/// args (the kind unifier instantiates the forall), so the
+/// `PartiallyAppliedSynonym` bare-constructor check must skip them.
+fn build_imported_poly_kind_set(
+    module: &cst::Module,
+    registry: &ModuleRegistry,
+) -> std::collections::HashSet<crate::interner::Symbol> {
+    use crate::interner::intern;
+    let mut out: std::collections::HashSet<crate::interner::Symbol> =
+        std::collections::HashSet::new();
+    for imp in &module.imports {
+        if imp.qualified.is_some() {
+            continue;
+        }
+        let target = join_module_name(&imp.module);
+        let exports = match registry.get(&target) {
+            Some(e) => e,
+            None => continue,
+        };
+        let insert_if_poly = |name: &str, out: &mut std::collections::HashSet<_>| {
+            if let Some(alias) = exports.type_aliases.get(name) {
+                if alias.has_poly_kind {
+                    out.insert(intern(name));
+                }
+            }
+        };
+        match &imp.imports {
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                for item in items {
+                    match item {
+                        crate::cst::Import::Type(tn, _) => {
+                            let n =
+                                crate::typecheck_db::util::resolve_symbol(tn.value.symbol());
+                            insert_if_poly(&n, &mut out);
+                        }
+                        crate::cst::Import::TypeOp(tn) => {
+                            let op =
+                                crate::typecheck_db::util::resolve_symbol(tn.value.symbol());
+                            if let Some(fix) = exports.type_fixities.get(&op) {
+                                if let Some(alias) =
+                                    exports.type_aliases.get(&fix.target_name)
+                                {
+                                    if alias.has_poly_kind {
+                                        out.insert(intern(&op));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(crate::cst::ImportList::Hiding(hidden)) => {
+                let hidden_types: std::collections::HashSet<String> = hidden
+                    .iter()
+                    .filter_map(|item| match item {
+                        crate::cst::Import::Type(tn, _) => {
+                            Some(crate::typecheck_db::util::resolve_symbol(tn.value.symbol()))
+                        }
+                        crate::cst::Import::TypeOp(tn) => {
+                            Some(crate::typecheck_db::util::resolve_symbol(tn.value.symbol()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (alias_name, alias) in &exports.type_aliases {
+                    if !hidden_types.contains(alias_name) && alias.has_poly_kind {
+                        out.insert(intern(alias_name));
+                    }
+                }
+                for (op_name, fix) in &exports.type_fixities {
+                    if !hidden_types.contains(op_name) {
+                        if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
+                            if alias.has_poly_kind {
+                                out.insert(intern(op_name));
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                for (alias_name, alias) in &exports.type_aliases {
+                    if alias.has_poly_kind {
+                        out.insert(intern(alias_name));
+                    }
+                }
+                for (op_name, fix) in &exports.type_fixities {
+                    if let Some(alias) = exports.type_aliases.get(&fix.target_name) {
+                        if alias.has_poly_kind {
+                            out.insert(intern(op_name));
+                        }
+                    }
+                }
             }
         }
     }
@@ -3459,8 +3756,40 @@ fn build_imported_class_arity(
             .get(&target)
             .or_else(|| prims.get(&target));
         let Some(exports) = exports else { continue };
-        for (class_name, class_info) in &exports.classes {
-            out.insert(intern(class_name), class_info.type_vars.len());
+        match &imp.imports {
+            Some(crate::cst::ImportList::Explicit(items)) => {
+                // Only insert classes that are explicitly named.
+                for item in items {
+                    if let crate::cst::Import::Class(cn) = item {
+                        let name = crate::typecheck_db::util::resolve_symbol(cn.value.symbol());
+                        if let Some(ci) = exports.classes.get(&name) {
+                            out.insert(intern(&name), ci.type_vars.len());
+                        }
+                    }
+                }
+            }
+            Some(crate::cst::ImportList::Hiding(hidden)) => {
+                let hidden_set: std::collections::HashSet<String> = hidden
+                    .iter()
+                    .filter_map(|item| {
+                        if let crate::cst::Import::Class(cn) = item {
+                            Some(crate::typecheck_db::util::resolve_symbol(cn.value.symbol()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for (class_name, class_info) in &exports.classes {
+                    if !hidden_set.contains(class_name) {
+                        out.insert(intern(class_name), class_info.type_vars.len());
+                    }
+                }
+            }
+            None => {
+                for (class_name, class_info) in &exports.classes {
+                    out.insert(intern(class_name), class_info.type_vars.len());
+                }
+            }
         }
     }
     out

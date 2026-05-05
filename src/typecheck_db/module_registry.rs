@@ -37,6 +37,12 @@ use crate::typecheck_db::types::{Scheme, Type};
 pub struct TypeAlias {
     pub type_vars: Vec<String>,
     pub body: Type,
+    /// True when the type alias has a polykinded standalone kind signature
+    /// (`type Foo :: forall k. ...`). Polykinded aliases can be used with
+    /// fewer explicit type args than their arity (the kind unifier handles
+    /// instantiation), so they're exempt from the `PartiallyAppliedSynonym`
+    /// check.
+    pub has_poly_kind: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +331,7 @@ pub fn distill_exports(
     instances: &[Instance],
     class_info: &HashMap<String, ClassInfo>,
     ctor_info: &HashMap<String, CtorInfo>,
+    alias_map: &crate::typecheck_db::types::AliasMap,
 ) -> ModuleExports {
     use crate::cst::{DataMembers, Export};
 
@@ -339,6 +346,14 @@ pub fn distill_exports(
     // the CST). Signature entries lose to inferred schemes when
     // both exist, since a `foo :: T` + `foo = body` pair should
     // export the inferred type, not the raw annotation.
+    let type_ops_default = crate::typecheck_db::types::TypeOpMap::default();
+    let conv = |ty: &crate::cst::TypeExpr| -> Type {
+        crate::typecheck_db::types::expand_aliases(
+            crate::typecheck_db::types::convert_type_expr(ty, &type_ops_default),
+            alias_map,
+        )
+    };
+
     let mut scheme_by_name: HashMap<String, std::sync::Arc<Scheme>> = HashMap::new();
     for d in &module.decls {
         match d {
@@ -357,10 +372,7 @@ pub fn distill_exports(
                 for m in members {
                     let method_name =
                         crate::typecheck_db::util::resolve_symbol(m.name.value.symbol());
-                    let method_ty = crate::typecheck_db::types::convert_type_expr(
-                        &m.ty,
-                        &crate::typecheck_db::types::TypeOpMap::default(),
-                    );
+                    let method_ty = conv(&m.ty);
                     let (method_vars, method_body) = match method_ty {
                         Type::Forall(qs, body) => {
                             let ns: Vec<String> =
@@ -390,10 +402,7 @@ pub fn distill_exports(
             }
             Decl::Foreign { name, ty, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-                let declared = crate::typecheck_db::types::convert_type_expr(
-                    ty,
-                    &crate::typecheck_db::types::TypeOpMap::default(),
-                );
+                let declared = conv(ty);
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {
                         let ns: Vec<String> =
@@ -406,10 +415,7 @@ pub fn distill_exports(
             }
             Decl::TypeSignature { name, ty, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
-                let declared = crate::typecheck_db::types::convert_type_expr(
-                    ty,
-                    &crate::typecheck_db::types::TypeOpMap::default(),
-                );
+                let declared = conv(ty);
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {
                         let ns: Vec<String> =
@@ -472,6 +478,31 @@ pub fn distill_exports(
         }
     }
 
+    // Pre-collect which type aliases have a standalone kind signature
+    // Pre-collect which type aliases have a POLYKINDED standalone kind signature
+    // (`type Foo :: forall k. ...`).  These are represented in the CST as
+    // Decl::Data { kind_sig: KindSigSource::Type, kind_type: Some(Forall{…}), … }.
+    // Polykinded aliases can be used with fewer explicit type args than their
+    // syntactic arity (the kind unifier instantiates the forall), so they are
+    // exempt from the PartiallyAppliedSynonym check.  Monokinded aliases like
+    // `type NaturalTransformation :: (Type->Type) -> (Type->Type) -> Type` are
+    // NOT exempt and must still be checked.
+    let mut poly_kind_alias_names: HashSet<String> = HashSet::new();
+    for d in &module.decls {
+        if let Decl::Data {
+            name,
+            kind_sig: crate::cst::KindSigSource::Type,
+            kind_type: Some(kt),
+            ..
+        } = d
+        {
+            if matches!(kt.as_ref(), crate::cst::TypeExpr::Forall { .. }) {
+                poly_kind_alias_names
+                    .insert(crate::typecheck_db::util::resolve_symbol(name.value.symbol()));
+            }
+        }
+    }
+
     for d in &module.decls {
         match d {
             Decl::Data { name, type_vars, constructors, .. } => {
@@ -501,8 +532,9 @@ pub fn distill_exports(
                     ty,
                     &crate::typecheck_db::types::TypeOpMap::default(),
                 );
+                let has_poly_kind = poly_kind_alias_names.contains(&n);
                 type_arities_all.insert(n.clone(), vars.len());
-                type_aliases_all.insert(n, TypeAlias { type_vars: vars, body });
+                type_aliases_all.insert(n, TypeAlias { type_vars: vars, body, has_poly_kind });
             }
             Decl::Class { name, type_vars, members, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
@@ -770,11 +802,64 @@ pub fn distill_exports(
                             out.type_fixities.insert(name, f.clone());
                         }
                     }
-                    Export::Module(_) => {
-                        // Handled in a second pass outside this
-                        // function — see `expand_module_reexports`,
-                        // which has access to the `ModuleRegistry`
-                        // needed to look up the target's exports.
+                    Export::Module(mn) => {
+                        let re_export_name: String = mn
+                            .parts
+                            .iter()
+                            .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if re_export_name == self_module_name {
+                            // Self-export: `module M (module M)` exports
+                            // all locally-defined items. Equivalent to
+                            // the None-export branch for local items.
+                            for (name, s) in &scheme_by_name {
+                                out.values.entry(name.clone()).or_insert_with(|| s.clone());
+                                out.value_origins.entry(name.clone()).or_insert_with(|| self_module_name.clone());
+                            }
+                            for (name, info) in ctor_info.iter() {
+                                out.ctors.entry(name.clone()).or_insert_with(|| info.clone());
+                                out.ctor_origins.entry(name.clone()).or_insert_with(|| self_module_name.clone());
+                            }
+                            for (name, cls) in class_info.iter() {
+                                out.classes.entry(name.clone()).or_insert_with(|| cls.clone());
+                                out.class_origins.entry(name.clone()).or_insert_with(|| self_module_name.clone());
+                            }
+                            for (name, arity) in &type_arities_all {
+                                out.type_arities.entry(name.clone()).or_insert(*arity);
+                                out.type_origins.entry(name.clone()).or_insert_with(|| self_module_name.clone());
+                            }
+                            for (name, alias) in &type_aliases_all {
+                                out.type_aliases.entry(name.clone()).or_insert_with(|| alias.clone());
+                            }
+                            for (name, ctors) in &data_ctors_all {
+                                out.data_constructors.entry(name.clone()).or_insert_with(|| ctors.clone());
+                            }
+                            for (k, v) in &type_fixities_all {
+                                out.type_fixities.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                            for name in &newtypes_all {
+                                out.newtypes.insert(name.clone());
+                            }
+                            for (name, kind) in &foreign_data_kinds_all {
+                                out.foreign_data_kinds.entry(name.clone()).or_insert_with(|| kind.clone());
+                            }
+                            // Make operators importable under their own name.
+                            for (op, fx) in &value_fixities_all {
+                                if let Some(scheme) = scheme_by_name.get(&fx.target_name) {
+                                    out.values.entry(op.clone()).or_insert_with(|| scheme.clone());
+                                    out.value_origins.entry(op.clone()).or_insert_with(|| self_module_name.clone());
+                                } else if let Some(info) = ctor_info.get(&fx.target_name) {
+                                    out.values.entry(op.clone()).or_insert_with(|| {
+                                        std::sync::Arc::new(crate::typecheck_db::passes::imports::synth_ctor_scheme(info))
+                                    });
+                                    out.value_origins.entry(op.clone()).or_insert_with(|| self_module_name.clone());
+                                }
+                            }
+                        }
+                        // Non-self Export::Module handled in second pass
+                        // outside this function — see `expand_module_reexports`,
+                        // which has access to the `ModuleRegistry`.
                     }
                 }
             }
@@ -876,6 +961,33 @@ pub fn expand_module_reexports(
                                 name.value.symbol(),
                             );
                             out.type_arities.entry(n).or_insert(0);
+                        }
+                        crate::cst::Decl::Fixity {
+                            is_type,
+                            operator,
+                            target,
+                            associativity,
+                            precedence,
+                            ..
+                        } => {
+                            let op = crate::typecheck_db::util::resolve_symbol(
+                                operator.value.symbol(),
+                            );
+                            let target_name = crate::typecheck_db::util::resolve_symbol(target.name);
+                            let target_module = target
+                                .module
+                                .map(|m| crate::typecheck_db::util::resolve_symbol(m));
+                            let decl = FixityDecl {
+                                associativity: *associativity,
+                                precedence: *precedence,
+                                target_module,
+                                target_name,
+                            };
+                            if *is_type {
+                                out.type_fixities.entry(op).or_insert(decl);
+                            } else {
+                                out.value_fixities.entry(op).or_insert(decl);
+                            }
                         }
                         _ => {}
                     }
@@ -1128,7 +1240,7 @@ mod tests {
             mono_scheme("foo", int_ty()),
             mono_scheme("bar", int_ty()),
         ];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(exports.values.contains_key("foo"));
         assert!(exports.values.contains_key("bar"));
     }
@@ -1149,7 +1261,7 @@ mod tests {
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors);
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
         assert!(exports.ctors.contains_key("Nothing"));
         assert!(exports.ctors.contains_key("Just"));
         assert_eq!(
@@ -1182,7 +1294,7 @@ instance Eq Int where
             chained: false,
         };
         let exports =
-            distill_exports(&m, &[], std::slice::from_ref(&instance), &classes, &HashMap::new());
+            distill_exports(&m, &[], std::slice::from_ref(&instance), &classes, &HashMap::new(), &HashMap::new());
         assert!(exports.classes.contains_key("Eq"));
         assert_eq!(exports.instances.len(), 1);
     }
@@ -1204,7 +1316,7 @@ bar = 2
             mono_scheme("foo", int_ty()),
             mono_scheme("bar", int_ty()),
         ];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(exports.values.contains_key("foo"));
         assert!(
             !exports.values.contains_key("bar"),
@@ -1235,7 +1347,7 @@ data Maybe a = Nothing | Just a
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors);
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
         assert!(exports.data_constructors.contains_key("Maybe"));
         // No ctors exported since no (..)
         assert!(exports.ctors.is_empty(), "got: {:?}", exports.ctors);
@@ -1262,7 +1374,7 @@ data Maybe a = Nothing | Just a
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors);
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
         assert!(exports.ctors.contains_key("Nothing"));
         assert!(exports.ctors.contains_key("Just"));
     }
@@ -1288,7 +1400,7 @@ data Maybe a = Nothing | Just a
                 fields: vec![Type::Var("a".into())],
             },
         );
-        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors);
+        let exports = distill_exports(&m, &[], &[], &HashMap::new(), &ctors, &HashMap::new());
         assert!(exports.ctors.contains_key("Just"));
         assert!(!exports.ctors.contains_key("Nothing"));
     }
@@ -1328,7 +1440,7 @@ class Eq a where
             constraint_dicts: HashMap::new(),
             hole_diagnostics: vec![],
         }];
-        let exports = distill_exports(&m, &schemes, &[], &classes, &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &classes, &HashMap::new(), &HashMap::new());
         assert!(exports.classes.contains_key("Eq"));
         assert!(
             exports.values.contains_key("eq"),
@@ -1343,7 +1455,7 @@ class Eq a where
             mono_scheme("foo", int_ty()),
             mono_scheme("private", int_ty()),
         ];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(exports.values.contains_key("foo"));
         assert!(!exports.values.contains_key("private"));
     }
@@ -1374,6 +1486,7 @@ instance Eq Int where
             std::slice::from_ref(&instance),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(exports.instances.len(), 1);
     }
@@ -1402,7 +1515,7 @@ infixl 6 add as +
             constraint_dicts: HashMap::new(),
             hole_diagnostics: vec![],
         }];
-        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new());
+        let exports = distill_exports(&m, &schemes, &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(exports.values.contains_key("add"));
         assert!(exports.value_fixities.contains_key("+"));
     }

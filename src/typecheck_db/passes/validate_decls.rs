@@ -372,6 +372,7 @@ pub fn validate_module_with_full_imports(
     validate_module_with_class_fundeps(
         module,
         imported_alias_arity,
+        &HashSet::new(),
         imported_class_arity,
         &HashMap::new(),
     )
@@ -385,6 +386,7 @@ pub fn validate_module_with_full_imports(
 pub fn validate_module_with_class_fundeps(
     module: &cst::Module,
     imported_alias_arity: &HashMap<Symbol, usize>,
+    imported_poly_kind_set: &HashSet<Symbol>,
     imported_class_arity: &HashMap<Symbol, usize>,
     imported_class_fundeps: &HashMap<Symbol, Vec<(Vec<usize>, Vec<usize>)>>,
 ) -> Vec<ValidationError> {
@@ -764,7 +766,12 @@ pub fn validate_module_with_class_fundeps(
         &mut errors,
     );
 
-    detect_partially_applied_synonyms(&module.decls, imported_alias_arity, &mut errors);
+    detect_partially_applied_synonyms(
+        &module.decls,
+        imported_alias_arity,
+        imported_poly_kind_set,
+        &mut errors,
+    );
     detect_invalid_instance_heads(
         &module.decls,
         imported_class_fundeps,
@@ -2308,21 +2315,27 @@ fn detect_transitive_export_errors(
     for e in export_list {
         match e {
             cst::Export::Type(type_name, Some(cst::DataMembers::Explicit(ctors))) => {
-                // Partial-ctor export: if the local data type has more
-                // ctors than this explicit list, the reference compiler
-                // rejects with TransitiveDctorExportError.
-                let tsym = type_name.symbol();
-                if let Some((span, all_ctors)) = data_ctors.get(&tsym) {
-                    let named: HashSet<Symbol> =
-                        ctors.iter().map(|c| c.value.symbol()).collect();
-                    let all: HashSet<Symbol> = all_ctors.iter().copied().collect();
-                    if named != all {
-                        errors.push(ValidationError {
-                            span: *span,
-                            kind: ValidationErrorKind::TransitiveDctorExportError(
-                                resolve(tsym),
-                            ),
-                        });
+                // Empty ctor list `Type()` = opaque export (no ctors).
+                // That is valid — treat it the same as `Type` alone.
+                if ctors.is_empty() {
+                    // nothing to check
+                } else {
+                    // Partial-ctor export: if the local data type has more
+                    // ctors than this explicit list, the reference compiler
+                    // rejects with TransitiveDctorExportError.
+                    let tsym = type_name.symbol();
+                    if let Some((span, all_ctors)) = data_ctors.get(&tsym) {
+                        let named: HashSet<Symbol> =
+                            ctors.iter().map(|c| c.value.symbol()).collect();
+                        let all: HashSet<Symbol> = all_ctors.iter().copied().collect();
+                        if named != all {
+                            errors.push(ValidationError {
+                                span: *span,
+                                kind: ValidationErrorKind::TransitiveDctorExportError(
+                                    resolve(tsym),
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -2418,6 +2431,8 @@ fn detect_transitive_export_errors(
         let mut newtype_decl_span: HashMap<Symbol, Span> = HashMap::new();
         let mut newtype_decl_field: HashMap<Symbol, &cst::TypeExpr> = HashMap::new();
         let mut newtype_decl_kind_anns: HashMap<Symbol, Vec<&cst::TypeExpr>> = HashMap::new();
+        // Maps newtype type-name → constructor name, for gating the field-type check.
+        let mut newtype_ctor_sym: HashMap<Symbol, Symbol> = HashMap::new();
         for d in &module.decls {
             match d {
                 cst::Decl::TypeSignature { name, ty, span, .. } => {
@@ -2453,11 +2468,13 @@ fn detect_transitive_export_errors(
                     ty,
                     span,
                     type_var_kind_anns,
+                    constructor,
                     ..
                 } => {
                     let n = name.value.symbol();
                     newtype_decl_span.insert(n, *span);
                     newtype_decl_field.insert(n, ty);
+                    newtype_ctor_sym.insert(n, constructor.value.symbol());
                     let anns: Vec<&cst::TypeExpr> = type_var_kind_anns
                         .iter()
                         .filter_map(|a| a.as_deref())
@@ -2557,9 +2574,17 @@ fn detect_transitive_export_errors(
                 }
             }
             if let Some(body) = newtype_decl_field.get(t) {
-                let span = newtype_decl_span.get(t).copied()
-                    .unwrap_or(crate::span::Span::new(0, 0));
-                check_ty_refs_inner(*t, span, body, false, errors, &mut reported_decl);
+                // Only check the internal field type if the newtype's
+                // constructor is also exported. Without the constructor,
+                // the representation is opaque to importers.
+                let ctor_exported = newtype_ctor_sym
+                    .get(t)
+                    .map_or(false, |c| exported_ctors.contains(c));
+                if ctor_exported {
+                    let span = newtype_decl_span.get(t).copied()
+                        .unwrap_or(crate::span::Span::new(0, 0));
+                    check_ty_refs_inner(*t, span, body, false, errors, &mut reported_decl);
+                }
             }
         }
 
@@ -3064,6 +3089,12 @@ fn detect_orphan_instances(
                 let refs = head_type_cons(ty);
                 local_aliases.insert(name.value.symbol(), refs);
             }
+            cst::Decl::Fixity { is_type: true, operator, .. } => {
+                // A locally-declared type operator (e.g. `infix 6 type
+                // NumCons as :*`) anchors instances that use it in their
+                // head, just like the underlying type does.
+                local_data.insert(operator.value.symbol());
+            }
             _ => {}
         }
     }
@@ -3193,9 +3224,14 @@ fn collect_all_cons(te: &cst::TypeExpr, out: &mut Vec<Symbol>) {
         }
         cst::TypeExpr::Parens { ty, .. } => collect_all_cons(ty, out),
         cst::TypeExpr::Kinded { ty, .. } => collect_all_cons(ty, out),
-        cst::TypeExpr::TypeOp { left, right, .. } => {
+        cst::TypeExpr::TypeOp { left, right, op, .. } => {
             collect_all_cons(left, out);
             collect_all_cons(right, out);
+            // The operator itself (e.g. `:*`) may be a locally-declared
+            // type alias; include it so orphan detection fires correctly.
+            if op.value.module.is_none() {
+                out.push(op.value.name.symbol());
+            }
         }
         cst::TypeExpr::Record { fields, .. } => {
             for f in fields {
@@ -3295,14 +3331,38 @@ fn collect_type_refs<F: FnMut(Symbol, bool)>(te: &cst::TypeExpr, cb: &mut F) {
 fn detect_partially_applied_synonyms(
     decls: &[cst::Decl],
     imported_alias_arity: &HashMap<Symbol, usize>,
+    imported_poly_kind_set: &HashSet<Symbol>,
     errors: &mut Vec<ValidationError>,
 ) {
     // Start with imported aliases (and operator aliases) as the
     // baseline. Local declarations override these on collision.
     let mut alias_arity: HashMap<Symbol, usize> = imported_alias_arity.clone();
+    // Collect type aliases that have a standalone kind signature
+    // (`type Foo :: Kind`). These can always be partially applied since
+    // the kind system validates their usage; the check here would only
+    // produce false positives for them.
+    let mut kinded_aliases: HashSet<Symbol> = HashSet::new();
     for d in decls {
-        if let cst::Decl::TypeAlias { name, type_vars, .. } = d {
-            alias_arity.insert(name.value.symbol(), type_vars.len());
+        if let cst::Decl::Data { name, kind_sig: cst::KindSigSource::Type, .. } = d {
+            kinded_aliases.insert(name.value.symbol());
+        }
+    }
+    for d in decls {
+        match d {
+            cst::Decl::TypeAlias { name, type_vars, .. } => {
+                if !kinded_aliases.contains(&name.value.symbol()) {
+                    alias_arity.insert(name.value.symbol(), type_vars.len());
+                }
+            }
+            // Local data/newtype/foreign-data declarations shadow any
+            // imported type alias with the same name. Remove from
+            // alias_arity so we don't false-positive on the local type.
+            cst::Decl::Data { name, is_role_decl: false, kind_sig: cst::KindSigSource::None, .. }
+            | cst::Decl::Newtype { name, .. }
+            | cst::Decl::ForeignData { name, .. } => {
+                alias_arity.remove(&name.value.symbol());
+            }
+            _ => {}
         }
     }
     if alias_arity.is_empty() {
@@ -3326,7 +3386,7 @@ fn detect_partially_applied_synonyms(
     // Helper used on every TypeExpr site.
     let mut reported: HashSet<(Symbol, usize)> = HashSet::new();
     let mut check = |te: &cst::TypeExpr, errors: &mut Vec<ValidationError>| {
-        walk_partial_apps(te, &alias_arity, errors, &mut reported);
+        walk_partial_apps(te, &alias_arity, imported_poly_kind_set, errors, &mut reported);
     };
 
     for d in decls {
@@ -3398,6 +3458,7 @@ fn detect_partially_applied_synonyms(
 fn walk_partial_apps(
     te: &cst::TypeExpr,
     alias_arity: &HashMap<Symbol, usize>,
+    poly_kind_set: &HashSet<Symbol>,
     errors: &mut Vec<ValidationError>,
     reported: &mut HashSet<(Symbol, usize)>,
 ) {
@@ -3406,8 +3467,10 @@ fn walk_partial_apps(
             if name.module.is_none() {
                 let sym = name.name.symbol();
                 if let Some(&n) = alias_arity.get(&sym) {
-                    if n > 0 {
-                        // Zero arguments applied.
+                    // Zero arguments applied. Skip polykinded aliases:
+                    // their forall-kind lets them unify with any kind at the
+                    // use site (e.g. `Id` used bare as a `Type -> Type`).
+                    if n > 0 && !poly_kind_set.contains(&sym) {
                         if reported.insert((sym, span.start)) {
                             errors.push(ValidationError {
                                 span: *span,
@@ -3451,69 +3514,65 @@ fn walk_partial_apps(
             // the alias's own expansion site.
             if !head_is_alias {
                 for a in &args {
-                    walk_partial_apps(a, alias_arity, errors, reported);
+                    walk_partial_apps(a, alias_arity, poly_kind_set, errors, reported);
                 }
             }
         }
         cst::TypeExpr::Function { from, to, .. } => {
-            walk_partial_apps(from, alias_arity, errors, reported);
-            walk_partial_apps(to, alias_arity, errors, reported);
+            walk_partial_apps(from, alias_arity, poly_kind_set, errors, reported);
+            walk_partial_apps(to, alias_arity, poly_kind_set, errors, reported);
         }
         cst::TypeExpr::Forall { ty, vars, .. } => {
             for (_, _, k) in vars {
                 if let Some(k) = k {
-                    walk_partial_apps(k, alias_arity, errors, reported);
+                    walk_partial_apps(k, alias_arity, poly_kind_set, errors, reported);
                 }
             }
-            walk_partial_apps(ty, alias_arity, errors, reported);
+            walk_partial_apps(ty, alias_arity, poly_kind_set, errors, reported);
         }
         cst::TypeExpr::Constrained { constraints, ty, .. } => {
             for c in constraints {
                 for a in &c.args {
-                    walk_partial_apps(a, alias_arity, errors, reported);
+                    walk_partial_apps(a, alias_arity, poly_kind_set, errors, reported);
                 }
             }
-            walk_partial_apps(ty, alias_arity, errors, reported);
+            walk_partial_apps(ty, alias_arity, poly_kind_set, errors, reported);
         }
         cst::TypeExpr::Record { fields, .. } => {
             for f in fields {
-                walk_partial_apps(&f.ty, alias_arity, errors, reported);
+                walk_partial_apps(&f.ty, alias_arity, poly_kind_set, errors, reported);
             }
         }
         cst::TypeExpr::Row { fields, tail, .. } => {
             for f in fields {
-                walk_partial_apps(&f.ty, alias_arity, errors, reported);
+                walk_partial_apps(&f.ty, alias_arity, poly_kind_set, errors, reported);
             }
             if let Some(t) = tail {
-                walk_partial_apps(t, alias_arity, errors, reported);
+                walk_partial_apps(t, alias_arity, poly_kind_set, errors, reported);
             }
         }
         cst::TypeExpr::Parens { ty, .. } => {
-            walk_partial_apps(ty, alias_arity, errors, reported);
+            walk_partial_apps(ty, alias_arity, poly_kind_set, errors, reported);
         }
-        cst::TypeExpr::TypeOp { left, op, right, .. } => {
-            // `r1 + r2` desugars to "set r2 as the open row tail of r1".
-            // A partially-applied row synonym on the left (1-arg short)
-            // is valid because `+` provides that missing tail argument.
-            let op_name = crate::typecheck_db::util::resolve_symbol(op.value.name.symbol());
-            if op_name == "+" {
-                walk_partial_apps_allow_one_short(left, alias_arity, errors, reported);
-            } else {
-                walk_partial_apps(left, alias_arity, errors, reported);
-            }
-            walk_partial_apps(right, alias_arity, errors, reported);
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            // Both operands of a binary type operator can be type
+            // constructors (HKT), so a synonym applied to one fewer
+            // arg than its arity is valid there — the operator itself
+            // supplies the context for the missing argument.
+            walk_partial_apps_allow_one_short(left, alias_arity, poly_kind_set, errors, reported);
+            walk_partial_apps_allow_one_short(right, alias_arity, poly_kind_set, errors, reported);
         }
         cst::TypeExpr::Kinded { ty, kind, .. } => {
-            walk_partial_apps(ty, alias_arity, errors, reported);
-            walk_partial_apps(kind, alias_arity, errors, reported);
+            walk_partial_apps(ty, alias_arity, poly_kind_set, errors, reported);
+            walk_partial_apps(kind, alias_arity, poly_kind_set, errors, reported);
         }
         cst::TypeExpr::ArrayPattern { elements, .. } => {
             for e in elements {
-                walk_partial_apps(e, alias_arity, errors, reported);
+                walk_partial_apps(e, alias_arity, poly_kind_set, errors, reported);
             }
         }
         cst::TypeExpr::AsPattern { ty, .. } => {
-            walk_partial_apps(ty, alias_arity, errors, reported);
+            walk_partial_apps(ty, alias_arity, poly_kind_set, errors, reported);
         }
         _ => {}
     }
@@ -3526,6 +3585,7 @@ fn walk_partial_apps(
 fn walk_partial_apps_allow_one_short(
     te: &cst::TypeExpr,
     alias_arity: &HashMap<Symbol, usize>,
+    poly_kind_set: &HashSet<Symbol>,
     errors: &mut Vec<ValidationError>,
     reported: &mut HashSet<(Symbol, usize)>,
 ) {
@@ -3538,7 +3598,7 @@ fn walk_partial_apps_allow_one_short(
                     let sym = name.name.symbol();
                     if let Some(&n) = alias_arity.get(&sym) {
                         head_is_alias = true;
-                        // allow arity - 1 (the `+` provides the last arg)
+                        // allow arity - 1 (the operator provides the last arg)
                         if args.len() + 1 < n {
                             if reported.insert((sym, span.start)) {
                                 errors.push(ValidationError {
@@ -3554,7 +3614,7 @@ fn walk_partial_apps_allow_one_short(
             }
             if !head_is_alias {
                 for a in &args {
-                    walk_partial_apps(a, alias_arity, errors, reported);
+                    walk_partial_apps(a, alias_arity, poly_kind_set, errors, reported);
                 }
             }
         }
@@ -3565,9 +3625,9 @@ fn walk_partial_apps_allow_one_short(
         }
         // Parenthesized: recurse with allowance
         cst::TypeExpr::Parens { ty, .. } => {
-            walk_partial_apps_allow_one_short(ty, alias_arity, errors, reported);
+            walk_partial_apps_allow_one_short(ty, alias_arity, poly_kind_set, errors, reported);
         }
-        _ => walk_partial_apps(te, alias_arity, errors, reported),
+        _ => walk_partial_apps(te, alias_arity, poly_kind_set, errors, reported),
     }
 }
 
@@ -5689,6 +5749,13 @@ fn detect_instance_member_sig_mismatch(
             {
                 continue;
             }
+            // Skip when either side uses row/record syntax (e.g. `{ | r }` vs
+            // `Record r` — syntactically distinct but semantically equivalent).
+            if type_expr_has_row_or_record(&expected)
+                || type_expr_has_row_or_record(inst_sig)
+            {
+                continue;
+            }
             if !type_expr_alpha_eq(&expected, inst_sig) {
                 errors.push(ValidationError {
                     span: *span,
@@ -5821,6 +5888,32 @@ fn type_expr_has_forall(te: &cst::TypeExpr) -> bool {
         cst::TypeExpr::Row { fields, tail, .. } => {
             fields.iter().any(|f| type_expr_has_forall(&f.ty))
                 || tail.as_ref().map_or(false, |t| type_expr_has_forall(t))
+        }
+        _ => false,
+    }
+}
+
+/// True if `te` contains a `Row` or `Record` type expression anywhere.
+/// Used to skip instance-member-sig-mismatch checks when row/record sugar
+/// may be in use (e.g. `{ | r }` ≡ `Record r` but they're structurally
+/// distinct in the CST).
+fn type_expr_has_row_or_record(te: &cst::TypeExpr) -> bool {
+    match te {
+        cst::TypeExpr::Record { .. } | cst::TypeExpr::Row { .. } => true,
+        cst::TypeExpr::Parens { ty, .. } | cst::TypeExpr::Kinded { ty, .. } => {
+            type_expr_has_row_or_record(ty)
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            type_expr_has_row_or_record(constructor) || type_expr_has_row_or_record(arg)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_has_row_or_record(from) || type_expr_has_row_or_record(to)
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            constraints
+                .iter()
+                .any(|c| c.args.iter().any(type_expr_has_row_or_record))
+                || type_expr_has_row_or_record(ty)
         }
         _ => false,
     }
@@ -12294,7 +12387,12 @@ fn head_at_least_as_general_seen(
         (
             cst::TypeExpr::Constructor { name: an, .. },
             cst::TypeExpr::Constructor { name: bn, .. },
-        ) => an.name.symbol() == bn.name.symbol(),
+        ) => {
+            // Name AND module must match. Different import aliases
+            // (e.g. `Uncurried.ReaderT` vs bare `ReaderT`) represent
+            // different types and must not be considered overlapping.
+            an.name.symbol() == bn.name.symbol() && an.module == bn.module
+        }
         (
             cst::TypeExpr::App { constructor: a1, arg: a2, .. },
             cst::TypeExpr::App { constructor: b1, arg: b2, .. },
