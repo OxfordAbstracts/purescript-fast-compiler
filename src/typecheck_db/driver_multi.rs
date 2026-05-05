@@ -1361,6 +1361,18 @@ fn check_one_module(
                     .last_mut()
                     .and_then(|s| s.remove(&method_name));
                 let inst_t = std::time::Instant::now();
+                let solve_calls_before = if profile_slow {
+                    crate::typecheck_db::passes::constraints::SOLVE_ONE_CALLS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    0
+                };
+                let try_match_before = if profile_slow {
+                    crate::typecheck_db::passes::constraints::TRY_MATCH_ATTEMPTS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    0
+                };
                 let inference = infer_value_scc_with_all(
                     &type_ops,
                     &mut env,
@@ -1372,8 +1384,19 @@ fn check_one_module(
                 let inst_elapsed = inst_t.elapsed();
                 if profile_slow && inst_elapsed >= std::time::Duration::from_millis(50) {
                     let class_str = crate::typecheck_db::util::resolve_symbol(class_qi.name);
+                    let solve_calls = crate::typecheck_db::passes::constraints
+                        ::SOLVE_ONE_CALLS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        - solve_calls_before;
+                    let try_match = crate::typecheck_db::passes::constraints
+                        ::TRY_MATCH_ATTEMPTS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        - try_match_before;
                     phase_log.push((
-                        format!("4b.inst:{}.{}", class_str, method_name),
+                        format!(
+                            "4b.inst:{}.{} solve={} try={}",
+                            class_str, method_name, solve_calls, try_match
+                        ),
                         inst_elapsed,
                     ));
                 }

@@ -31,6 +31,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::typecheck_db::types::{Constraint, Type};
 
+// Diagnostic counters wired up when TYPECHECK_DB_PROFILE_SLOW=1.
+// `solve_one` increments SOLVE_ONE_CALLS each time it enters; the
+// candidate-trial inner loop bumps TRY_MATCH_ATTEMPTS for every
+// snapshot/freshen/unify cycle. Driver dumps + resets these around
+// each per-instance body so we can attribute pathological constraint
+// fan-out to a specific instance method.
+pub static SOLVE_ONE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static TRY_MATCH_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Data
 // ---------------------------------------------------------------------------
@@ -213,6 +224,7 @@ pub fn solve_one(
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> SolveOutcome {
+    SOLVE_ONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Givens discharge before anything else: a constraint promised
     // by an enclosing sig's `Constrained` layer is already known-
     // true. Each `PendingConstraint` carries a snapshot of the
@@ -274,7 +286,46 @@ pub fn solve_one(
 
     let cands = instances.candidates(&pending.constraint.class.name);
     let cand_count = cands.len();
+    // Per-position head/arity of the (zonked) target args. Computed
+    // once so the per-candidate filter below is cheap. `None` slots
+    // (target is a unif / Var / row / etc.) impose no constraint —
+    // any candidate at that position is a structural match.
+    let target_heads: Vec<Option<(crate::typecheck_db::types::QName, usize)>> =
+        pending
+            .constraint
+            .args
+            .iter()
+            .map(|a| {
+                let z = state.zonk(a);
+                app_spine_head_arity(&z).map(|(qn, ar)| (qn.clone(), ar))
+            })
+            .collect();
     for (instance_idx, cand) in cands.iter().enumerate() {
+        // Cheap structural pre-filter: for every position where the
+        // target has a concrete `Con`-headed spine, the candidate's
+        // head at that position must either be a non-Con (type var,
+        // unifies with anything) or match `(qname, arity)` exactly.
+        // Without this, a constraint like `ConsGen (Param a) (Param
+        // b) ?r` against ~9 chain candidates still trial-unifies
+        // each one; with it we skip the head-incompatible candidates
+        // outright, slashing the per-body try_match count.
+        let mut head_ok = true;
+        for (i, target) in target_heads.iter().enumerate() {
+            if let Some((th, ta)) = target {
+                if let Some(cand_arg) = cand.types.get(i) {
+                    if let Some((ch, ca)) = app_spine_head_arity(cand_arg) {
+                        if ch != th || ca != *ta {
+                            head_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !head_ok {
+            continue;
+        }
+        TRY_MATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapshot = state.snapshot_bindings();
         if let Some((head, context)) = try_match(state, cand, &pending.constraint.args) {
             return SolveOutcome::Resolved(ResolvedDict {
