@@ -225,6 +225,60 @@ fn repro_pmock_perf() {
     }
 }
 
+/// Repro for the Blessed.UI.Base.Element.Property module that
+/// triggered a 9GB memory blow-up during the all-packages sweep.
+/// The module has heavily polymorphic getter/setter signatures
+/// with `Row.Cons prop a r' PropertiesRow` constraints — a deep
+/// concrete row + several free unif positions.
+#[test]
+#[ignore = "Blessed.UI.Base.Element.Property triggered OOM during all-packages sweep — track here while triaging."]
+fn repro_blessed_property_perf() {
+    let join_result: Result<Result<(), String>, _> =
+        std::thread::Builder::new()
+            .name("repro_blessed_property".into())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        let started = std::time::Instant::now();
+                        let res = check_single_package_module(
+                            "Blessed.UI.Base.Element.Property",
+                        );
+                        let elapsed = started.elapsed();
+                        if let Err(msg) = res {
+                            return Err(msg);
+                        }
+                        if elapsed > std::time::Duration::from_secs(10) {
+                            return Err(format!(
+                                "Blessed.UI.Base.Element.Property took {:?} — exceeds 10s budget",
+                                elapsed,
+                            ));
+                        }
+                        Ok(())
+                    },
+                ));
+                std::panic::set_hook(previous);
+                match outcome {
+                    Ok(res) => res,
+                    Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+                }
+            })
+            .expect("spawn repro thread")
+            .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_blessed_property_perf: {msg}");
+    }
+}
+
 /// Reproducer for the Deku.DOM 26-second hot module.
 #[test]
 #[ignore = "Deku.DOM closure is still 35s; module itself is 5s. Track here while triaging."]
