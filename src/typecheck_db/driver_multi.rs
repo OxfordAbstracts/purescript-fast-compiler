@@ -542,6 +542,11 @@ fn check_one_module(
     // class. Lookup: method simple name → (class_module, class_name).
     let mut method_index: HashMap<String, (String, String)> = HashMap::new();
 
+    let nonvalue_loop_started = if profile_slow {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     for d in &desugared {
         if !is_nonvalue_kind(d) {
             continue;
@@ -749,38 +754,51 @@ fn check_one_module(
         }
     }
 
+    if let Some(t) = nonvalue_loop_started {
+        let dur = t.elapsed();
+        if profile_slow && dur >= std::time::Duration::from_millis(50) {
+            phase_log.push(("3.nonvalue_decl_loop".to_string(), dur));
+        }
+    }
+
     // Fold every imported module's class methods into method_index
     // too, so users of `show` / `map` / etc. from imports pick up
     // class + instance deps.
+    //
+    // Walk values once per import — look at the first constraint
+    // (the class context the method is bound under) and resolve it
+    // against `exports.classes`. The earlier shape iterated classes
+    // ⨯ values per import, which on Deku.DOM (~170 instances ⨯ 170
+    // imports ⨯ Prelude-sized class/value lists) reached millions of
+    // iterations and dominated wall time.
+    let nonvalue_started = if profile_slow {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     for imp in &module.imports {
         let dep_mod = join_module_name(&imp.module);
         if let Some(exports) = registry.get(&dep_mod) {
-            for (class_name, _) in exports.classes.iter() {
-                // Every method sits under `exports.values` with its
-                // class name; we find them by consulting the class
-                // shape stored in the registry's nonvalue_hashes is
-                // not enough, so we walk exports.classes via the
-                // shape. A simpler path: we just iterate ALL
-                // exports.values and check if each entry's scheme
-                // is Constrained on this class. Cheaper: also store
-                // method names on `ClassInfo`? For now, use the
-                // shape available under `exports.classes`, which
-                // doesn't carry method names. Fallback: inspect
-                // exports.values bodies for leading Constrained
-                // layers.
-                for (val_name, scheme) in exports.values.iter() {
-                    if let crate::typecheck_db::types::Type::Constrained(cs, _) =
-                        &scheme.ty
-                    {
-                        if cs.iter().any(|c| &c.class.name == class_name) {
+            for (val_name, scheme) in exports.values.iter() {
+                if let crate::typecheck_db::types::Type::Constrained(cs, _) =
+                    &scheme.ty
+                {
+                    if let Some(first) = cs.first() {
+                        if exports.classes.contains_key(&first.class.name) {
                             method_index.insert(
                                 val_name.clone(),
-                                (dep_mod.clone(), class_name.clone()),
+                                (dep_mod.clone(), first.class.name.clone()),
                             );
                         }
                     }
                 }
             }
+        }
+    }
+    if let Some(t) = nonvalue_started {
+        let dur = t.elapsed();
+        if profile_slow && dur >= std::time::Duration::from_millis(50) {
+            phase_log.push(("3.method_index_build".to_string(), dur));
         }
     }
 
@@ -796,7 +814,18 @@ fn check_one_module(
     // in with source-module type names (which may be aliases);
     // unification on the call site uses the *expanded* form,
     // so `instance Foo SynString` should match a `String` call.
+    let alias_expand_started = if profile_slow {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     instance_index.expand_aliases_in_place(&alias_map);
+    if let Some(t) = alias_expand_started {
+        let dur = t.elapsed();
+        if profile_slow && dur >= std::time::Duration::from_millis(50) {
+            phase_log.push(("3.instance_alias_expand".to_string(), dur));
+        }
+    }
 
     // Cross-module overlap detection: walk the post-import,
     // post-alias-expansion instance index. Two instances overlap
@@ -806,11 +835,22 @@ fn check_one_module(
     // `OverlappingInstances` only for pairs where AT LEAST ONE
     // side comes from outside this module's local CST. Chain
     // members are deliberately ordered overlap and are skipped.
+    let overlap_started = if profile_slow {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     detect_cross_module_instance_overlaps(
         &instance_index,
         &local_instances,
         &mut validation_errors,
     );
+    if let Some(t) = overlap_started {
+        let dur = t.elapsed();
+        if profile_slow && dur >= std::time::Duration::from_millis(50) {
+            phase_log.push(("3.cross_mod_overlap".to_string(), dur));
+        }
+    }
 
     // Make the alias map available to every inference-side
     // `convert_type_expr` caller (type annotations, let-sigs,
@@ -1166,6 +1206,16 @@ fn check_one_module(
     // ordinary value decls.
     let mut instance_method_schemes: Vec<InferredScheme> = Vec::new();
     let inst_method_started = std::time::Instant::now();
+    // Per-class cache so a module that declares N instances for the
+    // same class (e.g. Deku.DOM.Attr.Tabindex with 170 `Attr X_
+    // Tabindex String` instances) doesn't re-walk
+    // `module.imports × registry` for each instance. The lookup is
+    // identical for every instance with the same class name.
+    let mut class_info_cache: HashMap<String, Option<ClassInfo>> = HashMap::new();
+    let mut method_scheme_cache: HashMap<
+        String,
+        Option<crate::typecheck_db::types::Scheme>,
+    > = HashMap::new();
     for d in non_value_decls.iter() {
         if let crate::typecheck_db::ir::Decl::Instance {
             class_name,
@@ -1182,21 +1232,29 @@ fn check_one_module(
             // in another module's exported `ClassInfo`. We only
             // need `type_vars` from it (to build the
             // class-var → instance-head subst).
-            let class_info = local_classes
-                .get(&class_name_str)
-                .cloned()
-                .or_else(|| {
-                    for imp in &module.imports {
-                        let imp_name = join_module_name(&imp.module);
-                        if let Some(exports) = registry.get(&imp_name) {
-                            if let Some(ci) = exports.classes.get(&class_name_str)
-                            {
-                                return Some(ci.clone());
+            let class_info = if let Some(cached) =
+                class_info_cache.get(&class_name_str)
+            {
+                cached.clone()
+            } else {
+                let resolved = local_classes
+                    .get(&class_name_str)
+                    .cloned()
+                    .or_else(|| {
+                        for imp in &module.imports {
+                            let imp_name = join_module_name(&imp.module);
+                            if let Some(exports) = registry.get(&imp_name) {
+                                if let Some(ci) = exports.classes.get(&class_name_str)
+                                {
+                                    return Some(ci.clone());
+                                }
                             }
                         }
-                    }
-                    None
-                });
+                        None
+                    });
+                class_info_cache.insert(class_name_str.clone(), resolved.clone());
+                resolved
+            };
             let class_info = match class_info {
                 Some(ci) => ci,
                 None => continue,
@@ -1258,15 +1316,27 @@ fn check_one_module(
                     .get(&crate::typecheck_db::types::QName::unqualified(&method_name))
                     .map(|arc| arc.as_ref().clone())
                     .or_else(|| {
-                        for imp in &module.imports {
-                            let imp_name = join_module_name(&imp.module);
-                            if let Some(exports) = registry.get(&imp_name) {
-                                if let Some(s) = exports.values.get(&method_name) {
-                                    return Some(s.as_ref().clone());
+                        if let Some(cached) =
+                            method_scheme_cache.get(&method_name)
+                        {
+                            return cached.clone();
+                        }
+                        let resolved = (|| {
+                            for imp in &module.imports {
+                                let imp_name = join_module_name(&imp.module);
+                                if let Some(exports) = registry.get(&imp_name) {
+                                    if let Some(s) =
+                                        exports.values.get(&method_name)
+                                    {
+                                        return Some(s.as_ref().clone());
+                                    }
                                 }
                             }
-                        }
-                        None
+                            None
+                        })();
+                        method_scheme_cache
+                            .insert(method_name.clone(), resolved.clone());
+                        resolved
                     });
                 let Some(full_scheme) = class_method_scheme else {
                     continue;
@@ -1919,7 +1989,13 @@ fn check_one_module(
             // missing within the loop is captured here.
         }
     }
-    if profile_slow && phase_total.elapsed() >= std::time::Duration::from_secs(5) {
+    let dump_threshold_ms: u64 = std::env::var("TYPECHECK_DB_DUMP_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    if profile_slow
+        && phase_total.elapsed() >= std::time::Duration::from_millis(dump_threshold_ms)
+    {
         let total_ms = phase_total.elapsed().as_millis();
         eprintln!("=== profile [{}] total {}ms ===", name, total_ms);
         let mut entries = phase_log.clone();
@@ -2161,6 +2237,12 @@ fn detect_cross_module_instance_overlaps(
                 ))
             })
             .collect();
+        // If this class has no local instances at all, every pair
+        // would be cross-module-only — those are caught when the
+        // owning modules are checked. Skip the whole class.
+        if !local_flags.iter().any(|f| *f) {
+            continue;
+        }
         // Pre-compute the head-constructor key vector once per
         // instance. Comparing keys before calling
         // `instances_heads_unify` filters out the dominant case —
@@ -2169,26 +2251,38 @@ fn detect_cross_module_instance_overlaps(
         // allocation-heavy unification entirely.
         let head_keys: Vec<Vec<Option<String>>> =
             list.iter().map(|inst| instance_head_keys(inst)).collect();
-        // Whether we've already emitted an overlap for THIS class.
-        // The reference compiler's diagnostic is class-level (one
-        // per class), so once we've found one pair we can stop
-        // scanning the rest — that's an O(n²) → O(n) early-exit
-        // when overlaps exist.
+        // Iterate `local × all` pairs only. The earlier shape
+        // walked all O(n²) pairs and rejected local-local /
+        // cross-cross inside the inner loop, which on
+        // Deku.DOM-style aggregations (~6800 imported `Attr`
+        // instances + 170 local) reached ~23M pair checks per
+        // module. The reference compiler's diagnostic is
+        // class-level (one per class), so we exit on the first
+        // overlap found.
+        let local_idxs: Vec<usize> = local_flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| if *f { Some(i) } else { None })
+            .collect();
         let mut emitted = false;
-        'outer: for i in 0..n {
+        'outer: for &i in &local_idxs {
             if emitted {
                 break;
             }
             let a = list[i];
-            let a_local = local_flags[i];
             let a_fp = fingerprints[i];
             let a_keys = &head_keys[i];
-            for j in (i + 1)..n {
-                let b = list[j];
-                if a.types.len() != b.types.len() {
+            for j in 0..n {
+                if i == j {
                     continue;
                 }
-                if a_local && local_flags[j] {
+                // Skip local-local — those are handled by the
+                // validate_decls detector at parse time.
+                if local_flags[j] {
+                    continue;
+                }
+                let b = list[j];
+                if a.types.len() != b.types.len() {
                     continue;
                 }
                 // Skip identical-head pairs — those are usually
