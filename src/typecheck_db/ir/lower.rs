@@ -301,6 +301,7 @@ pub fn lower_expr(expr: cst::Expr) -> Result<Expr, LoweringError> {
             span,
             bindings: bindings.into_iter().map(lower_let_binding).collect::<Result<_, _>>()?,
             body: Box::new(lower_expr(*body)?),
+            is_where: false,
         },
         cst::Expr::Do { span, module, statements } => Expr::Do {
             span,

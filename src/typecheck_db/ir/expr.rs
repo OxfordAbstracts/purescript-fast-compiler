@@ -81,6 +81,11 @@ pub enum Expr {
         span: Span,
         bindings: Vec<super::decl::LetBinding>,
         body: Box<Expr>,
+        /// true when this Let was synthesized from a `where` clause.
+        /// `where` bindings are mutually recursive — pattern-bound names
+        /// are in scope for all sibling value definitions. Plain `let`
+        /// expressions use source-order sequential semantics instead.
+        is_where: bool,
     },
     Do {
         span: Span,

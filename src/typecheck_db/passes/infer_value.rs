@@ -390,8 +390,8 @@ pub fn infer_expr(
         Expr::If { cond, then_expr, else_expr, .. } => {
             infer_if(state, env, type_ops, cond, then_expr, else_expr)
         }
-        Expr::Let { bindings, body, .. } => {
-            infer_let(state, env, type_ops, bindings, body)
+        Expr::Let { bindings, body, is_where, .. } => {
+            infer_let(state, env, type_ops, bindings, body, *is_where)
         }
         Expr::Case { span, exprs, alts } => {
             infer_case(state, env, type_ops, *span, exprs, alts)
@@ -2121,6 +2121,7 @@ fn infer_let(
     type_ops: &TypeOpMap,
     bindings: &[LetBinding],
     body: &Expr,
+    is_where: bool,
 ) -> Result<Type, InferError> {
     env.push_scope();
 
@@ -2196,11 +2197,26 @@ fn infer_let(
         }
     }
 
-    // Pass 3: infer each body. For signed bindings, check against
-    // a freshly-instantiated monotype of the sig (so constraints
-    // surface as pending and match the body's types correctly).
-    // For unsigned bindings, infer + unify with the pre-inserted
-    // monomorphic slot as before.
+    // Pass 3 / 3b ordering depends on context:
+    //
+    // `where` clause (is_where=true): ALL function-definition names are
+    // pre-inserted (Pass 2 above), so pattern bindings' RHS can reference
+    // them. We process pattern bindings FIRST so their introduced names are
+    // visible when value binding bodies are inferred (mutual-scope semantics).
+    //
+    // `let` expression (is_where=false): sequential/source-order semantics.
+    // A value binding cannot refer to a name introduced by a later pattern
+    // binding. Process value binding bodies FIRST, then pattern bindings.
+    if is_where {
+        // Pass 3b first: bind pattern variables before inferring function bodies.
+        for (binder, expr) in &pattern_bindings {
+            let rhs_ty = infer_expr(state, env, type_ops, expr)?;
+            let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+            state.unify(&pat_ty, &rhs_ty)?;
+        }
+    }
+
+    // Pass 3: infer each body.
     for vb in &value_bindings {
         if let Some(sig_ty) = vb.sig.clone() {
             let monotype = instantiate_sig_as_monotype(state, sig_ty);
@@ -2216,14 +2232,17 @@ fn infer_let(
         }
     }
 
-    // Pass 3b: pattern bindings. Infer the RHS, bind the pattern
-    // against it. Each name introduced by the pattern becomes a
-    // local monotype — pattern bindings don't participate in
-    // let-polymorphism the way bare-name bindings do.
-    for (binder, expr) in &pattern_bindings {
-        let rhs_ty = infer_expr(state, env, type_ops, expr)?;
-        let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-        state.unify(&pat_ty, &rhs_ty)?;
+    if !is_where {
+        // Pass 3b after: sequential let — pattern binding names only available
+        // to bindings that follow them in source order (handled here globally
+        // by processing them after all value bodies, matching the original
+        // source-order restriction that forward references to pattern-bound
+        // names are errors).
+        for (binder, expr) in &pattern_bindings {
+            let rhs_ty = infer_expr(state, env, type_ops, expr)?;
+            let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+            state.unify(&pat_ty, &rhs_ty)?;
+        }
     }
 
     // Pass 4: replace each monomorphic slot with a generalized scheme so the
@@ -2627,6 +2646,7 @@ fn wrap_guarded_with_where(
                 span,
                 bindings: where_clause,
                 body: e,
+                is_where: true,
             }))
         }
         ir::GuardedExpr::Guarded(guards) => ir::GuardedExpr::Guarded(
@@ -2639,6 +2659,7 @@ fn wrap_guarded_with_where(
                         span: grd.expr.span(),
                         bindings: where_clause.clone(),
                         body: grd.expr,
+                        is_where: true,
                     }),
                 })
                 .collect(),
