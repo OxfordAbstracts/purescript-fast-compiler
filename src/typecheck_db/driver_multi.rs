@@ -479,6 +479,12 @@ fn check_one_module(
     // them would change instance head representations and break performance
     // optimizations that rely on consistent type operator representation.
     for imp in &module.imports {
+        // Qualified-only imports (`import M as Q`) put type operators
+        // under `Q./\` only — they don't make the operator
+        // available as bare `/\`. Skip such imports here.
+        if imp.qualified.is_some() {
+            continue;
+        }
         let mod_name = imp
             .module
             .parts
