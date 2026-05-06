@@ -4457,6 +4457,34 @@ fn build_desugar_context(
             None => continue,
         };
         for (op_name, fx) in &target.value_fixities {
+            // Respect the import's explicit/hiding list. An operator is
+            // only in scope if:
+            //   - open import (`import M`) → all fixities visible
+            //   - explicit list containing the operator name (`import M ((:))`) → visible
+            //   - hiding list NOT containing the operator name → visible
+            // `import M (valueTarget)` does NOT implicitly bring the
+            // operator into scope — the operator must be explicitly
+            // listed. (PureScript's own compiler enforces the same rule.)
+            let op_in_scope = match &imp.imports {
+                None => true, // open import
+                Some(crate::cst::ImportList::Explicit(items)) => {
+                    let op_sym_raw = crate::interner::intern(op_name.as_str());
+                    items.iter().any(|item| {
+                        matches!(item, crate::cst::Import::Value(_))
+                            && item.name() == op_sym_raw
+                    })
+                }
+                Some(crate::cst::ImportList::Hiding(items)) => {
+                    let op_sym_raw = crate::interner::intern(op_name.as_str());
+                    !items.iter().any(|item| {
+                        matches!(item, crate::cst::Import::Value(_))
+                            && item.name() == op_sym_raw
+                    })
+                }
+            };
+            if !op_in_scope {
+                continue;
+            }
             let op_sym = crate::interner::intern(op_name);
             // Local fixities take precedence — don't let an
             // imported `infixl 6 sub as -` overwrite a module's
