@@ -2197,51 +2197,77 @@ fn infer_let(
         }
     }
 
-    // Pass 3 / 3b ordering depends on context:
-    //
-    // `where` clause (is_where=true): ALL function-definition names are
-    // pre-inserted (Pass 2 above), so pattern bindings' RHS can reference
-    // them. We process pattern bindings FIRST so their introduced names are
-    // visible when value binding bodies are inferred (mutual-scope semantics).
-    //
-    // `let` expression (is_where=false): sequential/source-order semantics.
-    // A value binding cannot refer to a name introduced by a later pattern
-    // binding. Process value binding bodies FIRST, then pattern bindings.
     if is_where {
-        // Pass 3b first: bind pattern variables before inferring function bodies.
+        // `where` clause: ALL function-definition names are pre-inserted
+        // (Pass 2 above), so process pattern bindings FIRST to make their
+        // introduced names visible when value binding bodies are inferred
+        // (mutual-scope semantics).
         for (binder, expr) in &pattern_bindings {
             let rhs_ty = infer_expr(state, env, type_ops, expr)?;
             let pat_ty = bind_pattern(state, env, type_ops, binder)?;
             state.unify(&pat_ty, &rhs_ty)?;
         }
-    }
-
-    // Pass 3: infer each body.
-    for vb in &value_bindings {
-        if let Some(sig_ty) = vb.sig.clone() {
-            let monotype = instantiate_sig_as_monotype(state, sig_ty);
-            check_expr(state, env, type_ops, vb.expr, &monotype)?;
-        } else {
-            let slot_ty = env
-                .lookup_unqualified(&vb.name)
-                .local_ty()
-                .expect("slot pre-inserted above")
-                .clone();
-            let actual = infer_expr(state, env, type_ops, vb.expr)?;
-            state.unify(&slot_ty, &actual)?;
+        // Pass 3: infer each body.
+        for vb in &value_bindings {
+            if let Some(sig_ty) = vb.sig.clone() {
+                let monotype = instantiate_sig_as_monotype(state, sig_ty);
+                check_expr(state, env, type_ops, vb.expr, &monotype)?;
+            } else {
+                let slot_ty = env
+                    .lookup_unqualified(&vb.name)
+                    .local_ty()
+                    .expect("slot pre-inserted above")
+                    .clone();
+                let actual = infer_expr(state, env, type_ops, vb.expr)?;
+                state.unify(&slot_ty, &actual)?;
+            }
         }
-    }
-
-    if !is_where {
-        // Pass 3b after: sequential let — pattern binding names only available
-        // to bindings that follow them in source order (handled here globally
-        // by processing them after all value bodies, matching the original
-        // source-order restriction that forward references to pattern-bound
-        // names are errors).
-        for (binder, expr) in &pattern_bindings {
-            let rhs_ty = infer_expr(state, env, type_ops, expr)?;
-            let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-            state.unify(&pat_ty, &rhs_ty)?;
+    } else {
+        // `let` expression: source-order semantics. A pattern binding
+        // introduces its variables to subsequent bindings only. We iterate
+        // through the original binding order — pattern bindings run at
+        // their source position (so `_ /\ f' = e; g = ...f'...` works),
+        // and value binding bodies run at their position (so
+        // `b = a; X a = X 10` correctly fails: `a` not yet in scope when `b` is checked).
+        // Value binding slots are already pre-inserted (Pass 2) so mutual
+        // recursion between value bindings still resolves.
+        let mut vb_done: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for b in bindings {
+            match b {
+                LetBinding::Value { binder: Binder::Var { name, .. }, .. } => {
+                    let n =
+                        crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                    // Deduplicate: multi-equation lets merge to a single
+                    // slot; each subsequent equation for the same name
+                    // is a no-op here.
+                    if !vb_done.insert(n.clone()) {
+                        continue;
+                    }
+                    if let Some(vb) = value_bindings.iter().find(|v| v.name == n) {
+                        if let Some(sig_ty) = vb.sig.clone() {
+                            let monotype = instantiate_sig_as_monotype(state, sig_ty);
+                            check_expr(state, env, type_ops, vb.expr, &monotype)?;
+                        } else {
+                            let slot_ty = env
+                                .lookup_unqualified(&n)
+                                .local_ty()
+                                .expect("slot pre-inserted above")
+                                .clone();
+                            let actual = infer_expr(state, env, type_ops, vb.expr)?;
+                            state.unify(&slot_ty, &actual)?;
+                        }
+                    }
+                }
+                LetBinding::Value { binder, expr, .. } => {
+                    // Pattern binding: infer RHS and bind variables into scope
+                    // at this source position.
+                    let rhs_ty = infer_expr(state, env, type_ops, expr)?;
+                    let pat_ty = bind_pattern(state, env, type_ops, binder)?;
+                    state.unify(&pat_ty, &rhs_ty)?;
+                }
+                LetBinding::Signature { .. } => {}
+            }
         }
     }
 

@@ -328,6 +328,14 @@ fn repro_deku_dom_perf() {
 }
 
 #[test]
+fn repro_hylograph_shape_arc() {
+    let inner = check_single_package_module("Hylograph.Shape.Arc");
+    if let Err(msg) = inner {
+        panic!("repro_hylograph_shape_arc: {msg}");
+    }
+}
+
+#[test]
 fn repro_hylograph_d3_simulation() {
     let join_result: Result<Result<(), String>, _> =
         std::thread::Builder::new()
