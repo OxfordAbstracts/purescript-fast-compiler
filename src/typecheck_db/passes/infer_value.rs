@@ -1775,19 +1775,40 @@ fn infer_record_update_from_fields(
     fields: &[ir::RecordField],
 ) -> Result<Type, InferError> {
     let expr_ty = infer_expr(state, env, type_ops, expr)?;
-    let mut update_fields: Vec<(String, Type)> = Vec::with_capacity(fields.len());
+    let mut old_fields: Vec<(String, Type)> = Vec::with_capacity(fields.len());
+    let mut new_fields: Vec<(String, Type)> = Vec::with_capacity(fields.len());
     for f in fields {
         let label = crate::typecheck_db::util::resolve_symbol(f.label.value.symbol());
         // A record update field always has a `value` (it's `x = expr`,
         // not a pun).
         let val = f.value.as_ref().expect("parser: update field must carry a value");
         let new_val_ty = infer_expr(state, env, type_ops, val)?;
-        update_fields.push((label, new_val_ty));
+        // Fresh var for this field's OLD type in the base record.
+        // Avoids forcing old_type = new_type, which breaks type-changing
+        // updates like `mapTextProps f props` where every field changes
+        // from `f a` to `g a`.
+        let old_val_ty = state.fresh();
+        old_fields.push((label.clone(), old_val_ty));
+        new_fields.push((label, new_val_ty));
     }
+    // Constrain the base expression to have at least the updated labels.
     let tail = state.fresh();
-    let expected = Type::Record(update_fields, Some(Box::new(tail)));
-    state.unify(&expr_ty, &expected)?;
-    Ok(expr_ty)
+    let base_expected = Type::Record(old_fields.clone(), Some(Box::new(tail.clone())));
+    state.unify(&expr_ty, &base_expected)?;
+    // For NESTED update specs (e.g. `r { bar { x = 1 } }`): after outer
+    // unification binds old field types, unify new_val ~ old_val to close
+    // open tails and surface type mismatches. Non-nested fields skip this
+    // so top-level type-changing updates (e.g. mapTextProps) still work.
+    for (i, f) in fields.iter().enumerate() {
+        if !f.is_nested {
+            continue;
+        }
+        let old_val = state.zonk(&old_fields[i].1);
+        let new_val = state.zonk(&new_fields[i].1);
+        state.unify(&new_val, &old_val)?;
+    }
+    // Result has new field types but the same tail (preserving non-updated fields).
+    Ok(Type::Record(new_fields, Some(Box::new(tail))))
 }
 
 fn infer_lambda(
@@ -2031,19 +2052,19 @@ fn infer_record_update(
     updates: &[ir::RecordUpdate],
 ) -> Result<Type, InferError> {
     let expr_ty = infer_expr(state, env, type_ops, expr)?;
-    // Infer the new value's type for each update field; the updated
-    // record must contain at least those labels with those types.
-    let mut update_fields: Vec<(String, Type)> = Vec::with_capacity(updates.len());
+    let mut old_fields: Vec<(String, Type)> = Vec::with_capacity(updates.len());
+    let mut new_fields: Vec<(String, Type)> = Vec::with_capacity(updates.len());
     for u in updates {
         let label = crate::typecheck_db::util::resolve_symbol(u.label.value.symbol());
         let new_val_ty = infer_expr(state, env, type_ops, &u.value)?;
-        update_fields.push((label, new_val_ty));
+        let old_val_ty = state.fresh();
+        old_fields.push((label.clone(), old_val_ty));
+        new_fields.push((label, new_val_ty));
     }
     let tail = state.fresh();
-    let expected = Type::Record(update_fields, Some(Box::new(tail)));
-    state.unify(&expr_ty, &expected)?;
-    // Record update preserves the record's shape.
-    Ok(expr_ty)
+    let base_expected = Type::Record(old_fields, Some(Box::new(tail.clone())));
+    state.unify(&expr_ty, &base_expected)?;
+    Ok(Type::Record(new_fields, Some(Box::new(tail))))
 }
 
 // ============================================================================
@@ -3627,8 +3648,9 @@ foo x | x = 1
     }
 
     #[test]
-    fn record_update_preserves_record_type() {
-        // `f r = r { x = 1 }` has the same type as `f :: { x :: Int | t } -> { x :: Int | t }`.
+    fn record_update_can_change_field_type() {
+        // PureScript record updates are type-changing: `f r = r { x = 1 }` infers
+        // `forall a t. { x :: a | t } -> { x :: Int | t }`, not the old type preserved.
         let src = "module M where\nf r = r { x = 1 }\n";
         let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
@@ -3636,21 +3658,37 @@ foo x | x = 1
         let mut env = Env::new();
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
         if let Type::Fun(arg, ret) = &schemes[0].scheme.ty {
-            assert_eq!(arg, ret, "update preserves record shape");
+            // arg has an open row; ret has x :: Int.
+            if let (Type::Record(arg_fs, Some(_)), Type::Record(ret_fs, Some(_))) =
+                (arg.as_ref(), ret.as_ref())
+            {
+                let arg_x = arg_fs.iter().find(|(l, _)| l == "x");
+                let ret_x = ret_fs.iter().find(|(l, _)| l == "x");
+                assert!(arg_x.is_some(), "arg should have x field");
+                assert_eq!(ret_x.map(|(_, t)| t), Some(&int()), "ret x should be Int");
+            } else {
+                panic!("expected Fun(Record, Record), got {:?}", schemes[0].scheme.ty);
+            }
         } else {
             panic!("expected Fun, got {:?}", schemes[0].scheme.ty);
         }
     }
 
     #[test]
-    fn record_update_on_wrong_field_type_errors() {
-        // `r :: { x :: Int }`; `r { x = "hi" }` must fail — String doesn't
-        // unify with the existing Int field type.
-        let src = "module M where\nv = r { x = \"hi\" }\n";
+    fn record_update_sig_mismatch_is_error() {
+        // `v :: { x :: Int }; v = r { x = "hi" }` — sig says Int, update gives String.
+        // The error must surface via the declared sig.
+        let src = "module M where\nv :: { x :: Int }\nv = r { x = \"hi\" }\n";
         let m = parse(src);
         let decls: Vec<&Decl> = m.decls.iter().collect();
         let ops = TypeOpMap::default();
         let mut env = Env::new();
+        // Simulate bind_local_ctors: register the sig and mark as signed.
+        env.bind_scheme(
+            QName::unqualified("v"),
+            Scheme::mono(Type::Record(vec![("x".into(), int())], None)),
+        );
+        env.local_signed.insert("v".into());
         env.bind_scheme(
             QName::unqualified("r"),
             Scheme::mono(Type::Record(vec![("x".into(), int())], None)),
