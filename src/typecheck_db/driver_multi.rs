@@ -4445,6 +4445,15 @@ fn build_desugar_context(
     // each import's target in the registry rather than walking
     // Prim submodules (Prim defines no operators).
     for imp in &module.imports {
+        // Qualified-only imports (`import M as Q`) put operators
+        // under `Q.(:)` only — they don't make the operator
+        // available as bare `(:)`. Skip such imports here so
+        // an open `import Data.Array as A` doesn't pre-empt a
+        // later `import Data.List (List(..), (:))` from
+        // claiming the unqualified slot.
+        if imp.qualified.is_some() {
+            continue;
+        }
         let target_name = imp
             .module
             .parts
