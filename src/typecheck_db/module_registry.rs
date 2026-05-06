@@ -535,10 +535,7 @@ pub fn distill_exports(
                     .iter()
                     .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
                     .collect();
-                let body = crate::typecheck_db::types::convert_type_expr(
-                    ty,
-                    &crate::typecheck_db::types::TypeOpMap::default(),
-                );
+                let body = crate::typecheck_db::types::convert_type_expr(ty, type_ops);
                 let has_poly_kind = poly_kind_alias_names.contains(&n);
                 type_arities_all.insert(n.clone(), vars.len());
                 type_aliases_all.insert(n, TypeAlias { type_vars: vars, body, has_poly_kind });
