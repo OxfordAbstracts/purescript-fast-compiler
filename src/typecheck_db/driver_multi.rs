@@ -960,7 +960,7 @@ fn check_one_module(
     // `check_value` sigs) via the env.
     env.aliases = alias_map.clone();
 
-    bind_local_ctors(&desugared, &mut env, &alias_map);
+    bind_local_ctors(&desugared, &mut env, &alias_map, &type_ops);
 
     // 4) Value decls: split into SCCs + cached per-SCC inference.
     //    `module_context_hash` is now zero — all context dependencies
@@ -4516,11 +4516,11 @@ fn bind_local_ctors(
     decls: &[crate::typecheck_db::ir::Decl],
     env: &mut Env,
     aliases: &crate::typecheck_db::types::AliasMap,
+    type_ops: &TypeOpMap,
 ) {
     use crate::typecheck_db::types::{expand_aliases, QName, Scheme, Type};
-    let type_ops = TypeOpMap::default();
     let conv = |ty: &crate::cst::TypeExpr| -> Type {
-        expand_aliases(crate::typecheck_db::types::convert_type_expr(ty, &type_ops), aliases)
+        expand_aliases(crate::typecheck_db::types::convert_type_expr(ty, type_ops), aliases)
     };
     for d in decls {
         match d {
