@@ -27,7 +27,7 @@ use crate::typecheck_db::generalize::{generalize, instantiate};
 use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::store::DepEdge;
 use crate::typecheck_db::types::{convert_type_expr, Constraint, QName, Scheme, Type, TypeOpMap};
-use crate::typecheck_db::unify::{UnifyError, UnifyState};
+use crate::typecheck_db::unify::{LocatedUnifyError, UnifyError, UnifyState};
 
 pub const PASS_NAME: &str = "infer_value_scc";
 pub const PASS_VERSION: u32 = 1;
@@ -35,7 +35,7 @@ pub const PASS_VERSION: u32 = 1;
 #[derive(Debug, Clone, Error)]
 pub enum InferError {
     #[error("unification: {0}")]
-    Unify(#[from] UnifyError),
+    Unify(LocatedUnifyError),
     #[error("unbound variable: {0}")]
     UnboundVar(String),
     #[error("unbound constructor: {0}")]
@@ -52,6 +52,49 @@ pub enum InferError {
     EmptyDoBlock,
     #[error("anonymous function argument in invalid context")]
     IncorrectAnonymousArgument,
+}
+
+impl From<LocatedUnifyError> for InferError {
+    fn from(e: LocatedUnifyError) -> Self {
+        InferError::Unify(e)
+    }
+}
+
+/// Extension trait for `UnifyState` that wraps `unify` and locates
+/// any failure into an `InferError::Unify(LocatedUnifyError)` using
+/// the state-tracked spans (`current_unify_span` /
+/// `current_expected_span` / `current_decl_span` / `current_decl`).
+///
+/// All `?`-propagating call sites in this file use `unify_here`
+/// instead of the bare `state.unify_here(...)?` so error reporting can
+/// pinpoint the offending source location. The handful of
+/// `let _ = state.unify(...)` callers (e.g. F2 sig-pin) keep using
+/// the bare form — their errors are intentionally swallowed.
+trait UnifyHere {
+    fn unify_here(&mut self, a: &Type, b: &Type) -> Result<(), InferError>;
+    fn unify_here_with_expected(
+        &mut self,
+        expected_span: crate::span::Span,
+        a: &Type,
+        b: &Type,
+    ) -> Result<(), InferError>;
+}
+
+impl UnifyHere for UnifyState {
+    fn unify_here(&mut self, a: &Type, b: &Type) -> Result<(), InferError> {
+        match self.unify(a, b) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(InferError::Unify(self.locate(e))),
+        }
+    }
+    fn unify_here_with_expected(
+        &mut self,
+        expected_span: crate::span::Span,
+        a: &Type,
+        b: &Type,
+    ) -> Result<(), InferError> {
+        self.with_expected_span(expected_span, |s| s.unify_here(a, b))
+    }
 }
 
 /// Output of `infer_value_scc` for one SCC of mutually-recursive value decls.
@@ -289,6 +332,23 @@ pub fn infer_expr(
     type_ops: &TypeOpMap,
     expr: &Expr,
 ) -> Result<Type, InferError> {
+    // Push the current expression's span as the "actual"-side
+    // location for any `unify_here` failure inside this arm. We
+    // save+restore around the call so the caller's outer span
+    // (set when it entered its own arm) is not lost on return.
+    let prev_unify_span = state.current_unify_span();
+    state.set_current_unify_span(Some(expr.span()));
+    let result = infer_expr_inner(state, env, type_ops, expr);
+    state.set_current_unify_span(prev_unify_span);
+    result
+}
+
+fn infer_expr_inner(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    expr: &Expr,
+) -> Result<Type, InferError> {
     match expr {
         Expr::Var { span, name } => infer_var(state, env, *span, name),
         Expr::Constructor { name, .. } => infer_constructor(state, env, name),
@@ -448,6 +508,22 @@ pub fn check_expr(
     expr: &Expr,
     expected: &Type,
 ) -> Result<(), InferError> {
+    // Push the current expression's span as the "actual"-side
+    // location for any `unify_here` failure inside this arm.
+    let prev_unify_span = state.current_unify_span();
+    state.set_current_unify_span(Some(expr.span()));
+    let result = check_expr_inner(state, env, type_ops, expr, expected);
+    state.set_current_unify_span(prev_unify_span);
+    result
+}
+
+fn check_expr_inner(
+    state: &mut UnifyState,
+    env: &mut Env,
+    type_ops: &TypeOpMap,
+    expr: &Expr,
+    expected: &Type,
+) -> Result<(), InferError> {
     // Zonk first in case `expected` is a unif bound to a Forall.
     let zonked = state.zonk(expected);
     // Deep-skolemisation: push fresh skolems through every
@@ -500,7 +576,7 @@ pub fn check_expr(
     } else {
         actual
     };
-    state.unify(&actual_inst, expected)?;
+    state.unify_here(&actual_inst, expected)?;
     Ok(())
 }
 
@@ -676,7 +752,7 @@ fn check_equation(
             }
             _ => {
                 let pat_ty = bind_pattern(state, env, type_ops, b)?;
-                state.unify(&pat_ty, &arg)?;
+                state.unify_here(&pat_ty, &arg)?;
             }
         }
         rest = new_rest;
@@ -692,7 +768,7 @@ fn check_equation(
             &binders[consumed..],
             guarded,
         )?;
-        state.unify(&tail_ty, &rest)?;
+        state.unify_here(&tail_ty, &rest)?;
     } else {
         check_guarded(state, env, type_ops, guarded, &rest)?;
     }
@@ -722,7 +798,7 @@ fn check_guarded(
         }
         ir::GuardedExpr::Guarded(_) => {
             let actual = infer_guarded(state, env, type_ops, g)?;
-            state.unify(&actual, expected)?;
+            state.unify_here(&actual, expected)?;
             Ok(())
         }
     }
@@ -784,7 +860,7 @@ fn check_lambda(
             }
             _ => {
                 let pat_ty = bind_pattern(state, env, type_ops, b)?;
-                state.unify(&pat_ty, &arg)?;
+                state.unify_here(&pat_ty, &arg)?;
             }
         }
         rest = new_rest;
@@ -793,7 +869,7 @@ fn check_lambda(
     if consumed < binders.len() {
         let tail_ty =
             infer_lambda(state, env, type_ops, &binders[consumed..], body)?;
-        state.unify(&tail_ty, &rest)?;
+        state.unify_here(&tail_ty, &rest)?;
     } else {
         check_expr(state, env, type_ops, body, &rest)?;
     }
@@ -900,9 +976,10 @@ pub fn infer_value_scc_with_all(
     // "current decl" marker on state lets `infer_case` stamp each
     // pending exhaustiveness record with its owning decl.
     for (decl, name) in &decl_refs {
-        if let Decl::Value { binders, guarded, where_clause, .. } = decl {
+        if let Decl::Value { span: decl_span, binders, guarded, where_clause, .. } = decl {
             let expected = slot_of.get(name).cloned().unwrap();
             state.set_current_decl(Some(name.clone()));
+            state.set_current_decl_span(Some(*decl_span));
             let _ = sig_param_types; // retained for future sig-aware work
             let guarded_with_where =
                 wrap_guarded_with_where(guarded.clone(), where_clause.clone());
@@ -1046,7 +1123,7 @@ pub fn infer_value_scc_with_all(
                     binders,
                     &guarded_with_where,
                 )?;
-                state.unify(&expected, &lam_ty)?;
+                state.unify_here(&expected, &lam_ty)?;
                 if let Some(scheme) = sig_scheme_for_pin {
                     let original_should_pin =
                         hole_sites.is_some() || scheme_has_constraint(&scheme);
@@ -1105,6 +1182,7 @@ pub fn infer_value_scc_with_all(
         }
     }
     state.set_current_decl(None);
+    state.set_current_decl_span(None);
 
     // Now generalize. Temporarily clear this SCC's slots from the env so
     // they don't count as "free in env" and block quantification.
@@ -1751,13 +1829,20 @@ fn infer_app(
             let arg_ty_res = infer_expr(state, env, type_ops, arg);
             state.pop_givens_to(snapshot);
             let arg_ty = arg_ty_res?;
-            state.unify(body, &arg_ty)?;
+            state.unify_here(body, &arg_ty)?;
             return Ok(*ret);
         }
     }
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
     let result = state.fresh();
-    state.unify(&func_ty, &Type::fun(arg_ty, result.clone()))?;
+    // The function position supplies the expected arg shape, so
+    // attribute any mismatch to `func.span()` as the
+    // "expected_from" location.
+    state.unify_here_with_expected(
+        func.span(),
+        &func_ty,
+        &Type::fun(arg_ty, result.clone()),
+    )?;
     Ok(result)
 }
 
@@ -1794,7 +1879,7 @@ fn infer_record_update_from_fields(
     // Constrain the base expression to have at least the updated labels.
     let tail = state.fresh();
     let base_expected = Type::Record(old_fields.clone(), Some(Box::new(tail.clone())));
-    state.unify(&expr_ty, &base_expected)?;
+    state.unify_here(&expr_ty, &base_expected)?;
     // For NESTED update specs (e.g. `r { bar { x = 1 } }`): after outer
     // unification binds old field types, unify new_val ~ old_val to close
     // open tails and surface type mismatches. Non-nested fields skip this
@@ -1805,7 +1890,9 @@ fn infer_record_update_from_fields(
         }
         let old_val = state.zonk(&old_fields[i].1);
         let new_val = state.zonk(&new_fields[i].1);
-        state.unify(&new_val, &old_val)?;
+        // The outer record expression supplies the expected
+        // shape — so a nested-update mismatch reports back to it.
+        state.unify_here_with_expected(expr.span(), &new_val, &old_val)?;
     }
     // Result has new field types but the same tail (preserving non-updated fields).
     Ok(Type::Record(new_fields, Some(Box::new(tail))))
@@ -1874,7 +1961,7 @@ fn bind_pattern(
                 declared = rewrite_type_holes(state, declared, &hole_sites, env);
             }
             let inferred = bind_pattern(state, env, type_ops, binder)?;
-            state.unify(&inferred, &declared)?;
+            state.unify_here(&inferred, &declared)?;
             Ok(declared)
         }
         Binder::Parens { binder, .. } => bind_pattern(state, env, type_ops, binder),
@@ -1957,13 +2044,13 @@ fn bind_constructor_pattern(
     for _ in 0..args.len() {
         let arg = state.fresh();
         let result = state.fresh();
-        state.unify(&cur, &Type::fun(arg.clone(), result.clone()))?;
+        state.unify_here(&cur, &Type::fun(arg.clone(), result.clone()))?;
         arg_tys.push(arg);
         cur = result;
     }
     for (sub, arg_ty) in args.iter().zip(arg_tys.iter()) {
         let sub_ty = bind_pattern(state, env, type_ops, sub)?;
-        state.unify(&sub_ty, arg_ty)?;
+        state.unify_here(&sub_ty, arg_ty)?;
     }
     Ok(cur)
 }
@@ -2029,7 +2116,7 @@ fn infer_record_access(
         vec![(label, field_ty.clone())],
         Some(Box::new(tail)),
     );
-    state.unify(&expr_ty, &expected)?;
+    state.unify_here(&expr_ty, &expected)?;
     // If the field's declared type is polymorphic (a nested
     // `Forall` — e.g. `{ return :: forall a. a -> m a }`), each
     // access site should see a fresh instantiation, not the
@@ -2063,7 +2150,7 @@ fn infer_record_update(
     }
     let tail = state.fresh();
     let base_expected = Type::Record(old_fields, Some(Box::new(tail.clone())));
-    state.unify(&expr_ty, &base_expected)?;
+    state.unify_here(&expr_ty, &base_expected)?;
     Ok(Type::Record(new_fields, Some(Box::new(tail))))
 }
 
@@ -2088,7 +2175,7 @@ fn infer_array(
     let elem = state.fresh();
     for e in elements {
         let t = infer_expr(state, env, type_ops, e)?;
-        state.unify(&t, &elem)?;
+        state.unify_here(&t, &elem)?;
     }
     Ok(array_of(elem))
 }
@@ -2106,7 +2193,7 @@ fn bind_array_pattern(
     let elem = state.fresh();
     for b in elements {
         let t = bind_pattern(state, env, type_ops, b)?;
-        state.unify(&t, &elem)?;
+        state.unify_here(&t, &elem)?;
     }
     Ok(array_of(elem))
 }
@@ -2122,7 +2209,7 @@ fn infer_if(
     check_expr(state, env, type_ops, cond, &Type::Con(QName::unqualified("Boolean")))?;
     let then_ty = infer_expr(state, env, type_ops, then_expr)?;
     let else_ty = infer_expr(state, env, type_ops, else_expr)?;
-    state.unify(&then_ty, &else_ty)?;
+    state.unify_here(&then_ty, &else_ty)?;
     Ok(then_ty)
 }
 
@@ -2226,7 +2313,7 @@ fn infer_let(
         for (binder, expr) in &pattern_bindings {
             let rhs_ty = infer_expr(state, env, type_ops, expr)?;
             let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-            state.unify(&pat_ty, &rhs_ty)?;
+            state.unify_here(&pat_ty, &rhs_ty)?;
         }
         // Pass 3: infer each body.
         for vb in &value_bindings {
@@ -2240,7 +2327,7 @@ fn infer_let(
                     .expect("slot pre-inserted above")
                     .clone();
                 let actual = infer_expr(state, env, type_ops, vb.expr)?;
-                state.unify(&slot_ty, &actual)?;
+                state.unify_here(&slot_ty, &actual)?;
             }
         }
     } else {
@@ -2276,7 +2363,7 @@ fn infer_let(
                                 .expect("slot pre-inserted above")
                                 .clone();
                             let actual = infer_expr(state, env, type_ops, vb.expr)?;
-                            state.unify(&slot_ty, &actual)?;
+                            state.unify_here(&slot_ty, &actual)?;
                         }
                     }
                 }
@@ -2285,7 +2372,7 @@ fn infer_let(
                     // at this source position.
                     let rhs_ty = infer_expr(state, env, type_ops, expr)?;
                     let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-                    state.unify(&pat_ty, &rhs_ty)?;
+                    state.unify_here(&pat_ty, &rhs_ty)?;
                 }
                 LetBinding::Signature { .. } => {}
             }
@@ -2365,9 +2452,9 @@ fn infer_do(
                 let expr_ty = infer_expr(state, env, type_ops, expr)?;
                 let a = state.fresh();
                 let expected = Type::App(Box::new(m.clone()), Box::new(a.clone()));
-                state.unify(&expr_ty, &expected)?;
+                state.unify_here(&expr_ty, &expected)?;
                 let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-                state.unify(&pat_ty, &a)?;
+                state.unify_here(&pat_ty, &a)?;
             }
             ir::DoStatement::Let { bindings, .. } => {
                 if is_last {
@@ -2384,12 +2471,12 @@ fn infer_do(
                     // shape and feed the surrounding context.
                     let r = state.fresh();
                     let expected = Type::App(Box::new(m.clone()), Box::new(r.clone()));
-                    state.unify(&expr_ty, &expected)?;
+                    state.unify_here(&expr_ty, &expected)?;
                     result_ty = Some(expr_ty);
                 } else {
                     let any = state.fresh();
                     let expected = Type::App(Box::new(m.clone()), Box::new(any));
-                    state.unify(&expr_ty, &expected)?;
+                    state.unify_here(&expr_ty, &expected)?;
                 }
             }
         }
@@ -2426,9 +2513,9 @@ fn infer_ado(
                 let expr_ty = infer_expr(state, &mut expr_env, type_ops, expr)?;
                 let a = state.fresh();
                 let expected = Type::App(Box::new(m.clone()), Box::new(a.clone()));
-                state.unify(&expr_ty, &expected)?;
+                state.unify_here(&expr_ty, &expected)?;
                 let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-                state.unify(&pat_ty, &a)?;
+                state.unify_here(&pat_ty, &a)?;
             }
             ir::DoStatement::Let { bindings, .. } => {
                 process_do_let_bindings(state, env, type_ops, bindings)?;
@@ -2443,7 +2530,7 @@ fn infer_ado(
                 let expr_ty = infer_expr(state, &mut expr_env, type_ops, expr)?;
                 let a = state.fresh();
                 let expected = Type::App(Box::new(m.clone()), Box::new(a));
-                state.unify(&expr_ty, &expected)?;
+                state.unify_here(&expr_ty, &expected)?;
             }
         }
     }
@@ -2492,13 +2579,13 @@ fn process_do_let_bindings(
                     let slot = state.fresh();
                     env.bind_local(n.clone(), slot.clone());
                     let actual = infer_expr(state, env, type_ops, expr)?;
-                    state.unify(&slot, &actual)?;
+                    state.unify_here(&slot, &actual)?;
                 }
             }
             LetBinding::Value { binder, expr, .. } => {
                 let rhs = infer_expr(state, env, type_ops, expr)?;
                 let pat_ty = bind_pattern(state, env, type_ops, binder)?;
-                state.unify(&pat_ty, &rhs)?;
+                state.unify_here(&pat_ty, &rhs)?;
             }
             LetBinding::Signature { .. } => {}
         }
@@ -2523,6 +2610,12 @@ fn infer_case(
 
     // All branches must unify with a single fresh result type.
     let result_ty = state.fresh();
+    // Track the first alt's body span — used as `expected_from`
+    // for subsequent alts so a later branch's mismatch points at
+    // the canonical-shape branch (the first one).
+    let mut first_alt_span: Option<crate::span::Span> = None;
+    let scrut_span: Option<crate::span::Span> =
+        scrutinees.first().map(|e| e.span());
 
     for alt in alts {
         if alt.binders.len() != scrut_tys.len() {
@@ -2531,10 +2624,26 @@ fn infer_case(
         env.push_scope();
         for (binder, scrut_ty) in alt.binders.iter().zip(scrut_tys.iter()) {
             let bt = bind_pattern(state, env, type_ops, binder)?;
-            state.unify(&bt, scrut_ty)?;
+            // Scrutinee supplies the expected type for the binder.
+            if let Some(sp) = scrut_span {
+                state.unify_here_with_expected(sp, &bt, scrut_ty)?;
+            } else {
+                state.unify_here(&bt, scrut_ty)?;
+            }
         }
         let branch_ty = infer_guarded(state, env, type_ops, &alt.result)?;
-        state.unify(&branch_ty, &result_ty)?;
+        if let Some(sp) = first_alt_span {
+            // Subsequent alts: the first alt's body span is the
+            // canonical "expected from" location.
+            state.unify_here_with_expected(sp, &branch_ty, &result_ty)?;
+        } else {
+            state.unify_here(&branch_ty, &result_ty)?;
+            // Capture the first alt's body span for the rest.
+            first_alt_span = match &alt.result {
+                ir::GuardedExpr::Unconditional(e) => Some(e.span()),
+                ir::GuardedExpr::Guarded(gs) => gs.first().map(|g| g.expr.span()),
+            };
+        }
         env.pop_scope();
     }
 
@@ -2590,12 +2699,12 @@ fn infer_guarded(
                         ir::GuardPattern::Pattern(binder, expr) => {
                             let scrut_ty = infer_expr(state, env, type_ops, expr)?;
                             let bt = bind_pattern(state, env, type_ops, binder)?;
-                            state.unify(&bt, &scrut_ty)?;
+                            state.unify_here(&bt, &scrut_ty)?;
                         }
                     }
                 }
                 let g_ty = infer_expr(state, env, type_ops, &g.expr)?;
-                state.unify(&g_ty, &result_ty)?;
+                state.unify_here(&g_ty, &result_ty)?;
                 env.pop_scope();
             }
             Ok(result_ty)
@@ -2637,7 +2746,7 @@ fn infer_equation_with_hints(
     for (i, b) in binders.iter().enumerate() {
         let ty = bind_pattern(state, env, type_ops, b)?;
         if let Some(h) = hints.and_then(|hs| hs.get(i)) {
-            state.unify(&ty, h)?;
+            state.unify_here(&ty, h)?;
         }
         param_tys.push(ty);
     }

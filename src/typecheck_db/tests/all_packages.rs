@@ -165,7 +165,10 @@ fn run_all_packages_failing_summary() -> Result<(), String> {
             reasons.push(format!("import:{:?}", ie.kind));
         }
         if let Some(ce) = result.constraint_errors.first() {
-            reasons.push(format!("constraint:{:?}", ce.kind));
+            reasons.push(format!(
+                "constraint:{:?} primary:{:?} decl_span:{:?}",
+                ce.kind, ce.span, ce.decl_span,
+            ));
         }
         if !reasons.is_empty() {
             failing += 1;

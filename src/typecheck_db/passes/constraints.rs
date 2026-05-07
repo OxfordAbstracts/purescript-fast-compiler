@@ -174,7 +174,16 @@ pub struct ResolvedDict {
 /// One diagnostic from the solver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstraintError {
+    /// Primary span — typically the `Var` / `Constructor` reference
+    /// site whose use produced this constraint (mirrors
+    /// `PendingConstraint.span`).
     pub span: crate::span::Span,
+    /// Source span of the enclosing decl (when known). Read off
+    /// `UnifyState::current_decl_span` at error-construction time.
+    /// Useful for the user to navigate back to the decl that owns
+    /// the offending call.
+    #[serde(default)]
+    pub decl_span: Option<crate::span::Span>,
     pub constraint: Constraint,
     pub kind: ConstraintErrorKind,
 }
@@ -1101,6 +1110,7 @@ pub fn solve_all(
                         .or_default()
                         .push(ConstraintError {
                             span: pc.span,
+                            decl_span: state.current_decl_span(),
                             constraint: zonked,
                             kind: ConstraintErrorKind::NoInstanceFound,
                         });
@@ -1122,6 +1132,7 @@ pub fn solve_all(
                         .or_default()
                         .push(ConstraintError {
                             span: pc.span,
+                            decl_span: state.current_decl_span(),
                             constraint: zonked,
                             kind: ConstraintErrorKind::InstanceHeadMismatch,
                         });
@@ -1145,6 +1156,7 @@ pub fn solve_all(
                         .or_default()
                         .push(ConstraintError {
                             span: pc.span,
+                            decl_span: state.current_decl_span(),
                             constraint: zonked,
                             kind: ConstraintErrorKind::OverlappingInstances,
                         });
@@ -1182,6 +1194,7 @@ pub fn solve_all(
                         .or_default()
                         .push(ConstraintError {
                             span: pc.span,
+                            decl_span: state.current_decl_span(),
                             constraint: pc.constraint.clone(),
                             kind: ConstraintErrorKind::SolverDepthExceeded,
                         });

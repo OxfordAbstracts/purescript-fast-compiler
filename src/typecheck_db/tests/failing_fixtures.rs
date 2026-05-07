@@ -270,7 +270,7 @@ fn collect_error_codes(report: &ModuleCheckReport) -> Vec<String> {
 
 fn infer_error_code(e: &InferError) -> String {
     match e {
-        InferError::Unify(u) => match u {
+        InferError::Unify(loc) => match &loc.kind {
             UnifyError::Mismatch(_, _) => "UnificationError".into(),
             UnifyError::Infinite { .. } => "InfiniteType".into(),
             // Skolem escape is a kind-1-vs-kind-N polymorphism

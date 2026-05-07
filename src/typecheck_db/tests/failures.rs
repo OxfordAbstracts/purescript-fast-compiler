@@ -26,6 +26,24 @@ fn wrong_type_annotation_fails_unification() {
         "expected Unify mismatch; got {:?}",
         r.inference_error,
     );
+    // Verify the LocatedUnifyError carries actual location info.
+    if let Some(InferError::Unify(loc)) = &r.inference_error {
+        assert!(
+            loc.primary.is_some(),
+            "expected primary span on Unify error; got {:?}",
+            loc,
+        );
+        assert!(
+            loc.decl_name.is_some(),
+            "expected decl_name on Unify error; got {:?}",
+            loc,
+        );
+        assert!(
+            loc.decl_span.is_some(),
+            "expected decl_span on Unify error; got {:?}",
+            loc,
+        );
+    }
 }
 
 #[test]

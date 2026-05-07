@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
+use crate::span::Span;
 use crate::typecheck_db::types::{Constraint, Type};
 
 /// True when the Forall body's outermost App head is a `Con` that
@@ -78,6 +79,45 @@ pub enum UnifyError {
     SkolemEscape { var: u32, skolem: u32, ty: Type },
 }
 
+/// `UnifyError` augmented with source-location info. Constructed at
+/// the `infer_value.rs::?` boundary by `unify_here` reading the
+/// state-tracked `current_unify_span` / `current_expected_span` /
+/// `current_decl_span` / `current_decl`. The unifier's internal
+/// recursion still produces span-free `UnifyError`s — they only get
+/// located when they cross out of the unifier into the inference
+/// layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedUnifyError {
+    /// Where the offending expression lives (the "actual" side).
+    pub primary: Option<Span>,
+    /// Where the expected type came from (when known) — typically the
+    /// callee's sig position, the case scrutinee, or the surrounding
+    /// expression that supplied the expected type.
+    pub expected_from: Option<Span>,
+    /// Enclosing decl's name, mirror of `current_decl`.
+    pub decl_name: Option<String>,
+    /// Enclosing decl's source span.
+    pub decl_span: Option<Span>,
+    /// The original unifier error.
+    pub kind: UnifyError,
+}
+
+impl std::fmt::Display for LocatedUnifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if let Some(s) = &self.primary {
+            write!(f, " at {:?}", s)?;
+        }
+        if let Some(s) = &self.expected_from {
+            write!(f, " (expected from {:?})", s)?;
+        }
+        if let Some(name) = &self.decl_name {
+            write!(f, " in decl `{}`", name)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct UnifyState {
     // bindings[i] = Some(ty) when ?i is solved, None when fresh.
     bindings: Vec<Option<Type>>,
@@ -143,6 +183,22 @@ pub struct UnifyState {
     /// any deeper call that would push past 1024 frames bails out
     /// with `Mismatch` rather than blow the stack.
     unify_depth: usize,
+    /// Current "actual"-side source span. Set by callers (typically
+    /// `infer_expr` / `check_expr`) at expression entry via the
+    /// `with_unify_span` RAII helper, and read at error-construction
+    /// time by `locate` to populate `LocatedUnifyError::primary`.
+    current_unify_span: Option<Span>,
+    /// Current "expected from" source span. Set by call sites that
+    /// know where the expected type was sourced (the callee's func
+    /// position, the case's first alt's body span, etc.) via
+    /// `with_expected_span` for the duration of one unify call.
+    /// Read at error-construction time to populate
+    /// `LocatedUnifyError::expected_from`.
+    current_expected_span: Option<Span>,
+    /// Current decl's source span — parallel to `current_decl`.
+    /// Set at the SCC loop entry alongside `set_current_decl` and
+    /// read by `locate` for `LocatedUnifyError::decl_span`.
+    current_decl_span: Option<Span>,
 }
 
 impl UnifyState {
@@ -158,6 +214,9 @@ impl UnifyState {
             givens: Vec::new(),
             skolem_names: std::collections::HashMap::new(),
             unify_depth: 0,
+            current_unify_span: None,
+            current_expected_span: None,
+            current_decl_span: None,
         }
     }
 
@@ -353,6 +412,85 @@ impl UnifyState {
     /// The decl name last set via `set_current_decl`, or `None`.
     pub fn current_decl(&self) -> Option<&str> {
         self.current_decl.as_deref()
+    }
+
+    /// Set the "currently inferring" decl's source span. Parallel to
+    /// `set_current_decl` — both are typically updated together at
+    /// the SCC loop's per-decl boundary.
+    pub fn set_current_decl_span(&mut self, span: Option<Span>) {
+        self.current_decl_span = span;
+    }
+
+    /// The decl span last set via `set_current_decl_span`.
+    pub fn current_decl_span(&self) -> Option<Span> {
+        self.current_decl_span
+    }
+
+    /// The current "actual"-side unify span (set by `with_unify_span`).
+    pub fn current_unify_span(&self) -> Option<Span> {
+        self.current_unify_span
+    }
+
+    /// Imperative setter for `current_unify_span`. Intended for the
+    /// save+restore pattern in `infer_expr` / `check_expr`'s thin
+    /// wrapper:
+    /// ```ignore
+    /// let prev = state.current_unify_span();
+    /// state.set_current_unify_span(Some(expr.span()));
+    /// let r = inner(state, …);
+    /// state.set_current_unify_span(prev);
+    /// ```
+    /// `with_unify_span` is the closure-flavoured equivalent, but
+    /// it's awkward to wrap a giant match around because of borrow
+    /// limitations on captured `env: &mut Env`.
+    pub fn set_current_unify_span(&mut self, span: Option<Span>) {
+        self.current_unify_span = span;
+    }
+
+    /// The current "expected from" unify span (set by `with_expected_span`).
+    pub fn current_expected_span(&self) -> Option<Span> {
+        self.current_expected_span
+    }
+
+    /// Replace `current_unify_span` for the duration of `f`'s call,
+    /// restoring the previous value when `f` returns. Use this at
+    /// every `infer_expr` / `check_expr` entry so internal unifies
+    /// inherit the surrounding expression's span without manual
+    /// push/pop.
+    pub fn with_unify_span<R>(&mut self, span: Span, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.current_unify_span.replace(span);
+        let r = f(self);
+        self.current_unify_span = prev;
+        r
+    }
+
+    /// Replace `current_expected_span` for the duration of `f`'s
+    /// call. Used by hot call sites that know where the expected
+    /// type was sourced (e.g. `infer_app` setting `func.span()` so
+    /// arg-type mismatches point at the function rather than the
+    /// arg's own location).
+    pub fn with_expected_span<R>(
+        &mut self,
+        span: Span,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prev = self.current_expected_span.replace(span);
+        let r = f(self);
+        self.current_expected_span = prev;
+        r
+    }
+
+    /// Build a `LocatedUnifyError` from a span-free `UnifyError` by
+    /// reading the four `current_*` fields. Called by `unify_here`
+    /// in `infer_value.rs` at the unifier-to-inference boundary.
+    pub fn locate(&self, err: UnifyError) -> LocatedUnifyError {
+        LocatedUnifyError {
+            primary: self.current_unify_span,
+            expected_from: self.current_expected_span,
+            decl_name: self.current_decl.clone(),
+            decl_span: self.current_decl_span,
+            kind: err,
+        }
     }
 
     /// Record one case / multi-equation group for post-inference
