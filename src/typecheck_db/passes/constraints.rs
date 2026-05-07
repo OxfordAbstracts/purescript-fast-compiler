@@ -280,7 +280,27 @@ pub fn solve_one(
         }
         _ => pending.constraint.args.iter().any(|a| is_bare_unif(a, state)),
     };
-    if needs_defer {
+    // Spine-head defer: an arg shaped like `?u a` (a partial app
+    // whose head is a unification variable) is indeterminate.
+    // Without this, any candidate with a concrete `Con`-headed spine
+    // (e.g. `Alternate f`, `Maybe`, `ParserT s m`) would unify with
+    // the unif head and pin it — picking the FIRST candidate that
+    // structurally fits, not the right one. The reference compiler's
+    // `typeHeadsAreEqual` returns `Unknown` for this case and defers
+    // the entire chain. Skip when fundeps say this position is
+    // determined by another arg (the solver has enough info).
+    let needs_spine_defer = match class_info {
+        Some(info) if !info.fundeps.is_empty() => {
+            pending
+                .constraint
+                .args
+                .iter()
+                .enumerate()
+                .any(|(i, a)| !improvable.contains(&i) && has_unif_spine_head(a, state))
+        }
+        _ => pending.constraint.args.iter().any(|a| has_unif_spine_head(a, state)),
+    };
+    if needs_defer || needs_spine_defer {
         return SolveOutcome::Deferred;
     }
 
@@ -589,6 +609,29 @@ fn contains_rigid_var(ty: &Type, state: &crate::typecheck_db::unify::UnifyState)
 /// solves them or proves they're polymorphic.
 fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
     matches!(state.zonk(ty), Type::Unif(_))
+}
+
+/// True when `ty`'s App-spine head is a unif var (so the structural
+/// shape `App(?u, _)` cannot yet be pinned to a specific
+/// constructor). Mirrors the reference compiler's
+/// `typeHeadsAreEqual (TUnknown _ _) _ = Unknown` rule: any
+/// candidate with a `Con`-headed spine at this position is
+/// indeterminate, so committing via unification would over-eagerly
+/// pin the unif to the first candidate's head (e.g. `Alternate
+/// f`) when the actual type isn't yet known.
+fn has_unif_spine_head(
+    ty: &Type,
+    state: &crate::typecheck_db::unify::UnifyState,
+) -> bool {
+    let z = state.zonk(ty);
+    let mut cur: &Type = &z;
+    loop {
+        match cur {
+            Type::App(f, _) => cur = f,
+            Type::Unif(_) => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// Result of a `try_magic` attempt.
