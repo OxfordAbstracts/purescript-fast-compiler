@@ -354,6 +354,16 @@ fn build_arity_env(
     // correct arity survives.
     let mut prim_submodule_imports: Vec<String> = Vec::new();
     for imp in &module.imports {
+        // `import M as Q` exposes types under `Q.Foo` only — never
+        // bare `Foo`. Including them here previously let an `as Q`
+        // import silently override an unqualified import's kind
+        // (e.g. `import Node.TLS.Types (TlsServer)` after
+        // `import Node.Net.Types (Server)` would smuggle TLS's
+        // arity-0 `Server :: Endpoint` over Net's arity-1
+        // `Server :: ConnectionType -> Type`).
+        if imp.qualified.is_some() {
+            continue;
+        }
         let name = imp
             .module
             .parts
@@ -367,7 +377,53 @@ fn build_arity_env(
             continue;
         }
         if let Some(exports) = registry.get(&name) {
+            // Compute the set of types this import actually brings
+            // into the unqualified scope, respecting the explicit
+            // and hiding lists. Open imports (`imports = None`)
+            // bring everything; explicit imports only the listed
+            // types (or types that travel with `Type(..)` data
+            // members); hiding lists bring everything else.
+            let in_scope: Option<std::collections::HashSet<String>> =
+                match &imp.imports {
+                    None => None,
+                    Some(cst::ImportList::Explicit(items)) => {
+                        let mut s: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for item in items {
+                            if let cst::Import::Type(tn, _) = item {
+                                s.insert(crate::interner::resolve(tn.value.symbol())
+                                    .unwrap_or_default());
+                            }
+                        }
+                        Some(s)
+                    }
+                    Some(cst::ImportList::Hiding(items)) => {
+                        let hidden: std::collections::HashSet<String> = items
+                            .iter()
+                            .filter_map(|item| match item {
+                                cst::Import::Type(tn, _) => Some(
+                                    crate::interner::resolve(tn.value.symbol())
+                                        .unwrap_or_default(),
+                                ),
+                                _ => None,
+                            })
+                            .collect();
+                        let mut s: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for tname in exports.type_arities.keys() {
+                            if !hidden.contains(tname) {
+                                s.insert(tname.clone());
+                            }
+                        }
+                        Some(s)
+                    }
+                };
             for (tname, arity) in &exports.type_arities {
+                if let Some(scope) = &in_scope {
+                    if !scope.contains(tname) {
+                        continue;
+                    }
+                }
                 let sym = crate::interner::intern(tname);
                 // Skip if (a) this is a local alias name or (b) it's
                 // an alias on the imported side. We can't tell aliases
