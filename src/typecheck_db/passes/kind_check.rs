@@ -518,6 +518,10 @@ fn build_class_arity_env(
         std::collections::HashSet::new();
 
     for imp in &module.imports {
+        // `import M as Q` exposes classes only under `Q.Cls`.
+        if imp.qualified.is_some() {
+            continue;
+        }
         let name = imp
             .module
             .parts
@@ -526,7 +530,50 @@ fn build_class_arity_env(
             .collect::<Vec<_>>()
             .join(".");
         if let Some(exports) = registry.get(&name) {
+            // Only classes that the import actually brings into
+            // unqualified scope (open import, or explicitly listed
+            // `class Cls`, or NOT listed in a hiding list).
+            let in_scope: Option<std::collections::HashSet<String>> =
+                match &imp.imports {
+                    None => None,
+                    Some(cst::ImportList::Explicit(items)) => {
+                        let mut s: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for item in items {
+                            if let cst::Import::Class(cn) = item {
+                                s.insert(crate::interner::resolve(cn.value.symbol())
+                                    .unwrap_or_default());
+                            }
+                        }
+                        Some(s)
+                    }
+                    Some(cst::ImportList::Hiding(items)) => {
+                        let hidden: std::collections::HashSet<String> = items
+                            .iter()
+                            .filter_map(|item| match item {
+                                cst::Import::Class(cn) => Some(
+                                    crate::interner::resolve(cn.value.symbol())
+                                        .unwrap_or_default(),
+                                ),
+                                _ => None,
+                            })
+                            .collect();
+                        let mut s: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for cname in exports.classes.keys() {
+                            if !hidden.contains(cname) {
+                                s.insert(cname.clone());
+                            }
+                        }
+                        Some(s)
+                    }
+                };
             for (cname, info) in &exports.classes {
+                if let Some(scope) = &in_scope {
+                    if !scope.contains(cname) {
+                        continue;
+                    }
+                }
                 let sym = crate::interner::intern(cname);
                 let arity = info.type_vars.len();
                 if let Some(&existing) = env.get(&sym) {
