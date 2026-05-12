@@ -10622,15 +10622,27 @@ fn binder_is_irrefutable(
         cst::Binder::Literal { .. } => false,
         cst::Binder::Constructor { name, args, .. } => {
             let qi = name.to_qi();
-            // Local single-ctor types: irrefutable. Multi-ctor or
-            // unknown (imported / undeclared): refutable.
-            let solo = qi.module.is_none()
-                && ctor_sibling_count.get(&qi.name).copied() == Some(1);
-            if !solo {
-                return false;
+            // Locally known: irrefutable iff sole ctor of its
+            // parent. Unknown ctors come from imported modules
+            // (the validator can't see their sibling count) —
+            // treat them as POTENTIALLY irrefutable. This errs
+            // toward false negatives on a Multi-ctor imported
+            // type (we miss a non-exhaustive guard) rather than
+            // false positives on a single-ctor imported type
+            // (e.g. `Tuple` in
+            // `Data.Sparse.Polynomial::degreeAccordingToFirstVariable
+            // | Tuple i _ <- dominantMonom p = i`). The runtime
+            // exhaustiveness check picks up the false-negative
+            // case correctly.
+            match ctor_sibling_count.get(&qi.name).copied() {
+                Some(1) => args
+                    .iter()
+                    .all(|a| binder_is_irrefutable(a, ctor_sibling_count)),
+                Some(_) => false,
+                None => args
+                    .iter()
+                    .all(|a| binder_is_irrefutable(a, ctor_sibling_count)),
             }
-            args.iter()
-                .all(|a| binder_is_irrefutable(a, ctor_sibling_count))
         }
         cst::Binder::Op { .. } | cst::Binder::Array { .. } => false,
     }
