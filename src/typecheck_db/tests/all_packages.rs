@@ -424,6 +424,12 @@ fn repro_control_parallel() {
 }
 
 #[test]
+#[ignore = "diagnostic — TypeEquals InstanceHeadMismatch"]
+fn repro_data_functor_nested() {
+    check_single_package_module("Data.Functor.Nested").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
 #[ignore = "diagnostic — point-free rank-N (sub-cluster A)"]
 fn repro_fft_nth() {
     check_single_package_module("Data.Complex.FFT").unwrap_or_else(|m| panic!("{m}"));

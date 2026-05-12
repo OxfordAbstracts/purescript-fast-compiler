@@ -8,6 +8,49 @@ use crate::typecheck_db::driver_multi::MultiModuleError;
 use crate::typecheck_db::passes::imports::ImportErrorKind;
 
 #[test]
+#[ignore = "diagnostic — alias-name vs locally-imported newtype collision"]
+fn diag_state_alias_collision() {
+    // Marionette.Controllers.Monadic imports `Marionette.Types.State`
+    // (a newtype) and `Control.Monad.State (class MonadState)` (NOT
+    // the alias). The body's `state` value has the imported newtype
+    // type. Our typechecker has occasionally conflated this with
+    // the `Control.Monad.State` alias `type State s = StateT s
+    // Identity`, producing `State` vs `StateT _` mismatches.
+    assert_typechecks_multi(&[
+        "\
+module StateT where
+
+foreign import data StateT :: Type -> (Type -> Type) -> Type -> Type
+foreign import data Identity :: Type -> Type
+
+type State s = StateT s Identity
+
+class MonadState s m where
+  getState :: m s
+",
+        "\
+module MyState where
+
+newtype State s m = State (s -> m s)
+",
+        "\
+module Main where
+
+import StateT (class MonadState)
+import MyState (State)
+
+foreign import data Aff :: Type -> Type
+
+useState :: forall sta. State sta Aff -> Aff Unit
+useState _ = pureAff
+
+foreign import pureAff :: forall a. Aff a
+data Unit = Unit
+",
+    ]);
+}
+
+#[test]
 #[ignore = "diagnostic — Eq instance body calls show + == on String"]
 fn diag_eq_instance_body_show_eq() {
     // Reproducer for Node.FS.Constants::eqFileFlags's
