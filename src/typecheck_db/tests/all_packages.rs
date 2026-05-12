@@ -418,6 +418,12 @@ fn repro_webb_parent_wrap() {
 }
 
 #[test]
+#[ignore = "diagnostic — Parallel SolverDepthExceeded"]
+fn repro_control_parallel() {
+    check_single_package_module("Control.Parallel").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
 #[ignore = "diagnostic — point-free rank-N (sub-cluster A)"]
 fn repro_fft_nth() {
     check_single_package_module("Data.Complex.FFT").unwrap_or_else(|m| panic!("{m}"));

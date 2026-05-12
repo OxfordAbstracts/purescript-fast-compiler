@@ -278,14 +278,36 @@ pub fn solve_one(
         }
         _ => std::collections::HashSet::new(),
     };
+    // For each fundep, at least one determiner must be concrete
+    // (non-bare-unif) for that fundep to fire. If EVERY fundep has
+    // only bare-unif determiners, no fundep can drive matching and
+    // the constraint must defer — otherwise trial-unifying each
+    // candidate instance speculatively binds the unifs, which for
+    // multi-instance classes with bidirectional fundeps (e.g.
+    // `class Parallel f m | m -> f, f -> m`) explodes into a
+    // self-referential `Parallel f' m'` sub-constraint chain that
+    // burns through the solver's depth budget.
+    let all_fundeps_blocked = match class_info {
+        Some(info) if !info.fundeps.is_empty() => info.fundeps.iter().all(|fd| {
+            fd.determiners.iter().all(|i| {
+                pending
+                    .constraint
+                    .args
+                    .get(*i)
+                    .map_or(true, |a| is_bare_unif(a, state))
+            })
+        }),
+        _ => false,
+    };
     let needs_defer = match class_info {
         Some(info) if !info.fundeps.is_empty() => {
-            pending
-                .constraint
-                .args
-                .iter()
-                .enumerate()
-                .any(|(i, a)| !improvable.contains(&i) && is_bare_unif(a, state))
+            all_fundeps_blocked
+                || pending
+                    .constraint
+                    .args
+                    .iter()
+                    .enumerate()
+                    .any(|(i, a)| !improvable.contains(&i) && is_bare_unif(a, state))
         }
         _ => pending.constraint.args.iter().any(|a| is_bare_unif(a, state)),
     };
