@@ -5208,6 +5208,26 @@ fn detect_value_decl_sig_alias_mismatch(
     if sig_of.is_empty() {
         return;
     }
+    // Collect local zero-parameter type aliases (`type Path =
+    // String`). The alpha-eq below uses these to canonicalise
+    // each side before comparing, so a sig `… -> String` paired
+    // with a body `unwrap :: … -> Path` (where Path = String)
+    // isn't false-flagged as a mismatch.
+    let mut zero_param_aliases: HashMap<Symbol, Symbol> = HashMap::new();
+    for d in decls {
+        if let cst::Decl::TypeAlias { name, type_vars, ty, .. } = d {
+            if !type_vars.is_empty() {
+                continue;
+            }
+            let body = peel_parens(ty);
+            if let cst::TypeExpr::Constructor { name: target, .. } = body {
+                let q = target.to_qi();
+                if q.module.is_none() {
+                    zero_param_aliases.insert(name.value.symbol(), q.name);
+                }
+            }
+        }
+    }
     for d in decls {
         let cst::Decl::Value { name, binders, guarded, .. } = d else {
             continue;
@@ -5249,7 +5269,7 @@ fn detect_value_decl_sig_alias_mismatch(
         {
             continue;
         }
-        if !type_expr_alpha_eq(my_sig, other_sig) {
+        if !type_expr_alpha_eq_modulo_aliases(my_sig, other_sig, &zero_param_aliases) {
             errors.push(ValidationError {
                 span: name.span,
                 kind: ValidationErrorKind::ValueDeclSigAliasMismatch(resolve(n)),
@@ -5923,6 +5943,71 @@ fn type_expr_has_row_or_record(te: &cst::TypeExpr) -> bool {
 /// Doesn't handle alpha-renaming under foralls — adequate for the
 /// current `InstanceSigs` fixtures whose member sigs are
 /// monomorphic post-substitution.
+/// Alpha-eq with zero-parameter alias resolution: a `Constructor`
+/// reference X is treated as Y when the module declares `type X
+/// = Y`. Used by `detect_value_decl_sig_alias_mismatch` so a
+/// sig of `… -> String` paired with a body `f :: … -> Path`
+/// (where Path is a local `type Path = String` alias) doesn't
+/// false-flag as a mismatch.
+fn type_expr_alpha_eq_modulo_aliases(
+    a: &cst::TypeExpr,
+    b: &cst::TypeExpr,
+    aliases: &HashMap<Symbol, Symbol>,
+) -> bool {
+    fn resolve_ctor(name: Symbol, aliases: &HashMap<Symbol, Symbol>) -> Symbol {
+        let mut cur = name;
+        let mut seen: std::collections::HashSet<Symbol> =
+            std::collections::HashSet::new();
+        while let Some(next) = aliases.get(&cur) {
+            if !seen.insert(cur) {
+                break;
+            }
+            cur = *next;
+        }
+        cur
+    }
+    let a = peel_parens(a);
+    let b = peel_parens(b);
+    match (a, b) {
+        (
+            cst::TypeExpr::Var { name: n1, .. },
+            cst::TypeExpr::Var { name: n2, .. },
+        ) => n1.value.symbol() == n2.value.symbol(),
+        (
+            cst::TypeExpr::Constructor { name: n1, .. },
+            cst::TypeExpr::Constructor { name: n2, .. },
+        ) => {
+            let q1 = n1.to_qi();
+            let q2 = n2.to_qi();
+            resolve_ctor(q1.name, aliases) == resolve_ctor(q2.name, aliases)
+        }
+        (
+            cst::TypeExpr::App { constructor: c1, arg: a1, .. },
+            cst::TypeExpr::App { constructor: c2, arg: a2, .. },
+        ) => {
+            type_expr_alpha_eq_modulo_aliases(c1, c2, aliases)
+                && type_expr_alpha_eq_modulo_aliases(a1, a2, aliases)
+        }
+        (
+            cst::TypeExpr::Function { from: f1, to: t1, .. },
+            cst::TypeExpr::Function { from: f2, to: t2, .. },
+        ) => {
+            type_expr_alpha_eq_modulo_aliases(f1, f2, aliases)
+                && type_expr_alpha_eq_modulo_aliases(t1, t2, aliases)
+        }
+        (
+            cst::TypeExpr::StringLiteral { value: v1, .. },
+            cst::TypeExpr::StringLiteral { value: v2, .. },
+        ) => v1 == v2,
+        (
+            cst::TypeExpr::IntLiteral { value: v1, .. },
+            cst::TypeExpr::IntLiteral { value: v2, .. },
+        ) => v1 == v2,
+        (cst::TypeExpr::Wildcard { .. }, cst::TypeExpr::Wildcard { .. }) => true,
+        _ => false,
+    }
+}
+
 fn type_expr_alpha_eq(a: &cst::TypeExpr, b: &cst::TypeExpr) -> bool {
     let a = peel_parens(a);
     let b = peel_parens(b);
