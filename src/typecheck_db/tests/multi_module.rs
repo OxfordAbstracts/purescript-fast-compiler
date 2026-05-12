@@ -8,6 +8,199 @@ use crate::typecheck_db::driver_multi::MultiModuleError;
 use crate::typecheck_db::passes::imports::ImportErrorKind;
 
 #[test]
+#[ignore = "diagnostic — Eq instance body calls show + == on String"]
+fn diag_eq_instance_body_show_eq() {
+    // Reproducer for Node.FS.Constants::eqFileFlags's
+    // `eq x y = show x == show y` pattern. Inside an `Eq T`
+    // instance method, references to `==` (which desugars to the
+    // class method `eq`) should resolve to the polymorphic class
+    // method, not be shadowed by the instance method's own
+    // specialised scheme.
+    assert_typechecks_multi(&[
+        "\
+module ShowEq where
+
+class Show a where
+  show :: a -> String
+
+class Eq a where
+  eq :: a -> a -> Boolean
+
+infix 4 eq as ==
+
+foreign import data String :: Type
+data Boolean = TT | FF
+
+instance Eq String where
+  eq = eqStringImpl
+
+foreign import eqStringImpl :: String -> String -> Boolean
+
+instance Show String where
+  show s = s
+",
+        "\
+module Main where
+
+import ShowEq (class Eq, class Show, eq, show, (==), String, Boolean)
+
+data Color = Red | Green | Blue
+
+instance Show Color where
+  show Red = \"Red\"
+  show Green = \"Green\"
+  show Blue = \"Blue\"
+
+instance Eq Color where
+  eq x y = show x == show y
+",
+    ]);
+}
+
+#[test]
+#[ignore = "diagnostic — MonadThrow Error Effect re-import chain"]
+fn diag_monad_throw_effect_re_imported() {
+    // Closer mirror of Webb.Monad.Prelude::expectM: `throwString`
+    // is in a separate module that imports its `Error` from one
+    // module and its `MonadThrow` class + instance from another.
+    // The consumer (Main) imports `throwString` AND `Effect` /
+    // `liftEffect`; the use site forces `m := Effect`, requiring
+    // `MonadThrow Error Effect` to discharge through both chains.
+    assert_typechecks_multi(&[
+        "\
+module Exception where
+
+foreign import data Error :: Type
+foreign import error :: String -> Error
+",
+        "\
+module Eff where
+
+foreign import data Effect :: Type -> Type
+",
+        "\
+module MonadErr where
+
+import Exception (Error)
+import Eff (Effect)
+
+class MonadThrow e m where
+  throwError :: forall a. e -> m a
+
+instance monadThrowEffect :: MonadThrow Error Effect where
+  throwError = throwErrorImpl
+
+foreign import throwErrorImpl :: forall a. Error -> Effect a
+",
+        "\
+module Helpers where
+
+import Exception (Error, error)
+import MonadErr (class MonadThrow, throwError)
+
+throwString :: forall a m. MonadThrow Error m => String -> m a
+throwString s = throwError (error s)
+",
+        "\
+module Main where
+
+import Eff (Effect)
+import Helpers (throwString)
+
+doThrow :: Effect Unit
+doThrow = throwString \"oh no\"
+
+data Unit = Unit
+",
+    ]);
+}
+
+#[test]
+#[ignore = "diagnostic — MonadThrow Error Effect discharge"]
+fn diag_monad_throw_effect_discharges() {
+    // Reproduces the MonadThrow NoInstanceFound cluster (19
+    // modules) — `expectM`-style helpers that call
+    // `liftEffect (throwError err)` against a `MonadThrow Error
+    // Effect` instance defined in a sibling module.
+    assert_typechecks_multi(&[
+        "\
+module Err where
+
+foreign import data Error :: Type
+
+class MonadThrow e m where
+  throwError :: forall a. e -> m a
+
+foreign import data Effect :: Type -> Type
+
+instance monadThrowEffect :: MonadThrow Error Effect where
+  throwError = throwErrorImpl
+
+foreign import throwErrorImpl :: forall a. Error -> Effect a
+
+foreign import error :: String -> Error
+
+throwString :: forall a m. MonadThrow Error m => String -> m a
+throwString s = throwError (error s)
+",
+        "\
+module Main where
+
+import Err (Effect, Error, MonadThrow, throwString)
+
+doThrow :: Effect Unit
+doThrow = throwString \"oh no\"
+
+data Unit = Unit
+",
+    ]);
+}
+
+#[test]
+fn compose_polymorphic_record_via_imported_class() {
+    // Reproducer for the Next.Router compose-direction bug: the
+    // failing usage `event "x" <<< mkEffectFn1` against a sig
+    // `forall r. ({ cancelled :: Boolean | r } -> Effect Unit) ->
+    // Effect (Effect Unit)`.
+    assert_typechecks_multi(&[
+        "\
+module Semi where
+
+class Semigroupoid a where
+  compose :: forall b c d. a c d -> a b c -> a b d
+
+instance semigroupoidFn :: Semigroupoid (->) where
+  compose f g x = f (g x)
+
+infixr 9 compose as <<<
+",
+        "\
+module Eff where
+
+foreign import data Effect :: Type -> Type
+foreign import data EffectFn1 :: Type -> Type -> Type
+
+foreign import mkEffectFn1 :: forall a r. (a -> Effect r) -> EffectFn1 a r
+",
+        "\
+module Main where
+
+import Semi (compose, (<<<))
+import Eff (Effect, EffectFn1, mkEffectFn1)
+
+data Unit = Unit
+data Boolean = TT | FF
+
+foreign import event :: forall a. String -> a -> Effect (Effect Unit)
+
+routeChangeError
+  :: forall r. ({ cancelled :: Boolean | r } -> Effect Unit) -> Effect (Effect Unit)
+routeChangeError = event \"rce\" <<< mkEffectFn1
+",
+    ]);
+}
+
+#[test]
 fn imported_alias_in_constrained_higher_order_sig() {
     // Mirrors `mapAccumL :: Traversable f => (s -> a -> Accum s b)
     // -> s -> f a -> Accum s (f b)` — a cross-module alias used

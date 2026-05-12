@@ -78,6 +78,15 @@ fn where_clause_bindings() {
 }
 
 #[test]
+fn compose_polymorphic_record() {
+    // Reproducer for the `<<<` direction confusion in
+    // `Next.Router.routeChangeError`. When the LHS has a
+    // polymorphic record-tail signature, the existing typechecker
+    // tried to unify g's input with g's output. See commit msg.
+    assert_typechecks(include_str!("fixtures/single_succeeds/compose_polymorphic_record.purs"));
+}
+
+#[test]
 fn comparing_style_higher_order_class_method() {
     // Mirrors `Data.Ord.comparing` — a polymorphic helper that
     // applies a user-supplied function `f :: a -> b` to two

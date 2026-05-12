@@ -26,6 +26,14 @@ fn forall_head_matches(body: &Type, other: &Type) -> bool {
         loop {
             match cur {
                 Type::App(f, _) => cur = f,
+                // Peel outer `Constrained` so a body shaped
+                // `Constrained([C a], Fun(...))` (e.g. the
+                // `Webb.AffList.Data.Node.Parent::wrap` shape
+                // `forall z. Parent z => z -> r`) is treated as
+                // `Fun`-headed. The constraint becomes a pending
+                // obligation post-instantiation; the unify still
+                // proceeds on the Fun spine.
+                Type::Constrained(_, inner) => cur = inner,
                 _ => return Some(cur),
             }
         }
@@ -52,6 +60,31 @@ fn forall_head_matches(body: &Type, other: &Type) -> bool {
         {
             true
         }
+        // Structurally compatible Fun heads. When the Forall body
+        // shares the outer scaffolding of `other` (matching
+        // `Con`s, matching `Skolem`s, recurse through `Fun`/`App`)
+        // and the body's `Var` positions correspond to the
+        // forall-quantified slots, instantiation is safe: each
+        // Var becomes a fresh unif and the subsequent unify
+        // refines it (or fails on a real mismatch).
+        //
+        // Catches the Codensity::apply / Ran::lift' / Webb
+        // ::wrap / Routing.Duplex.Generic::sum / Data.Lens.*
+        // family where the LHS arrives with concrete `Con` heads
+        // (`Forget`, RouteDuplex`, etc.) and the original
+        // `leaves_all_unif` gate rejected as `Mismatch`.
+        //
+        // Genuine rank-2 violations (`Int -> Int` against
+        // `forall a. a -> a`) are NOT silently accepted: this
+        // rule still instantiates the forall to `?u_a -> ?u_a`,
+        // and the follow-up unify will bind `?u_a := Int` and
+        // then reject `Int ~ String` (or `Int ~ Sk_x` in a
+        // skolem-context) as `Mismatch` / `SkolemEscape`.
+        (Some(Type::Fun(_, _)), Some(Type::Fun(_, _)))
+            if structurally_compatible(body, other) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -69,6 +102,41 @@ fn leaves_all_unif(ty: &Type) -> bool {
     }
 }
 
+/// True when the Forall `body` and `other` share enough outer
+/// scaffolding that instantiating the Forall is safe. `Var`s on
+/// the body side (forall-quantified slots) match anything;
+/// `Unif`s on either side match anything; matching `Con`/`Skolem`
+/// at the same position must agree; `Fun`/`App` recurse.
+///
+/// Used as a secondary gate for the rank-2 instantiation rule
+/// alongside `leaves_all_unif`. The follow-up unify still
+/// validates concrete mismatches after instantiation — this rule
+/// is purely about deciding whether to TRY instantiation.
+fn structurally_compatible(body: &Type, other: &Type) -> bool {
+    match (body, other) {
+        // Body-side inner `Forall` / `Constrained` will be peeled by
+        // a subsequent unify iteration after we instantiate the
+        // current outer Forall. Treat them as transparent here so a
+        // rank-N body like `forall a. f a -> forall b. (a -> b) -> g
+        // b` (the `Codensity::lift` shape — Ran's type alias unfolds
+        // to nested `forall` under a `Fun`) matches an instantiated
+        // `f ?u_a -> (?u_a -> b) -> g b` on the other side.
+        (Type::Forall(_, inner), _) => structurally_compatible(inner, other),
+        (Type::Constrained(_, inner), _) => structurally_compatible(inner, other),
+        (Type::Var(_), _) => true,
+        (Type::Unif(_), _) | (_, Type::Unif(_)) => true,
+        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::Skolem(a), Type::Skolem(b)) => a == b,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            structurally_compatible(f1, f2) && structurally_compatible(a1, a2)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            structurally_compatible(a1, a2) && structurally_compatible(b1, b2)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum UnifyError {
     #[error("cannot unify {0} with {1}")]
@@ -77,6 +145,13 @@ pub enum UnifyError {
     Infinite { var: u32, ty: Type },
     #[error("skolem !s{skolem} escapes its scope via ?{var}")]
     SkolemEscape { var: u32, skolem: u32, ty: Type },
+    /// Per-decl deadline expired during typechecking. Carries the
+    /// budget in ms so the diagnostic shows what was exceeded.
+    /// Configured via the `TYPECHECK_DECL_TIMEOUT_MS` env var (set
+    /// to `0` to disable). `LocatedUnifyError::decl_name`
+    /// /`decl_span` carry the attribution.
+    #[error("typecheck exceeded {budget_ms}ms decl deadline")]
+    Timeout { budget_ms: u64 },
 }
 
 /// `UnifyError` augmented with source-location info. Constructed at
@@ -199,6 +274,17 @@ pub struct UnifyState {
     /// Set at the SCC loop entry alongside `set_current_decl` and
     /// read by `locate` for `LocatedUnifyError::decl_span`.
     current_decl_span: Option<Span>,
+    /// Per-decl typecheck deadline. `unify_inner` polls this on
+    /// entry and bails with `UnifyError::Timeout` when the deadline
+    /// is past, so a pathological decl (e.g. fundep-driven solver
+    /// loop, deeply nested alias expansion) can't stall the whole
+    /// SCC. Set per decl by `infer_value_scc_with_all`; `None`
+    /// disables the check entirely.
+    deadline: Option<std::time::Instant>,
+    /// Budget that produced the current `deadline`, in ms. Recorded
+    /// so the `Timeout` error variant can surface what was exceeded
+    /// rather than re-deriving from `Instant`.
+    deadline_budget_ms: u64,
 }
 
 impl UnifyState {
@@ -217,7 +303,43 @@ impl UnifyState {
             current_unify_span: None,
             current_expected_span: None,
             current_decl_span: None,
+            deadline: None,
+            deadline_budget_ms: 0,
         }
+    }
+
+    /// Arm the per-decl typecheck deadline. Callers pass the
+    /// budget in ms together with the deadline `Instant` so the
+    /// `Timeout` error can report what was exceeded.
+    pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>, budget_ms: u64) {
+        self.deadline = deadline;
+        self.deadline_budget_ms = budget_ms;
+    }
+
+    /// Drop the deadline (re-enable unbounded unification). Used
+    /// on the error paths in `infer_value_scc_with_all` so a
+    /// stale deadline doesn't leak into the next SCC.
+    pub fn clear_deadline(&mut self) {
+        self.deadline = None;
+        self.deadline_budget_ms = 0;
+    }
+
+    /// True iff a deadline is armed and the current instant is past
+    /// it. Cheap (one `Instant::now()` plus a compare) — `unify_inner`
+    /// polls this on entry, and the solver / coercible-check
+    /// fixed-point loops poll it at the top of each iteration.
+    pub fn deadline_exceeded(&self) -> bool {
+        match self.deadline {
+            Some(d) => std::time::Instant::now() >= d,
+            None => false,
+        }
+    }
+
+    /// Budget that armed the current deadline, in ms. Read at
+    /// timeout-error construction so the variant carries the
+    /// exceeded budget.
+    pub fn deadline_budget_ms(&self) -> u64 {
+        self.deadline_budget_ms
     }
 
     /// Allocate a fresh skolem AND record its source-level name.
@@ -656,6 +778,18 @@ impl UnifyState {
     }
 
     fn unify_inner(&mut self, a: &Type, b: &Type) -> Result<(), UnifyError> {
+        // Per-decl deadline check. `infer_value_scc_with_all` arms
+        // the deadline before each decl's body inference (and once
+        // more for the post-body SCC phases); a pathological
+        // recursion / fundep-driven solver loop will go through
+        // `unify` densely enough that this single `Instant::now()`
+        // compare per call reliably surfaces the timeout. The
+        // helper bails fast when no deadline is armed.
+        if self.deadline_exceeded() {
+            return Err(UnifyError::Timeout {
+                budget_ms: self.deadline_budget_ms,
+            });
+        }
         match (a, b) {
             (Type::Unif(i), Type::Unif(j)) if i == j => Ok(()),
             (Type::Unif(id), other) | (other, Type::Unif(id)) => self.bind_var(*id, other),
@@ -763,14 +897,35 @@ impl UnifyState {
                 }
                 self.unify(b1, b2)
             }
-            // A `Constrained(cs, body)` against a non-constrained
-            // type: only compatible if `cs` is empty (no
-            // obligations left). Otherwise leave as Mismatch so
-            // the caller sees the stuck constraint.
+            // `Constrained(cs, body)` against a non-constrained
+            // type: peel `cs` as pending obligations and continue
+            // unifying `body` with `other`. This is the
+            // subsumption rule for a "polymorphic" type with
+            // dictionary args: the recipient is responsible for
+            // discharging the constraints, and the body must
+            // unify with the expected shape. Arises after
+            // `forall_head_matches` instantiates a `forall z.
+            // Parent z => z -> r`-shaped binder type and the
+            // unifier then sees `Constrained([Parent ?u_z],
+            // Fun(?u_z, ?u_r))` against the expected `Fun(...)`.
+            // The constraints get recorded with the current
+            // expression's span; the solver picks them up after
+            // body inference.
             (Type::Constrained(cs, body), other)
-            | (other, Type::Constrained(cs, body))
-                if cs.is_empty() =>
-            {
+            | (other, Type::Constrained(cs, body)) => {
+                use crate::typecheck_db::passes::constraints::{
+                    ConstraintOrigin, PendingConstraint,
+                };
+                let span = self.current_unify_span.unwrap_or(Span { start: 0, end: 0 });
+                for c in cs {
+                    self.record_pending_constraint(PendingConstraint {
+                        decl_name: None,
+                        span,
+                        constraint: c.clone(),
+                        origin: ConstraintOrigin::Signature,
+                        givens: Vec::new(),
+                    });
+                }
                 self.unify(body, other)
             }
             // Forall-vs-Forall: accept the simplest case where
@@ -874,24 +1029,31 @@ impl UnifyState {
         if occurs_in(id, other) {
             return Err(UnifyError::Infinite { var: id, ty: other.clone() });
         }
-        // Escape check: `id`'s skolem boundary is the skolem
-        // counter value at its allocation time. `other` may only
-        // reference skolems introduced BEFORE that boundary. A
-        // skolem with id >= boundary was introduced AFTER the unif
-        // existed, so binding would leak the skolem out of its
-        // scope — exactly the rank-2 violation pattern.
-        let boundary = self
-            .unif_skolem_levels
-            .get(id as usize)
-            .copied()
-            .unwrap_or(u32::MAX);
+        // Skolem-level reconciliation. `id`'s skolem boundary is the
+        // skolem counter value at its allocation time; `other` may
+        // reference skolems with id >= that boundary when this is a
+        // rank-2 subsumption: an outer unif (e.g. `mutate`'s `b`)
+        // gets bound to a type containing a skolem from the
+        // arg-side `forall` (e.g. `r` in `forall r. STObject r a ->
+        // ST r b`). The reference compiler (PureScript) accepts
+        // this bind during unification and defers the escape
+        // verdict to a separate `skolemEscapeCheck` over the
+        // typed AST (see `Language.PureScript.TypeChecker.Skolems`).
+        //
+        // We promote `id`'s level to admit the skolem and rely on
+        // a downstream pass (decl-level free-skolem walk in
+        // `infer_value_scc_with_all`) to flag genuine escapes.
+        // Without this, valid rank-2 patterns like
+        // `mutate (OST.poke k v)` and `ST.run (STRef.new 0)` are
+        // rejected here even though the would-be-captured unifs
+        // are inert (never reach the outer scheme).
         if let Some(skolem) = max_skolem_in(other) {
-            if skolem >= boundary {
-                return Err(UnifyError::SkolemEscape {
-                    var: id,
-                    skolem,
-                    ty: other.clone(),
-                });
+            let slot = id as usize;
+            if slot < self.unif_skolem_levels.len() {
+                let cur = self.unif_skolem_levels[slot];
+                if skolem >= cur {
+                    self.unif_skolem_levels[slot] = skolem.saturating_add(1);
+                }
             }
         }
         self.assign(id, other.clone());
@@ -903,6 +1065,16 @@ impl UnifyState {
         let mut out = HashSet::new();
         collect_free(&self.zonk(ty), &mut out);
         out
+    }
+
+    /// True if any `Type::Skolem` appears anywhere in `ty`. Used for
+    /// the post-hoc escape check at decl-finalize time: a skolem
+    /// surviving in a generalized scheme means it leaked out of its
+    /// `forall` introduction site (since generalize can't quantify
+    /// rigid skolems — only unif vars). Mirrors the reference
+    /// compiler's `skolemEscapeCheck` over typed values.
+    pub fn contains_free_skolem(&self, ty: &Type) -> Option<u32> {
+        max_skolem_in(&self.zonk(ty))
     }
 }
 
@@ -1260,6 +1432,37 @@ mod tests {
     fn unify_different_con_fails() {
         let mut s = UnifyState::new();
         assert!(s.unify(&int(), &bool_ty()).is_err());
+    }
+
+    #[test]
+    fn expired_deadline_returns_timeout() {
+        let mut s = UnifyState::new();
+        // Arm with a deadline already in the past.
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        s.set_deadline(Some(past), 1000);
+        assert!(s.deadline_exceeded());
+        match s.unify(&int(), &int()) {
+            Err(UnifyError::Timeout { budget_ms }) => assert_eq!(budget_ms, 1000),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn future_deadline_does_not_fire() {
+        let mut s = UnifyState::new();
+        let future =
+            std::time::Instant::now() + std::time::Duration::from_secs(60);
+        s.set_deadline(Some(future), 60_000);
+        assert!(!s.deadline_exceeded());
+        s.unify(&int(), &int()).unwrap();
+    }
+
+    #[test]
+    fn no_deadline_armed_disables_check() {
+        let mut s = UnifyState::new();
+        s.set_deadline(None, 0);
+        assert!(!s.deadline_exceeded());
+        s.unify(&int(), &int()).unwrap();
     }
 
     #[test]

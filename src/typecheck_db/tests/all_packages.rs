@@ -51,8 +51,13 @@ fn check_single_package_module(target: &str) -> Result<(), String> {
             }
             if let Some(ce) = r.constraint_errors.first() {
                 return Err(format!(
-                    "{}: constraint {:?}: {}",
-                    r.name, ce.kind, ce.constraint.class.name,
+                    "{}: constraint {:?}: {} (args={:?}, span={:?}, decl_span={:?})",
+                    r.name,
+                    ce.kind,
+                    ce.constraint.class.name,
+                    ce.constraint.args,
+                    ce.span,
+                    ce.decl_span,
                 ));
             }
             if let Some(ke) = r.kind_errors.first() {
@@ -331,6 +336,30 @@ fn repro_deku_dom_perf() {
 }
 
 #[test]
+#[ignore = "diagnostic — compose direction"]
+fn repro_next_router() {
+    check_single_package_module("Next.Router").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — rank2 ST cluster"]
+fn repro_foreign_object() {
+    check_single_package_module("Foreign.Object").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — rank2 ST cluster"]
+fn repro_jelly_render() {
+    check_single_package_module("Jelly.Render").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — rank2 ST cluster"]
+fn repro_routing_duplex_generic() {
+    check_single_package_module("Routing.Duplex.Generic").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
 fn repro_hylograph_shape_arc() {
     let inner = check_single_package_module("Hylograph.Shape.Arc");
     if let Err(msg) = inner {
@@ -367,6 +396,142 @@ fn repro_hylograph_d3_simulation() {
     };
     if let Err(msg) = inner {
         panic!("repro_hylograph_d3_simulation: {msg}");
+    }
+}
+
+#[test]
+#[ignore = "diagnostic — MonadThrow Error Effect cluster"]
+fn repro_webb_monad_prelude() {
+    check_single_package_module("Webb.Monad.Prelude").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — Eq String solver issue"]
+fn repro_node_fs_constants() {
+    check_single_package_module("Node.FS.Constants").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — rank-2 forall Parent z => z -> r"]
+fn repro_webb_parent_wrap() {
+    check_single_package_module("Webb.AffList.Data.Node.Parent").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — point-free rank-N (sub-cluster A)"]
+fn repro_fft_nth() {
+    check_single_package_module("Data.Complex.FFT").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
+#[ignore = "diagnostic — Doc Infinite (sub-cluster B)"]
+fn repro_dodo_appendspacebreak() {
+    check_single_package_module("Dodo").unwrap_or_else(|m| panic!("{m}"));
+}
+
+/// Bisect: import the real Prelude/etc. but only define `nth`.
+#[test]
+#[ignore = "diagnostic — bisect FFT nth"]
+fn repro_synth_fft_nth_minimal() {
+    use crate::typecheck_db::driver_multi::{check_many_modules, ModuleInput};
+    use crate::typecheck_db::tests::harness::{module_name, parse_source};
+    use crate::typecheck_db::test_support::{
+        gather_package_src_sources, package_modules_by_name, transitive_closure_of,
+    };
+    let main = r#"module Test where
+
+import Prelude
+import Data.Array ((!!)) as Array
+import Data.Maybe (fromJust)
+import Partial.Unsafe (unsafePartial)
+
+nth :: forall a. Array a -> Int -> a
+nth xs i =  unsafePartial fromJust $ xs Array.!! i
+
+infixl 6 nth as !!
+"#;
+    // Base closure for Test — pull in what `import` mentions.
+    let pkgs = package_modules_by_name();
+    let mut closure: Vec<ModuleInput> = Vec::new();
+    for target in &["Prelude", "Data.Array", "Data.Maybe", "Partial.Unsafe"] {
+        for m in transitive_closure_of(target, &pkgs) {
+            if !closure.iter().any(|c| c.name == m.name) {
+                closure.push(m);
+            }
+        }
+    }
+    let m = parse_source(main);
+    closure.push(ModuleInput::new(module_name(&m), main, m));
+    let report = check_many_modules(closure);
+    if let Some(err) = report.errors.first() {
+        panic!("driver: {err:?}");
+    }
+    for r in &report.results {
+        if r.name == "Test" {
+            if let Some(err) = &r.inference_error {
+                panic!("inference error in Test: {err:?}");
+            }
+        }
+    }
+}
+
+/// Tiny synthetic for sub-cluster A. Mimics
+/// `unsafePartial fromJust $ xs !! i` from FFT — the rank-2
+/// `unsafePartial :: (Partial => a) -> a` applied to `fromJust ::
+/// Partial => Maybe b -> b` should NOT trigger an `?N ~ Maybe ?N`
+/// occurs check.
+#[test]
+#[ignore = "diagnostic — synthetic for unsafePartial fromJust"]
+fn repro_synth_unsafe_partial_fromjust() {
+    use crate::typecheck_db::driver_multi::{check_many_modules, ModuleInput};
+    use crate::typecheck_db::tests::harness::{module_name, parse_source};
+    let other = r#"module Other where
+
+data Maybe a = Nothing | Just a
+
+foreign import fromJust :: forall a. Partial => Maybe a -> a
+foreign import _unsafePartial :: forall a b. a -> b
+
+unsafePartial :: forall a. (Partial => a) -> a
+unsafePartial = _unsafePartial
+
+foreign import index :: forall a. Array a -> Int -> Maybe a
+
+apply :: forall a b. (a -> b) -> a -> b
+apply f x = f x
+
+applyOp :: forall a b. (a -> b) -> a -> b
+applyOp = apply
+
+indexOp :: forall a. Array a -> Int -> Maybe a
+indexOp = index
+
+infixr 0 applyOp as $
+infixl 8 indexOp as !!
+"#;
+    let main = r#"module Test where
+
+import Other (unsafePartial, fromJust, ($))
+import Other ((!!)) as Arr
+
+nth :: forall a. Array a -> Int -> a
+nth xs i = unsafePartial fromJust $ xs Arr.!! i
+"#;
+    let mut parsed: Vec<ModuleInput> = Vec::new();
+    for src in &[other, main] {
+        let m = parse_source(src);
+        parsed.push(ModuleInput::new(module_name(&m), *src, m));
+    }
+    let report = check_many_modules(parsed);
+    if let Some(err) = report.errors.first() {
+        panic!("driver: {err:?}");
+    }
+    for r in &report.results {
+        if r.name == "Test" {
+            if let Some(err) = &r.inference_error {
+                panic!("inference error in Test: {err:?}");
+            }
+        }
     }
 }
 

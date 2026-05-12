@@ -28,6 +28,14 @@ use super::walk::fold_decl_exprs;
 
 pub fn desugar_decl(decl: crate::cst::Decl) -> crate::cst::Decl {
     let mut counter: u32 = 0;
+    // Pre-order: re-associate record-update applications so the
+    // postfix `{ … = … }` binds tighter than function application
+    // — `f x { a = 1 }` parses to `App(App(f, x), Record{is_update})`
+    // left-associatively, but the PureScript spec says it means
+    // `f (x { a = 1 })`. Re-associate before the section pass so a
+    // `Wildcard` in `x`'s position (`f _ { a = 1 }`) gets paired
+    // with the record-update instead of being lifted standalone.
+    let decl = reassociate_record_update_decl(decl);
     // Pre-order pass: lift record-accessor sections (`_.x.y`) at
     // the OUTERMOST `RecordAccess` of each chain. Post-order would
     // wrap the innermost access in a lambda first and leave the
@@ -35,6 +43,52 @@ pub fn desugar_decl(decl: crate::cst::Decl) -> crate::cst::Decl {
     let decl = lift_accessor_sections_decl(decl, &mut counter);
     // Post-order pass: the rest of the section shapes.
     fold_decl_exprs(decl, &mut |node| rewrite_node(node, &mut counter))
+}
+
+/// Re-associate `App(App(f, x), Record{is_update})` to
+/// `App(f, App(x, Record{is_update}))`. PureScript spec: postfix
+/// record-update binds tighter than function application. Applied
+/// pre-order so nested chains (`f x { a = 1 } { b = 2 }`) collapse
+/// iteratively on the way down.
+fn reassociate_record_update_decl(decl: crate::cst::Decl) -> crate::cst::Decl {
+    super::walk::fold_decl_exprs_preorder(decl, &mut |e| reassociate_record_update_expr(e))
+}
+
+fn reassociate_record_update_expr(e: Expr) -> Expr {
+    if let Expr::App { span: outer_span, func: outer_func, arg: outer_arg } = e {
+        let is_update_record = matches!(
+            outer_arg.as_ref(),
+            Expr::Record { fields, .. }
+                if !fields.is_empty() && fields.iter().all(|f| f.is_update)
+        );
+        if is_update_record {
+            if let Expr::App { func: inner_func, arg: inner_arg, .. } = *outer_func {
+                let inner_span = Span {
+                    start: span_of(&inner_arg).start,
+                    end: span_of(&outer_arg).end,
+                };
+                return Expr::App {
+                    span: outer_span,
+                    func: inner_func,
+                    arg: Box::new(Expr::App {
+                        span: inner_span,
+                        func: inner_arg,
+                        arg: outer_arg,
+                    }),
+                };
+            } else {
+                // Restore the App; can't move outer_func twice.
+                return Expr::App {
+                    span: outer_span,
+                    func: outer_func,
+                    arg: outer_arg,
+                };
+            }
+        }
+        Expr::App { span: outer_span, func: outer_func, arg: outer_arg }
+    } else {
+        e
+    }
 }
 
 fn lift_accessor_sections_decl(

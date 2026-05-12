@@ -277,6 +277,10 @@ fn infer_error_code(e: &InferError) -> String {
             // violation — fits the same bucket as `EscapedSkolem`
             // in the reference compiler.
             UnifyError::SkolemEscape { .. } => "EscapedSkolem".into(),
+            // Per-decl deadline expired. The reference compiler
+            // has no analogue; surface as a distinct bucket so
+            // the all_packages summary can count timeouts.
+            UnifyError::Timeout { .. } => "Timeout".into(),
         },
         InferError::UnboundVar(_) => "UnboundVar".into(),
         InferError::UnboundConstructor(_) => "UnboundConstructor".into(),

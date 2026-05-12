@@ -333,17 +333,32 @@ pub fn solve_one(
         // Cheap structural pre-filter: for every position where the
         // target has a concrete `Con`-headed spine, the candidate's
         // head at that position must either be a non-Con (type var,
-        // unifies with anything) or match `(qname, arity)` exactly.
-        // Without this, a constraint like `ConsGen (Param a) (Param
-        // b) ?r` against ~9 chain candidates still trial-unifies
-        // each one; with it we skip the head-incompatible candidates
-        // outright, slashing the per-body try_match count.
+        // unifies with anything) or match `(qname, arity)`. We use
+        // the unifier's lenient module-qualifier rule (names must
+        // agree; one side missing a module qualifier is OK) so a
+        // user-side `MonadThrow Error Effect` (unqualified
+        // `Error`) doesn't pre-filter out an instance whose head
+        // is registered as `MonadThrow Effect.Exception.Error
+        // Effect`. Without the lenient compare the candidate gets
+        // dropped here even though `try_match` would unify it
+        // cleanly.
         let mut head_ok = true;
         for (i, target) in target_heads.iter().enumerate() {
             if let Some((th, ta)) = target {
                 if let Some(cand_arg) = cand.types.get(i) {
                     if let Some((ch, ca)) = app_spine_head_arity(cand_arg) {
-                        if ch != th || ca != *ta {
+                        if ca != *ta {
+                            head_ok = false;
+                            break;
+                        }
+                        if ch.name != th.name {
+                            head_ok = false;
+                            break;
+                        }
+                        if ch.module.is_some()
+                            && th.module.is_some()
+                            && ch.module != th.module
+                        {
                             head_ok = false;
                             break;
                         }
@@ -1050,6 +1065,15 @@ pub fn solve_all(
     for _ in 0..MAX_SOLVER_DEPTH {
         if queue.is_empty() {
             last_made_progress = false;
+            break;
+        }
+        // Per-decl timeout: the SCC's `infer_value_scc_with_all`
+        // arms a deadline on `state`, and a pathological fundep-
+        // driven re-queue can otherwise loop up to
+        // `MAX_SOLVER_DEPTH` times. Break early and let the caller
+        // surface the `Timeout` (it polls `state.deadline_exceeded()`
+        // immediately after `solve_all` returns).
+        if state.deadline_exceeded() {
             break;
         }
         let current = std::mem::take(&mut queue);

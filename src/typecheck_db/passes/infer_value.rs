@@ -929,6 +929,30 @@ pub fn infer_value_scc_with_all(
     // references within the SCC type-check. After inference, we generalize.
     let mut state = UnifyState::new();
 
+    // Per-decl typecheck deadline. Read the env var once per SCC
+    // (cheap — single getenv) so a pathological declaration can't
+    // stall the run. `0` disables the deadline entirely; the
+    // default is 10000ms (ten seconds per decl, plus ten seconds
+    // for the post-body SCC phases). 10s leaves enough headroom
+    // for legitimately heavy fixtures like `BigFunction` (whose
+    // `Main` takes ~4.6s standalone, more under parallel test
+    // load) while still bounding pathological cases that would
+    // otherwise hang the all_packages acceptance run.
+    let decl_timeout_ms: u64 = std::env::var("TYPECHECK_DECL_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
+    let fresh_deadline = || -> Option<std::time::Instant> {
+        if decl_timeout_ms == 0 {
+            None
+        } else {
+            Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(decl_timeout_ms),
+            )
+        }
+    };
+
     let mut slot_of: HashMap<String, Type> = HashMap::new();
     let mut decl_refs: Vec<(&Decl, String)> = Vec::new();
     // Track decls whose declared signature carries a `Partial`
@@ -971,7 +995,6 @@ pub fn infer_value_scc_with_all(
             decl_refs.push((*decl, n));
         }
     }
-
     // Infer each decl's body against its pre-registered slot. The
     // "current decl" marker on state lets `infer_case` stamp each
     // pending exhaustiveness record with its owning decl.
@@ -980,6 +1003,11 @@ pub fn infer_value_scc_with_all(
             let expected = slot_of.get(name).cloned().unwrap();
             state.set_current_decl(Some(name.clone()));
             state.set_current_decl_span(Some(*decl_span));
+            // Arm the per-decl deadline before any body work. The
+            // `unify_inner` hot path polls this and bails with
+            // `UnifyError::Timeout`; cleared on every error exit
+            // below so the next SCC starts clean.
+            state.set_deadline(fresh_deadline(), decl_timeout_ms);
             let _ = sig_param_types; // retained for future sig-aware work
             let guarded_with_where =
                 wrap_guarded_with_where(guarded.clone(), where_clause.clone());
@@ -1183,6 +1211,14 @@ pub fn infer_value_scc_with_all(
     }
     state.set_current_decl(None);
     state.set_current_decl_span(None);
+    // Re-arm the deadline for the post-body SCC phases. `solve_all`,
+    // exhaustiveness, generalize, and the second-pass solver run
+    // unbounded otherwise; arming a fresh budget once covers them
+    // collectively. `decl_name` on any timeout error will be `None`
+    // because we just cleared it — `decl_span` is None too — which
+    // is the right reading: the post-body work is per-SCC, not
+    // per-decl.
+    state.set_deadline(fresh_deadline(), decl_timeout_ms);
 
     // Now generalize. Temporarily clear this SCC's slots from the env so
     // they don't count as "free in env" and block quantification.
@@ -1421,6 +1457,17 @@ pub fn infer_value_scc_with_all(
         instances,
         &all_pending,
     );
+    // `solve_all` swallows errors into its report struct, so a
+    // timeout that fires mid-solve needs to be surfaced here.
+    // Bail the whole SCC with a located `Timeout` if the deadline
+    // expired during solving.
+    if state.deadline_exceeded() {
+        let budget = state.deadline_budget_ms();
+        state.clear_deadline();
+        return Err(InferError::Unify(
+            state.locate(UnifyError::Timeout { budget_ms: budget }),
+        ));
+    }
     let crate::typecheck_db::passes::constraints::SolveReport {
         mut dicts,
         mut dicts_by_span,
@@ -1491,6 +1538,13 @@ pub fn infer_value_scc_with_all(
             instances,
             &deferred,
         );
+        if state.deadline_exceeded() {
+            let budget = state.deadline_budget_ms();
+            state.clear_deadline();
+            return Err(InferError::Unify(
+                state.locate(UnifyError::Timeout { budget_ms: budget }),
+            ));
+        }
         for (k, mut v) in report2.dicts {
             dicts.entry(k).or_default().append(&mut v);
         }
@@ -1531,17 +1585,115 @@ pub fn infer_value_scc_with_all(
         // constraints in the bound scheme and re-instantiate them at
         // each use-site; without this they'd see `forall a. a -> ..`
         // and miss the `Eq a => Semiring a =>` requirements.
+        //
+        // Drop constraints whose zonked args contain a rigid
+        // `Skolem`: those were emitted inside a rank-2 lambda
+        // check where the corresponding given was on the stack,
+        // but didn't discharge there (typically because a fundep-
+        // improvement step didn't run on the given side). The
+        // skolem is scoped to the rank-2 check that has already
+        // closed — propagating the constraint into the outer
+        // scheme would publish a rigid `Skolem` to downstream
+        // consumers, which is meaningless.
         let constraint_args: Vec<crate::typecheck_db::types::Constraint> =
             pending_constraints
                 .iter()
-                .map(|pc| pc.constraint.clone())
+                .filter_map(|pc| {
+                    let zc = crate::typecheck_db::types::Constraint {
+                        class: pc.constraint.class.clone(),
+                        args: pc
+                            .constraint
+                            .args
+                            .iter()
+                            .map(|a| state.zonk(a))
+                            .collect(),
+                    };
+                    let has_skolem = zc
+                        .args
+                        .iter()
+                        .any(|a| state.contains_free_skolem(a).is_some());
+                    if has_skolem { None } else { Some(zc) }
+                })
                 .collect();
-        let scheme = crate::typecheck_db::generalize::generalize_with_constraints(
+        let generalized = crate::typecheck_db::generalize::generalize_with_constraints(
             &state,
             env,
             &ty,
             &constraint_args,
         );
+        // Post-hoc skolem-escape rescue (see PureScript reference
+        // compiler's `skolemEscapeCheck`). If `generalize` left a
+        // rigid `Skolem` in the scheme body, a `forall`-bound
+        // var from a rank-2 sibling in the same SCC leaked into
+        // this decl's slot during inference. (Our permissive
+        // `bind_var` admits these intermediate bindings, so
+        // genuine leaks only manifest here, after all
+        // intermediates have zonked through.) For clean user-
+        // signed rank-1 decls — no inner Forall, no `Type::Hole`
+        // sites, no wildcards / Partial / `_` — recover by
+        // republishing the user's scheme directly: the body was
+        // already checked against the sig via unification, so
+        // the user's authoritative shape is what downstream
+        // consumers should see.
+        //
+        // Rank-2 sigs and decls with holes/wildcards have to
+        // stay on `generalize`'s output: the call-site
+        // instantiation logic flattens nested
+        // `forall x. C => forall y. ...` into a single outer
+        // forall + constraint (otherwise rank-2 uses stall on
+        // `forall_head_matches` for non-`Fun` bodies), and hole
+        // / wildcard sigs need the body-inferred shape filled
+        // in to be useful. Without a sig to fall back on, the
+        // skolem leak is propagated as a `SkolemEscape` error
+        // — matches the old eager `bind_var` behaviour.
+        let scheme = if state.contains_free_skolem(&generalized.ty).is_some() {
+            let sig_override: Option<Scheme> = if env.local_signed.contains(name)
+                && env.local_signed_hole_sites.get(name).is_none()
+            {
+                env.top_level
+                    .get(&QName { module: None, name: name.clone() })
+                    .and_then(|s| {
+                        if scheme_has_inner_forall(s) {
+                            return None;
+                        }
+                        let full = if s.vars.is_empty() {
+                            s.ty.clone()
+                        } else {
+                            Type::Forall(
+                                s.vars
+                                    .iter()
+                                    .cloned()
+                                    .map(|n| (n, false, None))
+                                    .collect(),
+                                Box::new(s.ty.clone()),
+                            )
+                        };
+                        if sig_ty_unsafe_to_pin(&full) {
+                            None
+                        } else {
+                            Some(s.as_ref().clone())
+                        }
+                    })
+            } else {
+                None
+            };
+            match sig_override {
+                Some(sig) => sig,
+                None => {
+                    let zonked_slot = state.zonk(&ty);
+                    let sk = state.contains_free_skolem(&generalized.ty).unwrap();
+                    return Err(InferError::Unify(state.locate(
+                        UnifyError::SkolemEscape {
+                            var: 0,
+                            skolem: sk,
+                            ty: zonked_slot,
+                        },
+                    )));
+                }
+            }
+        } else {
+            generalized
+        };
         out.push(InferredScheme {
             name: name.clone(),
             scheme,
@@ -1554,6 +1706,14 @@ pub fn infer_value_scc_with_all(
         });
     }
 
+    // Restore env — callers may reuse it. First wipe every slot
+    // this SCC added to `env.locals` (their `Type::Unif` ids
+    // belong to THIS state and would dangle once we drop it —
+    // a later SCC's `lookup_unqualified` would return a stale
+    // unif from a foreign `UnifyState`, e.g. an earlier instance
+    // method's slot leaking into a sibling instance method's
+    // body). Then restore the pre-SCC slots for any decl that
+    // had one before we entered.
     // Restore env — callers may reuse it.
     for (name, v) in slots_backup {
         env.bind_local(name, v);
@@ -1834,6 +1994,26 @@ fn infer_app(
         }
     }
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
+    // Subsumption on the actual arg type: if `infer_expr` returned
+    // a `Forall` / `Constrained` (e.g. a `Var` lookup whose scheme
+    // had an inner forall — `Getter s t a b = forall r. Fold r s
+    // t a b`, the lens-cluster pattern), deep-instantiate before
+    // unifying against the function's concrete arg slot. The
+    // `Forall`-vs-`Fun` unify rule has a `leaves_all_unif` gate
+    // that rejects the polymorphic side when the function arg has
+    // any concrete `Con` heads (e.g. `Forget`, `Wander`, `Strong`
+    // from the profunctor-lenses encoding). Peyton-Jones §5
+    // subsumption: deep-instantiate the actual, then unify
+    // against the (already-rho-shaped) expected.
+    let arg_ty_zonked = state.zonk(&arg_ty);
+    let arg_ty_inst = if matches!(
+        &arg_ty_zonked,
+        Type::Forall(_, _) | Type::Constrained(_, _)
+    ) {
+        deep_instantiate_positive(state, arg_ty_zonked, true)
+    } else {
+        arg_ty
+    };
     let result = state.fresh();
     // The function position supplies the expected arg shape, so
     // attribute any mismatch to `func.span()` as the
@@ -1841,7 +2021,7 @@ fn infer_app(
     state.unify_here_with_expected(
         func.span(),
         &func_ty,
-        &Type::fun(arg_ty, result.clone()),
+        &Type::fun(arg_ty_inst, result.clone()),
     )?;
     Ok(result)
 }
