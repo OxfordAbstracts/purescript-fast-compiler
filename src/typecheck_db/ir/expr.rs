@@ -51,7 +51,7 @@ pub enum Expr {
     },
     Constructor {
         span: Span,
-        name: Qualified<ConstructorName>,
+        name: Resolved<ConstructorName>,
     },
     Literal {
         span: Span,

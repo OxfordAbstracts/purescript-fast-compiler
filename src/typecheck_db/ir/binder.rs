@@ -5,7 +5,9 @@
 //! `Binder::Constructor { args: [...] }`. Downstream code can
 //! assume operator binders don't exist.
 
-use crate::names::{ConstructorName, Qualified, ValueName};
+use crate::names::{ConstructorName, Resolved, ValueName};
+#[allow(unused_imports)]
+use crate::names::Qualified;
 use crate::span::Span;
 
 pub use crate::cst::{Spanned, TypeExpr};
@@ -27,7 +29,7 @@ pub enum Binder {
     },
     Constructor {
         span: Span,
-        name: Qualified<ConstructorName>,
+        name: Resolved<ConstructorName>,
         args: Vec<Binder>,
     },
     Record {

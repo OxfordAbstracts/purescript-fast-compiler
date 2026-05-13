@@ -453,12 +453,13 @@ pub mod check_instance {
             }
             _ => unreachable!("check_instance only handles Instance/Derive"),
         };
-        let class = {
-            let qi = class_name.to_qi();
-            QName {
-                module: qi.module.map(util::resolve_symbol),
-                name: util::resolve_symbol(qi.name),
-            }
+        let class = QName {
+            module: if class_name.module.is_unresolved() {
+                None
+            } else {
+                Some(util::resolve_symbol(class_name.module.symbol()))
+            },
+            name: util::resolve_symbol(class_name.name.symbol()),
         };
         let head_tys: Vec<Type> = types.iter().map(|t| convert_type_expr(t, type_ops)).collect();
         let context: Vec<Constraint> = constraints
@@ -736,15 +737,15 @@ pub fn decl_key_for_nonvalue(decl: &Decl) -> (String, String) {
             (format!("c__{n}"), format!("class {n}"))
         }
         Decl::Instance { class_name, types, .. } | Decl::Derive { class_name, types, .. } => {
-            let class_qi = class_name.to_qi();
+            let module_str = if class_name.module.is_unresolved() {
+                String::new()
+            } else {
+                format!("{}.", util::resolve_symbol(class_name.module.symbol()))
+            };
             let class_debug = format!(
                 "{}{}",
-                class_qi
-                    .module
-                    .map(util::resolve_symbol)
-                    .map(|m| format!("{m}."))
-                    .unwrap_or_default(),
-                util::resolve_symbol(class_qi.name),
+                module_str,
+                util::resolve_symbol(class_name.name.symbol()),
             );
             // Hash the class + head types for a stable, content-derived
             // key.

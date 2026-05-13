@@ -266,7 +266,7 @@ pub fn from_decls(decls: &[Decl], type_ops: &TypeOpMap) -> InstanceIndex {
             ..
         } = d
         {
-            let class = cst_constraint_qname(class_name);
+            let class = resolved_class_qname(class_name);
             let head_tys: Vec<Type> =
                 types.iter().map(|t| convert_type_expr(t, type_ops)).collect();
             let context: Vec<Constraint> = constraints
@@ -321,6 +321,21 @@ fn cst_constraint_qname(
         module: q
             .module
             .map(|m| crate::typecheck_db::util::resolve_symbol(m.symbol())),
+        name: crate::typecheck_db::util::resolve_symbol(q.name.symbol()),
+    }
+}
+
+/// Variant of `cst_constraint_qname` for `Resolved<ClassName>`
+/// (used by IR instance/derive class-name positions).
+fn resolved_class_qname(
+    q: &crate::names::Resolved<crate::names::ClassName>,
+) -> crate::typecheck_db::types::QName {
+    crate::typecheck_db::types::QName {
+        module: if q.module.is_unresolved() {
+            None
+        } else {
+            Some(crate::typecheck_db::util::resolve_symbol(q.module.symbol()))
+        },
         name: crate::typecheck_db::util::resolve_symbol(q.name.symbol()),
     }
 }

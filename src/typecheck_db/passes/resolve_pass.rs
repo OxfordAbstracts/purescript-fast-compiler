@@ -926,14 +926,14 @@ fn rewrite_decl(r: &NameResolver, decl: ir::Decl) -> ir::Decl {
             }
         }
         ir::Decl::Instance { span, name, constraints, class_name, types, members, chain, doc_comments } => {
-            let class_name = rewrite_class_name(r, class_name);
+            let class_name = rewrite_class_name_resolved(r, class_name);
             let constraints = constraints.into_iter().map(|c| rewrite_constraint(r, c)).collect();
             let types = types.into_iter().map(|t| rewrite_type(r, t)).collect();
             let members = members.into_iter().map(|d| rewrite_decl(r, d)).collect();
             ir::Decl::Instance { span, name, constraints, class_name, types, members, chain, doc_comments }
         }
         ir::Decl::Derive { span, newtype, name, constraints, class_name, types, doc_comments } => {
-            let class_name = rewrite_class_name(r, class_name);
+            let class_name = rewrite_class_name_resolved(r, class_name);
             let constraints = constraints.into_iter().map(|c| rewrite_constraint(r, c)).collect();
             let types = types.into_iter().map(|t| rewrite_type(r, t)).collect();
             ir::Decl::Derive { span, newtype, name, constraints, class_name, types, doc_comments }
@@ -1046,14 +1046,15 @@ fn rewrite_expr(r: &NameResolver, locals: &LocalScope, e: ir::Expr) -> ir::Expr 
             Var { span, name: new_name }
         }
         Constructor { span, name } => {
-            let q = name.module.map(|m| resolve_symbol(m.symbol()));
+            let q = if name.module.is_unresolved() {
+                None
+            } else {
+                Some(resolve_symbol(name.module.symbol()))
+            };
             let name_str = resolve_symbol(name.name.symbol());
             let origin = r.resolve_ctor(q.as_deref(), &name_str);
             let new_name = match origin {
-                Some(m) => Qualified {
-                    module: Some(module_qualifier(m)),
-                    name: name.name,
-                },
+                Some(m) => crate::names::Resolved::new(module_qualifier(m), name.name),
                 None => name,
             };
             Constructor { span, name: new_name }
@@ -1178,14 +1179,15 @@ fn rewrite_literal(r: &NameResolver, locals: &LocalScope, lit: ir::Literal) -> i
 fn rewrite_binder(r: &NameResolver, locals: &LocalScope, b: ir::Binder) -> ir::Binder {
     match b {
         ir::Binder::Constructor { span, name, args } => {
-            let q = name.module.map(|m| resolve_symbol(m.symbol()));
+            let q = if name.module.is_unresolved() {
+                None
+            } else {
+                Some(resolve_symbol(name.module.symbol()))
+            };
             let name_str = resolve_symbol(name.name.symbol());
             let origin = r.resolve_ctor(q.as_deref(), &name_str);
             let new_name = match origin {
-                Some(m) => Qualified {
-                    module: Some(module_qualifier(m)),
-                    name: name.name,
-                },
+                Some(m) => crate::names::Resolved::new(module_qualifier(m), name.name),
                 None => name,
             };
             let args = args.into_iter().map(|a| rewrite_binder(r, locals, a)).collect();
@@ -1332,6 +1334,25 @@ fn rewrite_class_name(r: &NameResolver, q: Qualified<ClassName>) -> Qualified<Cl
             module: Some(module_qualifier(m)),
             name: q.name,
         },
+        None => q,
+    }
+}
+
+/// `rewrite_class_name` variant for the IR's `Resolved<ClassName>`
+/// positions. Same lookup, different wrapper.
+fn rewrite_class_name_resolved(
+    r: &NameResolver,
+    q: crate::names::Resolved<ClassName>,
+) -> crate::names::Resolved<ClassName> {
+    let qual = if q.module.is_unresolved() {
+        None
+    } else {
+        Some(resolve_symbol(q.module.symbol()))
+    };
+    let name_str = resolve_symbol(q.name.symbol());
+    let origin = r.resolve_class(qual.as_deref(), &name_str);
+    match origin {
+        Some(m) => crate::names::Resolved::new(module_qualifier(m), q.name),
         None => q,
     }
 }
@@ -1835,7 +1856,7 @@ mod tests {
         for d in &resolved.decls {
             if let ir::Decl::Instance { class_name, .. } = d {
                 if resolve_symbol(class_name.name.symbol()) == "Eq" {
-                    assert_eq!(module_of(class_name).as_deref(), Some("Data.Eq"));
+                    assert_eq!(resolved_module_of(class_name).as_deref(), Some("Data.Eq"));
                     return;
                 }
             }

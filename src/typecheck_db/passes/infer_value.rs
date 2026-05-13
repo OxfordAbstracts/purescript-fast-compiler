@@ -1896,12 +1896,14 @@ fn instantiate_and_record_constraints(
 fn infer_constructor(
     state: &mut UnifyState,
     env: &Env,
-    name: &crate::names::Qualified<crate::names::ConstructorName>,
+    name: &crate::names::Resolved<crate::names::ConstructorName>,
 ) -> Result<Type, InferError> {
-    let qi = name.to_qi();
-    let name_str =
-        crate::typecheck_db::util::resolve_symbol(qi.name);
-    let module_str = qi.module.map(crate::typecheck_db::util::resolve_symbol);
+    let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+    let module_str = if name.module.is_unresolved() {
+        None
+    } else {
+        Some(crate::typecheck_db::util::resolve_symbol(name.module.symbol()))
+    };
 
     let q = QName { module: module_str, name: name_str.clone() };
     let scheme = env
@@ -2214,12 +2216,15 @@ fn bind_constructor_pattern(
     state: &mut UnifyState,
     env: &mut Env,
     type_ops: &TypeOpMap,
-    name: &crate::names::Qualified<crate::names::ConstructorName>,
+    name: &crate::names::Resolved<crate::names::ConstructorName>,
     args: &[Binder],
 ) -> Result<Type, InferError> {
-    let qi = name.to_qi();
-    let name_str = crate::typecheck_db::util::resolve_symbol(qi.name);
-    let module_str = qi.module.map(crate::typecheck_db::util::resolve_symbol);
+    let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+    let module_str = if name.module.is_unresolved() {
+        None
+    } else {
+        Some(crate::typecheck_db::util::resolve_symbol(name.module.symbol()))
+    };
     let q = QName { module: module_str, name: name_str.clone() };
     let scheme = env
         .lookup_qualified(&q)

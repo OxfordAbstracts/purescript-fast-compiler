@@ -1388,9 +1388,8 @@ fn check_one_module(
             ..
         } = d
         {
-            let class_qi = class_name.to_qi();
             let class_name_str =
-                crate::typecheck_db::util::resolve_symbol(class_qi.name);
+                crate::typecheck_db::util::resolve_symbol(class_name.name.symbol());
             // Class info: prefer the local declaration; otherwise
             // walk the importer's direct imports to find the class
             // in another module's exported `ClassInfo`. We only
@@ -1617,7 +1616,7 @@ fn check_one_module(
                 );
                 let inst_elapsed = inst_t.elapsed();
                 if profile_slow && inst_elapsed >= std::time::Duration::from_millis(50) {
-                    let class_str = crate::typecheck_db::util::resolve_symbol(class_qi.name);
+                    let class_str = crate::typecheck_db::util::resolve_symbol(class_name.name.symbol());
                     let solve_calls = crate::typecheck_db::passes::constraints
                         ::SOLVE_ONE_CALLS
                         .load(std::sync::atomic::Ordering::Relaxed)

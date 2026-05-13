@@ -115,7 +115,9 @@ pub fn lower_decl(decl: cst::Decl) -> Result<Decl, LoweringError> {
         cst::Decl::Instance {
             span, name, constraints, class_name, types, members, chain, doc_comments,
         } => Decl::Instance {
-            span, name, constraints, class_name, types,
+            span, name, constraints,
+            class_name: crate::names::Resolved::from_qualified(class_name),
+            types,
             members: members.into_iter().map(lower_decl).collect::<Result<_, _>>()?,
             chain, doc_comments,
         },
@@ -133,7 +135,9 @@ pub fn lower_decl(decl: cst::Decl) -> Result<Decl, LoweringError> {
         cst::Decl::Derive {
             span, newtype, name, constraints, class_name, types, doc_comments,
         } => Decl::Derive {
-            span, newtype, name, constraints, class_name, types, doc_comments,
+            span, newtype, name, constraints,
+            class_name: crate::names::Resolved::from_qualified(class_name),
+            types, doc_comments,
         },
     })
 }
@@ -181,7 +185,7 @@ pub fn lower_binder(binder: cst::Binder) -> Result<Binder, LoweringError> {
         cst::Binder::Literal { span, lit } => Binder::Literal { span, lit: lower_literal(lit)? },
         cst::Binder::Constructor { span, name, args } => Binder::Constructor {
             span,
-            name,
+            name: crate::names::Resolved::from_qualified(name),
             args: lower_binders(args)?,
         },
         cst::Binder::Record { span, fields } => {
@@ -236,7 +240,10 @@ pub fn lower_expr(expr: cst::Expr) -> Result<Expr, LoweringError> {
             span,
             name: crate::names::Resolved::from_qualified(name),
         },
-        cst::Expr::Constructor { span, name } => Expr::Constructor { span, name },
+        cst::Expr::Constructor { span, name } => Expr::Constructor {
+            span,
+            name: crate::names::Resolved::from_qualified(name),
+        },
         cst::Expr::Literal { span, lit } => Expr::Literal { span, lit: lower_literal(lit)? },
         cst::Expr::App { span, func, arg } => Expr::App {
             span,

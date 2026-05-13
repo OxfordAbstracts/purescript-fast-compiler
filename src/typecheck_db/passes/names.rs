@@ -501,10 +501,15 @@ impl Collector {
                 }
             }
             Decl::Instance { constraints, class_name, types, members, .. } => {
+                let module_opt = if class_name.module.is_unresolved() {
+                    None
+                } else {
+                    Some(sym_to_string(class_name.module.symbol()))
+                };
                 self.emit(Reference {
                     kind: NameKind::Class,
-                    module: qi_module(&class_name.to_qi()),
-                    name: sym_to_string(class_name.name_symbol()),
+                    module: module_opt,
+                    name: sym_to_string(class_name.name.symbol()),
                 });
                 for c in constraints {
                     self.visit_constraint(c);
@@ -520,10 +525,15 @@ impl Collector {
                 }
             }
             Decl::Derive { constraints, class_name, types, .. } => {
+                let module_opt = if class_name.module.is_unresolved() {
+                    None
+                } else {
+                    Some(sym_to_string(class_name.module.symbol()))
+                };
                 self.emit(Reference {
                     kind: NameKind::Class,
-                    module: qi_module(&class_name.to_qi()),
-                    name: sym_to_string(class_name.name_symbol()),
+                    module: module_opt,
+                    name: sym_to_string(class_name.name.symbol()),
                 });
                 for c in constraints {
                     self.visit_constraint(c);
@@ -567,11 +577,15 @@ impl Collector {
                 });
             }
             Expr::Constructor { name, .. } => {
-                let qi = name.to_qi();
+                let module_opt = if name.module.is_unresolved() {
+                    None
+                } else {
+                    Some(sym_to_string(name.module.symbol()))
+                };
                 self.emit(Reference {
                     kind: NameKind::Constructor,
-                    module: qi.module.map(sym_to_string),
-                    name: sym_to_string(qi.name),
+                    module: module_opt,
+                    name: sym_to_string(name.name.symbol()),
                 });
             }
             Expr::Literal { lit, .. } => self.visit_literal(lit),
@@ -804,11 +818,15 @@ impl Collector {
             Binder::Wildcard { .. } | Binder::Var { .. } => {}
             Binder::Literal { lit, .. } => self.visit_literal(lit),
             Binder::Constructor { name, args, .. } => {
-                let qi = name.to_qi();
+                let module_opt = if name.module.is_unresolved() {
+                    None
+                } else {
+                    Some(sym_to_string(name.module.symbol()))
+                };
                 self.emit(Reference {
                     kind: NameKind::Constructor,
-                    module: qi.module.map(sym_to_string),
-                    name: sym_to_string(qi.name),
+                    module: module_opt,
+                    name: sym_to_string(name.name.symbol()),
                 });
                 for a in args {
                     self.visit_binder_for_refs(a);

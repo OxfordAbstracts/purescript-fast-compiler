@@ -14,8 +14,8 @@
 use crate::cst::{self, Associativity, Comment, Constraint as CstConstraint, DataConstructor,
     ClassMember, ExportList, FunDep, ImportDecl, KindSigSource, ModuleName, QualifiedIdent,
     Spanned, TypeExpr};
-use crate::names::{ClassName, ConstructorName, InstanceName, OpName, Qualified, TypeName,
-    TypeVarName, ValueName};
+use crate::names::{ClassName, ConstructorName, InstanceName, OpName, Qualified, Resolved,
+    TypeName, TypeVarName, ValueName};
 use crate::span::Span;
 
 use super::binder::Binder;
@@ -92,7 +92,7 @@ pub enum Decl {
         span: Span,
         name: Option<Spanned<InstanceName>>,
         constraints: Vec<CstConstraint>,
-        class_name: Qualified<ClassName>,
+        class_name: Resolved<ClassName>,
         types: Vec<TypeExpr>,
         members: Vec<Decl>,
         chain: bool,
@@ -124,7 +124,7 @@ pub enum Decl {
         newtype: bool,
         name: Option<Spanned<InstanceName>>,
         constraints: Vec<CstConstraint>,
-        class_name: Qualified<ClassName>,
+        class_name: Resolved<ClassName>,
         types: Vec<TypeExpr>,
         doc_comments: Vec<Comment>,
     },
