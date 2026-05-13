@@ -795,22 +795,13 @@ impl UnifyState {
             (Type::Unif(id), other) | (other, Type::Unif(id)) => self.bind_var(*id, other),
             (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
             (Type::Con(c1), Type::Con(c2)) if c1 == c2 => Ok(()),
-            // Lenient module-qualifier comparison: `Core.ForceHandle`
-            // (qualified through an `import M as Core` alias) and
-            // `ForceHandle` (unqualified, referring to the same
-            // imported type) refer to the same underlying type. We
-            // unify whenever the names match AND one side has no
-            // module qualifier OR both have the same module string.
-            // We deliberately stay strict when both sides carry
-            // DIFFERENT explicit qualifiers (e.g. `LibA.DemoKind`
-            // vs `LibB.DemoKind`) — that's a real mismatch.
-            //
-            // NOTE: Phase H of the name-resolution lockstep aims to
-            // remove this clause once every Type::Con carries
-            // Some(defining_module). Current state: enough sites
-            // still produce None (e.g. local-data ctor result types
-            // in bind_local_ctors, some unification synthesizers)
-            // that removing this regresses ~500 unit tests.
+            // Lenient module-qualifier comparison. After the resolve
+            // pass + Prim helpers + CtorInfo parent_module + IR
+            // Resolved<N> migration, most Type::Con cells carry
+            // Some(defining_module). But many synthesizer + test sites
+            // still produce None-qualified Type::Con's. This lenient
+            // clause bridges them. Remove once all production
+            // synthesizers carry origins.
             (Type::Con(c1), Type::Con(c2))
                 if c1.name == c2.name
                     && (c1.module.is_none() || c2.module.is_none()) =>
