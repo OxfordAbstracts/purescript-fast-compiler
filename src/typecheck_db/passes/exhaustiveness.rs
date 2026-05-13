@@ -38,10 +38,16 @@ use crate::typecheck_db::types::Type;
 /// Everything the exhaustiveness checker needs to know about one
 /// constructor. Populated from [`crate::typecheck_db::passes::ctor_details`]
 /// outputs across every data type in scope.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CtorInfo {
     /// Name of the parent `data`/`newtype`.
     pub parent_type: String,
+    /// Defining module of the parent type. Populated for the
+    /// resolved-IR pipeline so the synthesized ctor scheme's result
+    /// type matches resolver-produced `Type::Con(Some(definer).Type)`
+    /// references; `None` only for legacy / test-fixture entries.
+    #[serde(default)]
+    pub parent_module: Option<String>,
     /// The parent type's declared type vars — used when instantiating
     /// constructor field types against the scrutinee's actual type
     /// arguments.
@@ -433,12 +439,13 @@ mod tests {
         );
         ctors.insert(
             "Nothing".into(),
-            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "Maybe".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },
@@ -453,6 +460,7 @@ mod tests {
             "Left".into(),
             CtorInfo {
                 parent_type: "Either".into(),
+                parent_module: None,
                 type_vars: vec!["a".into(), "b".into()],
                 fields: vec![Type::Var("a".into())],
             },
@@ -461,6 +469,7 @@ mod tests {
             "Right".into(),
             CtorInfo {
                 parent_type: "Either".into(),
+                parent_module: None,
                 type_vars: vec!["a".into(), "b".into()],
                 fields: vec![Type::Var("b".into())],
             },
@@ -470,23 +479,24 @@ mod tests {
         data.insert("Boolean".into(), vec!["True".into(), "False".into()]);
         ctors.insert(
             "True".into(),
-            CtorInfo { parent_type: "Boolean".into(), type_vars: vec![], fields: vec![] },
+            CtorInfo { parent_type: "Boolean".into(), parent_module: None, type_vars: vec![], fields: vec![] },
         );
         ctors.insert(
             "False".into(),
-            CtorInfo { parent_type: "Boolean".into(), type_vars: vec![], fields: vec![] },
+            CtorInfo { parent_type: "Boolean".into(), parent_module: None, type_vars: vec![], fields: vec![] },
         );
 
         // data List a = Nil | Cons a (List a)  (two-field, no recursion)
         data.insert("List".into(), vec!["Nil".into(), "Cons".into()]);
         ctors.insert(
             "Nil".into(),
-            CtorInfo { parent_type: "List".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "List".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Cons".into(),
             CtorInfo {
                 parent_type: "List".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![
                     Type::Var("a".into()),
@@ -501,6 +511,7 @@ mod tests {
             "Age".into(),
             CtorInfo {
                 parent_type: "Age".into(),
+                parent_module: None,
                 type_vars: vec![],
                 fields: vec![type_con("Int")],
             },

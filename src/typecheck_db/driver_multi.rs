@@ -729,6 +729,7 @@ fn check_one_module(
                         .into_iter()
                         .map(|f| crate::typecheck_db::types::expand_aliases(f, &alias_map))
                         .collect();
+                    info.parent_module = Some(name.clone());
                     ctor_details.insert(cname.clone(), info);
                     local_ctor_parent_hash.insert(cname, oh);
                 }
@@ -4485,6 +4486,7 @@ fn collect_decl_scope(
                         ctor_name,
                         CtorInfo {
                             parent_type: type_name.clone(),
+                            parent_module: None,
                             type_vars: tvars.clone(),
                             fields,
                         },
@@ -4505,6 +4507,7 @@ fn collect_decl_scope(
                     ctor_name,
                     CtorInfo {
                         parent_type: type_name,
+                        parent_module: None,
                         type_vars: tvars,
                         fields: vec![crate::typecheck_db::types::convert_type_expr(
                             ty, &type_ops,

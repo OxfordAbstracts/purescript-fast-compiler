@@ -188,6 +188,7 @@ fn prim_ordering() -> ModuleExports {
             ctor.into(),
             CtorInfo {
                 parent_type: "Ordering".into(),
+                parent_module: Some("Prim.Ordering".into()),
                 type_vars: vec![],
                 fields: vec![],
             },

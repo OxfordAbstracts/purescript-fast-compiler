@@ -1255,12 +1255,13 @@ mod tests {
         let mut ctors: HashMap<String, CtorInfo> = HashMap::new();
         ctors.insert(
             "Nothing".into(),
-            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "Maybe".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },
@@ -1341,12 +1342,13 @@ data Maybe a = Nothing | Just a
         let mut ctors: HashMap<String, CtorInfo> = HashMap::new();
         ctors.insert(
             "Nothing".into(),
-            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "Maybe".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },
@@ -1368,12 +1370,13 @@ data Maybe a = Nothing | Just a
         let mut ctors: HashMap<String, CtorInfo> = HashMap::new();
         ctors.insert(
             "Nothing".into(),
-            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "Maybe".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },
@@ -1394,12 +1397,13 @@ data Maybe a = Nothing | Just a
         let mut ctors: HashMap<String, CtorInfo> = HashMap::new();
         ctors.insert(
             "Nothing".into(),
-            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "Maybe".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },

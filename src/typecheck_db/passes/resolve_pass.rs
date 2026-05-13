@@ -1710,6 +1710,7 @@ mod tests {
                 ctor.into(),
                 crate::typecheck_db::passes::exhaustiveness::CtorInfo {
                     parent_type: "Maybe".into(),
+                    parent_module: None,
                     type_vars: vec!["a".into()],
                     fields: vec![],
                 },

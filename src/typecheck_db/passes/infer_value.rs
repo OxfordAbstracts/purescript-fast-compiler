@@ -4159,6 +4159,7 @@ foo x | x = 1
             "Nothing".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![],
             },
@@ -4167,6 +4168,7 @@ foo x | x = 1
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },
@@ -4181,11 +4183,11 @@ foo x | x = 1
         data.insert("Boolean".into(), vec!["True".into(), "False".into()]);
         ctors.insert(
             "True".into(),
-            CtorInfo { parent_type: "Boolean".into(), type_vars: vec![], fields: vec![] },
+            CtorInfo { parent_type: "Boolean".into(), parent_module: None, type_vars: vec![], fields: vec![] },
         );
         ctors.insert(
             "False".into(),
-            CtorInfo { parent_type: "Boolean".into(), type_vars: vec![], fields: vec![] },
+            CtorInfo { parent_type: "Boolean".into(), parent_module: None, type_vars: vec![], fields: vec![] },
         );
         (data, ctors)
     }
@@ -4441,12 +4443,13 @@ f x = case x of
         data.insert("Maybe".into(), vec!["Nothing".into(), "Just".into()]);
         ctors.insert(
             "Nothing".into(),
-            CtorInfo { parent_type: "Maybe".into(), type_vars: vec!["a".into()], fields: vec![] },
+            CtorInfo { parent_type: "Maybe".into(), parent_module: None, type_vars: vec!["a".into()], fields: vec![] },
         );
         ctors.insert(
             "Just".into(),
             CtorInfo {
                 parent_type: "Maybe".into(),
+                parent_module: None,
                 type_vars: vec!["a".into()],
                 fields: vec![Type::Var("a".into())],
             },

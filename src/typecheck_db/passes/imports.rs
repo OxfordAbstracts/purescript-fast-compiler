@@ -701,7 +701,15 @@ pub(crate) fn synth_ctor_scheme(
     info: &crate::typecheck_db::passes::exhaustiveness::CtorInfo,
 ) -> crate::typecheck_db::types::Scheme {
     use crate::typecheck_db::types::{Scheme, Type};
-    let head = Type::Con(QName::unqualified(&info.parent_type));
+    // Use the defining module if known so the synthesized ctor
+    // scheme's result type aligns with resolver-rewritten use-site
+    // qualifiers. Legacy entries (no parent_module) still produce
+    // unqualified Type::Con and rely on the lenient unify rule.
+    let head_qname = match &info.parent_module {
+        Some(m) => QName::qualified(m, &info.parent_type),
+        None => QName::unqualified(&info.parent_type),
+    };
+    let head = Type::Con(head_qname);
     let mut result = head;
     for v in &info.type_vars {
         result = Type::app(result, Type::Var(v.clone()));

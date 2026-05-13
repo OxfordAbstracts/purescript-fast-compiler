@@ -682,6 +682,7 @@ pub fn ctor_info_from_data_shape(shape: &DataShape) -> HashMap<String, CtorInfo>
             cname.clone(),
             CtorInfo {
                 parent_type: shape.name.clone(),
+                parent_module: None,
                 type_vars: shape.type_vars.clone(),
                 fields: fields.clone(),
             },
