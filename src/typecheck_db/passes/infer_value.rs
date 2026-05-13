@@ -1842,9 +1842,20 @@ fn infer_var(
 
     if let Some(module) = module_str {
         let q = QName { module: Some(module), name: name_str.clone() };
-        return match env.lookup_qualified(&q) {
-            Some(scheme) => Ok(instantiate_and_record_constraints(state, scheme, span)),
-            None => Err(InferError::UnboundVar(format!("{}", q))),
+        if let Some(scheme) = env.lookup_qualified(&q) {
+            return Ok(instantiate_and_record_constraints(state, scheme, span));
+        }
+        // Post-resolve_pass refs to locally-defined values carry the
+        // current module's qualifier (e.g. `Some("Main").fib` for a
+        // self-reference). The pre-insert in `infer_value_scc` puts
+        // the fresh unif var into `env.locals` under just the simple
+        // name — `lookup_qualified` only consults `top_level`. Fall
+        // back to the unqualified path for local binders so recursive
+        // and mutual definitions still resolve.
+        return match env.lookup_unqualified(&name_str) {
+            Lookup::Local(ty) => Ok(ty.clone()),
+            Lookup::Scheme(s) => Ok(instantiate_and_record_constraints(state, s, span)),
+            Lookup::Missing => Err(InferError::UnboundVar(format!("{}", q))),
         };
     }
 
@@ -2340,7 +2351,7 @@ fn infer_record_update(
 
 /// Build `Array α` for the current element type.
 fn array_of(elem: Type) -> Type {
-    Type::app(Type::Con(QName::unqualified("Array")), elem)
+    Type::app(crate::typecheck_db::types::prim_array(), elem)
 }
 
 fn infer_array(
@@ -2386,7 +2397,7 @@ fn infer_if(
     then_expr: &Expr,
     else_expr: &Expr,
 ) -> Result<Type, InferError> {
-    check_expr(state, env, type_ops, cond, &Type::Con(QName::unqualified("Boolean")))?;
+    check_expr(state, env, type_ops, cond, &crate::typecheck_db::types::prim_boolean())?;
     let then_ty = infer_expr(state, env, type_ops, then_expr)?;
     let else_ty = infer_expr(state, env, type_ops, else_expr)?;
     state.unify_here(&then_ty, &else_ty)?;
@@ -2873,7 +2884,7 @@ fn infer_guarded(
                                 env,
                                 type_ops,
                                 e,
-                                &Type::Con(QName::unqualified("Boolean")),
+                                &crate::typecheck_db::types::prim_boolean(),
                             )?;
                         }
                         ir::GuardPattern::Pattern(binder, expr) => {
@@ -3285,12 +3296,18 @@ fn has_partial_constraint(env: &Env, name: &str) -> bool {
 }
 
 fn type_of_literal(lit: &Literal) -> Type {
+    use crate::typecheck_db::types::{
+        prim_boolean, prim_char, prim_int, prim_number, prim_string,
+    };
     match lit {
-        Literal::Int(_) => Type::Con(QName::unqualified("Int")),
-        Literal::Float(_) => Type::Con(QName::unqualified("Number")),
-        Literal::String(_) => Type::Con(QName::unqualified("String")),
-        Literal::Char(_) => Type::Con(QName::unqualified("Char")),
-        Literal::Boolean(_) => Type::Con(QName::unqualified("Boolean")),
+        Literal::Int(_) => prim_int(),
+        Literal::Float(_) => prim_number(),
+        Literal::String(_) => prim_string(),
+        Literal::Char(_) => prim_char(),
+        Literal::Boolean(_) => prim_boolean(),
+        // Array literal placeholder: the synthesizer for Array is in
+        // array_of(). This sentinel is left as a non-Prim marker name
+        // so it cannot collide with the real `Prim.Array` type.
         Literal::Array(_) => Type::Con(QName::unqualified("_Array_M4a")),
     }
 }
@@ -3323,11 +3340,11 @@ mod tests {
     }
 
     fn int() -> Type {
-        Type::Con(QName::unqualified("Int"))
+        crate::typecheck_db::types::prim_int()
     }
 
     fn bool_ty() -> Type {
-        Type::Con(QName::unqualified("Boolean"))
+        crate::typecheck_db::types::prim_boolean()
     }
 
     fn parse_expr_from_val(src: &str) -> Expr {
@@ -3846,7 +3863,7 @@ foo x | x = 1
     // ------------------------------------------------------------------
 
     fn string_ty() -> Type {
-        Type::Con(QName::unqualified("String"))
+        crate::typecheck_db::types::prim_string()
     }
 
     #[test]
@@ -4033,7 +4050,7 @@ foo x | x = 1
     // ------------------------------------------------------------------
 
     fn array_ty(elem: Type) -> Type {
-        Type::app(Type::Con(QName::unqualified("Array")), elem)
+        Type::app(crate::typecheck_db::types::prim_array(), elem)
     }
 
     #[test]

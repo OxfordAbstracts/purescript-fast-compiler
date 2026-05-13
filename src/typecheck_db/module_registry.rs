@@ -1184,7 +1184,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn int_ty() -> Type {
-        Type::Con(QName::unqualified("Int"))
+        crate::typecheck_db::types::prim_int()
     }
 
     fn parse_module(src: &str) -> crate::cst::Module {

@@ -81,7 +81,7 @@ pub fn compute(decl: &Decl, type_ops: &TypeOpMap) -> KindOutput {
                 type_vars.len(),
                 type_var_kind_anns,
                 type_ops,
-                Type::Con(QName::unqualified("Constraint")),
+                crate::typecheck_db::types::prim_constraint(),
             ))
         }
         Decl::ForeignData { kind, .. } => KindOutput::Kind(convert_type_expr(kind, type_ops)),
@@ -176,7 +176,7 @@ mod tests {
             out,
             KindOutput::Kind(Type::fun(
                 Type::kind_type(),
-                Type::Con(QName::unqualified("Constraint")),
+                crate::typecheck_db::types::prim_constraint(),
             ))
         );
     }

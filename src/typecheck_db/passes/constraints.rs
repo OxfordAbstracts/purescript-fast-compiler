@@ -1308,11 +1308,11 @@ mod tests {
     // -- helpers ------------------------------------------------------
 
     fn int_ty() -> Type {
-        Type::Con(QName::unqualified("Int"))
+        crate::typecheck_db::types::prim_int()
     }
 
     fn bool_ty() -> Type {
-        Type::Con(QName::unqualified("Boolean"))
+        crate::typecheck_db::types::prim_boolean()
     }
 
     fn eq_a_a_to_bool() -> Scheme {

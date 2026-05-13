@@ -189,6 +189,62 @@ impl<N: std::fmt::Display> std::fmt::Display for Qualified<N> {
 }
 
 // ---------------------------------------------------------------------------
+// Resolved<N> — a name with a mandatory defining-module qualifier
+// ---------------------------------------------------------------------------
+
+/// A name guaranteed to be fully resolved against an originating module.
+///
+/// Used by the post-resolution IR (`ir_resolved`). Unlike `Qualified<N>`,
+/// the module field is mandatory — every `Resolved<N>` points at the
+/// module that DEFINES the entity, not at any intermediate re-exporter.
+///
+/// The resolution pass (`passes::resolve_pass`) is the only place that
+/// constructs `Resolved` values; consumers downstream simply consume.
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct Resolved<N> {
+    pub module: ModuleQualifier,
+    pub name: N,
+}
+
+impl<N> Resolved<N> {
+    pub fn new(module: ModuleQualifier, name: N) -> Self {
+        Resolved { module, name }
+    }
+
+    /// Map the name component, preserving the module qualifier.
+    pub fn map<M>(self, f: impl FnOnce(N) -> M) -> Resolved<M> {
+        Resolved {
+            module: self.module,
+            name: f(self.name),
+        }
+    }
+}
+
+impl<N: Copy> Resolved<N> {
+    pub fn module(&self) -> ModuleQualifier {
+        self.module
+    }
+}
+
+impl<N: Copy> Resolved<N> {
+    /// Project to a `Qualified<N>` with `Some(module)`. Used at the
+    /// boundary with code that still operates on the legacy
+    /// optional-qualifier representation.
+    pub fn to_qualified(self) -> Qualified<N> {
+        Qualified {
+            module: Some(self.module),
+            name: self.name,
+        }
+    }
+}
+
+impl<N: std::fmt::Display> std::fmt::Display for Resolved<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.module, self.name)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QualifiedIdent ↔ Qualified<N> conversion
 //
 // Bridge between untyped CST QualifiedIdent and typed Qualified<N>.

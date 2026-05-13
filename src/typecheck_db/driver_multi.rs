@@ -437,6 +437,32 @@ fn check_one_module(
             })
     });
 
+    // 2b) Resolve every qualified name in the IR to its DEFINING
+    //     module. After this pass every `Qualified<N>::module` is
+    //     `Some(origin_module)`. Downstream consumers can lookup via
+    //     env's qualified path; the existing unqualified fallback
+    //     in `lookup_qualified` covers locally-pre-inserted recursive
+    //     values until Step C lands.
+    let desugared: Vec<crate::typecheck_db::ir::Decl> = phase!("2b.resolve_pass", {
+        let prims = crate::typecheck_db::prim::prim_exports();
+        let synthetic = crate::typecheck_db::ir::Module {
+            span: module.span,
+            name: module.name.clone(),
+            exports: module.exports.clone(),
+            imports: module.imports.clone(),
+            decls: desugared,
+            comments: module.comments.clone(),
+            doc_comments: module.doc_comments.clone(),
+        };
+        let resolved = crate::typecheck_db::passes::resolve_pass::resolve_module(
+            synthetic,
+            &name,
+            registry,
+            &prims,
+        );
+        resolved.decls
+    });
+
     // Type-level operator map: every `infixr N type Target as op`
     // decl in this module (and every imported module) becomes an
     // entry mapping `(module, op)` → `Target`'s QName so
@@ -540,9 +566,22 @@ fn check_one_module(
     // refuse to unify with `String`.
     let alias_map: crate::typecheck_db::types::AliasMap = {
         let mut m: crate::typecheck_db::types::AliasMap = HashMap::new();
-        // Local aliases from the (raw) CST so forward references
-        // don't need the registry.
-        for d in &module.decls {
+        // Local aliases from the CST. Walk a *resolved* copy of
+        // the decls so the alias body's `Type::Con` qualifiers
+        // name defining modules. Without this, an alias like
+        // `type Foo = Q.Bar` (where `Q` is an import alias)
+        // would expand to `Some("Q").Bar` and fail to unify with
+        // user-side references that resolve to the defining
+        // module's qualifier.
+        let mut resolved_for_aliases = module.clone();
+        let prims = crate::typecheck_db::prim::prim_exports();
+        crate::typecheck_db::passes::resolve_pass::resolve_cst_types_in_place(
+            &mut resolved_for_aliases,
+            &name,
+            registry,
+            &prims,
+        );
+        for d in &resolved_for_aliases.decls {
             if let cst::Decl::TypeAlias { name, type_vars, ty, .. } = d {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let vars: Vec<String> = type_vars
@@ -966,7 +1005,7 @@ fn check_one_module(
     // `check_value` sigs) via the env.
     env.aliases = alias_map.clone();
 
-    bind_local_ctors(&desugared, &mut env, &alias_map, &type_ops);
+    bind_local_ctors(&desugared, &name, &mut env, &alias_map, &type_ops);
 
     // 4) Value decls: split into SCCs + cached per-SCC inference.
     //    `module_context_hash` is now zero — all context dependencies
@@ -1002,11 +1041,25 @@ fn check_one_module(
         value_names.push(n);
         value_spans.push(span);
         let free = free_names::compute(d);
+        // Intra-module dep edges include refs that are EITHER
+        // unqualified OR qualified with this module's name. After
+        // resolve_pass runs, self-references to top-level values
+        // carry `Some(self_module)` — without accepting them here the
+        // SCC builder splits mutual-recursion groups (`f` calling `g`
+        // and vice versa) into singletons and the pre-insert
+        // mechanism breaks.
         let refs: Vec<String> = free
             .refs
             .iter()
-            .filter(|r| r.kind == crate::typecheck_db::passes::names::NameKind::Value
-                && r.module.is_none())
+            .filter(|r| {
+                if r.kind != crate::typecheck_db::passes::names::NameKind::Value {
+                    return false;
+                }
+                match &r.module {
+                    None => true,
+                    Some(m) => m == &name,
+                }
+            })
             .map(|r| r.name.clone())
             .collect();
         value_free.push(refs);
@@ -1126,23 +1179,24 @@ fn check_one_module(
                         // method, add class + in-scope-instance
                         // deps. A method's user is invalidated when
                         // the class changes OR when a new instance
-                        // of the class is in scope.
-                        if r.module.is_none() {
-                            if let Some((class_mod, class_name)) =
-                                method_index.get(&r.name)
-                            {
-                                add_class_method_deps(
-                                    class_mod,
-                                    class_name,
-                                    &name,
-                                    &imports_lookup,
-                                    registry,
-                                    &local_class_hashes,
-                                    &local_instance_hashes_by_class,
-                                    &mut dep_output_hashes,
-                                    &mut dep_seen,
-                                );
-                            }
+                        // of the class is in scope. Post-resolve_pass
+                        // refs may have a defining-module qualifier;
+                        // method_index keys on the simple name so
+                        // the check fires regardless.
+                        if let Some((class_mod, class_name)) =
+                            method_index.get(&r.name)
+                        {
+                            add_class_method_deps(
+                                class_mod,
+                                class_name,
+                                &name,
+                                &imports_lookup,
+                                registry,
+                                &local_class_hashes,
+                                &local_instance_hashes_by_class,
+                                &mut dep_output_hashes,
+                                &mut dep_seen,
+                            );
                         }
                     }
                     NameKind::Type => resolve_type_dep(
@@ -1631,8 +1685,23 @@ fn check_one_module(
     // need a second pass because their expansion requires a
     // `ModuleRegistry` reference, which `distill_exports` doesn't
     // hold.
+    //
+    // distill_exports reads cst::Decl directly. To preserve the
+    // resolved-qualifier invariant on exported schemes / instance
+    // heads, we apply the CST-side type-position rewriter to a
+    // clone before distillation. Validation passes (above) still
+    // see the un-rewritten module so their `module.is_none()`
+    // local-detection logic continues to fire correctly.
+    let mut resolved_for_distill = module.clone();
+    let prims = crate::typecheck_db::prim::prim_exports();
+    crate::typecheck_db::passes::resolve_pass::resolve_cst_types_in_place(
+        &mut resolved_for_distill,
+        &name,
+        registry,
+        &prims,
+    );
     let mut exports = distill_exports(
-        module,
+        &resolved_for_distill,
         &all_schemes,
         &local_instances,
         &local_classes,
@@ -3915,9 +3984,16 @@ fn lookup_unqualified_import(
 }
 
 /// Map a qualified-import alias (`Q` from `import M as Q`) to its
-/// canonical module name.
+/// canonical module name. Also accepts canonical module names that
+/// match an import target or that the resolver attributed via
+/// re-exports (e.g. `Some("Control.Apply")` reached through an
+/// `import Prelude`). Downstream lookups consult the registry and
+/// fail naturally for non-existent modules.
 fn canonical_module_for_alias(imports: &ImportLookup, alias: &str) -> Option<String> {
-    imports.alias_to_target.get(alias).cloned()
+    if let Some(m) = imports.alias_to_target.get(alias) {
+        return Some(m.clone());
+    }
+    Some(alias.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3962,6 +4038,22 @@ fn resolve_value_dep(
                 lookup_unqualified_import(imports, registry, nm)
             {
                 push_dep(out, seen, &dep_mod, nm, oh);
+            }
+        }
+        (Some(alias), nm) if alias == self_module => {
+            // Self-module qualified ref (post-resolve_pass). Same
+            // dep-edge semantics as the unqualified local-name path.
+            if let Some(&dep_idx) = name_to_idx.get(nm) {
+                if scc_member_set.contains(&dep_idx) {
+                    return;
+                }
+                if let Some(oh) = local_scheme_hashes.get(nm) {
+                    push_dep(out, seen, self_module, nm, *oh);
+                }
+                return;
+            }
+            if let Some(oh) = local_foreign_value_hashes.get(nm) {
+                push_dep(out, seen, self_module, nm, *oh);
             }
         }
         (Some(alias), nm) => {
@@ -4128,6 +4220,12 @@ fn resolve_type_dep(
                 }
             }
         }
+        (Some(alias), nm) if alias == self_module => {
+            // Self-module qualified type ref (post-resolve_pass).
+            if let Some(oh) = local_type_hashes.get(nm) {
+                push_dep(out, seen, self_module, &format!("type:{nm}"), *oh);
+            }
+        }
         (Some(alias), nm) => {
             if let Some(dep_mod) = canonical_module_for_alias(imports, alias) {
                 for kp in &type_prefixes {
@@ -4171,6 +4269,12 @@ fn resolve_ctor_dep(
                     push_dep(out, seen, dep_mod, &format!("ctor:{nm}"), oh);
                     return;
                 }
+            }
+        }
+        (Some(alias), nm) if alias == self_module => {
+            // Self-module qualified ctor ref (post-resolve_pass).
+            if let Some(oh) = local_ctor_parent_hash.get(nm) {
+                push_dep(out, seen, self_module, &format!("ctor:{nm}"), *oh);
             }
         }
         (Some(alias), nm) => {
@@ -4288,6 +4392,11 @@ fn resolve_fixity_dep(
                     );
                     return;
                 }
+            }
+        }
+        (Some(alias), op) if alias == self_module => {
+            if let Some(oh) = local_fixity_hashes.get(op) {
+                push_dep(out, seen, self_module, &format!("fixity:{op}"), *oh);
             }
         }
         (Some(alias), op) => {
@@ -4557,6 +4666,7 @@ fn hash_fixity_table(
 
 fn bind_local_ctors(
     decls: &[crate::typecheck_db::ir::Decl],
+    self_module: &str,
     env: &mut Env,
     aliases: &crate::typecheck_db::types::AliasMap,
     type_ops: &TypeOpMap,
@@ -4676,7 +4786,14 @@ fn bind_local_ctors(
                         other => (Vec::new(), other),
                     };
                     let constraint = crate::typecheck_db::types::Constraint {
-                        class: QName::unqualified(&class_name),
+                        // Class methods carry a constraint whose class
+                        // qualifier names the DEFINING module — same
+                        // form the resolver emits for user references
+                        // to the class. Without this the solver sees
+                        // a Some(M).C constraint at the call site
+                        // and a None.C in the method's scheme and
+                        // can't discharge.
+                        class: QName::qualified(self_module, &class_name),
                         args: class_vars
                             .iter()
                             .map(|v| Type::Var(v.clone()))

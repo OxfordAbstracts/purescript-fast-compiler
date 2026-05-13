@@ -426,11 +426,24 @@ fn import_all_except(
         let arc = std::sync::Arc::new(synth_ctor_scheme(info));
         let key = QName { module: qualifier.clone(), name: ctor_name.clone() };
         env.bind_scheme_arc(key, std::sync::Arc::clone(&arc));
-        let origin_key = QName {
+        // Bind under BOTH the import-target module AND the ctor's
+        // DEFINING module (when they differ — re-export chain).
+        // Post-resolve_pass refs carry the defining module; the
+        // import-target key stays as a transition belt-and-braces.
+        let target_key = QName {
             module: Some(target_name.to_string()),
             name: ctor_name.clone(),
         };
-        env.bind_scheme_arc(origin_key, arc);
+        env.bind_scheme_arc(target_key, std::sync::Arc::clone(&arc));
+        if let Some(origin) = target.ctor_origins.get(ctor_name) {
+            if origin != target_name {
+                let origin_key = QName {
+                    module: Some(origin.clone()),
+                    name: ctor_name.clone(),
+                };
+                env.bind_scheme_arc(origin_key, arc);
+            }
+        }
     }
     // Instances + class info: always propagated.
     merge_instances_and_classes(target, ix);
@@ -616,11 +629,22 @@ fn apply_explicit(
                             name: ctor.clone(),
                         };
                         env.bind_scheme(key, scheme.clone());
-                        let origin_key = QName {
+                        let target_key = QName {
                             module: Some(target_name.to_string()),
                             name: ctor.clone(),
                         };
-                        env.bind_scheme(origin_key, scheme);
+                        env.bind_scheme(target_key, scheme.clone());
+                        // Also bind under the DEFINING module so
+                        // post-resolve_pass refs resolve.
+                        if let Some(origin) = target.ctor_origins.get(&ctor) {
+                            if origin != target_name {
+                                let origin_key = QName {
+                                    module: Some(origin.clone()),
+                                    name: ctor.clone(),
+                                };
+                                env.bind_scheme(origin_key, scheme);
+                            }
+                        }
                     }
                 }
             }
@@ -771,7 +795,7 @@ mod tests {
     use crate::typecheck_db::types::{Scheme, Type};
 
     fn int_ty() -> Type {
-        Type::Con(QName::unqualified("Int"))
+        crate::typecheck_db::types::prim_int()
     }
 
     fn parse_mod(src: &str) -> cst::Module {

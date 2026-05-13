@@ -7,6 +7,7 @@
 pub mod parse_decl;
 pub mod desugar_decl;
 pub mod names;
+pub mod resolve_pass;
 pub mod signatures;
 pub mod ctor_details;
 pub mod kinds;

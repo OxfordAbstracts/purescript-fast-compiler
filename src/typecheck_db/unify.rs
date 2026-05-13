@@ -804,6 +804,13 @@ impl UnifyState {
             // We deliberately stay strict when both sides carry
             // DIFFERENT explicit qualifiers (e.g. `LibA.DemoKind`
             // vs `LibB.DemoKind`) — that's a real mismatch.
+            //
+            // NOTE: Phase H of the name-resolution lockstep aims to
+            // remove this clause once every Type::Con carries
+            // Some(defining_module). Current state: enough sites
+            // still produce None (e.g. local-data ctor result types
+            // in bind_local_ctors, some unification synthesizers)
+            // that removing this regresses ~500 unit tests.
             (Type::Con(c1), Type::Con(c2))
                 if c1.name == c2.name
                     && (c1.module.is_none() || c2.module.is_none()) =>
@@ -846,9 +853,7 @@ impl UnifyState {
                         Type::Unif(_) => {
                             self.unify(
                                 inner_f,
-                                &Type::Con(
-                                    crate::typecheck_db::types::QName::unqualified("->"),
-                                ),
+                                &crate::typecheck_db::types::prim_function(),
                             )?;
                             true
                         }
@@ -869,8 +874,7 @@ impl UnifyState {
                 // arrow stays folded inside the head unif until
                 // the solver discharges `Category a` with `->`.
                 if let Type::Unif(_) = outer_f.as_ref() {
-                    let arrow =
-                        Type::Con(crate::typecheck_db::types::QName::unqualified("->"));
+                    let arrow = crate::typecheck_db::types::prim_function();
                     self.unify(
                         outer_f,
                         &Type::App(Box::new(arrow), Box::new((**fa).clone())),
@@ -1001,12 +1005,7 @@ impl UnifyState {
                     || matches!(f.as_ref(), Type::Unif(_)) =>
             {
                 if let Type::Unif(_) = f.as_ref() {
-                    self.unify(
-                        f,
-                        &Type::Con(crate::typecheck_db::types::QName::unqualified(
-                            "Record",
-                        )),
-                    )?;
+                    self.unify(f, &crate::typecheck_db::types::prim_record())?;
                 }
                 let empty: Vec<(String, Type)> = Vec::new();
                 let tail_box: Option<Box<Type>> = Some(Box::new((**row).clone()));
@@ -1389,11 +1388,11 @@ mod tests {
     use crate::typecheck_db::types::QName;
 
     fn int() -> Type {
-        Type::Con(QName::unqualified("Int"))
+        crate::typecheck_db::types::prim_int()
     }
 
     fn bool_ty() -> Type {
-        Type::Con(QName::unqualified("Boolean"))
+        crate::typecheck_db::types::prim_boolean()
     }
 
     #[test]

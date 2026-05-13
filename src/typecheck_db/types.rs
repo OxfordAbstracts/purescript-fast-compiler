@@ -39,12 +39,140 @@ impl QName {
 impl fmt::Display for QName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(m) = &self.module {
-            write!(f, "{}.{}", m, self.name)
+            // Elide the Prim[.Sub] prefix in display: matches the
+            // PureScript reference compiler's convention of showing
+            // `Int` not `Prim.Int`, `Maybe` not `Data.Maybe.Maybe`
+            // when the type is unambiguous. Diagnostics stay
+            // readable; structural equality still uses the full
+            // qualified form.
+            if m == "Prim" || m.starts_with("Prim.") {
+                write!(f, "{}", self.name)
+            } else {
+                write!(f, "{}.{}", m, self.name)
+            }
         } else {
             write!(f, "{}", self.name)
         }
     }
 }
+
+/// Like [`QName`] but with a mandatory defining-module qualifier.
+///
+/// Produced by the name-resolution pass; the `module` field always
+/// points at the module that DEFINES the entity, never an intermediate
+/// re-exporter. Downstream passes consume `ResolvedQName` instead of
+/// `QName` to eliminate the ambient `Option`-handling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResolvedQName {
+    pub module: String,
+    pub name: String,
+}
+
+impl ResolvedQName {
+    pub fn new(module: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { module: module.into(), name: name.into() }
+    }
+
+    /// Convert to a legacy [`QName`] with `Some(module)`. Used at
+    /// boundaries with code that still operates on the optional-
+    /// qualifier representation during the migration.
+    pub fn to_qname(&self) -> QName {
+        QName {
+            module: Some(self.module.clone()),
+            name: self.name.clone(),
+        }
+    }
+}
+
+impl fmt::Display for ResolvedQName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.module, self.name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prim helpers — every primitive built-in Type::Con with its defining module
+// ---------------------------------------------------------------------------
+//
+// Prim is split into submodules: `Prim` defines Int/Number/Boolean/etc.;
+// `Prim.Boolean` defines True/False; `Prim.Ordering` defines LT/EQ/GT;
+// `Prim.Row` / `Prim.RowList` / `Prim.Symbol` / `Prim.TypeError` / `Prim.Coerce`
+// / `Prim.Int` define their respective entities. These helpers produce
+// `Type::Con` with the correct defining-module qualifier so the resolver-
+// driven invariant (every Type::Con carries Some(defining_module)) holds
+// throughout the codebase.
+
+macro_rules! prim_helper {
+    ($fn:ident, $module:expr, $name:expr) => {
+        #[inline]
+        pub fn $fn() -> Type {
+            Type::Con(QName::qualified($module, $name))
+        }
+    };
+}
+
+// Prim itself (the canonical primitive module).
+prim_helper!(prim_int, "Prim", "Int");
+prim_helper!(prim_number, "Prim", "Number");
+prim_helper!(prim_string, "Prim", "String");
+prim_helper!(prim_char, "Prim", "Char");
+prim_helper!(prim_boolean, "Prim", "Boolean");
+prim_helper!(prim_array, "Prim", "Array");
+prim_helper!(prim_record, "Prim", "Record");
+prim_helper!(prim_function, "Prim", "Function");
+prim_helper!(prim_kind_type, "Prim", "Type");
+prim_helper!(prim_constraint, "Prim", "Constraint");
+prim_helper!(prim_symbol, "Prim", "Symbol");
+prim_helper!(prim_row, "Prim", "Row");
+prim_helper!(prim_partial, "Prim", "Partial");
+// Note: `IsSymbol` is defined in `Data.Symbol` (compiler-magic class).
+// `Prim` exposes it as a fallback for legacy import resolution, but the
+// canonical defining module is Data.Symbol — no Prim helper here.
+
+// Prim.Boolean — type-level booleans.
+prim_helper!(prim_true, "Prim.Boolean", "True");
+prim_helper!(prim_false, "Prim.Boolean", "False");
+
+// Prim.Ordering.
+prim_helper!(prim_ordering, "Prim.Ordering", "Ordering");
+prim_helper!(prim_lt, "Prim.Ordering", "LT");
+prim_helper!(prim_eq, "Prim.Ordering", "EQ");
+prim_helper!(prim_gt, "Prim.Ordering", "GT");
+
+// Prim.Row — row-polymorphism classes.
+prim_helper!(prim_row_cons, "Prim.Row", "Cons");
+prim_helper!(prim_row_union, "Prim.Row", "Union");
+prim_helper!(prim_row_nub, "Prim.Row", "Nub");
+prim_helper!(prim_row_lacks, "Prim.Row", "Lacks");
+
+// Prim.RowList — row reflection.
+prim_helper!(prim_rowlist_cons, "Prim.RowList", "Cons");
+prim_helper!(prim_rowlist_nil, "Prim.RowList", "Nil");
+prim_helper!(prim_rowlist_rowlist, "Prim.RowList", "RowList");
+
+// Prim.Symbol — type-level string ops.
+prim_helper!(prim_symbol_cons, "Prim.Symbol", "Cons");
+prim_helper!(prim_symbol_compare, "Prim.Symbol", "Compare");
+prim_helper!(prim_symbol_append, "Prim.Symbol", "Append");
+
+// Prim.TypeError — type-level error messages.
+prim_helper!(prim_fail, "Prim.TypeError", "Fail");
+prim_helper!(prim_warn, "Prim.TypeError", "Warn");
+prim_helper!(prim_above, "Prim.TypeError", "Above");
+prim_helper!(prim_beside, "Prim.TypeError", "Beside");
+prim_helper!(prim_quote, "Prim.TypeError", "Quote");
+prim_helper!(prim_quote_label, "Prim.TypeError", "QuoteLabel");
+prim_helper!(prim_text, "Prim.TypeError", "Text");
+prim_helper!(prim_doc, "Prim.TypeError", "Doc");
+
+// Prim.Coerce.
+prim_helper!(prim_coercible, "Prim.Coerce", "Coercible");
+
+// Prim.Int — type-level integer arithmetic.
+prim_helper!(prim_int_add, "Prim.Int", "Add");
+prim_helper!(prim_int_mul, "Prim.Int", "Mul");
+prim_helper!(prim_int_compare, "Prim.Int", "Compare");
+prim_helper!(prim_int_to_string, "Prim.Int", "ToString");
 
 impl Type {
     /// Format with explicit precedence context.
@@ -197,7 +325,7 @@ pub enum Type {
 impl Type {
     /// `Type` — the kind of ordinary types.
     pub fn kind_type() -> Type {
-        Type::Con(QName::unqualified("Type"))
+        prim_kind_type()
     }
 
     pub fn fun(from: Type, to: Type) -> Type {

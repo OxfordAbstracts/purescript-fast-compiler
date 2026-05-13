@@ -431,7 +431,7 @@ mod tests {
     use crate::typecheck_db::types::QName;
 
     fn int_ty() -> Type {
-        Type::Con(QName::unqualified("Int"))
+        crate::typecheck_db::types::prim_int()
     }
 
     #[test]
