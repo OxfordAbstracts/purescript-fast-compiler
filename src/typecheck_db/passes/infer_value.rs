@@ -1833,12 +1833,14 @@ fn infer_var(
     state: &mut UnifyState,
     env: &Env,
     span: crate::span::Span,
-    name: &crate::names::Qualified<crate::names::ValueName>,
+    name: &crate::names::Resolved<crate::names::ValueName>,
 ) -> Result<Type, InferError> {
-    let qi = name.to_qi();
-    let name_str =
-        crate::typecheck_db::util::resolve_symbol(qi.name);
-    let module_str = qi.module.map(crate::typecheck_db::util::resolve_symbol);
+    let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+    let module_str = if name.module.is_unresolved() {
+        None
+    } else {
+        Some(crate::typecheck_db::util::resolve_symbol(name.module.symbol()))
+    };
 
     if let Some(module) = module_str {
         let q = QName { module: Some(module), name: name_str.clone() };

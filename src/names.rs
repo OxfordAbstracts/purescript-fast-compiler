@@ -111,6 +111,24 @@ name_wrapper!(
     ModuleQualifier
 );
 
+impl ModuleQualifier {
+    /// Sentinel for "module qualifier not yet known". Used by
+    /// `Resolved::from_qualified` when lifting a CST-side
+    /// `Qualified<N>` (with `Option<ModuleQualifier>`) into an IR
+    /// `Resolved<N>`. The `resolve_pass` replaces these sentinels
+    /// with proper defining-module qualifiers; sentinels that
+    /// survive into inference indicate locally-bound binders that
+    /// `infer_var` resolves through `env.locals` instead.
+    pub fn unresolved() -> Self {
+        ModuleQualifier::new(interner::intern(""))
+    }
+
+    /// True when this qualifier is the `unresolved()` sentinel.
+    pub fn is_unresolved(self) -> bool {
+        interner::symbol_eq(self.0, "")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // matches_ident — CST boundary bridge
 //
@@ -234,6 +252,19 @@ impl<N: Copy> Resolved<N> {
         Qualified {
             module: Some(self.module),
             name: self.name,
+        }
+    }
+
+    /// Lift a `Qualified<N>` to a `Resolved<N>`. The CST/lowering
+    /// pipeline still produces `Qualified<N>` with optional module;
+    /// this lift maps `None → ModuleQualifier::unresolved()` so
+    /// downstream IR can carry a non-Option qualifier even before
+    /// `resolve_pass` runs. After resolve_pass, the sentinel is
+    /// replaced with the defining module.
+    pub fn from_qualified(q: Qualified<N>) -> Self {
+        Resolved {
+            module: q.module.unwrap_or_else(ModuleQualifier::unresolved),
+            name: q.name,
         }
     }
 }

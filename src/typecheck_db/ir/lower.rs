@@ -232,7 +232,10 @@ pub fn lower_binder(binder: cst::Binder) -> Result<Binder, LoweringError> {
 
 pub fn lower_expr(expr: cst::Expr) -> Result<Expr, LoweringError> {
     Ok(match expr {
-        cst::Expr::Var { span, name } => Expr::Var { span, name },
+        cst::Expr::Var { span, name } => Expr::Var {
+            span,
+            name: crate::names::Resolved::from_qualified(name),
+        },
         cst::Expr::Constructor { span, name } => Expr::Constructor { span, name },
         cst::Expr::Literal { span, lit } => Expr::Literal { span, lit: lower_literal(lit)? },
         cst::Expr::App { span, func, arg } => Expr::App {

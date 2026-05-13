@@ -212,12 +212,11 @@ fn is_guard_true_literal(e: &Expr) -> bool {
             if n != "otherwise" {
                 return false;
             }
-            match name.module {
-                None => true,
-                Some(m) => {
-                    let ms = crate::typecheck_db::util::resolve_symbol(m.symbol());
-                    ms == "Prelude" || ms == "Data.Boolean"
-                }
+            if name.module.is_unresolved() {
+                true
+            } else {
+                let ms = crate::typecheck_db::util::resolve_symbol(name.module.symbol());
+                ms == "Prelude" || ms == "Data.Boolean"
             }
         }
         _ => false,

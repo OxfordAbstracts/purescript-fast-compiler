@@ -1024,19 +1024,23 @@ fn rewrite_expr(r: &NameResolver, locals: &LocalScope, e: ir::Expr) -> ir::Expr 
     use ir::Expr::*;
     match e {
         Var { span, name } => {
-            // If the name is locally-bound and unqualified, leave it
-            // alone — `infer_var` walks the local scope first.
-            let q = name.module.map(|m| resolve_symbol(m.symbol()));
+            // `name` is `Resolved<ValueName>` — module is always
+            // present (sentinel for unresolved CST-side refs). If it
+            // resolves to a locally-bound binder by unqualified name,
+            // leave the sentinel in place so `infer_var` falls
+            // through to the local-scope lookup.
+            let q = if name.module.is_unresolved() {
+                None
+            } else {
+                Some(resolve_symbol(name.module.symbol()))
+            };
             let name_str = resolve_symbol(name.name.symbol());
             if q.is_none() && locals.is_bound(&name_str) {
                 return Var { span, name };
             }
             let origin = r.resolve_value(q.as_deref(), &name_str);
             let new_name = match origin {
-                Some(m) => Qualified {
-                    module: Some(module_qualifier(m)),
-                    name: name.name,
-                },
+                Some(m) => crate::names::Resolved::new(module_qualifier(m), name.name),
                 None => name,
             };
             Var { span, name: new_name }
@@ -1776,6 +1780,16 @@ mod tests {
         name.module.map(|m| resolve_symbol(m.symbol()))
     }
 
+    fn resolved_module_of(
+        name: &crate::names::Resolved<impl crate::names::NameLike>,
+    ) -> Option<String> {
+        if name.module.is_unresolved() {
+            None
+        } else {
+            Some(resolve_symbol(name.module.symbol()))
+        }
+    }
+
     #[test]
     fn resolve_module_rewrites_re_exported_value() {
         // `M` imports Prelude unqualified, references `apply`. After
@@ -1796,7 +1810,7 @@ mod tests {
                 }
                 if let ir::GuardedExpr::Unconditional(e) = guarded {
                     if let ir::Expr::Var { name, .. } = &**e {
-                        assert_eq!(module_of(name).as_deref(), Some("Control.Apply"));
+                        assert_eq!(resolved_module_of(name).as_deref(), Some("Control.Apply"));
                         return;
                     }
                 }
@@ -1845,8 +1859,14 @@ mod tests {
                 if let ir::GuardedExpr::Unconditional(e) = guarded {
                     if let ir::Expr::Lambda { body, .. } = &**e {
                         if let ir::Expr::Var { name, .. } = &**body {
-                            // Local binder — module stays None.
-                            assert!(name.module.is_none(), "expected None, got {:?}", name.module);
+                            // Local binder — module stays as the
+                            // unresolved sentinel (resolver doesn't
+                            // rewrite locally-bound refs).
+                            assert!(
+                                name.module.is_unresolved(),
+                                "expected unresolved, got {:?}",
+                                name.module
+                            );
                             return;
                         }
                     }

@@ -549,14 +549,21 @@ impl Collector {
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Var { name, .. } => {
-                let qi = name.to_qi();
-                if qi.module.is_none() && self.is_value_bound(&sym_to_string(qi.name)) {
+                // `Expr::Var.name` is now `Resolved<ValueName>` —
+                // module is always present (sentinel for unresolved).
+                let module_opt = if name.module.is_unresolved() {
+                    None
+                } else {
+                    Some(sym_to_string(name.module.symbol()))
+                };
+                let name_str = sym_to_string(name.name.symbol());
+                if module_opt.is_none() && self.is_value_bound(&name_str) {
                     return;
                 }
                 self.emit(Reference {
                     kind: NameKind::Value,
-                    module: qi.module.map(sym_to_string),
-                    name: sym_to_string(qi.name),
+                    module: module_opt,
+                    name: name_str,
                 });
             }
             Expr::Constructor { name, .. } => {

@@ -14,7 +14,7 @@
 //! [`super::Binder`], etc.
 
 use crate::cst;
-use crate::names::{ConstructorName, Qualified, ValueName};
+use crate::names::{ConstructorName, Qualified, Resolved, ValueName};
 use crate::span::Span;
 
 use super::binder::{Binder, RecordBinderField};
@@ -41,7 +41,13 @@ pub enum Literal {
 pub enum Expr {
     Var {
         span: Span,
-        name: Qualified<ValueName>,
+        /// Post-lowering, this is a `Resolved<ValueName>` — the module
+        /// qualifier is always present. Pre-resolve_pass the module
+        /// field carries `ModuleQualifier::unresolved()` as a
+        /// sentinel; resolve_pass replaces it with the defining
+        /// module. Downstream consumers can rely on the field being
+        /// non-Option.
+        name: Resolved<ValueName>,
     },
     Constructor {
         span: Span,
