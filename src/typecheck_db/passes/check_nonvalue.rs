@@ -453,6 +453,13 @@ pub mod check_instance {
             }
             _ => unreachable!("check_instance only handles Instance/Derive"),
         };
+        // Instance heads always reference a class, which is always
+        // module-level. In production every class ref should resolve
+        // (the resolver qualifies known classes; unknown classes
+        // surface as user errors at validation time). Tolerate the
+        // unresolved sentinel here so the user-facing error path —
+        // which still runs to emit the actual diagnostic — isn't
+        // pre-empted by a panic on the way there.
         let class = QName {
             module: if class_name.module.is_unresolved() {
                 None

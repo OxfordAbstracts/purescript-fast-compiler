@@ -326,7 +326,11 @@ fn cst_constraint_qname(
 }
 
 /// Variant of `cst_constraint_qname` for `Resolved<ClassName>`
-/// (used by IR instance/derive class-name positions).
+/// (used by IR instance/derive class-name positions). Classes are
+/// always module-level; in production every class ref should
+/// resolve. We tolerate the unresolved sentinel here because
+/// scanner unit tests build IR without running `resolve_pass` and
+/// rely on this graceful fall-through.
 fn resolved_class_qname(
     q: &crate::names::Resolved<crate::names::ClassName>,
 ) -> crate::typecheck_db::types::QName {

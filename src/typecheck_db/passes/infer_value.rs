@@ -1867,7 +1867,7 @@ fn infer_var(
             Lookup::Missing => {}
         }
     }
-    let q = QName { module: Some(module), name: name_str.clone() };
+    let q = QName { module: Some(module), name: name_str };
     match env.lookup_qualified(&q) {
         Some(scheme) => Ok(instantiate_and_record_constraints(state, scheme, span)),
         None => Err(InferError::UnboundVar(format!("{}", q))),
@@ -1905,24 +1905,24 @@ fn infer_constructor(
     name: &crate::names::Resolved<crate::names::ConstructorName>,
 ) -> Result<Type, InferError> {
     let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
-    let module_str = if name.module.is_unresolved() {
-        None
-    } else {
-        Some(crate::typecheck_db::util::resolve_symbol(name.module.symbol()))
-    };
-
-    let q = QName { module: module_str, name: name_str.clone() };
+    if name.module.is_unresolved() {
+        // Constructors are always module-level (data / newtype /
+        // imported). If the resolver left an unresolved sentinel
+        // here it means the ctor reference wasn't bound — either a
+        // resolver bug or a user-written ctor that isn't in scope.
+        // Surface as `UnboundConstructor`. The unqualified
+        // fallback lookup keeps unit tests that bypass resolve_pass
+        // working.
+        return env
+            .top_level
+            .get(&QName::unqualified(name_str.clone()))
+            .map(|arc| instantiate(state, arc.as_ref()))
+            .ok_or(InferError::UnboundConstructor(name_str));
+    }
+    let module = crate::typecheck_db::util::resolve_symbol(name.module.symbol());
+    let q = QName { module: Some(module), name: name_str };
     let scheme = env
         .lookup_qualified(&q)
-        .or_else(|| match &q.module {
-            // Try unqualified too for the common case where the caller
-            // seeded constructors without a module prefix.
-            Some(_) => None,
-            None => env
-                .top_level
-                .get(&QName::unqualified(name_str.clone()))
-                .map(|arc| arc.as_ref()),
-        })
         .ok_or_else(|| InferError::UnboundConstructor(format!("{}", q)))?;
     Ok(instantiate(state, scheme))
 }
@@ -2226,24 +2226,24 @@ fn bind_constructor_pattern(
     args: &[Binder],
 ) -> Result<Type, InferError> {
     let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
-    let module_str = if name.module.is_unresolved() {
-        None
+    let scheme: Scheme = if name.module.is_unresolved() {
+        // Pattern ctors are module-level; an unresolved sentinel
+        // here means the resolver failed to bind the name. Look up
+        // under the unqualified key for the unit-test path (no
+        // resolve_pass), otherwise surface UnboundConstructor.
+        env.top_level
+            .get(&QName::unqualified(name_str.clone()))
+            .map(|arc| arc.as_ref().clone())
+            .ok_or(InferError::UnboundConstructor(name_str.clone()))?
     } else {
-        Some(crate::typecheck_db::util::resolve_symbol(name.module.symbol()))
+        let module = crate::typecheck_db::util::resolve_symbol(name.module.symbol());
+        let q = QName { module: Some(module), name: name_str.clone() };
+        env.lookup_qualified(&q)
+            .cloned()
+            .ok_or_else(|| InferError::UnboundConstructor(format!("{}", q)))?
     };
-    let q = QName { module: module_str, name: name_str.clone() };
-    let scheme = env
-        .lookup_qualified(&q)
-        .or_else(|| match &q.module {
-            Some(_) => None,
-            None => env
-                .top_level
-                .get(&QName::unqualified(name_str.clone()))
-                .map(|arc| arc.as_ref()),
-        })
-        .ok_or_else(|| InferError::UnboundConstructor(format!("{}", q)))?;
 
-    let mut cur = instantiate(state, scheme);
+    let mut cur = instantiate(state, &scheme);
     let mut arg_tys: Vec<Type> = Vec::with_capacity(args.len());
     for _ in 0..args.len() {
         let arg = state.fresh();
