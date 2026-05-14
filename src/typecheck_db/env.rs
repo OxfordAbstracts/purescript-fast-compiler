@@ -144,14 +144,29 @@ impl Env {
     }
 
     /// Look up a qualified name against the top-level scheme map.
-    /// Strict — no fallback to the unqualified key. With every
-    /// scheme dual-bound under both qualifier forms, callers that
-    /// hand us a resolved `Some(M).x` always get an exact match.
-    /// Falling back to `None.x` here would route hole-bearing sigs
-    /// (which we deliberately leave unbound under the qualified
-    /// key) to recursive value refs, defeating the SCC slot path.
+    /// Falls back to the unqualified key when the module-qualified
+    /// form isn't bound AND the unqualified scheme doesn't carry a
+    /// `Type::Hole`. Hole-bearing sigs are deliberately left unbound
+    /// under the qualified key so SCC-recursive references hit the
+    /// `env.locals` mono slot via `infer_var`'s fallback path; if
+    /// we fell back to None.name here, the hole-bearing sig would
+    /// be picked up again and the body would unify against the
+    /// Hole instead of the fresh unif.
     pub fn lookup_qualified(&self, q: &QName) -> Option<&Scheme> {
-        self.top_level.get(q).map(|s| s.as_ref())
+        if let Some(s) = self.top_level.get(q) {
+            return Some(s.as_ref());
+        }
+        if q.module.is_some() {
+            if let Some(s) = self
+                .top_level
+                .get(&QName { module: None, name: q.name.clone() })
+            {
+                if !crate::typecheck_db::types::type_contains_hole(&s.as_ref().ty) {
+                    return Some(s.as_ref());
+                }
+            }
+        }
+        None
     }
 
     /// Every unification variable free in any local or top-level type.

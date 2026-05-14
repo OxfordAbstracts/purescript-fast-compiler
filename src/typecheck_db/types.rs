@@ -552,6 +552,40 @@ fn collect_app_spine(ty: &Type) -> Option<(Type, Vec<Type>)> {
 /// conversion total. Real operator resolution happens in passes that
 /// thread the full scope.
 /// Walk a TypeExpr collecting every TE::Hole site as
+/// True if a (post-conversion) `Type` contains a `Type::Hole`
+/// anywhere. Used by `env::lookup_qualified` to bypass schemes
+/// whose body still carries a user-written `?h` — those schemes
+/// only become useful AFTER the sig-pin path rewrites the holes
+/// to fresh unifs, so we don't want them returned by recursive-
+/// reference lookups during body inference.
+pub fn type_contains_hole(ty: &Type) -> bool {
+    match ty {
+        Type::Hole(_) => true,
+        Type::App(f, a) => type_contains_hole(f) || type_contains_hole(a),
+        Type::Fun(a, b) => type_contains_hole(a) || type_contains_hole(b),
+        Type::Forall(_, body) => type_contains_hole(body),
+        Type::Constrained(cs, body) => {
+            cs.iter().any(|c| c.args.iter().any(type_contains_hole)) || type_contains_hole(body)
+        }
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_contains_hole(t))
+                || tail.as_deref().map_or(false, type_contains_hole)
+        }
+        Type::Row(fields, tail) => {
+            fields.iter().any(|(_, t)| type_contains_hole(t))
+                || tail.as_deref().map_or(false, type_contains_hole)
+        }
+        Type::Kinded(t, k) => type_contains_hole(t) || type_contains_hole(k),
+        Type::Var(_)
+        | Type::Con(_)
+        | Type::Unif(_)
+        | Type::Skolem(_)
+        | Type::TypeString(_)
+        | Type::TypeInt(_)
+        | Type::Wildcard => false,
+    }
+}
+
 /// `(span, hole_name)` in source order. Used by inference paths to
 /// allocate unif vars + emit `HoleDiagnostic`s for type-level holes.
 pub fn collect_type_holes(
