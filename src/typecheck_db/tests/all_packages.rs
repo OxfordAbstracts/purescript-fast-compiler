@@ -360,6 +360,12 @@ fn repro_routing_duplex_generic() {
 }
 
 #[test]
+#[ignore = "diagnostic — Pathy.Sandboxed bisect probe"]
+fn repro_pathy_sandboxed() {
+    check_single_package_module("Pathy.Sandboxed").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
 fn repro_hylograph_shape_arc() {
     let inner = check_single_package_module("Hylograph.Shape.Arc");
     if let Err(msg) = inner {

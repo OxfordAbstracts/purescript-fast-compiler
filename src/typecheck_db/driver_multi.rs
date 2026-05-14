@@ -4726,7 +4726,8 @@ fn bind_local_ctors(
                 // holes.
                 let mut hole_sites: Vec<(crate::span::Span, String)> = Vec::new();
                 crate::typecheck_db::types::collect_type_holes(ty, &mut hole_sites);
-                if !hole_sites.is_empty() {
+                let has_holes = !hole_sites.is_empty();
+                if has_holes {
                     env.local_signed_hole_sites.insert(n.clone(), hole_sites);
                 }
                 let declared = conv(ty);
@@ -4739,7 +4740,18 @@ fn bind_local_ctors(
                 };
                 let scheme = Scheme { vars, ty: body };
                 env.bind_scheme(QName::unqualified(&n), scheme.clone());
-                env.bind_scheme(QName::qualified(self_module, &n), scheme);
+                // Sigs with `?h` (type-level holes) MUST NOT be bound
+                // under the qualified key. `infer_var`'s qualified-first
+                // lookup would otherwise route recursive references
+                // (`loop x = loop (x + 1.0)` with `loop :: ?h -> a`)
+                // through this Hole-bearing scheme. Leaving the
+                // qualified slot empty makes the qualified lookup
+                // miss, and the unqualified fallback finds the SCC
+                // pre-insert's fresh unif slot in `env.locals` — the
+                // right behavior for hole rewrite + body inference.
+                if !has_holes {
+                    env.bind_scheme(QName::qualified(self_module, &n), scheme);
+                }
             }
             crate::typecheck_db::ir::Decl::Data { name, type_vars, constructors, .. } => {
                 let type_name =

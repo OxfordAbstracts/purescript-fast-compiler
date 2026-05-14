@@ -1850,27 +1850,26 @@ fn infer_var(
         };
     }
     let module = crate::typecheck_db::util::resolve_symbol(name.module.symbol());
-    // Self-module refs may resolve to a top-level value currently
-    // being inferred by the surrounding SCC. `infer_value_scc_with_all`
-    // inserts a fresh unif into `env.locals` for each SCC member under
-    // the bare name. When the resolved module is the current one, walk
-    // `env.locals` (mono SCC slot or shadowing lambda binder) first
-    // before falling through to the top-level scheme. Otherwise the
-    // recursive ref hits a (possibly `Type::Hole`-bearing) sig scheme
-    // installed by `bind_local_ctors`.
-    if module == env.self_module {
-        match env.lookup_unqualified(&name_str) {
-            Lookup::Local(ty) => return Ok(ty.clone()),
-            Lookup::Scheme(s) => {
-                return Ok(instantiate_and_record_constraints(state, s, span))
-            }
-            Lookup::Missing => {}
-        }
+    let q = QName { module: Some(module), name: name_str.clone() };
+    // env.top_level FIRST. The qualified path produces the correct
+    // scheme for: imported values, locally-defined values (post-SCC
+    // re-bind), and locally-defined class methods. Preferring
+    // env.locals here would route instance-method-body self-refs to
+    // their per-instance SCC pre-insert slot (a fresh unif) when the
+    // body really wants the polymorphic class scheme — that broke
+    // Pathy.Sandboxed (the `compose` / `<<<` lookup) and many
+    // packages declaring classes alongside instances.
+    if let Some(scheme) = env.lookup_qualified(&q) {
+        return Ok(instantiate_and_record_constraints(state, scheme, span));
     }
-    let q = QName { module: Some(module), name: name_str };
-    match env.lookup_qualified(&q) {
-        Some(scheme) => Ok(instantiate_and_record_constraints(state, scheme, span)),
-        None => Err(InferError::UnboundVar(format!("{}", q))),
+    // Fall back to env.locals for the SCC pre-insert slot — top-level
+    // value recursive references (`fib n = ... fib (n-1)` in a
+    // sig-less or non-hole-bearing decl) land here once
+    // `bind_local_ctors` has NOT bound a scheme for the name.
+    match env.lookup_unqualified(&name_str) {
+        Lookup::Local(ty) => Ok(ty.clone()),
+        Lookup::Scheme(s) => Ok(instantiate_and_record_constraints(state, s, span)),
+        Lookup::Missing => Err(InferError::UnboundVar(format!("{}", q))),
     }
 }
 

@@ -144,22 +144,14 @@ impl Env {
     }
 
     /// Look up a qualified name against the top-level scheme map.
-    /// Falls back to the unqualified key when the module-qualified
-    /// form isn't bound — this handles the case where a fixity
-    /// target was canonicalized to its origin module (e.g.
-    /// `$` → `Data.Function.apply`) but the current module
-    /// hides that import and shadows it with a local `apply`.
+    /// Strict — no fallback to the unqualified key. With every
+    /// scheme dual-bound under both qualifier forms, callers that
+    /// hand us a resolved `Some(M).x` always get an exact match.
+    /// Falling back to `None.x` here would route hole-bearing sigs
+    /// (which we deliberately leave unbound under the qualified
+    /// key) to recursive value refs, defeating the SCC slot path.
     pub fn lookup_qualified(&self, q: &QName) -> Option<&Scheme> {
-        if let Some(s) = self.top_level.get(q) {
-            return Some(s.as_ref());
-        }
-        if q.module.is_some() {
-            return self
-                .top_level
-                .get(&QName { module: None, name: q.name.clone() })
-                .map(|s| s.as_ref());
-        }
-        None
+        self.top_level.get(q).map(|s| s.as_ref())
     }
 
     /// Every unification variable free in any local or top-level type.
