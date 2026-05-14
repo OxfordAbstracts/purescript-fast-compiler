@@ -16,6 +16,7 @@
 //! returns a [`Scheme`] per name defined in the SCC.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1761,6 +1762,7 @@ pub fn try_get_cached(
     if let Some((schemes, _blob_oh)) = db.get_cached::<Vec<InferredScheme>>(&key, input_hash)? {
         for s in &schemes {
             env.bind_scheme(QName::unqualified(&s.name), s.scheme.clone());
+            env.bind_scheme(QName::qualified(module, &s.name), s.scheme.clone());
         }
         let scheme_oh = scheme_only_output_hash(&schemes);
         return Ok(Some((schemes, scheme_oh)));
@@ -1836,34 +1838,39 @@ fn infer_var(
     name: &crate::names::Resolved<crate::names::ValueName>,
 ) -> Result<Type, InferError> {
     let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
-    let module_str = if name.module.is_unresolved() {
-        None
-    } else {
-        Some(crate::typecheck_db::util::resolve_symbol(name.module.symbol()))
-    };
-
-    if let Some(module) = module_str {
-        let q = QName { module: Some(module), name: name_str.clone() };
-        if let Some(scheme) = env.lookup_qualified(&q) {
-            return Ok(instantiate_and_record_constraints(state, scheme, span));
-        }
-        // Post-resolve_pass refs to locally-defined values carry the
-        // current module's qualifier. The pre-insert in `infer_value_scc`
-        // puts the fresh unif var into `env.locals` under just the simple
-        // name — `lookup_qualified` only consults `top_level`. Fall
-        // back to the unqualified path for local binders so recursive
-        // and mutual definitions still resolve.
+    if name.module.is_unresolved() {
+        // Lexical-scope ref (lambda / case / let / where / do
+        // binder). The resolver filters these via its `LocalScope`
+        // stack before this point, so the unresolved sentinel here
+        // means the ref is bound in the current lexical scope.
         return match env.lookup_unqualified(&name_str) {
             Lookup::Local(ty) => Ok(ty.clone()),
             Lookup::Scheme(s) => Ok(instantiate_and_record_constraints(state, s, span)),
-            Lookup::Missing => Err(InferError::UnboundVar(format!("{}", q))),
+            Lookup::Missing => Err(InferError::UnboundVar(name_str)),
         };
     }
-
-    match env.lookup_unqualified(&name_str) {
-        Lookup::Local(ty) => Ok(ty.clone()),
-        Lookup::Scheme(s) => Ok(instantiate_and_record_constraints(state, s, span)),
-        Lookup::Missing => Err(InferError::UnboundVar(name_str)),
+    let module = crate::typecheck_db::util::resolve_symbol(name.module.symbol());
+    // Self-module refs may resolve to a top-level value currently
+    // being inferred by the surrounding SCC. `infer_value_scc_with_all`
+    // inserts a fresh unif into `env.locals` for each SCC member under
+    // the bare name. When the resolved module is the current one, walk
+    // `env.locals` (mono SCC slot or shadowing lambda binder) first
+    // before falling through to the top-level scheme. Otherwise the
+    // recursive ref hits a (possibly `Type::Hole`-bearing) sig scheme
+    // installed by `bind_local_ctors`.
+    if module == env.self_module {
+        match env.lookup_unqualified(&name_str) {
+            Lookup::Local(ty) => return Ok(ty.clone()),
+            Lookup::Scheme(s) => {
+                return Ok(instantiate_and_record_constraints(state, s, span))
+            }
+            Lookup::Missing => {}
+        }
+    }
+    let q = QName { module: Some(module), name: name_str.clone() };
+    match env.lookup_qualified(&q) {
+        Some(scheme) => Ok(instantiate_and_record_constraints(state, scheme, span)),
+        None => Err(InferError::UnboundVar(format!("{}", q))),
     }
 }
 

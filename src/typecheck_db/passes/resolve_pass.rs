@@ -560,18 +560,15 @@ impl NameResolver {
     }
 
     fn resolve_value(&self, qualifier: Option<&str>, name: &str) -> Option<&str> {
-        // Locally-declared unqualified value references stay
-        // unresolved (None). Top-level recursive references (`fib n
-        // = ... fib (n-1)`) are pre-inserted into `env.locals` as a
-        // fresh unif slot by `infer_value_scc`; rewriting them to
-        // `Some(self_module).fib` would route the recursive call
-        // through the polymorphic top-level scheme path (which may
-        // still carry `Type::Hole` from the sig), producing a
-        // Hole-vs-Concrete mismatch. Leaving the qualifier as the
-        // unresolved sentinel keeps `infer_var` on the
-        // local-binder path that finds the pre-insert slot.
+        // Locally-defined module-level values resolve to
+        // `Some(self_module)`. Lexical-scope refs (lambda / case /
+        // let / where / do binders) are filtered upstream in
+        // `rewrite_expr` by the `LocalScope` stack BEFORE this
+        // function is consulted — so by the time we get here the
+        // name is module-level and the resolved qualifier is the
+        // defining module.
         if qualifier.is_none() && self.local_values.contains(name) {
-            return None;
+            return Some(self.self_module.as_str());
         }
         self.values
             .get(&(qualifier.unwrap_or("").to_string(), name.to_string()))

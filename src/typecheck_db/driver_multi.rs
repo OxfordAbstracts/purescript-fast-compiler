@@ -339,6 +339,7 @@ fn check_one_module(
     // 1) Pull imports into an Env + InstanceIndex.
     let (mut env, mut instance_index, mut import_errors) =
         phase!("1.build_env_from_imports", build_env_from_imports(module, registry));
+    env.self_module = name.clone();
 
     // 1b) Structural validation (duplicates, orphans, fixity conflicts,
     //     duplicate type arguments). Pure traversal over the CST plus
@@ -1332,6 +1333,10 @@ fn check_one_module(
         for s in &schemes {
             env.bind_scheme(
                 crate::typecheck_db::types::QName::unqualified(&s.name),
+                s.scheme.clone(),
+            );
+            env.bind_scheme(
+                crate::typecheck_db::types::QName::qualified(&name, &s.name),
                 s.scheme.clone(),
             );
         }
@@ -4695,7 +4700,14 @@ fn bind_local_ctors(
                     }
                     other => (Vec::new(), other),
                 };
-                env.bind_scheme(QName::unqualified(&n), Scheme { vars, ty: body });
+                let scheme = Scheme { vars, ty: body };
+                // Dual-bind during transition: legacy consumers look up under
+                // `QName::unqualified(name)`, post-resolve consumers under
+                // `QName::qualified(self_module, name)`. Once every consumer
+                // is migrated to the qualified form, drop the unqualified
+                // binding here.
+                env.bind_scheme(QName::unqualified(&n), scheme.clone());
+                env.bind_scheme(QName::qualified(self_module, &n), scheme);
             }
             crate::typecheck_db::ir::Decl::TypeSignature { name, ty, .. } => {
                 // A top-level `foo :: T` before `foo = …` — bind
@@ -4725,7 +4737,9 @@ fn bind_local_ctors(
                     }
                     other => (Vec::new(), other),
                 };
-                env.bind_scheme(QName::unqualified(&n), Scheme { vars, ty: body });
+                let scheme = Scheme { vars, ty: body };
+                env.bind_scheme(QName::unqualified(&n), scheme.clone());
+                env.bind_scheme(QName::qualified(self_module, &n), scheme);
             }
             crate::typecheck_db::ir::Decl::Data { name, type_vars, constructors, .. } => {
                 let type_name =
@@ -4742,7 +4756,8 @@ fn bind_local_ctors(
                     let fields: Vec<Type> = c.fields.iter().map(|f| conv(f)).collect();
                     let scheme_ty = build_fn_chain(&fields, &result_ty);
                     let scheme = Scheme { vars: tvars.clone(), ty: scheme_ty };
-                    env.bind_scheme(QName::unqualified(&ctor_name), scheme);
+                    env.bind_scheme(QName::unqualified(&ctor_name), scheme.clone());
+                    env.bind_scheme(QName::qualified(self_module, &ctor_name), scheme);
                 }
             }
             crate::typecheck_db::ir::Decl::Newtype { name, type_vars, constructor, ty, .. } => {
@@ -4759,7 +4774,8 @@ fn bind_local_ctors(
                     crate::typecheck_db::util::resolve_symbol(constructor.value.symbol());
                 let scheme_ty = Type::fun(field_ty, result_ty);
                 let scheme = Scheme { vars: tvars.clone(), ty: scheme_ty };
-                env.bind_scheme(QName::unqualified(&ctor_name), scheme);
+                env.bind_scheme(QName::unqualified(&ctor_name), scheme.clone());
+                env.bind_scheme(QName::qualified(self_module, &ctor_name), scheme);
             }
             crate::typecheck_db::ir::Decl::Class { name, type_vars, members, .. } => {
                 // Expose each class method as a constrained scheme:
@@ -4805,9 +4821,11 @@ fn bind_local_ctors(
                         Type::Constrained(vec![constraint], Box::new(method_body));
                     let mut all_vars = class_vars.clone();
                     all_vars.extend(method_vars);
+                    let scheme = Scheme { vars: all_vars, ty: constrained_body };
+                    env.bind_scheme(QName::unqualified(&method_name), scheme.clone());
                     env.bind_scheme(
-                        QName::unqualified(&method_name),
-                        Scheme { vars: all_vars, ty: constrained_body },
+                        QName::qualified(self_module, &method_name),
+                        scheme,
                     );
                 }
             }

@@ -13,6 +13,12 @@ use crate::typecheck_db::unify::UnifyState;
 
 #[derive(Debug, Clone, Default)]
 pub struct Env {
+    /// The module this `Env` is checking. Used by the SCC inference
+    /// to bind pre-insert slots under `QName::qualified(self_module,
+    /// name)` so resolved self-references (e.g. `Some("M").fib`) hit
+    /// the SCC's mono slot rather than the (possibly Hole-bearing)
+    /// sig scheme. Empty string when not set (test-only `Env::new()`).
+    pub self_module: String,
     /// Qualified top-level schemes (values, constructors, class methods).
     /// `Arc`-shared so the import path can bind a single scheme under
     /// multiple `QName` keys (qualifier + origin) with one
@@ -64,6 +70,7 @@ pub struct Env {
 impl Env {
     pub fn new() -> Self {
         Self {
+            self_module: String::new(),
             top_level: HashMap::new(),
             locals: vec![HashMap::new()],
             local_schemes: vec![HashMap::new()],
