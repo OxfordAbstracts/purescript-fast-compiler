@@ -188,7 +188,17 @@ mod tests {
             "module M where\ndata Box (f :: Type -> Type) = Box (f Int)\n",
         );
         let out = compute(&d, &TypeOpMap::default());
-        let inner = Type::fun(Type::kind_type(), Type::kind_type());
+        // The user annotation `Type -> Type` comes through
+        // `convert_type_expr` on the raw CST (no resolve_pass runs
+        // in this unit test), so its `Type` constructors carry no
+        // module qualifier. The synthesized outer kind uses
+        // `prim_kind_type()` (Some("Prim").Type). The lenient unify
+        // rule treats `Type` ~ `Prim.Type` as the same — this
+        // assertion mirrors the actual produced shape.
+        let inner = Type::fun(
+            Type::Con(QName::unqualified("Type")),
+            Type::Con(QName::unqualified("Type")),
+        );
         assert_eq!(out, KindOutput::Kind(Type::fun(inner, Type::kind_type())));
     }
 

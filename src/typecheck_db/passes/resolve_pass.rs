@@ -560,14 +560,18 @@ impl NameResolver {
     }
 
     fn resolve_value(&self, qualifier: Option<&str>, name: &str) -> Option<&str> {
-        // Top-level recursive values (`fib n = ... fib (n-1)`) are
-        // inserted into the env under
-        // `QName::qualified(self_module, name)` by `infer_value`'s
-        // pre-insert. Locally-declared values resolve to
-        // Some(self_module) so the env lookup picks them up via the
-        // single resolved key.
+        // Locally-declared unqualified value references stay
+        // unresolved (None). Top-level recursive references (`fib n
+        // = ... fib (n-1)`) are pre-inserted into `env.locals` as a
+        // fresh unif slot by `infer_value_scc`; rewriting them to
+        // `Some(self_module).fib` would route the recursive call
+        // through the polymorphic top-level scheme path (which may
+        // still carry `Type::Hole` from the sig), producing a
+        // Hole-vs-Concrete mismatch. Leaving the qualifier as the
+        // unresolved sentinel keeps `infer_var` on the
+        // local-binder path that finds the pre-insert slot.
         if qualifier.is_none() && self.local_values.contains(name) {
-            return Some(self.self_module.as_str());
+            return None;
         }
         self.values
             .get(&(qualifier.unwrap_or("").to_string(), name.to_string()))

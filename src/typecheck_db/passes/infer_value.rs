@@ -1848,9 +1848,8 @@ fn infer_var(
             return Ok(instantiate_and_record_constraints(state, scheme, span));
         }
         // Post-resolve_pass refs to locally-defined values carry the
-        // current module's qualifier (e.g. `Some("Main").fib` for a
-        // self-reference). The pre-insert in `infer_value_scc` puts
-        // the fresh unif var into `env.locals` under just the simple
+        // current module's qualifier. The pre-insert in `infer_value_scc`
+        // puts the fresh unif var into `env.locals` under just the simple
         // name — `lookup_qualified` only consults `top_level`. Fall
         // back to the unqualified path for local binders so recursive
         // and mutual definitions still resolve.
