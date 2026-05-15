@@ -1388,6 +1388,7 @@ fn check_one_module(
     for d in non_value_decls.iter() {
         if let crate::typecheck_db::ir::Decl::Instance {
             class_name,
+            constraints: inst_constraints,
             types,
             members,
             ..
@@ -1395,6 +1396,30 @@ fn check_one_module(
         {
             let class_name_str =
                 crate::typecheck_db::util::resolve_symbol(class_name.name.symbol());
+            // Convert instance head context to typecheck_db
+            // Constraints. We'll wrap the synthesized method sig with
+            // these so the SCC's bidirectional check-mode skolemizes
+            // the instance head vars and pushes the context as
+            // givens (matching the original PureScript compiler's
+            // semantics for instance method body checking).
+            let inst_context_constraints: Vec<crate::typecheck_db::types::Constraint> =
+                inst_constraints
+                    .iter()
+                    .map(|c| {
+                        let qi = c.class.to_qi();
+                        crate::typecheck_db::types::Constraint {
+                            class: crate::typecheck_db::types::QName {
+                                module: qi.module.map(|m| {
+                                    crate::typecheck_db::util::resolve_symbol(m)
+                                }),
+                                name: crate::typecheck_db::util::resolve_symbol(qi.name),
+                            },
+                            args: c.args.iter().map(|a| {
+                                crate::typecheck_db::types::convert_type_expr(a, &type_ops)
+                            }).collect(),
+                        }
+                    })
+                    .collect();
             // Class info: prefer the local declaration; otherwise
             // walk the importer's direct imports to find the class
             // in another module's exported `ClassInfo`. We only
@@ -1534,16 +1559,41 @@ fn check_one_module(
                     .filter(|v| !subst.contains_key(*v))
                     .cloned()
                     .collect();
-                let class_synthesized_sig = if method_vars.is_empty() {
-                    crate::typecheck_db::types::Scheme {
-                        vars: Vec::new(),
-                        ty: peeled,
-                    }
+                // Collect free instance-head vars (e.g. `inner` in
+                // `instance C inner => D Foo inner`). These must be
+                // quantified by an INNER Forall in the synthesized
+                // sig (NOT outer scheme.vars) so the SCC's check-
+                // mode trigger (`scheme_has_inner_forall`) fires and
+                // peels them into fresh skolems — letting the body's
+                // pending constraints discharge against the
+                // instance-context givens that check-mode pushes.
+                let instance_head_vars =
+                    crate::typecheck_db::passes::instance_index::collect_instance_vars(
+                        &head_tys,
+                        &inst_context_constraints,
+                    );
+                let with_ctx = if inst_context_constraints.is_empty() {
+                    peeled
                 } else {
-                    crate::typecheck_db::types::Scheme {
-                        vars: method_vars,
-                        ty: peeled,
-                    }
+                    crate::typecheck_db::types::Type::Constrained(
+                        inst_context_constraints.clone(),
+                        Box::new(peeled),
+                    )
+                };
+                let with_inner_forall = if instance_head_vars.is_empty() {
+                    with_ctx
+                } else {
+                    crate::typecheck_db::types::Type::Forall(
+                        instance_head_vars
+                            .into_iter()
+                            .map(|n| (n, false, None))
+                            .collect(),
+                        Box::new(with_ctx),
+                    )
+                };
+                let class_synthesized_sig = crate::typecheck_db::types::Scheme {
+                    vars: method_vars,
+                    ty: with_inner_forall,
                 };
                 // If the user wrote a member-level type signature for
                 // this method (e.g. `foo :: ?test` inside an instance),

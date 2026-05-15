@@ -619,6 +619,17 @@ fn ty_eq(a: &Type, b: &Type) -> bool {
         (App(f1, a1), App(f2, a2)) | (Fun(f1, a1), Fun(f2, a2)) => {
             ty_eq(f1, f2) && ty_eq(a1, a2)
         }
+        (Record(fa, ta), Record(fb, tb)) | (Row(fa, ta), Row(fb, tb)) => {
+            fa.len() == fb.len()
+                && fa.iter().zip(fb.iter()).all(|((la, va), (lb, vb))| {
+                    la == lb && ty_eq(va, vb)
+                })
+                && match (ta, tb) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => ty_eq(a, b),
+                    _ => false,
+                }
+        }
         (Kinded(t1, _), other) => ty_eq(t1, other),
         (other, Kinded(t2, _)) => ty_eq(other, t2),
         _ => false,
