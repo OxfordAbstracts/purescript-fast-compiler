@@ -1623,7 +1623,41 @@ fn check_one_module(
                     if !hs.is_empty() {
                         new_hole_sites = Some(hs);
                     }
-                    crate::typecheck_db::types::Scheme { vars, ty: body }
+                    // Wrap with instance context + inner Forall over
+                    // instance head vars so the SCC's check-mode peels
+                    // them as skolems/givens (same treatment as the
+                    // class-derived synthesized sig — without this, a
+                    // user-written member sig like
+                    // `fromOutHtml :: forall msg. CtxT ctx html (These msg out) -> CtxT ctx html msg`
+                    // would leave `ctx`/`html`/`out` as free
+                    // Type::Vars in the body, and the method body's
+                    // pending constraints couldn't discharge against
+                    // the instance context.
+                    let head_vars =
+                        crate::typecheck_db::passes::instance_index::collect_instance_vars(
+                            &head_tys,
+                            &inst_context_constraints,
+                        );
+                    let body_with_ctx = if inst_context_constraints.is_empty() {
+                        body
+                    } else {
+                        crate::typecheck_db::types::Type::Constrained(
+                            inst_context_constraints.clone(),
+                            Box::new(body),
+                        )
+                    };
+                    let body_with_inner_forall = if head_vars.is_empty() {
+                        body_with_ctx
+                    } else {
+                        crate::typecheck_db::types::Type::Forall(
+                            head_vars.into_iter().map(|n| (n, false, None)).collect(),
+                            Box::new(body_with_ctx),
+                        )
+                    };
+                    crate::typecheck_db::types::Scheme {
+                        vars,
+                        ty: body_with_inner_forall,
+                    }
                 } else {
                     class_synthesized_sig
                 };
