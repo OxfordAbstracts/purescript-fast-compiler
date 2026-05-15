@@ -372,6 +372,12 @@ fn repro_state_trans() {
 }
 
 #[test]
+#[ignore = "diagnostic — Fmt"]
+fn repro_fmt() {
+    check_single_package_module("Fmt").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
 fn repro_hylograph_shape_arc() {
     let inner = check_single_package_module("Hylograph.Shape.Arc");
     if let Err(msg) = inner {

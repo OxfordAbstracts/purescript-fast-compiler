@@ -525,7 +525,7 @@ fn app_spine_head_arity(
 /// pairwise `ty_eq` on zonked args — givens aren't subject to
 /// further unification.
 fn given_discharges_pending(
-    state: &crate::typecheck_db::unify::UnifyState,
+    state: &mut crate::typecheck_db::unify::UnifyState,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> bool {
@@ -541,6 +541,28 @@ fn given_discharges_pending(
         };
         if constraints_eq(&zg, &zp) || superclass_matches(instances, &zg, &zp) {
             return true;
+        }
+        // Functional-dependency-style improvement: if the names match
+        // and unifying the args succeeds, the given satisfies the
+        // pending — bind any free unifs in the pending to the
+        // skolems / concrete types from the given. Mirrors GHC's
+        // wanted-from-given improvement for class fundeps. We accept
+        // ANY successful unify (without consulting fundeps) because
+        // the given is provably true: if its args are unifiable with
+        // the pending's, the pending is provably true too.
+        if zg.class == zp.class && zg.args.len() == zp.args.len() {
+            let snapshot = state.snapshot_bindings();
+            let mut all_ok = true;
+            for (g_arg, p_arg) in zg.args.iter().zip(zp.args.iter()) {
+                if state.unify(g_arg, p_arg).is_err() {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                return true;
+            }
+            state.restore_bindings(snapshot);
         }
     }
     false
