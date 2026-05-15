@@ -354,6 +354,14 @@ pub fn distill_exports(
         )
     };
 
+    let distill_self_module: String = module
+        .name
+        .value
+        .parts
+        .iter()
+        .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(".");
     let mut scheme_by_name: HashMap<String, std::sync::Arc<Scheme>> = HashMap::new();
     for d in &module.decls {
         match d {
@@ -382,7 +390,14 @@ pub fn distill_exports(
                         other => (Vec::new(), other),
                     };
                     let constraint = crate::typecheck_db::types::Constraint {
-                        class: crate::typecheck_db::types::QName::unqualified(
+                        // Use the DEFINING module's qualifier (this is
+                        // distill_exports for `module`, so its decls
+                        // define the class here). Matches
+                        // `bind_local_ctors`'s qualified-class form
+                        // so cross-module constraint discharge
+                        // compares apples to apples.
+                        class: crate::typecheck_db::types::QName::qualified(
+                            &distill_self_module,
                             &class_name,
                         ),
                         args: class_vars
