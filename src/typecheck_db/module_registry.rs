@@ -601,6 +601,15 @@ pub fn distill_exports(
                 //   Otherwise leave as `None`.
                 let target_is_local_value = scheme_by_name.contains_key(&target_name);
                 let target_is_local_ctor = ctor_info.contains_key(&target_name);
+                // Type fixities (`infixr 4 type RowApply as +`)
+                // target a TYPE — check local_type_names.
+                // Without this, a locally-defined-type target
+                // leaves `target_module = None`, so importers
+                // build `type_ops[+] = QName(None, "RowApply")`
+                // and their distilled alias bodies that mention
+                // `+` keep the unqualified `RowApply`.
+                let target_is_local_type =
+                    local_type_names.contains(&target_name);
                 let self_module_name_str: String = module
                     .name
                     .value
@@ -611,7 +620,10 @@ pub fn distill_exports(
                     .join(".");
                 let target_module = match user_target_module {
                     Some(m) => Some(m),
-                    None if target_is_local_value || target_is_local_ctor => {
+                    None if target_is_local_value
+                        || target_is_local_ctor
+                        || target_is_local_type =>
+                    {
                         Some(self_module_name_str.clone())
                     }
                     // Non-local target (e.g. `infixr 6 Tuple as
