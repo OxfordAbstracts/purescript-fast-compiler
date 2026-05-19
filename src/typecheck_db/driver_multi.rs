@@ -582,15 +582,24 @@ fn check_one_module(
             registry,
             &prims,
         );
+        let self_module_str: String = name.clone();
         for d in &resolved_for_aliases.decls {
-            if let cst::Decl::TypeAlias { name, type_vars, ty, .. } = d {
-                let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+            if let cst::Decl::TypeAlias { name: alias_name, type_vars, ty, .. } = d {
+                let n = crate::typecheck_db::util::resolve_symbol(alias_name.value.symbol());
                 let vars: Vec<String> = type_vars
                     .iter()
                     .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
                     .collect();
                 let body = crate::typecheck_db::types::convert_type_expr(ty, &type_ops);
-                m.insert(n, (vars, body));
+                // Local aliases: register under both the qualified
+                // form (Some(self_module), name) and the bare
+                // (None, name) — local aliases are always in scope
+                // unqualified within their defining module.
+                m.insert(
+                    (Some(self_module_str.clone()), n.clone()),
+                    (vars.clone(), body.clone()),
+                );
+                m.insert((None, n), (vars, body));
             }
         }
         // Names of locally-declared data/newtype/class/foreign-data
@@ -618,16 +627,34 @@ fn check_one_module(
         // whole chain.
         for imp in &module.imports {
             let imp_name = join_module_name(&imp.module);
-            if let Some(e) = registry.get(&imp_name) {
-                for (k, a) in &e.type_aliases {
-                    // Skip aliases whose unqualified name collides
-                    // with a locally-defined concrete type.
-                    if local_concrete_names.contains(k.as_str()) {
-                        continue;
-                    }
-                    m.entry(k.clone())
-                        .or_insert_with(|| (a.type_vars.clone(), a.body.clone()));
+            let target = match registry.get(&imp_name) {
+                Some(e) => e,
+                None => continue,
+            };
+            for (k, a) in &target.type_aliases {
+                // Defining-module key — populate ALWAYS so a
+                // resolver-qualified `Type::Con(Some(M), name)` from
+                // an alias body (e.g. transitive `type N3 = Succ N2`
+                // where `N2` isn't directly imported) still
+                // expands.
+                let origin = target
+                    .type_origins
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| imp_name.clone());
+                m.entry((Some(origin), k.clone()))
+                    .or_insert_with(|| (a.type_vars.clone(), a.body.clone()));
+                // Unqualified key — skip when the name collides
+                // with a locally-defined concrete type (the local
+                // newtype/data wins). Otherwise register so a
+                // call-site `Type::Con(None, name)` that survived
+                // the resolver (legacy or transitive operator
+                // desugar) still expands.
+                if local_concrete_names.contains(k.as_str()) {
+                    continue;
                 }
+                m.entry((None, k.clone()))
+                    .or_insert_with(|| (a.type_vars.clone(), a.body.clone()));
             }
         }
         m

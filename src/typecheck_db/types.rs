@@ -382,14 +382,26 @@ impl Scheme {
 /// module-qualified) to `QName { module: Some("Data.Tuple"), name: "Tuple" }`.
 pub type TypeOpMap = HashMap<(Option<String>, String), QName>;
 
-/// Map from a type-alias name to its `(type_vars, body)`. Built
-/// once per module check (local aliases + every imported
-/// module's aliases) and passed to `expand_aliases` so
-/// signatures, constructor fields, instance heads, and the like
-/// all get their aliases unfolded before unification compares
-/// them. Without this, unifying `SynString` (an alias for
-/// `String`) against `String` fails as a `Mismatch`.
-pub type AliasMap = HashMap<String, (Vec<String>, Type)>;
+/// Map from a type-alias `(Option<module>, name)` to its
+/// `(type_vars, body)`. Built once per module check (local
+/// aliases + every imported module's aliases) and passed to
+/// `expand_aliases` so signatures, constructor fields, instance
+/// heads, and the like all get their aliases unfolded before
+/// unification compares them.
+///
+/// The qualifier-aware key distinguishes aliases from different
+/// modules that happen to share a simple name (e.g.
+/// `Control.Monad.State.State` and a locally-imported
+/// `Marionette.Types.State` newtype — the alias for `State`
+/// from `Control.Monad.State` is registered ONLY under
+/// `(Some("Control.Monad.State"), "State")`, never under
+/// `(None, "State")`, so it doesn't silently expand at use-sites
+/// that expect the newtype).
+///
+/// `expand_once` looks up the qualified form first (using the
+/// `Type::Con`'s module qualifier), then falls back to the
+/// unqualified form when the user explicitly imported the alias.
+pub type AliasMap = HashMap<(Option<String>, String), (Vec<String>, Type)>;
 
 /// Walk `ty` and replace every `Type::Con(name)` / applied
 /// `App(Con(name), ...)` whose simple name matches an alias
@@ -456,7 +468,17 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
     // structural recurse.
     let spine = collect_app_spine(ty);
     if let Some((Type::Con(qn), args)) = spine {
-        if let Some((vars, body)) = aliases.get(&qn.name) {
+        // Qualifier-aware lookup: try the resolved `(Some(module),
+        // name)` first; if that misses, fall back to `(None,
+        // name)`. The unqualified entry is only present when the
+        // user explicitly imported the alias (or it's local), so
+        // the fallback avoids the collision that an
+        // import-list-blind alias_map would produce when two
+        // modules export same-named aliases.
+        let entry = aliases
+            .get(&(qn.module.clone(), qn.name.clone()))
+            .or_else(|| aliases.get(&(None, qn.name.clone())));
+        if let Some((vars, body)) = entry {
             // Only expand saturated applications (vars.len() ==
             // args.len()) for now — partial aliases need the
             // leftover args re-applied to the expanded body and
