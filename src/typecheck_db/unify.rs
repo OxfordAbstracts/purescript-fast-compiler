@@ -39,7 +39,16 @@ fn forall_head_matches(body: &Type, other: &Type) -> bool {
         }
     }
     match (app_head(body), app_head(other)) {
-        (Some(Type::Con(a)), Some(Type::Con(b))) => a == b,
+        (Some(Type::Con(a)), Some(Type::Con(b))) => {
+            // Lenient module-qualifier comparison (mirrors the unify
+            // arm): names must match; one side may be None-qualified
+            // when the other is Some(defining_module). Lets a forall
+            // body's qualified `Z3` instantiate against a call-site
+            // unqualified `Z3` (legacy synthesizer didn't qualify).
+            a == b
+                || (a.name == b.name
+                    && (a.module.is_none() || b.module.is_none()))
+        }
         // The other side's head is a unification variable —
         // we don't know its identity yet, but instantiating the
         // Forall and recursing lets the unif bind to whatever
