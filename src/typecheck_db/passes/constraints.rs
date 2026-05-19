@@ -351,6 +351,55 @@ pub fn solve_one(
                 app_spine_head_arity(&z).map(|(qn, ar)| (qn.clone(), ar))
             })
             .collect();
+    // Overlap-aware deferral. When the target contains a unif AND
+    // multiple candidates pass the head-pre-filter, committing to
+    // the first match would pin the unif to that candidate's
+    // type-args — but a later inference step (e.g. `UInt64 <$>
+    // Internal.fromNumber n` forcing `Long' ?s ~ Long' Unsigned`)
+    // may pin it the other way. Defer so the constraint can
+    // resolve unambiguously once the unif is bound.
+    //
+    // Skip when the class has fundeps (fundep-driven matching
+    // already handles improvement) or has 0/1 candidates.
+    let target_has_unif =
+        pending.constraint.args.iter().any(|a| contains_unif(a, state));
+    let class_has_fundeps =
+        class_info.map(|info| !info.fundeps.is_empty()).unwrap_or(false);
+    if target_has_unif && cand_count > 1 && !class_has_fundeps {
+        let mut passing = 0usize;
+        for cand in cands.iter() {
+            let mut head_ok = true;
+            for (i, target) in target_heads.iter().enumerate() {
+                if let Some((th, ta)) = target {
+                    if let Some(cand_arg) = cand.types.get(i) {
+                        if let Some((ch, ca)) = app_spine_head_arity(cand_arg) {
+                            if ca != *ta {
+                                head_ok = false;
+                                break;
+                            }
+                            if ch.name != th.name {
+                                head_ok = false;
+                                break;
+                            }
+                            if ch.module.is_some()
+                                && th.module.is_some()
+                                && ch.module != th.module
+                            {
+                                head_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if head_ok {
+                passing += 1;
+                if passing >= 2 {
+                    return SolveOutcome::Deferred;
+                }
+            }
+        }
+    }
     for (instance_idx, cand) in cands.iter().enumerate() {
         // Cheap structural pre-filter: for every position where the
         // target has a concrete `Con`-headed spine, the candidate's
@@ -688,6 +737,28 @@ fn contains_rigid_var(ty: &Type, state: &crate::typecheck_db::unify::UnifyState)
 /// solves them or proves they're polymorphic.
 fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
     matches!(state.zonk(ty), Type::Unif(_))
+}
+
+/// True when `ty` structurally contains a `Type::Unif` anywhere
+/// (after zonking). Used by the overlap-aware deferral rule below.
+fn contains_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
+    fn walk(t: &Type) -> bool {
+        match t {
+            Type::Unif(_) => true,
+            Type::App(f, a) | Type::Fun(f, a) => walk(f) || walk(a),
+            Type::Forall(_, body) => walk(body),
+            Type::Constrained(cs, body) => {
+                cs.iter().any(|c| c.args.iter().any(walk)) || walk(body)
+            }
+            Type::Record(fs, tail) | Type::Row(fs, tail) => {
+                fs.iter().any(|(_, t)| walk(t))
+                    || tail.as_deref().map(walk).unwrap_or(false)
+            }
+            Type::Kinded(t, k) => walk(t) || walk(k),
+            _ => false,
+        }
+    }
+    walk(&state.zonk(ty))
 }
 
 /// True when `ty`'s App-spine head is a unif var (so the structural
