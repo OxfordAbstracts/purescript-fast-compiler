@@ -1093,7 +1093,7 @@ fn try_match(
 /// Maximum number of solver iterations before giving up. Guards
 /// against pathological self-referential instances like
 /// `instance Loop a => Loop a`.
-const MAX_SOLVER_DEPTH: usize = 32;
+const MAX_SOLVER_DEPTH: usize = 128;
 
 /// Drain a list of pending constraints and emit per-decl
 /// resolutions + errors. Runs a fixed-point loop: each match may

@@ -378,6 +378,12 @@ fn repro_fmt() {
 }
 
 #[test]
+#[ignore = "diagnostic — Foreign.ReadWrite"]
+fn repro_foreign_readwrite() {
+    check_single_package_module("Foreign.ReadWrite").unwrap_or_else(|m| panic!("{m}"));
+}
+
+#[test]
 fn repro_hylograph_shape_arc() {
     let inner = check_single_package_module("Hylograph.Shape.Arc");
     if let Err(msg) = inner {
