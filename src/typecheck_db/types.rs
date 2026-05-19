@@ -460,6 +460,38 @@ fn body_mentions_name(ty: &Type, name: &str) -> bool {
     }
 }
 
+/// True when `ty` structurally contains `Con(QName { module, name
+/// })` — both fields must match. Used by `expand_once` to detect
+/// self-referential aliases without false positives across modules
+/// (e.g. `type Result = Other.Result` is not self-referential when
+/// the alias's qualified key is `(Some("W"), "Result")`).
+fn body_mentions_qname(ty: &Type, module: &Option<String>, name: &str) -> bool {
+    match ty {
+        Type::Con(qn) => &qn.module == module && qn.name == name,
+        Type::App(f, a) | Type::Fun(f, a) => {
+            body_mentions_qname(f, module, name)
+                || body_mentions_qname(a, module, name)
+        }
+        Type::Row(fs, tail) | Type::Record(fs, tail) => {
+            fs.iter().any(|(_, t)| body_mentions_qname(t, module, name))
+                || tail
+                    .as_ref()
+                    .map_or(false, |t| body_mentions_qname(t, module, name))
+        }
+        Type::Forall(_, b) => body_mentions_qname(b, module, name),
+        Type::Kinded(t, k) => {
+            body_mentions_qname(t, module, name)
+                || body_mentions_qname(k, module, name)
+        }
+        Type::Constrained(cs, b) => {
+            cs.iter().any(|c| {
+                c.args.iter().any(|a| body_mentions_qname(a, module, name))
+            }) || body_mentions_qname(b, module, name)
+        }
+        _ => false,
+    }
+}
+
 fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
     // Collect the Con head + its App spine so we can try to
     // match the whole applied form against an alias. Anything
@@ -487,29 +519,35 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
             aliases.get(&(None, qn.name.clone()))
         };
         if let Some((vars, body)) = entry {
-            // Only expand saturated applications (vars.len() ==
-            // args.len()) for now — partial aliases need the
-            // leftover args re-applied to the expanded body and
-            // that interacts badly with some of our existing
-            // fixtures. Saturated covers the overwhelming common
-            // case (`type SynString = String`, `type Fn a = a ->
-            // a`).
-            if vars.len() == args.len()
-                // Skip self-referential aliases: if the body
-                // mentions the alias name (Con("X") inside alias
-                // "X"), expanding it would produce a type that
-                // again contains Con("X"), causing exponential
-                // blow-up across MAX_EXPANSIONS iterations.
-                // Leaving the Con unexpanded is safe — the type
-                // stays opaque but well-formed.
-                && !body_mentions_name(body, &qn.name)
+            // Expand saturated or OVER-saturated applications.
+            // Over-saturated: `type Result = M.Result` (vars=[])
+            // applied as `Result a` (args=[a]). The alias body is
+            // a partially-applied constructor `M.Result`; we
+            // expand to the body and re-apply the leftover args.
+            //
+            // Skip self-referential aliases: if the body mentions
+            // a `Con` matching the alias's qualified key, expanding
+            // would loop. We compare BOTH module and name —
+            // `type Result = M.Result` in module W (lookup key
+            // `(Some("W"), "Result")`) is NOT self-referential
+            // because the body's `Con` carries `Some("M")`, not
+            // `Some("W")`.
+            if vars.len() <= args.len()
+                && !body_mentions_qname(body, &qn.module, &qn.name)
             {
                 let mut subst: std::collections::HashMap<String, Type> =
                     std::collections::HashMap::with_capacity(vars.len());
                 for (v, a) in vars.iter().zip(args.iter()) {
                     subst.insert(v.clone(), expand_once(a, aliases));
                 }
-                return crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+                let expanded =
+                    crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+                // Re-apply leftover args for over-saturated case.
+                let leftover = &args[vars.len()..];
+                let result = leftover.iter().fold(expanded, |acc, a| {
+                    Type::app(acc, expand_once(a, aliases))
+                });
+                return result;
             }
         }
     }
