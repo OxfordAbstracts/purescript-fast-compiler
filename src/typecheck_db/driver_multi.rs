@@ -657,6 +657,44 @@ fn check_one_module(
                     .or_insert_with(|| (a.type_vars.clone(), a.body.clone()));
             }
         }
+        // Transitive aliases: an imported alias body may reference
+        // OTHER modules' aliases (e.g.
+        // `type SimulationNode r = Record (D3_ID + D3_XY + r)` where
+        // `+` desugars to `Type.Row.RowApply`). Walk every alias body
+        // we've registered so far, collect `Type::Con` references with
+        // `Some(module)` qualifiers, and pull in those modules'
+        // aliases too. Iterate to fixed point so multi-step
+        // transitive chains all land.
+        let mut frontier: std::collections::HashSet<String> =
+            m.values()
+                .flat_map(|(_, body)| collect_referenced_modules(body))
+                .collect();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(mod_name) = frontier.iter().next().cloned() {
+            frontier.remove(&mod_name);
+            if !visited.insert(mod_name.clone()) {
+                continue;
+            }
+            let target = match registry.get(&mod_name) {
+                Some(e) => e,
+                None => continue,
+            };
+            for (k, a) in &target.type_aliases {
+                let origin = target
+                    .type_origins
+                    .get(k)
+                    .cloned()
+                    .unwrap_or(mod_name.clone());
+                if !m.contains_key(&(Some(origin.clone()), k.clone())) {
+                    m.insert((Some(origin), k.clone()), (a.type_vars.clone(), a.body.clone()));
+                    for referenced in collect_referenced_modules(&a.body) {
+                        if !visited.contains(&referenced) {
+                            frontier.insert(referenced);
+                        }
+                    }
+                }
+            }
+        }
         m
     };
 
@@ -4550,6 +4588,61 @@ fn join_module_name(mn: &cst::ModuleName) -> String {
         .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Walk a `Type` and collect every defining module mentioned in
+/// `Type::Con(Some(module), _)`. Used by the alias_map builder to
+/// pull in transitive alias dependencies (e.g.
+/// `type SimulationNode r = Record (Type.Row.RowApply ...)` —
+/// importing SimulationNode should also pull `Type.Row`'s aliases
+/// so `RowApply` expands at use-sites).
+fn collect_referenced_modules(ty: &crate::typecheck_db::types::Type) -> Vec<String> {
+    use crate::typecheck_db::types::Type;
+    let mut out: Vec<String> = Vec::new();
+    fn walk(t: &Type, out: &mut Vec<String>) {
+        match t {
+            Type::Con(qn) => {
+                if let Some(m) = &qn.module {
+                    if !out.contains(m) {
+                        out.push(m.clone());
+                    }
+                }
+            }
+            Type::App(f, a) | Type::Fun(f, a) => {
+                walk(f, out);
+                walk(a, out);
+            }
+            Type::Forall(_, b) => walk(b, out),
+            Type::Constrained(cs, b) => {
+                for c in cs {
+                    if let Some(m) = &c.class.module {
+                        if !out.contains(m) {
+                            out.push(m.clone());
+                        }
+                    }
+                    for arg in &c.args {
+                        walk(arg, out);
+                    }
+                }
+                walk(b, out);
+            }
+            Type::Record(fs, tail) | Type::Row(fs, tail) => {
+                for (_, v) in fs {
+                    walk(v, out);
+                }
+                if let Some(t) = tail {
+                    walk(t, out);
+                }
+            }
+            Type::Kinded(t, k) => {
+                walk(t, out);
+                walk(k, out);
+            }
+            _ => {}
+        }
+    }
+    walk(ty, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
