@@ -808,6 +808,17 @@ impl UnifyState {
             {
                 Ok(())
             }
+            // `->` is the type-level operator alias for `Prim.Function`.
+            // Equate the two names so a Type::Con-carried arrow head
+            // (produced by some legacy synthesizer that didn't desugar
+            // `->` into `Type::Fun`) unifies with `Prim.Function` from
+            // the prim helpers.
+            (Type::Con(c1), Type::Con(c2))
+                if (c1.name == "->" && c2.name == "Function")
+                    || (c1.name == "Function" && c2.name == "->") =>
+            {
+                Ok(())
+            }
             // Skolems are rigid — they unify only with themselves.
             // A skolem-vs-anything-else mismatch is exactly how
             // rank-2 violations get rejected: a lambda `\\n -> n + 1`
