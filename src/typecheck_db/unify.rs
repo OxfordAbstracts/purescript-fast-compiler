@@ -134,7 +134,16 @@ fn structurally_compatible(body: &Type, other: &Type) -> bool {
         (Type::Constrained(_, inner), _) => structurally_compatible(inner, other),
         (Type::Var(_), _) => true,
         (Type::Unif(_), _) | (_, Type::Unif(_)) => true,
-        (Type::Con(a), Type::Con(b)) => a == b,
+        // Lenient module-qualifier comparison: mirrors the
+        // `forall_head_matches` / outer unify clauses so a body
+        // with `Con(Some("M"), "Thunk")` is compatible with an
+        // `other` carrying `Con(None, "Thunk")` (legacy synthesizer
+        // didn't qualify) or vice versa.
+        (Type::Con(a), Type::Con(b)) => {
+            a == b
+                || (a.name == b.name
+                    && (a.module.is_none() || b.module.is_none()))
+        }
         (Type::Skolem(a), Type::Skolem(b)) => a == b,
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             structurally_compatible(f1, f2) && structurally_compatible(a1, a2)
