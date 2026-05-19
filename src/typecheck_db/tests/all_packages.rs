@@ -366,24 +366,6 @@ fn repro_pathy_sandboxed() {
 }
 
 #[test]
-#[ignore = "diagnostic — Control.Monad.State.Trans"]
-fn repro_state_trans() {
-    check_single_package_module("Control.Monad.State.Trans").unwrap_or_else(|m| panic!("{m}"));
-}
-
-#[test]
-#[ignore = "diagnostic — Fmt"]
-fn repro_fmt() {
-    check_single_package_module("Fmt").unwrap_or_else(|m| panic!("{m}"));
-}
-
-#[test]
-#[ignore = "diagnostic — Foreign.ReadWrite"]
-fn repro_foreign_readwrite() {
-    check_single_package_module("Foreign.ReadWrite").unwrap_or_else(|m| panic!("{m}"));
-}
-
-#[test]
 fn repro_hylograph_shape_arc() {
     let inner = check_single_package_module("Hylograph.Shape.Arc");
     if let Err(msg) = inner {
