@@ -460,6 +460,61 @@ fn body_mentions_name(ty: &Type, name: &str) -> bool {
     }
 }
 
+/// Eta-reduce `body` by stripping trailing `App(_, Var(v))` layers
+/// matching the `missing` vars in order. Returns the stripped body
+/// only when:
+///   * each trailing App's arg is exactly `Var(missing[k])`, AND
+///   * after stripping, none of the missing vars appear anywhere
+///     in the remaining body (otherwise eta-reduction is unsound).
+///
+/// Used for under-saturated alias expansion (`type Tree a = Cofree
+/// Array a` applied as just `Tree`).
+fn try_eta_reduce(body: &Type, missing: &[String]) -> Option<Type> {
+    let mut current = body.clone();
+    for v in missing.iter().rev() {
+        match current {
+            Type::App(inner, arg) => match arg.as_ref() {
+                Type::Var(n) if n == v => {
+                    current = (*inner).clone();
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    for v in missing {
+        if type_mentions_var(&current, v) {
+            return None;
+        }
+    }
+    Some(current)
+}
+
+fn type_mentions_var(ty: &Type, var: &str) -> bool {
+    match ty {
+        Type::Var(n) => n == var,
+        Type::App(f, a) | Type::Fun(f, a) => {
+            type_mentions_var(f, var) || type_mentions_var(a, var)
+        }
+        Type::Row(fs, tail) | Type::Record(fs, tail) => {
+            fs.iter().any(|(_, t)| type_mentions_var(t, var))
+                || tail.as_ref().map_or(false, |t| type_mentions_var(t, var))
+        }
+        Type::Forall(vs, b) => {
+            !vs.iter().any(|(n, _, _)| n == var) && type_mentions_var(b, var)
+        }
+        Type::Kinded(t, k) => {
+            type_mentions_var(t, var) || type_mentions_var(k, var)
+        }
+        Type::Constrained(cs, b) => {
+            cs.iter()
+                .any(|c| c.args.iter().any(|a| type_mentions_var(a, var)))
+                || type_mentions_var(b, var)
+        }
+        _ => false,
+    }
+}
+
 /// True when `ty` structurally contains `Con(QName { module, name
 /// })` — both fields must match. Used by `expand_once` to detect
 /// self-referential aliases without false positives across modules
@@ -519,35 +574,56 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
             aliases.get(&(None, qn.name.clone()))
         };
         if let Some((vars, body)) = entry {
-            // Expand saturated or OVER-saturated applications.
-            // Over-saturated: `type Result = M.Result` (vars=[])
-            // applied as `Result a` (args=[a]). The alias body is
-            // a partially-applied constructor `M.Result`; we
-            // expand to the body and re-apply the leftover args.
-            //
-            // Skip self-referential aliases: if the body mentions
-            // a `Con` matching the alias's qualified key, expanding
-            // would loop. We compare BOTH module and name —
-            // `type Result = M.Result` in module W (lookup key
-            // `(Some("W"), "Result")`) is NOT self-referential
-            // because the body's `Con` carries `Some("M")`, not
-            // `Some("W")`.
-            if vars.len() <= args.len()
-                && !body_mentions_qname(body, &qn.module, &qn.name)
-            {
-                let mut subst: std::collections::HashMap<String, Type> =
-                    std::collections::HashMap::with_capacity(vars.len());
-                for (v, a) in vars.iter().zip(args.iter()) {
-                    subst.insert(v.clone(), expand_once(a, aliases));
+            // Skip self-referential aliases: comparing both module
+            // and name avoids the cross-module false positive
+            // (`type Result = M.Result` in module W is not
+            // self-referential — body Con has module Some("M")).
+            if !body_mentions_qname(body, &qn.module, &qn.name) {
+                let n_args = args.len();
+                let n_vars = vars.len();
+                if n_vars == n_args {
+                    // Saturated.
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::with_capacity(n_vars);
+                    for (v, a) in vars.iter().zip(args.iter()) {
+                        subst.insert(v.clone(), expand_once(a, aliases));
+                    }
+                    return crate::typecheck_db::generalize::apply_var_subst(
+                        body, &subst,
+                    );
+                } else if n_args > n_vars {
+                    // Over-saturated: substitute, then re-apply
+                    // leftover args (`type R = M.R` as `R a` →
+                    // `M.R a`).
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::with_capacity(n_vars);
+                    for (v, a) in vars.iter().zip(args.iter()) {
+                        subst.insert(v.clone(), expand_once(a, aliases));
+                    }
+                    let expanded =
+                        crate::typecheck_db::generalize::apply_var_subst(
+                            body, &subst,
+                        );
+                    return args[n_vars..].iter().fold(expanded, |acc, a| {
+                        Type::app(acc, expand_once(a, aliases))
+                    });
+                } else if let Some(eta_body) =
+                    try_eta_reduce(body, &vars[n_args..])
+                {
+                    // Under-saturated: eta-reduce when the missing
+                    // vars sit at the trailing spine of the body
+                    // and nowhere else. `type Tree a = Cofree Array
+                    // a` used as just `Tree` (kind `Type -> Type`)
+                    // reduces to `Cofree Array`.
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::with_capacity(n_args);
+                    for (v, a) in vars[..n_args].iter().zip(args.iter()) {
+                        subst.insert(v.clone(), expand_once(a, aliases));
+                    }
+                    return crate::typecheck_db::generalize::apply_var_subst(
+                        &eta_body, &subst,
+                    );
                 }
-                let expanded =
-                    crate::typecheck_db::generalize::apply_var_subst(body, &subst);
-                // Re-apply leftover args for over-saturated case.
-                let leftover = &args[vars.len()..];
-                let result = leftover.iter().fold(expanded, |acc, a| {
-                    Type::app(acc, expand_once(a, aliases))
-                });
-                return result;
             }
         }
     }
