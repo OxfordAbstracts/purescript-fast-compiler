@@ -468,16 +468,24 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
     // structural recurse.
     let spine = collect_app_spine(ty);
     if let Some((Type::Con(qn), args)) = spine {
-        // Qualifier-aware lookup: try the resolved `(Some(module),
-        // name)` first; if that misses, fall back to `(None,
-        // name)`. The unqualified entry is only present when the
-        // user explicitly imported the alias (or it's local), so
-        // the fallback avoids the collision that an
-        // import-list-blind alias_map would produce when two
-        // modules export same-named aliases.
-        let entry = aliases
-            .get(&(qn.module.clone(), qn.name.clone()))
-            .or_else(|| aliases.get(&(None, qn.name.clone())));
+        // Qualifier-aware lookup. When the type carries a module
+        // qualifier (resolver-rewritten), look up the exact
+        // `(Some(module), name)` key — DO NOT fall back to the
+        // unqualified entry. That would misroute a
+        // `Type::Con(Some("Marionette.Types"), "State")` (a local
+        // newtype, no alias entry) to the imported
+        // `Control.Monad.State.State` alias's `(None, "State")`
+        // entry, expanding the newtype as if it were the
+        // transformers alias.
+        //
+        // Only the unqualified case (`module: None`, surviving
+        // some legacy synthesizer that didn't qualify) falls
+        // through to the `(None, name)` entry.
+        let entry = if qn.module.is_some() {
+            aliases.get(&(qn.module.clone(), qn.name.clone()))
+        } else {
+            aliases.get(&(None, qn.name.clone()))
+        };
         if let Some((vars, body)) = entry {
             // Only expand saturated applications (vars.len() ==
             // args.len()) for now — partial aliases need the
