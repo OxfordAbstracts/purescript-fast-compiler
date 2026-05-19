@@ -108,6 +108,17 @@ pub fn build_env_from_imports(
         (Option<String>, String),
         (String, bool),
     > = std::collections::HashMap::new();
+    // Qualified-import-only conflicts deferred to use-site. The
+    // reference compiler defers `import A as X; import B as X` (no
+    // explicit list either side) to the actual `X.thing` reference
+    // — if the conflicted name is never used, no error.
+    let mut deferred_qualified_conflicts: Vec<(
+        crate::span::Span,
+        Option<String>,
+        String,
+        String,
+        String,
+    )> = Vec::new();
     for imp in &module.imports {
         let target_name = module_name_string(&imp.module);
         // Prim and its submodules are resolved from the static
@@ -151,9 +162,11 @@ pub fn build_env_from_imports(
             match name_origins.get(&key) {
                 Some((prev_origin, prev_explicit))
                     if *prev_origin != origin
-                        && ((*prev_explicit && is_explicit_list)
-                            || qualifier.is_some()) =>
+                        && *prev_explicit
+                        && is_explicit_list =>
                 {
+                    // Both sides explicitly listed — user committed
+                    // to both. Flag at import time.
                     errors.push(ImportError {
                         span: imp.span,
                         kind: ImportErrorKind::ScopeConflict {
@@ -162,6 +175,20 @@ pub fn build_env_from_imports(
                             second_module: origin.clone(),
                         },
                     });
+                }
+                Some((prev_origin, _))
+                    if *prev_origin != origin && qualifier.is_some() =>
+                {
+                    // Qualified conflict — defer to use-site. Only
+                    // emit if `Q.n` is actually referenced in the
+                    // module body.
+                    deferred_qualified_conflicts.push((
+                        imp.span,
+                        qualifier.clone(),
+                        n,
+                        prev_origin.clone(),
+                        origin.clone(),
+                    ));
                 }
                 _ => {
                     name_origins.insert(key, (origin, is_explicit_list));
@@ -177,8 +204,211 @@ pub fn build_env_from_imports(
     // `import M (T)`. Reference compiler reports as ScopeConflict.
     detect_local_explicit_import_conflicts(module, registry, &prims, &mut errors);
 
+    // Use-site filter for deferred qualified conflicts. Walk every
+    // decl body and collect `Q.x` references; emit ScopeConflict
+    // only for the deferred entries whose qualified pair is
+    // actually referenced — OR whose qualifier appears as a
+    // `module Q` re-export clause (a wholesale re-export touches
+    // every name in Q's scope, so any conflict under Q fires).
+    if !deferred_qualified_conflicts.is_empty() {
+        let mut referenced: std::collections::HashSet<(Option<String>, String)> =
+            std::collections::HashSet::new();
+        collect_qualified_refs(module, &mut referenced);
+        let mut reexported_qualifiers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(exports) = &module.exports {
+            for e in &exports.value.exports {
+                if let cst::Export::Module(q) = e {
+                    reexported_qualifiers.insert(module_name_string(q));
+                }
+            }
+        }
+        for (span, q, n, m1, m2) in deferred_qualified_conflicts {
+            let q_re_exported = q
+                .as_ref()
+                .map_or(false, |qn| reexported_qualifiers.contains(qn));
+            if q_re_exported
+                || referenced.contains(&(q.clone(), n.clone()))
+            {
+                errors.push(ImportError {
+                    span,
+                    kind: ImportErrorKind::ScopeConflict {
+                        name: n,
+                        first_module: m1,
+                        second_module: m2,
+                    },
+                });
+            }
+        }
+    }
+
     (env, ix, errors)
 }
+
+fn collect_qualified_refs(
+    module: &cst::Module,
+    out: &mut std::collections::HashSet<(Option<String>, String)>,
+) {
+    for d in &module.decls {
+        collect_qualified_refs_decl(d, out);
+    }
+}
+
+fn collect_qualified_refs_decl(
+    d: &cst::Decl,
+    out: &mut std::collections::HashSet<(Option<String>, String)>,
+) {
+    match d {
+        cst::Decl::Value { guarded, where_clause, .. } => {
+            collect_qualified_refs_guarded(guarded, out);
+            for b in where_clause {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    collect_qualified_refs_expr(expr, out);
+                }
+            }
+        }
+        cst::Decl::Instance { members, .. } => {
+            for m in members {
+                collect_qualified_refs_decl(m, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_qualified_refs_guarded(
+    g: &cst::GuardedExpr,
+    out: &mut std::collections::HashSet<(Option<String>, String)>,
+) {
+    match g {
+        cst::GuardedExpr::Unconditional(e) => collect_qualified_refs_expr(e, out),
+        cst::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        cst::GuardPattern::Pattern(_, e)
+                        | cst::GuardPattern::Boolean(e) => {
+                            collect_qualified_refs_expr(e, out)
+                        }
+                    }
+                }
+                collect_qualified_refs_expr(&gd.expr, out);
+            }
+        }
+    }
+}
+
+fn collect_qualified_refs_expr(
+    expr: &cst::Expr,
+    out: &mut std::collections::HashSet<(Option<String>, String)>,
+) {
+    match expr {
+        cst::Expr::Var { name, .. } => {
+            if let Some(m) = &name.module {
+                let q = crate::typecheck_db::util::resolve_symbol(m.symbol());
+                let n = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+                out.insert((Some(q), n));
+            }
+        }
+        cst::Expr::Constructor { name, .. } => {
+            if let Some(m) = &name.module {
+                let q = crate::typecheck_db::util::resolve_symbol(m.symbol());
+                let n = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+                out.insert((Some(q), n));
+            }
+        }
+        cst::Expr::App { func, arg, .. } => {
+            collect_qualified_refs_expr(func, out);
+            collect_qualified_refs_expr(arg, out);
+        }
+        cst::Expr::VisibleTypeApp { func, .. } => {
+            collect_qualified_refs_expr(func, out);
+        }
+        cst::Expr::Lambda { body, .. } => collect_qualified_refs_expr(body, out),
+        cst::Expr::Op { left, right, .. } => {
+            collect_qualified_refs_expr(left, out);
+            collect_qualified_refs_expr(right, out);
+        }
+        cst::Expr::BacktickApp { func, left, right, .. } => {
+            collect_qualified_refs_expr(func, out);
+            collect_qualified_refs_expr(left, out);
+            collect_qualified_refs_expr(right, out);
+        }
+        cst::Expr::If { cond, then_expr, else_expr, .. } => {
+            collect_qualified_refs_expr(cond, out);
+            collect_qualified_refs_expr(then_expr, out);
+            collect_qualified_refs_expr(else_expr, out);
+        }
+        cst::Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                collect_qualified_refs_expr(e, out);
+            }
+            for alt in alts {
+                collect_qualified_refs_guarded(&alt.result, out);
+            }
+        }
+        cst::Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let cst::LetBinding::Value { expr, .. } = b {
+                    collect_qualified_refs_expr(expr, out);
+                }
+            }
+            collect_qualified_refs_expr(body, out);
+        }
+        cst::Expr::Do { statements, .. } | cst::Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    cst::DoStatement::Bind { expr, .. }
+                    | cst::DoStatement::Discard { expr, .. } => {
+                        collect_qualified_refs_expr(expr, out);
+                    }
+                    cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let cst::LetBinding::Value { expr, .. } = b {
+                                collect_qualified_refs_expr(expr, out);
+                            }
+                        }
+                    }
+                }
+            }
+            if let cst::Expr::Ado { result, .. } = expr {
+                collect_qualified_refs_expr(result, out);
+            }
+        }
+        cst::Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    collect_qualified_refs_expr(v, out);
+                }
+            }
+        }
+        cst::Expr::RecordAccess { expr, .. } => {
+            collect_qualified_refs_expr(expr, out);
+        }
+        cst::Expr::RecordUpdate { expr: rec, updates, .. } => {
+            collect_qualified_refs_expr(rec, out);
+            for u in updates {
+                collect_qualified_refs_expr(&u.value, out);
+            }
+        }
+        cst::Expr::TypeAnnotation { expr, .. } => {
+            collect_qualified_refs_expr(expr, out);
+        }
+        cst::Expr::Negate { expr, .. } => {
+            collect_qualified_refs_expr(expr, out);
+        }
+        cst::Expr::Parens { expr, .. } => {
+            collect_qualified_refs_expr(expr, out);
+        }
+        cst::Expr::Array { elements, .. } => {
+            for e in elements {
+                collect_qualified_refs_expr(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 
 fn detect_local_explicit_import_conflicts(
     module: &cst::Module,
