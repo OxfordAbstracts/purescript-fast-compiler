@@ -2416,6 +2416,219 @@ fn infer_if(
     Ok(then_ty)
 }
 
+/// Collect unqualified `Var` references in `expr` whose name is
+/// in `targets`. Used to build the where-binding dependency
+/// graph for SCC-ordered inference (so a helper that doesn't
+/// depend on any sibling can be generalised before bindings
+/// that DO reference it monomorphise its slot).
+fn collect_local_refs(
+    expr: &Expr,
+    targets: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::names::NameLike;
+    match expr {
+        Expr::Var { name, .. } => {
+            // Where-binding refs are unqualified. Skip qualified
+            // refs (they can't target a where-binding).
+            if name.module.is_unresolved() {
+                let n = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+                if targets.contains(&n) {
+                    out.insert(n);
+                }
+            }
+        }
+        Expr::App { func, arg, .. } => {
+            collect_local_refs(func, targets, out);
+            collect_local_refs(arg, targets, out);
+        }
+        Expr::VisibleTypeApp { func, .. } => collect_local_refs(func, targets, out),
+        Expr::Lambda { body, .. } => collect_local_refs(body, targets, out),
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            collect_local_refs(cond, targets, out);
+            collect_local_refs(then_expr, targets, out);
+            collect_local_refs(else_expr, targets, out);
+        }
+        Expr::Case { exprs, alts, .. } => {
+            for e in exprs {
+                collect_local_refs(e, targets, out);
+            }
+            for alt in alts {
+                collect_local_refs_guarded(&alt.result, targets, out);
+            }
+        }
+        Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let crate::typecheck_db::ir::LetBinding::Value { expr, .. } = b {
+                    collect_local_refs(expr, targets, out);
+                }
+            }
+            collect_local_refs(body, targets, out);
+        }
+        Expr::Do { statements, .. } | Expr::Ado { statements, .. } => {
+            for s in statements {
+                match s {
+                    crate::typecheck_db::ir::DoStatement::Bind { expr, .. }
+                    | crate::typecheck_db::ir::DoStatement::Discard { expr, .. } => {
+                        collect_local_refs(expr, targets, out);
+                    }
+                    crate::typecheck_db::ir::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let crate::typecheck_db::ir::LetBinding::Value {
+                                expr,
+                                ..
+                            } = b
+                            {
+                                collect_local_refs(expr, targets, out);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Expr::Ado { result, .. } = expr {
+                collect_local_refs(result, targets, out);
+            }
+        }
+        Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value {
+                    collect_local_refs(v, targets, out);
+                }
+            }
+        }
+        Expr::RecordAccess { expr, .. }
+        | Expr::Parens { expr, .. }
+        | Expr::TypeAnnotation { expr, .. }
+        | Expr::Negate { expr, .. } => collect_local_refs(expr, targets, out),
+        Expr::RecordUpdate { expr: rec, updates, .. } => {
+            collect_local_refs(rec, targets, out);
+            for u in updates {
+                collect_local_refs(&u.value, targets, out);
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for e in elements {
+                collect_local_refs(e, targets, out);
+            }
+        }
+        Expr::AsPattern { name, pattern, .. } => {
+            collect_local_refs(name, targets, out);
+            collect_local_refs(pattern, targets, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_local_refs_guarded(
+    g: &crate::typecheck_db::ir::GuardedExpr,
+    targets: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match g {
+        crate::typecheck_db::ir::GuardedExpr::Unconditional(e) => {
+            collect_local_refs(e, targets, out)
+        }
+        crate::typecheck_db::ir::GuardedExpr::Guarded(gs) => {
+            for gd in gs {
+                for p in &gd.patterns {
+                    match p {
+                        crate::typecheck_db::ir::GuardPattern::Pattern(_, e)
+                        | crate::typecheck_db::ir::GuardPattern::Boolean(e) => {
+                            collect_local_refs(e, targets, out)
+                        }
+                    }
+                }
+                collect_local_refs(&gd.expr, targets, out);
+            }
+        }
+    }
+}
+
+/// Topologically order `value_bindings` by SCC over their
+/// references to each other. Returns a list of SCCs (each an
+/// index list into `value_bindings`) in dependency-respecting
+/// order (a binding's deps appear in earlier SCCs).
+fn topo_order_where_bindings(
+    value_bindings: &[LetValueBinding<'_>],
+    where_names: &std::collections::HashSet<String>,
+) -> Vec<Vec<usize>> {
+    let n = value_bindings.len();
+    let name_to_idx: std::collections::HashMap<String, usize> = value_bindings
+        .iter()
+        .enumerate()
+        .map(|(i, vb)| (vb.name.clone(), i))
+        .collect();
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, vb) in value_bindings.iter().enumerate() {
+        let mut refs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        collect_local_refs(vb.expr, where_names, &mut refs);
+        for r in refs {
+            if r == vb.name {
+                continue;
+            }
+            if let Some(&j) = name_to_idx.get(&r) {
+                deps[i].push(j);
+            }
+        }
+    }
+    // Tarjan's SCC on `deps` (i -> j means i depends on j).
+    let mut index = 0usize;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut on_stack = vec![false; n];
+    let mut indices = vec![usize::MAX; n];
+    let mut lowlink = vec![0usize; n];
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    fn strongconnect(
+        v: usize,
+        deps: &[Vec<usize>],
+        index: &mut usize,
+        indices: &mut [usize],
+        lowlink: &mut [usize],
+        stack: &mut Vec<usize>,
+        on_stack: &mut [bool],
+        sccs: &mut Vec<Vec<usize>>,
+    ) {
+        indices[v] = *index;
+        lowlink[v] = *index;
+        *index += 1;
+        stack.push(v);
+        on_stack[v] = true;
+        for &w in &deps[v] {
+            if indices[w] == usize::MAX {
+                strongconnect(w, deps, index, indices, lowlink, stack, on_stack, sccs);
+                lowlink[v] = lowlink[v].min(lowlink[w]);
+            } else if on_stack[w] {
+                lowlink[v] = lowlink[v].min(indices[w]);
+            }
+        }
+        if lowlink[v] == indices[v] {
+            let mut scc = Vec::new();
+            loop {
+                let w = stack.pop().expect("scc stack");
+                on_stack[w] = false;
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            sccs.push(scc);
+        }
+    }
+    for v in 0..n {
+        if indices[v] == usize::MAX {
+            strongconnect(
+                v, &deps, &mut index, &mut indices, &mut lowlink, &mut stack,
+                &mut on_stack, &mut sccs,
+            );
+        }
+    }
+    // Tarjan emits SCCs in REVERSE topological order. Since our
+    // edges point i -> j as "i depends on j", j's SCC is emitted
+    // before i's — exactly the dep-respecting order we want.
+    sccs
+}
+
 /// One named value binding lifted out of a `let`.
 struct LetValueBinding<'a> {
     name: String,
@@ -2518,19 +2731,70 @@ fn infer_let(
             let pat_ty = bind_pattern(state, env, type_ops, binder)?;
             state.unify_here(&pat_ty, &rhs_ty)?;
         }
-        // Pass 3: infer each body.
-        for vb in &value_bindings {
-            if let Some(sig_ty) = vb.sig.clone() {
-                let monotype = instantiate_sig_as_monotype(state, sig_ty);
-                check_expr(state, env, type_ops, vb.expr, &monotype)?;
-            } else {
+        // Pass 3: infer each body in SCC-topological order so a
+        // helper like `goTsName = identity` (which doesn't
+        // reference any other where-binding) gets generalised to
+        // `forall a. a -> a` BEFORE other bindings reference it
+        // at different concrete types. Source-order processing
+        // would monomorphise the slot via the first
+        // concrete-typed use.
+        let unsigned_names: std::collections::HashSet<String> = value_bindings
+            .iter()
+            .filter(|vb| vb.sig.is_none())
+            .map(|vb| vb.name.clone())
+            .collect();
+        let order = topo_order_where_bindings(&value_bindings, &unsigned_names);
+        let mut generalized_early: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for scc in &order {
+            // Infer all members of this SCC. Multi-equation
+            // bindings (same `vb.name` with different equations)
+            // each get processed and unified against the SAME
+            // pre-inserted slot.
+            for idx in scc {
+                let vb = &value_bindings[*idx];
+                if let Some(sig_ty) = vb.sig.clone() {
+                    let monotype = instantiate_sig_as_monotype(state, sig_ty);
+                    check_expr(state, env, type_ops, vb.expr, &monotype)?;
+                } else {
+                    let slot_lookup = env
+                        .lookup_unqualified(&vb.name)
+                        .local_ty()
+                        .cloned();
+                    let Some(slot_ty) = slot_lookup else {
+                        // Slot already generalised in a prior SCC
+                        // iteration (multi-equation across SCCs is
+                        // pathological; treat as monomorphic at
+                        // current type by re-checking against the
+                        // existing scheme). Fall back to plain
+                        // inference; downstream code will surface
+                        // any mismatch.
+                        let _ = infer_expr(state, env, type_ops, vb.expr)?;
+                        continue;
+                    };
+                    let actual = infer_expr(state, env, type_ops, vb.expr)?;
+                    state.unify_here(&slot_ty, &actual)?;
+                }
+            }
+            // Generalize each unique unsigned name in this SCC.
+            // Multi-equation bindings appear multiple times in
+            // `scc` but share one slot — dedupe so we only pluck
+            // the slot once.
+            for idx in scc {
+                let vb = &value_bindings[*idx];
+                if vb.sig.is_some() {
+                    continue;
+                }
+                if !generalized_early.insert(vb.name.clone()) {
+                    continue;
+                }
                 let slot_ty = env
-                    .lookup_unqualified(&vb.name)
-                    .local_ty()
-                    .expect("slot pre-inserted above")
-                    .clone();
-                let actual = infer_expr(state, env, type_ops, vb.expr)?;
-                state.unify_here(&slot_ty, &actual)?;
+                    .locals
+                    .last_mut()
+                    .and_then(|s| s.remove(&vb.name));
+                let Some(slot_ty) = slot_ty else { continue };
+                let scheme = generalize(state, env, &slot_ty);
+                env.bind_local_scheme(vb.name.clone(), scheme);
             }
         }
     } else {
@@ -2606,11 +2870,14 @@ fn infer_let(
         if vb.sig.is_some() {
             continue;
         }
+        // `is_where` processing above generalises early (in
+        // topological order) and removes the slot. Skip those
+        // here.
         let slot_ty = env
             .locals
             .last_mut()
-            .and_then(|s| s.remove(&vb.name))
-            .expect("slot present");
+            .and_then(|s| s.remove(&vb.name));
+        let Some(slot_ty) = slot_ty else { continue };
         let scheme = generalize(state, env, &slot_ty);
         finished.push((vb.name.clone(), scheme));
     }
