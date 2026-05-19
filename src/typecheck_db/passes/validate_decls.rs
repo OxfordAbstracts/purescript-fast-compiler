@@ -5214,8 +5214,19 @@ fn detect_value_decl_sig_alias_mismatch(
     // with a body `unwrap :: … -> Path` (where Path = String)
     // isn't false-flagged as a mismatch.
     let mut zero_param_aliases: HashMap<Symbol, Symbol> = HashMap::new();
+    // Locally-declared aliases whose body contains a `forall`.
+    // The mismatch detector below skips when either sig references
+    // any such alias — `medium :: ImageModifier Thumbnail; medium
+    // = defaultSize` where `type ImageModifier c = forall r.
+    // PropsModifier (component :: c | r)` is legal even though the
+    // raw sigs aren't alpha-equal.
+    let mut polymorphic_aliases: std::collections::HashSet<Symbol> =
+        std::collections::HashSet::new();
     for d in decls {
         if let cst::Decl::TypeAlias { name, type_vars, ty, .. } = d {
+            if type_expr_has_forall(ty) {
+                polymorphic_aliases.insert(name.value.symbol());
+            }
             if !type_vars.is_empty() {
                 continue;
             }
@@ -5266,6 +5277,17 @@ fn detect_value_decl_sig_alias_mismatch(
         }
         if type_expr_has_constraint(my_sig)
             || type_expr_has_constraint(other_sig)
+        {
+            continue;
+        }
+        // Either sig references a polymorphic alias (alias whose
+        // body contains `forall`) — the alpha-eq comparison can't
+        // see through into the forall, so skip.
+        if type_expr_references_polymorphic_alias(my_sig, &polymorphic_aliases)
+            || type_expr_references_polymorphic_alias(
+                other_sig,
+                &polymorphic_aliases,
+            )
         {
             continue;
         }
@@ -5881,6 +5903,57 @@ fn subst_type_expr(
             span: *span,
         },
         _ => te.clone(),
+    }
+}
+
+/// True if `te` references (via a `Constructor`) any name in
+/// `polymorphic_aliases`. Used by the sig-vs-body alpha-eq checker
+/// to bail out when an alias whose expansion contains a `forall`
+/// might be in scope — the alpha-eq comparison only looks at the
+/// surface syntax and can't see through the alias to the inner
+/// quantifier.
+fn type_expr_references_polymorphic_alias(
+    te: &cst::TypeExpr,
+    polymorphic_aliases: &std::collections::HashSet<Symbol>,
+) -> bool {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            name.module.is_none()
+                && polymorphic_aliases.contains(&name.name.symbol())
+        }
+        cst::TypeExpr::Parens { ty, .. } | cst::TypeExpr::Kinded { ty, .. } => {
+            type_expr_references_polymorphic_alias(ty, polymorphic_aliases)
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            type_expr_references_polymorphic_alias(constructor, polymorphic_aliases)
+                || type_expr_references_polymorphic_alias(arg, polymorphic_aliases)
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            type_expr_references_polymorphic_alias(from, polymorphic_aliases)
+                || type_expr_references_polymorphic_alias(to, polymorphic_aliases)
+        }
+        cst::TypeExpr::Forall { ty, .. } => {
+            type_expr_references_polymorphic_alias(ty, polymorphic_aliases)
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            constraints.iter().any(|c| {
+                c.args
+                    .iter()
+                    .any(|a| type_expr_references_polymorphic_alias(a, polymorphic_aliases))
+            }) || type_expr_references_polymorphic_alias(ty, polymorphic_aliases)
+        }
+        cst::TypeExpr::Record { fields, .. } => fields
+            .iter()
+            .any(|f| type_expr_references_polymorphic_alias(&f.ty, polymorphic_aliases)),
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            fields
+                .iter()
+                .any(|f| type_expr_references_polymorphic_alias(&f.ty, polymorphic_aliases))
+                || tail.as_ref().map_or(false, |t| {
+                    type_expr_references_polymorphic_alias(t, polymorphic_aliases)
+                })
+        }
+        _ => false,
     }
 }
 
