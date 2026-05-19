@@ -151,6 +151,25 @@ fn structurally_compatible(body: &Type, other: &Type) -> bool {
         (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
             structurally_compatible(a1, a2) && structurally_compatible(b1, b2)
         }
+        // Records / rows: same labels in same order, each field
+        // value structurally compatible. Both tails compatible
+        // (None vs None, or each present and compatible).
+        (Type::Record(f1, t1), Type::Record(f2, t2))
+        | (Type::Row(f1, t1), Type::Row(f2, t2)) => {
+            if f1.len() != f2.len() {
+                return false;
+            }
+            for ((l1, v1), (l2, v2)) in f1.iter().zip(f2.iter()) {
+                if l1 != l2 || !structurally_compatible(v1, v2) {
+                    return false;
+                }
+            }
+            match (t1, t2) {
+                (None, None) => true,
+                (Some(a), Some(b)) => structurally_compatible(a, b),
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
