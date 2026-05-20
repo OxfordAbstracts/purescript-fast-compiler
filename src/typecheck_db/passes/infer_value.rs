@@ -1198,10 +1198,13 @@ pub fn infer_value_scc_with_all(
                             full_sig,
                             true,
                         );
-                        let snapshot = state.snapshot_bindings();
-                        if state.unify(&expected, &slot_shape).is_err() {
-                            state.restore_bindings(snapshot);
-                        }
+                        // Surface sig-vs-body mismatches as a hard
+                        // unification error. `narrow_no_arg_pin`
+                        // only fires for no-arg decls whose sig
+                        // is a concrete shape with no forall /
+                        // wildcard / constraint / inner-forall,
+                        // so a mismatch here is unambiguous.
+                        state.unify_here(&expected, &slot_shape)?;
                     }
                 }
                 for n in scoped_added {
