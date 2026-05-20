@@ -1784,7 +1784,7 @@ mod tests {
         };
         let module = parse_mod(src);
         let (fixity_table, module_fixity_hash) = fixity_table_from_decls(&module.decls);
-        let ctx = DesugarContext { module_fixity_hash, fixity_table };
+        let ctx = DesugarContext { module_fixity_hash, fixity_table, qualified_fixity_table: Default::default() };
         let decls = desugar_module(module.decls.clone(), &ctx);
         let desugared = cst::Module {
             span: module.span,

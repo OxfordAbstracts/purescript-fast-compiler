@@ -1432,7 +1432,7 @@ mod tests {
         };
         let cst_mod = parse_cst(src).unwrap();
         let (fixity_table, module_fixity_hash) = fixity_table_from_decls(&cst_mod.decls);
-        let ctx = DesugarContext { module_fixity_hash, fixity_table };
+        let ctx = DesugarContext { module_fixity_hash, fixity_table, qualified_fixity_table: Default::default() };
         let decls = desugar_module(cst_mod.decls.clone(), &ctx);
         let desugared = crate::cst::Module { decls, ..cst_mod };
         crate::typecheck_db::ir::lower_module(desugared).expect("lower")

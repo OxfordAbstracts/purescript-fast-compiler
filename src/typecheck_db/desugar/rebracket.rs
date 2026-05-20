@@ -56,6 +56,14 @@ pub struct FixityInfo {
 /// Keyed by the operator symbol — e.g. the `Symbol` interned for `+`.
 pub type FixityTable = HashMap<Ident, FixityInfo>;
 
+/// Fixities reachable ONLY via a qualifier (`import M as Q`
+/// brings `Q.(:)` into scope but not bare `(:)`). Keyed by
+/// `(qualifier_symbol, op_symbol)`. Used as a fallback when
+/// `rebracket::lookup_op` finds no entry under just the op
+/// symbol — preserves `infixr N` declarations across qualified
+/// imports.
+pub type QualifiedFixityTable = HashMap<(Ident, Ident), FixityInfo>;
+
 /// Collect value-level fixity entries from a decl list.
 ///
 /// Only `Decl::Fixity { is_type: false, .. }` entries contribute. The
@@ -119,14 +127,14 @@ fn key_to_u32(s: Ident) -> u32 {
 // Decl entry
 // ---------------------------------------------------------------------------
 
-pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
+pub fn desugar_decl(decl: Decl, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> Decl {
     use crate::cst::{GuardedExpr, Guard, GuardPattern, LetBinding};
     match decl {
         Decl::Value { name, binders, guarded, where_clause, span, doc_comments } => {
-            let binders = binders.into_iter().map(|b| rewrite_binder(b, fixity)).collect();
+            let binders = binders.into_iter().map(|b| rewrite_binder(b, fixity, qualified)).collect();
             let guarded = match guarded {
                 GuardedExpr::Unconditional(e) => {
-                    GuardedExpr::Unconditional(Box::new(rewrite_expr(*e, fixity)))
+                    GuardedExpr::Unconditional(Box::new(rewrite_expr(*e, fixity, qualified)))
                 }
                 GuardedExpr::Guarded(gs) => GuardedExpr::Guarded(
                     gs.into_iter()
@@ -137,15 +145,15 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                                 .into_iter()
                                 .map(|p| match p {
                                     GuardPattern::Boolean(e) => {
-                                        GuardPattern::Boolean(Box::new(rewrite_expr(*e, fixity)))
+                                        GuardPattern::Boolean(Box::new(rewrite_expr(*e, fixity, qualified)))
                                     }
                                     GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
-                                        rewrite_binder(b, fixity),
-                                        Box::new(rewrite_expr(*e, fixity)),
+                                        rewrite_binder(b, fixity, qualified),
+                                        Box::new(rewrite_expr(*e, fixity, qualified)),
                                     ),
                                 })
                                 .collect(),
-                            expr: Box::new(rewrite_expr(*g.expr, fixity)),
+                            expr: Box::new(rewrite_expr(*g.expr, fixity, qualified)),
                         })
                         .collect(),
                 ),
@@ -156,8 +164,8 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
                     .map(|b| match b {
                         LetBinding::Value { span, binder, expr } => LetBinding::Value {
                             span,
-                            binder: rewrite_binder(binder, fixity),
-                            expr: rewrite_expr(expr, fixity),
+                            binder: rewrite_binder(binder, fixity, qualified),
+                            expr: rewrite_expr(expr, fixity, qualified),
                         },
                         LetBinding::Signature { span, name, ty } => {
                             LetBinding::Signature { span, name, ty }
@@ -185,7 +193,7 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
             constraints,
             class_name,
             types,
-            members: members.into_iter().map(|m| desugar_decl(m, fixity)).collect(),
+            members: members.into_iter().map(|m| desugar_decl(m, fixity, qualified)).collect(),
             chain,
             doc_comments,
         },
@@ -207,15 +215,20 @@ pub fn desugar_decl(decl: Decl, fixity: &FixityTable) -> Decl {
 /// `Binder::Constructor { name: Cons, .. }` rather than a
 /// constructor literally named `:` (which would be unbound at
 /// inference time).
-fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Binder {
+fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> crate::cst::Binder {
     use crate::cst::Binder;
     use crate::names::{ConstructorName, Qualified};
     match b {
         Binder::Op { span, left, op, right } => {
-            let left = rewrite_binder(*left, fixity);
-            let right = rewrite_binder(*right, fixity);
+            let left = rewrite_binder(*left, fixity, qualified);
+            let right = rewrite_binder(*right, fixity, qualified);
             let op_sym = op.value.name.symbol();
-            let (ctor_str, ctor_module) = match fixity.get(&op_sym) {
+            let info = op
+                .value
+                .module
+                .and_then(|m| qualified.get(&(m.symbol(), op_sym)).copied())
+                .or_else(|| fixity.get(&op_sym).copied());
+            let (ctor_str, ctor_module) = match info {
                 Some(info) => (resolve_sym(info.target_name), info.target_module),
                 None => (resolve_sym(op_sym), op.value.module.map(|m| m.symbol())),
             };
@@ -229,7 +242,7 @@ fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Bi
         Binder::Constructor { span, name, args } => Binder::Constructor {
             span,
             name,
-            args: args.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
+            args: args.into_iter().map(|b| rewrite_binder(b, fixity, qualified)).collect(),
         },
         Binder::Record { span, fields } => Binder::Record {
             span,
@@ -238,26 +251,26 @@ fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Bi
                 .map(|f| crate::cst::RecordBinderField {
                     span: f.span,
                     label: f.label,
-                    binder: f.binder.map(|b| rewrite_binder(b, fixity)),
+                    binder: f.binder.map(|b| rewrite_binder(b, fixity, qualified)),
                 })
                 .collect(),
         },
         Binder::As { span, name, binder } => Binder::As {
             span,
             name,
-            binder: Box::new(rewrite_binder(*binder, fixity)),
+            binder: Box::new(rewrite_binder(*binder, fixity, qualified)),
         },
         Binder::Parens { span, binder } => Binder::Parens {
             span,
-            binder: Box::new(rewrite_binder(*binder, fixity)),
+            binder: Box::new(rewrite_binder(*binder, fixity, qualified)),
         },
         Binder::Array { span, elements } => Binder::Array {
             span,
-            elements: elements.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
+            elements: elements.into_iter().map(|b| rewrite_binder(b, fixity, qualified)).collect(),
         },
         Binder::Typed { span, binder, ty } => Binder::Typed {
             span,
-            binder: Box::new(rewrite_binder(*binder, fixity)),
+            binder: Box::new(rewrite_binder(*binder, fixity, qualified)),
             ty,
         },
         leaf @ (Binder::Wildcard { .. }
@@ -274,8 +287,8 @@ fn rewrite_binder(b: crate::cst::Binder, fixity: &FixityTable) -> crate::cst::Bi
 /// capture `b` as its left operand. Flattening the whole chain
 /// at the outermost Op preserves precedence; we then recurse
 /// into each individual operand to handle nested expressions.
-fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
-    rewrite_expr_ctx(e, fixity, false)
+fn rewrite_expr(e: Expr, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> Expr {
+    rewrite_expr_ctx(e, fixity, qualified, false)
 }
 
 /// `in_parens` is true when the expression being rewritten is
@@ -284,7 +297,7 @@ fn rewrite_expr(e: Expr, fixity: &FixityTable) -> Expr {
 /// bare position (e.g. `test = 1 + 2 * _`) the user must wrap
 /// the section explicitly, and leaving the wildcard unlifted
 /// surfaces as `IncorrectAnonymousArgument` downstream.
-fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, in_parens: bool) -> Expr {
+fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, qualified: &QualifiedFixityTable, in_parens: bool) -> Expr {
     match e {
         Expr::Op { .. } | Expr::BacktickApp { .. } => {
             let (mut operands_raw, ops_raw, root_span) = flatten_chain(e);
@@ -309,7 +322,7 @@ fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, in_parens: bool) -> Expr {
             }
             let mut operands: Vec<Expr> = operands_raw
                 .into_iter()
-                .map(|x| rewrite_expr(x, fixity))
+                .map(|x| rewrite_expr(x, fixity, qualified))
                 .collect();
             // Chain-level section lifting: any leaf wildcard in
             // the flattened chain becomes a fresh lambda param,
@@ -360,11 +373,11 @@ fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, in_parens: bool) -> Expr {
                     ChainOp::Named(n) => ChainOp::Named(n),
                     ChainOp::Backtick { span, func } => ChainOp::Backtick {
                         span,
-                        func: rewrite_expr(func, fixity),
+                        func: rewrite_expr(func, fixity, qualified),
                     },
                 })
                 .collect();
-            let shunted = shunt(operands, ops, fixity, root_span);
+            let shunted = shunt(operands, ops, fixity, qualified, root_span);
             let result = if section_params.is_empty() {
                 shunted
             } else {
@@ -383,7 +396,7 @@ fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, in_parens: bool) -> Expr {
                 None => result,
             }
         }
-        Expr::OpParens { span, op } => match lookup_op(&op, fixity) {
+        Expr::OpParens { span, op } => match lookup_op(&op, fixity, qualified) {
             Some(info) if target_is_constructor(info) => Expr::Constructor {
                 span,
                 name: target_ctor(info, span),
@@ -410,9 +423,9 @@ fn rewrite_expr_ctx(e: Expr, fixity: &FixityTable, in_parens: bool) -> Expr {
         },
         Expr::Parens { span, expr } => Expr::Parens {
             span,
-            expr: Box::new(rewrite_expr_ctx(*expr, fixity, true)),
+            expr: Box::new(rewrite_expr_ctx(*expr, fixity, qualified, true)),
         },
-        other => recurse_children(other, fixity),
+        other => recurse_children(other, fixity, qualified),
     }
 }
 
@@ -462,34 +475,34 @@ fn flatten_chain(root: Expr) -> (Vec<Expr>, Vec<ChainOp>, Span) {
 /// `super::walk::recurse_children` but invokes our pre-order
 /// rewriter on each child so nested chains are caught at their
 /// outermost Op.
-fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
+fn recurse_children(e: Expr, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> Expr {
     use crate::cst::{
         CaseAlternative, DoStatement, Guard, GuardPattern, GuardedExpr, LetBinding, Literal,
         RecordField, RecordUpdate,
     };
 
-    fn rec(e: Expr, fixity: &FixityTable) -> Expr {
-        rewrite_expr(e, fixity)
+    fn rec(e: Expr, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> Expr {
+        rewrite_expr(e, fixity, qualified)
     }
-    fn rec_box(e: Box<Expr>, fixity: &FixityTable) -> Box<Expr> {
-        Box::new(rec(*e, fixity))
+    fn rec_box(e: Box<Expr>, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> Box<Expr> {
+        Box::new(rec(*e, fixity, qualified))
     }
-    fn rec_field(r: RecordField, fixity: &FixityTable) -> RecordField {
+    fn rec_field(r: RecordField, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> RecordField {
         RecordField {
             span: r.span,
             label: r.label,
-            value: r.value.map(|e| rec(e, fixity)),
+            value: r.value.map(|e| rec(e, fixity, qualified)),
             type_ann: r.type_ann,
             is_update: r.is_update,
             is_nested: r.is_nested,
         }
     }
-    fn rec_update(u: RecordUpdate, fixity: &FixityTable) -> RecordUpdate {
-        RecordUpdate { span: u.span, label: u.label, value: rec(u.value, fixity) }
+    fn rec_update(u: RecordUpdate, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> RecordUpdate {
+        RecordUpdate { span: u.span, label: u.label, value: rec(u.value, fixity, qualified) }
     }
-    fn rec_guarded(g: GuardedExpr, fixity: &FixityTable) -> GuardedExpr {
+    fn rec_guarded(g: GuardedExpr, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> GuardedExpr {
         match g {
-            GuardedExpr::Unconditional(e) => GuardedExpr::Unconditional(rec_box(e, fixity)),
+            GuardedExpr::Unconditional(e) => GuardedExpr::Unconditional(rec_box(e, fixity, qualified)),
             GuardedExpr::Guarded(gs) => GuardedExpr::Guarded(
                 gs.into_iter()
                     .map(|guard| Guard {
@@ -498,48 +511,48 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
                             .patterns
                             .into_iter()
                             .map(|p| match p {
-                                GuardPattern::Boolean(e) => GuardPattern::Boolean(rec_box(e, fixity)),
+                                GuardPattern::Boolean(e) => GuardPattern::Boolean(rec_box(e, fixity, qualified)),
                                 GuardPattern::Pattern(b, e) => GuardPattern::Pattern(
-                                    rewrite_binder(b, fixity),
-                                    rec_box(e, fixity),
+                                    rewrite_binder(b, fixity, qualified),
+                                    rec_box(e, fixity, qualified),
                                 ),
                             })
                             .collect(),
-                        expr: rec_box(guard.expr, fixity),
+                        expr: rec_box(guard.expr, fixity, qualified),
                     })
                     .collect(),
             ),
         }
     }
-    fn rec_let(b: LetBinding, fixity: &FixityTable) -> LetBinding {
+    fn rec_let(b: LetBinding, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> LetBinding {
         match b {
             LetBinding::Value { span, binder, expr } => LetBinding::Value {
                 span,
-                binder: rewrite_binder(binder, fixity),
-                expr: rec(expr, fixity),
+                binder: rewrite_binder(binder, fixity, qualified),
+                expr: rec(expr, fixity, qualified),
             },
             LetBinding::Signature { span, name, ty } => LetBinding::Signature { span, name, ty },
         }
     }
-    fn rec_alt(a: CaseAlternative, fixity: &FixityTable) -> CaseAlternative {
+    fn rec_alt(a: CaseAlternative, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> CaseAlternative {
         CaseAlternative {
             span: a.span,
-            binders: a.binders.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
-            result: rec_guarded(a.result, fixity),
+            binders: a.binders.into_iter().map(|b| rewrite_binder(b, fixity, qualified)).collect(),
+            result: rec_guarded(a.result, fixity, qualified),
         }
     }
-    fn rec_do(s: DoStatement, fixity: &FixityTable) -> DoStatement {
+    fn rec_do(s: DoStatement, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> DoStatement {
         match s {
             DoStatement::Bind { span, binder, expr } => DoStatement::Bind {
                 span,
-                binder: rewrite_binder(binder, fixity),
-                expr: rec(expr, fixity),
+                binder: rewrite_binder(binder, fixity, qualified),
+                expr: rec(expr, fixity, qualified),
             },
             DoStatement::Let { span, bindings } => DoStatement::Let {
                 span,
-                bindings: bindings.into_iter().map(|b| rec_let(b, fixity)).collect(),
+                bindings: bindings.into_iter().map(|b| rec_let(b, fixity, qualified)).collect(),
             },
-            DoStatement::Discard { span, expr } => DoStatement::Discard { span, expr: rec(expr, fixity) },
+            DoStatement::Discard { span, expr } => DoStatement::Discard { span, expr: rec(expr, fixity, qualified) },
         }
     }
 
@@ -552,85 +565,85 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
         Expr::Literal { span, lit } => match lit {
             Literal::Array(xs) => Expr::Literal {
                 span,
-                lit: Literal::Array(xs.into_iter().map(|x| rec(x, fixity)).collect()),
+                lit: Literal::Array(xs.into_iter().map(|x| rec(x, fixity, qualified)).collect()),
             },
             other => Expr::Literal { span, lit: other },
         },
         Expr::App { span, func, arg } => Expr::App {
             span,
-            func: rec_box(func, fixity),
-            arg: rec_box(arg, fixity),
+            func: rec_box(func, fixity, qualified),
+            arg: rec_box(arg, fixity, qualified),
         },
         Expr::VisibleTypeApp { span, func, ty } => Expr::VisibleTypeApp {
             span,
-            func: rec_box(func, fixity),
+            func: rec_box(func, fixity, qualified),
             ty,
         },
         Expr::Lambda { span, binders, body } => Expr::Lambda {
             span,
-            binders: binders.into_iter().map(|b| rewrite_binder(b, fixity)).collect(),
-            body: rec_box(body, fixity),
+            binders: binders.into_iter().map(|b| rewrite_binder(b, fixity, qualified)).collect(),
+            body: rec_box(body, fixity, qualified),
         },
-        Expr::Op { .. } | Expr::BacktickApp { .. } => rewrite_expr(e, fixity),
+        Expr::Op { .. } | Expr::BacktickApp { .. } => rewrite_expr(e, fixity, qualified),
         Expr::If { span, cond, then_expr, else_expr } => Expr::If {
             span,
-            cond: rec_box(cond, fixity),
-            then_expr: rec_box(then_expr, fixity),
-            else_expr: rec_box(else_expr, fixity),
+            cond: rec_box(cond, fixity, qualified),
+            then_expr: rec_box(then_expr, fixity, qualified),
+            else_expr: rec_box(else_expr, fixity, qualified),
         },
         Expr::Case { span, exprs, alts } => Expr::Case {
             span,
-            exprs: exprs.into_iter().map(|e| rec(e, fixity)).collect(),
-            alts: alts.into_iter().map(|a| rec_alt(a, fixity)).collect(),
+            exprs: exprs.into_iter().map(|e| rec(e, fixity, qualified)).collect(),
+            alts: alts.into_iter().map(|a| rec_alt(a, fixity, qualified)).collect(),
         },
         Expr::Let { span, bindings, body } => Expr::Let {
             span,
             bindings: super::multi_eq::merge_let_bindings(bindings)
                 .into_iter()
-                .map(|b| rec_let(b, fixity))
+                .map(|b| rec_let(b, fixity, qualified))
                 .collect(),
-            body: rec_box(body, fixity),
+            body: rec_box(body, fixity, qualified),
         },
         Expr::Do { span, module, statements } => Expr::Do {
             span,
             module,
-            statements: statements.into_iter().map(|s| rec_do(s, fixity)).collect(),
+            statements: statements.into_iter().map(|s| rec_do(s, fixity, qualified)).collect(),
         },
         Expr::Ado { span, module, statements, result } => Expr::Ado {
             span,
             module,
-            statements: statements.into_iter().map(|s| rec_do(s, fixity)).collect(),
-            result: rec_box(result, fixity),
+            statements: statements.into_iter().map(|s| rec_do(s, fixity, qualified)).collect(),
+            result: rec_box(result, fixity, qualified),
         },
         Expr::Record { span, fields } => Expr::Record {
             span,
-            fields: fields.into_iter().map(|r| rec_field(r, fixity)).collect(),
+            fields: fields.into_iter().map(|r| rec_field(r, fixity, qualified)).collect(),
         },
         Expr::RecordAccess { span, expr, field } => Expr::RecordAccess {
             span,
-            expr: rec_box(expr, fixity),
+            expr: rec_box(expr, fixity, qualified),
             field,
         },
         Expr::RecordUpdate { span, expr, updates } => Expr::RecordUpdate {
             span,
-            expr: rec_box(expr, fixity),
-            updates: updates.into_iter().map(|u| rec_update(u, fixity)).collect(),
+            expr: rec_box(expr, fixity, qualified),
+            updates: updates.into_iter().map(|u| rec_update(u, fixity, qualified)).collect(),
         },
-        Expr::Parens { span, expr } => Expr::Parens { span, expr: rec_box(expr, fixity) },
+        Expr::Parens { span, expr } => Expr::Parens { span, expr: rec_box(expr, fixity, qualified) },
         Expr::TypeAnnotation { span, expr, ty } => Expr::TypeAnnotation {
             span,
-            expr: rec_box(expr, fixity),
+            expr: rec_box(expr, fixity, qualified),
             ty,
         },
         Expr::Array { span, elements } => Expr::Array {
             span,
-            elements: elements.into_iter().map(|e| rec(e, fixity)).collect(),
+            elements: elements.into_iter().map(|e| rec(e, fixity, qualified)).collect(),
         },
-        Expr::Negate { span, expr } => Expr::Negate { span, expr: rec_box(expr, fixity) },
+        Expr::Negate { span, expr } => Expr::Negate { span, expr: rec_box(expr, fixity, qualified) },
         Expr::AsPattern { span, name, pattern } => Expr::AsPattern {
             span,
-            name: rec_box(name, fixity),
-            pattern: rec_box(pattern, fixity),
+            name: rec_box(name, fixity, qualified),
+            pattern: rec_box(pattern, fixity, qualified),
         },
     }
 }
@@ -638,7 +651,7 @@ fn recurse_children(e: Expr, fixity: &FixityTable) -> Expr {
 fn shunt(
     mut operands: Vec<Expr>,
     ops: Vec<ChainOp>,
-    fixity: &FixityTable,
+    fixity: &FixityTable, qualified: &QualifiedFixityTable,
     span: Span,
 ) -> Expr {
     // Output: Vec<Expr>; op_stack: Vec<usize> (indices into `ops`).
@@ -650,9 +663,9 @@ fn shunt(
     output.push(first);
 
     for i in 0..ops.len() {
-        let (assoc_i, prec_i) = op_fixity(&ops[i], fixity);
+        let (assoc_i, prec_i) = op_fixity(&ops[i], fixity, qualified);
         while let Some(&top) = op_stack.last() {
-            let (_, prec_top) = op_fixity(&ops[top], fixity);
+            let (_, prec_top) = op_fixity(&ops[top], fixity, qualified);
             let should_pop = prec_top > prec_i
                 || (prec_top == prec_i && assoc_i == Associativity::Left);
             if !should_pop {
@@ -661,7 +674,7 @@ fn shunt(
             op_stack.pop();
             let right = output.pop().unwrap();
             let left = output.pop().unwrap();
-            output.push(apply_op(&ops[top], left, right, fixity, span));
+            output.push(apply_op(&ops[top], left, right, fixity, qualified, span));
         }
         op_stack.push(i);
         output.push(operands.remove(0));
@@ -671,16 +684,25 @@ fn shunt(
     while let Some(top) = op_stack.pop() {
         let right = output.pop().unwrap();
         let left = output.pop().unwrap();
-        output.push(apply_op(&ops[top], left, right, fixity, span));
+        output.push(apply_op(&ops[top], left, right, fixity, qualified, span));
     }
     output.pop().unwrap()
 }
 
-fn op_fixity(op: &ChainOp, fixity: &FixityTable) -> (Associativity, u8) {
+fn op_fixity(op: &ChainOp, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> (Associativity, u8) {
     match op {
         ChainOp::Named(n) => {
             let sym = n.value.name.symbol();
-            match fixity.get(&sym) {
+            // Consult the qualified table first for `Q.op`; that
+            // lets `x List.: y List.: ds` pick up `Data.List.Types`'s
+            // `infixr 6` even when bare `:` isn't unqualified-
+            // imported.
+            let info = n
+                .value
+                .module
+                .and_then(|m| qualified.get(&(m.symbol(), sym)).copied())
+                .or_else(|| fixity.get(&sym).copied());
+            match info {
                 Some(info) => (info.associativity, info.precedence),
                 // Unknown op: default to `infixl 9` per the
                 // PureScript reference. Both identifier-shaped
@@ -697,12 +719,17 @@ fn op_fixity(op: &ChainOp, fixity: &FixityTable) -> (Associativity, u8) {
     }
 }
 
-fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: Span) -> Expr {
+fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, qualified: &QualifiedFixityTable, span: Span) -> Expr {
     let func = match op {
         ChainOp::Named(n) => {
             let sym = n.value.name.symbol();
-            match fixity.get(&sym) {
-                Some(info) if target_is_constructor(*info) => {
+            let info = n
+                .value
+                .module
+                .and_then(|m| qualified.get(&(m.symbol(), sym)).copied())
+                .or_else(|| fixity.get(&sym).copied());
+            match info {
+                Some(info) if target_is_constructor(info) => {
                     // Constructor operator (e.g. `infixr 6 Cons as :`).
                     // Emit an `Expr::Constructor` node so downstream
                     // binder/inference passes treat the operands as
@@ -710,12 +737,12 @@ fn apply_op(op: &ChainOp, left: Expr, right: Expr, fixity: &FixityTable, span: S
                     // name up in the value namespace.
                     Expr::Constructor {
                         span,
-                        name: target_ctor(*info, span),
+                        name: target_ctor(info, span),
                     }
                 }
                 Some(info) => Expr::Var {
                     span,
-                    name: target_var(*info, span),
+                    name: target_var(info, span),
                 },
                 None => {
                     // No fixity decl in scope. Two flavors:
@@ -759,8 +786,20 @@ fn is_identifier_op(sym: Ident) -> bool {
     s.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
 }
 
-fn lookup_op(op: &Spanned<Qualified<crate::names::OpName>>, fixity: &FixityTable) -> Option<FixityInfo> {
-    fixity.get(&op.value.name.symbol()).copied()
+fn lookup_op(op: &Spanned<Qualified<crate::names::OpName>>, fixity: &FixityTable, qualified: &QualifiedFixityTable) -> Option<FixityInfo> {
+    let op_sym = op.value.name.symbol();
+    // Qualified operators (`List.:`) consult the per-qualifier
+    // table first — only `Q.op` from `import M as Q` is in scope
+    // under Q, even if no bare `op` was imported. Fall back to
+    // the unqualified table for legacy/lenient handling (the
+    // resolver may surface a qualified name later for ops that
+    // are also visible unqualified).
+    if let Some(m) = op.value.module {
+        if let Some(info) = qualified.get(&(m.symbol(), op_sym)) {
+            return Some(*info);
+        }
+    }
+    fixity.get(&op_sym).copied()
 }
 
 fn target_is_constructor(info: FixityInfo) -> bool {
@@ -870,7 +909,7 @@ infixl 6 add as +
 foo a b = a + b
 ");
         let value = decls.into_iter().find(|d| matches!(d, Decl::Value { .. })).unwrap();
-        let out = desugar_decl(value, &table);
+        let out = desugar_decl(value, &table, &QualifiedFixityTable::new());
         assert_eq!(count_op(&out), 0, "Op should be lowered: {out:#?}");
     }
 
@@ -884,7 +923,7 @@ infixl 7 mul as *
 foo a b c = a + b * c
 ");
         let value = decls.into_iter().find(|d| matches!(d, Decl::Value { .. })).unwrap();
-        let out = desugar_decl(value, &table);
+        let out = desugar_decl(value, &table, &QualifiedFixityTable::new());
         assert_eq!(count_op(&out), 0);
         // The outermost App should be the `+` call; its arg should be
         // the `*` call.
@@ -924,7 +963,7 @@ foo a b c = a + b * c
 module M where
 foo a b = a ?? b
 ");
-        let out = desugar_decl(d, &table);
+        let out = desugar_decl(d, &table, &QualifiedFixityTable::new());
         assert_eq!(count_op(&out), 0, "unknown op must still be lowered");
     }
 
@@ -938,7 +977,7 @@ foo a b = a ?? b
 module M where
 foo a b = a `f` b
 ");
-        let out = desugar_decl(d, &table);
+        let out = desugar_decl(d, &table, &QualifiedFixityTable::new());
         assert_eq!(count_op(&out), 0);
     }
 
@@ -950,7 +989,7 @@ infixl 6 add as +
 bar = (+)
 ");
         let value = decls.into_iter().find(|d| matches!(d, Decl::Value { .. })).unwrap();
-        let out = desugar_decl(value, &table);
+        let out = desugar_decl(value, &table, &QualifiedFixityTable::new());
         if let Decl::Value { guarded: crate::cst::GuardedExpr::Unconditional(body), .. } = &out {
             assert!(matches!(body.as_ref(), Expr::Var { .. }), "(+) → Var, got {body:?}");
         }
@@ -972,7 +1011,7 @@ infixr 2 disj as ||
 foo a b zero = a == zero || b == zero
 ");
         let value = decls.into_iter().find(|d| matches!(d, Decl::Value { .. })).unwrap();
-        let out = desugar_decl(value, &table);
+        let out = desugar_decl(value, &table, &QualifiedFixityTable::new());
         assert_eq!(count_op(&out), 0, "all Op nodes should be lowered: {out:#?}");
         // Outermost call should be to `disj`, not `eq`. Walk down
         // the function-of-function pattern: App(App(Var(disj), _), _).
@@ -1005,8 +1044,8 @@ infixl 7 mul as *
 foo a b c = a + b * c
 ");
         let value = decls.into_iter().find(|d| matches!(d, Decl::Value { .. })).unwrap();
-        let once = desugar_decl(value, &table);
-        let twice = desugar_decl(once.clone(), &table);
+        let once = desugar_decl(value, &table, &QualifiedFixityTable::new());
+        let twice = desugar_decl(once.clone(), &table, &QualifiedFixityTable::new());
         assert_eq!(once, twice);
     }
 }

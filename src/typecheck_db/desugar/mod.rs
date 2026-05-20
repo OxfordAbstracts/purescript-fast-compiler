@@ -31,7 +31,9 @@ pub mod do_notation;
 pub mod multi_eq;
 pub mod rebracket;
 
-pub use rebracket::{fixity_table_from_decls, FixityInfo, FixityTable};
+pub use rebracket::{
+    fixity_table_from_decls, FixityInfo, FixityTable, QualifiedFixityTable,
+};
 
 /// Module-scoped inputs that steer the desugar pipeline.
 ///
@@ -49,6 +51,14 @@ pub use rebracket::{fixity_table_from_decls, FixityInfo, FixityTable};
 pub struct DesugarContext {
     pub module_fixity_hash: [u8; 32],
     pub fixity_table: FixityTable,
+    /// Operators reached only via qualified imports (`import M as
+    /// Q` brings `Q.(:)` into scope but not bare `(:)`). Keyed by
+    /// `(qualifier, op_symbol)` so `Q.op` can pick up its source
+    /// module's `infixr N` declaration even when no
+    /// unqualified-equivalent is in scope. The rebracketer
+    /// consults this on a fallback path when the bare-op lookup
+    /// misses.
+    pub qualified_fixity_table: rebracket::QualifiedFixityTable,
 }
 
 /// Apply every sub-transform to `decl` in pipeline order and return the
@@ -73,7 +83,7 @@ pub fn desugar(decl: &Decl, ctx: &DesugarContext) -> Decl {
     let d = records::desugar_decl(d);
     let d = signed::desugar_decl(d);
     let d = do_notation::desugar_decl(d);
-    let d = rebracket::desugar_decl(d, &ctx.fixity_table);
+    let d = rebracket::desugar_decl(d, &ctx.fixity_table, &ctx.qualified_fixity_table);
     d
 }
 

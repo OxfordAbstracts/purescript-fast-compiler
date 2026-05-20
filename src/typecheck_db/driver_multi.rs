@@ -4756,17 +4756,82 @@ fn build_desugar_context(
     let (mut table, _local_hash) =
         fixity_table_from_decls(&module.decls);
 
+    // Qualified-only operator fixities (`import M as Q` brings
+    // `Q.(:)` into scope but not bare `(:)`). Keyed by
+    // `(qualifier_symbol, op_symbol)`; consulted as a fallback
+    // by the rebracketer when the bare-op lookup misses, so
+    // `Q.(:)` picks up `infixr N` from M.
+    let mut qualified_table: crate::typecheck_db::desugar::QualifiedFixityTable =
+        std::collections::HashMap::new();
+
     // Merge every imported module's value_fixities. We look up
     // each import's target in the registry rather than walking
     // Prim submodules (Prim defines no operators).
     for imp in &module.imports {
         // Qualified-only imports (`import M as Q`) put operators
         // under `Q.(:)` only — they don't make the operator
-        // available as bare `(:)`. Skip such imports here so
-        // an open `import Data.Array as A` doesn't pre-empt a
+        // available as bare `(:)`. Capture those into the
+        // qualified_table so `Q.op` still gets its declared
+        // fixity; skip them from the unqualified merge so an
+        // open `import Data.Array as A` doesn't pre-empt a
         // later `import Data.List (List(..), (:))` from
         // claiming the unqualified slot.
-        if imp.qualified.is_some() {
+        if let Some(qualifier) = &imp.qualified {
+            let target_name = imp
+                .module
+                .parts
+                .iter()
+                .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                .collect::<Vec<_>>()
+                .join(".");
+            let target = match registry.get(&target_name) {
+                Some(t) => t,
+                None => continue,
+            };
+            let qualifier_str: String = qualifier
+                .parts
+                .iter()
+                .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                .collect::<Vec<_>>()
+                .join(".");
+            let qualifier_sym = crate::interner::intern(&qualifier_str);
+            for (op_name, fx) in &target.value_fixities {
+                // Respect the import's explicit/hiding list,
+                // same rules as the unqualified path below.
+                let op_in_scope = match &imp.imports {
+                    None => true,
+                    Some(crate::cst::ImportList::Explicit(items)) => {
+                        let op_sym_raw = crate::interner::intern(op_name.as_str());
+                        items.iter().any(|item| {
+                            matches!(item, crate::cst::Import::Value(_))
+                                && item.name() == op_sym_raw
+                        })
+                    }
+                    Some(crate::cst::ImportList::Hiding(items)) => {
+                        let op_sym_raw = crate::interner::intern(op_name.as_str());
+                        !items.iter().any(|item| {
+                            matches!(item, crate::cst::Import::Value(_))
+                                && item.name() == op_sym_raw
+                        })
+                    }
+                };
+                if !op_in_scope {
+                    continue;
+                }
+                let op_sym = crate::interner::intern(op_name);
+                let target_module_sym =
+                    fx.target_module.as_deref().map(crate::interner::intern);
+                let target_name_sym = crate::interner::intern(&fx.target_name);
+                qualified_table.insert(
+                    (qualifier_sym, op_sym),
+                    FixityInfo {
+                        associativity: fx.associativity,
+                        precedence: fx.precedence,
+                        target_module: target_module_sym,
+                        target_name: target_name_sym,
+                    },
+                );
+            }
             continue;
         }
         let target_name = imp
@@ -4835,7 +4900,11 @@ fn build_desugar_context(
     // Re-hash after the imported fixities land so the module's
     // module_fixity_hash reflects the full visible set.
     let combined_hash = hash_fixity_table(&table);
-    DesugarContext { module_fixity_hash: combined_hash, fixity_table: table }
+    DesugarContext {
+        module_fixity_hash: combined_hash,
+        fixity_table: table,
+        qualified_fixity_table: qualified_table,
+    }
 }
 
 fn hash_fixity_table(
