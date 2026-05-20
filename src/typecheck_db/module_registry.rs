@@ -928,18 +928,23 @@ pub fn distill_exports(
 /// re-export behaviour for those.
 #[derive(Clone, Debug)]
 enum CtorReexportFilter {
-    /// `import M` (open) or no list — every ctor passes.
+    /// `import M` (open) or no list — every ctor / value passes.
     Open,
-    /// `import M hiding (xs)` — every ctor passes unless its parent
-    /// type appears in the hide list. We approximate by hiding
-    /// ctors whose parent type is hidden; individually-listed ctor
-    /// hides aren't expressible in PureScript's surface syntax.
-    Hiding { hidden_types: std::collections::HashSet<String> },
+    /// `import M hiding (xs)` — every ctor / value passes unless
+    /// the corresponding name is hidden. `hidden_types` covers
+    /// ctors whose parent type is hidden; `values` lists hidden
+    /// values (and value operators).
+    Hiding {
+        hidden_types: std::collections::HashSet<String>,
+        values: std::collections::HashSet<String>,
+    },
     /// `import M (xs)` — only ctors whose parent type was imported
-    /// with `(..)` (or whose name was listed individually) pass.
+    /// with `(..)` (or whose name was listed individually) pass,
+    /// and only values explicitly listed pass.
     Explicit {
         types_with_all_ctors: std::collections::HashSet<String>,
         ctors: std::collections::HashSet<String>,
+        values: std::collections::HashSet<String>,
     },
 }
 
@@ -947,7 +952,7 @@ impl CtorReexportFilter {
     fn includes_ctor(&self, ctor_name: &str, target: &ModuleExports) -> bool {
         match self {
             CtorReexportFilter::Open => true,
-            CtorReexportFilter::Hiding { hidden_types } => {
+            CtorReexportFilter::Hiding { hidden_types, .. } => {
                 // Hide the ctor only when EVERY parent type is
                 // hidden. A name like `Action` can appear as a ctor
                 // of both `Input` (hidden in some hiding lists) and
@@ -964,7 +969,7 @@ impl CtorReexportFilter {
                 }
                 !had_match
             }
-            CtorReexportFilter::Explicit { types_with_all_ctors, ctors } => {
+            CtorReexportFilter::Explicit { types_with_all_ctors, ctors, .. } => {
                 if ctors.contains(ctor_name) {
                     return true;
                 }
@@ -986,6 +991,21 @@ impl CtorReexportFilter {
             }
         }
     }
+
+    /// True if this re-export should surface `value_name` from
+    /// the target. Used to filter values when a `module M`
+    /// re-export collides with another `module N` re-export —
+    /// e.g. Halogen.HTML re-exports `module Halogen.HTML.Core`
+    /// and `module Halogen.HTML.Properties`, both defining `attr`
+    /// with different arities. Only the import list that
+    /// explicitly listed `attr` should surface it.
+    fn includes_value(&self, value_name: &str) -> bool {
+        match self {
+            CtorReexportFilter::Open => true,
+            CtorReexportFilter::Hiding { values, .. } => !values.contains(value_name),
+            CtorReexportFilter::Explicit { values, .. } => values.contains(value_name),
+        }
+    }
 }
 
 fn build_ctor_reexport_filter(
@@ -1001,21 +1021,31 @@ fn build_ctor_reexport_filter(
         Some(ImportList::Hiding(items)) => {
             let mut hidden_types: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            let mut values: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for item in items {
-                if let Import::Type(n, _) = item {
-                    hidden_types.insert(resolve(n.value.symbol()));
+                match item {
+                    Import::Type(n, _) => {
+                        hidden_types.insert(resolve(n.value.symbol()));
+                    }
+                    Import::Value(n) => {
+                        values.insert(resolve(n.value.symbol()));
+                    }
+                    _ => {}
                 }
             }
-            CtorReexportFilter::Hiding { hidden_types }
+            CtorReexportFilter::Hiding { hidden_types, values }
         }
         Some(ImportList::Explicit(items)) => {
             let mut types_with_all_ctors: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             let mut ctors: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            let mut values: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for item in items {
-                if let Import::Type(n, members) = item {
-                    match members {
+                match item {
+                    Import::Type(n, members) => match members {
                         Some(crate::cst::DataMembers::All) => {
                             types_with_all_ctors.insert(resolve(n.value.symbol()));
                         }
@@ -1025,10 +1055,18 @@ fn build_ctor_reexport_filter(
                             }
                         }
                         None => {}
+                    },
+                    Import::Value(n) => {
+                        values.insert(resolve(n.value.symbol()));
                     }
+                    _ => {}
                 }
             }
-            CtorReexportFilter::Explicit { types_with_all_ctors, ctors }
+            CtorReexportFilter::Explicit {
+                types_with_all_ctors,
+                ctors,
+                values,
+            }
         }
     }
 }
@@ -1211,9 +1249,29 @@ pub fn expand_module_reexports(
                         .get(k)
                         .cloned()
                         .unwrap_or_else(|| target_name.clone());
+                    // `qualified_values` always carries the
+                    // multi-origin map so consumers needing the
+                    // ORIGIN-keyed scheme (e.g. the per-import
+                    // post-distill fixity resolver) still find
+                    // it even when the unqualified slot loses to
+                    // a sibling re-export.
                     out.qualified_values
                         .entry((origin.clone(), k.clone()))
                         .or_insert_with(|| v.clone());
+                    // The UNQUALIFIED slot is filtered by the
+                    // importing module's per-import list: a
+                    // `module M` clause only surfaces names the
+                    // current module pulled in from M. Without
+                    // this, `Halogen.HTML` re-exporting
+                    // `module Halogen.HTML.Core` AND
+                    // `module Halogen.HTML.Properties` collides
+                    // on `attr` (Core's 3-arg variant vs
+                    // Properties's 2-arg variant) and the first
+                    // merge wins regardless of which one the
+                    // user explicitly imported.
+                    if !ctor_filter.includes_value(k) {
+                        continue;
+                    }
                     out.values.entry(k.clone()).or_insert_with(|| v.clone());
                     out.value_origins.entry(k.clone()).or_insert(origin);
                 }
