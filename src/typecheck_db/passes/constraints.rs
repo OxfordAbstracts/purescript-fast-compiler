@@ -452,6 +452,24 @@ pub fn solve_one(
         }
         state.restore_bindings(snapshot);
     }
+    // Rigid `Type::Var` defer FIRST. Rigid type vars come from a
+    // surrounding signature (e.g. inside `default :: forall t a.
+    // Reflectable t a => …`, the body sees `t` / `a` as Vars).
+    // The instance for those vars comes from a "given" the outer
+    // scope provides; we don't track givens explicitly, so defer
+    // the constraint and let it bubble up into the inferred
+    // scheme via `generalize_with_constraints`. The importer then
+    // re-instantiates fresh unifs and the solver retries at each
+    // concrete use-site.
+    //
+    // Crucially this fires BEFORE the fundep-class HeadMismatch
+    // diagnostic below — a sole-candidate fundep class with a
+    // rigid-var target shouldn't surface as
+    // `InstanceHeadMismatch` (the constraint is propagating, not
+    // failing).
+    if pending.constraint.args.iter().any(|a| contains_rigid_var(a, state)) {
+        return SolveOutcome::Deferred;
+    }
     // Specialised diagnostic: when the class has fundeps and the
     // SOLE candidate failed to unify, surface as
     // `InstanceHeadMismatch` (coded as `UnificationError`). The
@@ -467,19 +485,6 @@ pub fn solve_one(
             .unwrap_or(false)
     {
         return SolveOutcome::HeadMismatch;
-    }
-    // No instance matched. Before declaring failure, check whether
-    // any argument contains a rigid `Type::Var`. Rigid type vars
-    // here come from a surrounding signature (e.g. inside `power
-    // :: forall m. Monoid m => …`, the body sees `m` as a Var).
-    // The instance for that variable must come from a "given" the
-    // outer scope provides; we don't track givens explicitly, so
-    // defer the constraint and let it bubble up into the inferred
-    // scheme via `generalize_with_constraints`. The importer then
-    // re-instantiates fresh unifs and the solver retries at each
-    // concrete use-site.
-    if pending.constraint.args.iter().any(|a| contains_rigid_var(a, state)) {
-        return SolveOutcome::Deferred;
     }
     // Classes with no in-scope candidates: defer when the
     // constraint still has wiggle room (some arg contains a unif
