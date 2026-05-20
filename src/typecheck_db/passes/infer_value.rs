@@ -413,6 +413,19 @@ fn infer_expr_inner(
                     &env.scoped_tys,
                 );
             }
+            // Replace every `Type::Wildcard` in the converted
+            // annotation with a fresh unif. `Wildcard` "unifies
+            // with anything" in `unify.rs` but doesn't CAPTURE
+            // the type it was unified with, so a literal `_` in
+            // `LProxy :: _ ScrollTop` leaks into downstream
+            // constraint solving as a position that overlap-
+            // aware instance dispatch can't pin to its real
+            // value (LProxy). Turning each `_` into a fresh unif
+            // lets unification record `?u := LProxy`, which the
+            // surrounding instance constraint then disambiguates
+            // against (e.g. NonKeyedGrain GProxy a vs
+            // NonKeyedGrain LProxy a).
+            let declared = replace_wildcards_with_fresh_unifs(state, declared);
             let monotype =
                 deep_instantiate_positive(state, declared, true);
             let outcome = check_expr(state, env, type_ops, expr, &monotype);
@@ -3421,6 +3434,64 @@ fn instantiate_sig_as_monotype(state: &mut UnifyState, sig_ty: Type) -> Type {
 /// pending constraints on `state` (matches
 /// `instantiate_sig_as_monotype`'s existing behaviour); `false`
 /// drops them (safe for diagnostic-only uses).
+/// Walk `ty` and replace every `Type::Wildcard` with a fresh
+/// unification variable. Used at TypeAnnotation sites so that a
+/// literal `_` in a type annotation participates in unification
+/// like a normal unif: its eventual binding records the real
+/// type, which downstream consumers (overlap-aware instance
+/// dispatch, scheme generalisation) can then read.
+fn replace_wildcards_with_fresh_unifs(state: &mut UnifyState, ty: Type) -> Type {
+    match ty {
+        Type::Wildcard => state.fresh(),
+        Type::App(f, a) => Type::App(
+            Box::new(replace_wildcards_with_fresh_unifs(state, *f)),
+            Box::new(replace_wildcards_with_fresh_unifs(state, *a)),
+        ),
+        Type::Fun(f, a) => Type::fun(
+            replace_wildcards_with_fresh_unifs(state, *f),
+            replace_wildcards_with_fresh_unifs(state, *a),
+        ),
+        Type::Forall(vs, body) => Type::Forall(
+            vs,
+            Box::new(replace_wildcards_with_fresh_unifs(state, *body)),
+        ),
+        Type::Constrained(cs, body) => {
+            let cs = cs
+                .into_iter()
+                .map(|c| Constraint {
+                    class: c.class,
+                    args: c
+                        .args
+                        .into_iter()
+                        .map(|a| replace_wildcards_with_fresh_unifs(state, a))
+                        .collect(),
+                })
+                .collect();
+            Type::Constrained(
+                cs,
+                Box::new(replace_wildcards_with_fresh_unifs(state, *body)),
+            )
+        }
+        Type::Record(fs, tail) => Type::Record(
+            fs.into_iter()
+                .map(|(l, t)| (l, replace_wildcards_with_fresh_unifs(state, t)))
+                .collect(),
+            tail.map(|t| Box::new(replace_wildcards_with_fresh_unifs(state, *t))),
+        ),
+        Type::Row(fs, tail) => Type::Row(
+            fs.into_iter()
+                .map(|(l, t)| (l, replace_wildcards_with_fresh_unifs(state, t)))
+                .collect(),
+            tail.map(|t| Box::new(replace_wildcards_with_fresh_unifs(state, *t))),
+        ),
+        Type::Kinded(t, k) => Type::Kinded(
+            Box::new(replace_wildcards_with_fresh_unifs(state, *t)),
+            Box::new(replace_wildcards_with_fresh_unifs(state, *k)),
+        ),
+        other => other,
+    }
+}
+
 fn deep_instantiate_positive(
     state: &mut UnifyState,
     ty: Type,
