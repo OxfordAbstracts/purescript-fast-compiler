@@ -917,6 +917,122 @@ pub fn distill_exports(
 /// module's `ModuleExports` in the registry, and merge those
 /// items into `out`. `distill_exports` itself can't do this
 /// because it doesn't hold a registry reference — so this lives
+/// Per-import filter restricting which CONSTRUCTORS a `module M`
+/// re-export forwards. Mirrors the reference compiler's rule that
+/// `module M` re-exports only the slice of M the importing module
+/// actually pulled in. We narrow this to ctors specifically because
+/// ctor collisions across modules with different arities are the
+/// motivating bug (Halogen's `Input.Action` vs `HalogenQ.Action`).
+/// Other namespaces (values / types / classes / fixities) use the
+/// existing unfiltered merge — many fixtures depend on transitive
+/// re-export behaviour for those.
+#[derive(Clone, Debug)]
+enum CtorReexportFilter {
+    /// `import M` (open) or no list — every ctor passes.
+    Open,
+    /// `import M hiding (xs)` — every ctor passes unless its parent
+    /// type appears in the hide list. We approximate by hiding
+    /// ctors whose parent type is hidden; individually-listed ctor
+    /// hides aren't expressible in PureScript's surface syntax.
+    Hiding { hidden_types: std::collections::HashSet<String> },
+    /// `import M (xs)` — only ctors whose parent type was imported
+    /// with `(..)` (or whose name was listed individually) pass.
+    Explicit {
+        types_with_all_ctors: std::collections::HashSet<String>,
+        ctors: std::collections::HashSet<String>,
+    },
+}
+
+impl CtorReexportFilter {
+    fn includes_ctor(&self, ctor_name: &str, target: &ModuleExports) -> bool {
+        match self {
+            CtorReexportFilter::Open => true,
+            CtorReexportFilter::Hiding { hidden_types } => {
+                // Hide the ctor only when EVERY parent type is
+                // hidden. A name like `Action` can appear as a ctor
+                // of both `Input` (hidden in some hiding lists) and
+                // `HalogenQ` (not hidden); the ctor survives if any
+                // parent is visible.
+                let mut had_match = false;
+                for (parent, ctor_list) in &target.data_constructors {
+                    if ctor_list.iter().any(|c| c == ctor_name) {
+                        had_match = true;
+                        if !hidden_types.contains(parent) {
+                            return true;
+                        }
+                    }
+                }
+                !had_match
+            }
+            CtorReexportFilter::Explicit { types_with_all_ctors, ctors } => {
+                if ctors.contains(ctor_name) {
+                    return true;
+                }
+                // Iterate ALL parent types for `ctor_name` —
+                // `target.data_constructors` may carry multiple
+                // entries that share a constructor name (e.g.
+                // `Action` is a ctor of both `Input` and `HalogenQ`
+                // in Halogen.Query after both are merged). The
+                // re-export includes the ctor if ANY parent was
+                // imported with `(..)`.
+                for (parent, ctor_list) in &target.data_constructors {
+                    if ctor_list.iter().any(|c| c == ctor_name) {
+                        if types_with_all_ctors.contains(parent) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+fn build_ctor_reexport_filter(
+    list: &Option<crate::cst::ImportList>,
+) -> CtorReexportFilter {
+    use crate::cst::Import;
+    use crate::cst::ImportList;
+    let resolve = |s: crate::interner::Symbol| -> String {
+        crate::typecheck_db::util::resolve_symbol(s)
+    };
+    match list {
+        None => CtorReexportFilter::Open,
+        Some(ImportList::Hiding(items)) => {
+            let mut hidden_types: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for item in items {
+                if let Import::Type(n, _) = item {
+                    hidden_types.insert(resolve(n.value.symbol()));
+                }
+            }
+            CtorReexportFilter::Hiding { hidden_types }
+        }
+        Some(ImportList::Explicit(items)) => {
+            let mut types_with_all_ctors: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut ctors: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for item in items {
+                if let Import::Type(n, members) = item {
+                    match members {
+                        Some(crate::cst::DataMembers::All) => {
+                            types_with_all_ctors.insert(resolve(n.value.symbol()));
+                        }
+                        Some(crate::cst::DataMembers::Explicit(names)) => {
+                            for cn in names {
+                                ctors.insert(resolve(cn.value.symbol()));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            CtorReexportFilter::Explicit { types_with_all_ctors, ctors }
+        }
+    }
+}
+
 /// here and is called from the driver after the primary distill.
 pub fn expand_module_reexports(
     out: &mut ModuleExports,
@@ -1030,7 +1146,22 @@ pub fn expand_module_reexports(
             // refers to. Multiple imports may share the same alias
             // (e.g. `import A.Foo (Foo) as Exports` + `import A.Bar
             // (Bar) as Exports`), so collect ALL matching targets.
-            let mut target_modules: Vec<String> = Vec::new();
+            // We track the per-import CTOR filter so the re-export
+            // surfaces only constructors the importing module
+            // actually pulled in. Without this, `import M (T(..))`
+            // re-exports every ctor M happens to define — letting
+            // an unrelated `Action` from one module shadow another
+            // module's `Action` of different arity (the Halogen
+            // `Input.Action` / `HalogenQ.Action` ambiguity).
+            //
+            // The filter intentionally only restricts CTORS. Other
+            // fields (values, types, classes, fixities) propagate
+            // unchanged: many tests rely on the existing transitive
+            // re-export behaviour for those namespaces and they
+            // don't share the ctor-collision pattern (values have
+            // `qualified_values` for multi-origin disambiguation;
+            // types/classes don't typically collide cross-module).
+            let mut target_modules: Vec<(String, CtorReexportFilter)> = Vec::new();
             for imp in &module.imports {
                 let imp_target: String = imp
                     .module
@@ -1039,8 +1170,9 @@ pub fn expand_module_reexports(
                     .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
                     .collect::<Vec<_>>()
                     .join(".");
+                let ctor_filter = build_ctor_reexport_filter(&imp.imports);
                 if imp_target == re_exported_name {
-                    target_modules.push(imp_target);
+                    target_modules.push((imp_target, ctor_filter));
                     continue;
                 }
                 if let Some(alias) = &imp.qualified {
@@ -1051,7 +1183,7 @@ pub fn expand_module_reexports(
                         .collect::<Vec<_>>()
                         .join(".");
                     if alias_str == re_exported_name {
-                        target_modules.push(imp_target);
+                        target_modules.push((imp_target, ctor_filter));
                     }
                 }
             }
@@ -1059,7 +1191,7 @@ pub fn expand_module_reexports(
                 continue;
             }
             let prim_map = crate::typecheck_db::prim::prim_exports();
-            for target_name in &target_modules {
+            for (target_name, ctor_filter) in &target_modules {
                 // Re-export target may be a user module (in the
                 // registry) OR a Prim submodule (not in the registry,
                 // built from `prim::prim_exports`). Safe.Coerce relies
@@ -1091,6 +1223,9 @@ pub fn expand_module_reexports(
                         .or_insert_with(|| scheme.clone());
                 }
                 for (k, v) in &target_exports.ctors {
+                    if !ctor_filter.includes_ctor(k, target_exports) {
+                        continue;
+                    }
                     out.ctors.entry(k.clone()).or_insert_with(|| v.clone());
                     let origin = target_exports
                         .ctor_origins

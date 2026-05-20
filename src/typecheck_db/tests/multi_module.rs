@@ -579,3 +579,259 @@ fn module_cycle_is_reported() {
         report.errors,
     );
 }
+
+// ---------------------------------------------------------------------------
+// MREs for the Halogen "ambiguous re-exported ctor" issue
+// ---------------------------------------------------------------------------
+//
+// `Halogen.Query.Input` defines `data Input action = ... | Action action`
+// (1-arg `Action`). `Halogen.Query.HalogenQ` defines `data HalogenQ q a i b
+// = ... | Action a b ...` (2-arg `Action`). `Halogen.Query` re-exports BOTH
+// via `module Halogen.Query.Input` + `module Halogen.Query.HalogenQ`, and
+// `Halogen` re-exports `Halogen.Query`. Downstream code (e.g.
+// `Halogen.Hooks.Internal.Eval`) writes `H.Action act a` — two arguments,
+// matching `HalogenQ.Action`. The compiler must:
+//   - filter re-exports by the importing module's actual import list (so
+//     `Halogen.Query`'s `module M` clauses re-export only the names this
+//     module pulled in from M), and
+//   - if both candidates survive filtering, choose the one whose arity
+//     matches the use site (or carry both and disambiguate at use).
+//
+// The MREs below strip the situation down to its essentials.
+
+/// Mirrors Halogen.Query's actual imports: `Input` is brought in
+/// only via `(RefLabel(..))` while `HalogenQ` is brought in via
+/// `(HalogenQ(..))`. The `module Halogen.Query.Input` re-export
+/// should re-export ONLY the names Halogen.Query pulled from Input
+/// (RefLabel + its ctors) — Action from Input must NOT leak. Then
+/// `module Halogen.Query.HalogenQ` re-exports HalogenQ + Action.
+/// Downstream `H.Action act a` resolves unambiguously to
+/// HalogenQ.Action (2-arg).
+#[test]
+fn diag_reexport_ctor_arity_disambig() {
+    assert_typechecks_multi(&[
+        "\
+module A where
+
+data RefLabel = RefLabel
+data Input action = RefUpdate | Action action
+",
+        "\
+module B where
+
+data HalogenQ q a = Initialize a | Receive q a | Action q a
+",
+        "\
+module M
+  ( module A
+  , module B
+  ) where
+
+import A (RefLabel(..))
+import B (HalogenQ(..))
+",
+        "\
+module Main where
+
+import M (HalogenQ(..))
+
+data Foo = Foo
+data Bar = Bar
+
+useAction :: Foo -> Bar -> HalogenQ Foo Bar
+useAction f b = Action f b
+",
+    ]);
+}
+
+/// Same scenario but the user qualifies the import (`import M as H`)
+/// and writes `H.Action f b`. The qualified-resolution path must pick
+/// the arity-2 ctor.
+#[test]
+fn diag_reexport_ctor_qualified_arity_disambig() {
+    assert_typechecks_multi(&[
+        "\
+module A where
+
+data RefLabel = RefLabel
+data Input action = RefUpdate | Action action
+",
+        "\
+module B where
+
+data HalogenQ q a = Initialize a | Receive q a | Action q a
+",
+        "\
+module M
+  ( module A
+  , module B
+  ) where
+
+import A (RefLabel(..))
+import B (HalogenQ(..))
+",
+        "\
+module Main where
+
+import M as H
+
+data Foo = Foo
+data Bar = Bar
+
+useAction :: Foo -> Bar -> H.HalogenQ Foo Bar
+useAction f b = H.Action f b
+",
+    ]);
+}
+
+/// Layered re-export, mirroring `Halogen` → `Halogen.Query` →
+/// (`Halogen.Query.Input`, `Halogen.Query.HalogenQ`). The deeper
+/// re-export chain is where the original compiler propagates only
+/// the names actually imported via the explicit lists.
+#[test]
+fn diag_reexport_ctor_layered_chain() {
+    assert_typechecks_multi(&[
+        "\
+module Halogen.Query.Input where
+
+data RefLabel = RefLabel
+data Input action = RefUpdate | Action action
+",
+        "\
+module Halogen.Query.HalogenQ where
+
+data HalogenQ q a = Initialize a | Receive q a | Action q a
+",
+        "\
+module Halogen.Query
+  ( module Halogen.Query.Input
+  , module Halogen.Query.HalogenQ
+  ) where
+
+import Halogen.Query.Input (RefLabel(..))
+import Halogen.Query.HalogenQ (HalogenQ(..))
+",
+        "\
+module Halogen
+  ( module Halogen.Query
+  ) where
+
+import Halogen.Query
+",
+        "\
+module Main where
+
+import Halogen as H
+
+data Foo = Foo
+data Bar = Bar
+
+useAction :: Foo -> Bar -> H.HalogenQ Foo Bar
+useAction f b = H.Action f b
+",
+    ]);
+}
+
+/// Closer mirror of the real Halogen surface: Halogen.Query exports
+/// `module Halogen.Query.Input`, `module Halogen.Query.HalogenM`,
+/// and `module Halogen.Query.HalogenQ`; the HalogenM submodule
+/// adds extra fixtures (its own data type with its own ctors).
+/// `Halogen` re-exports `module Halogen.Query` with an explicit
+/// list. Downstream `H.Action` must still resolve to HalogenQ.Action.
+#[test]
+fn diag_reexport_ctor_layered_with_halogenm() {
+    assert_typechecks_multi(&[
+        "\
+module Halogen.Query.Input where
+
+data RefLabel = RefLabel
+data Input action = RefUpdate | Action action
+",
+        "\
+module Halogen.Query.HalogenQ where
+
+data HalogenQ q a = Initialize a | Receive q a | Action q a
+",
+        "\
+module Halogen.Query.HalogenM where
+
+data HalogenF state action a = State | Other action a
+data HalogenM state action a = MkHalogenM a
+",
+        "\
+module Halogen.Query
+  ( module Halogen.Query.Input
+  , module Halogen.Query.HalogenM
+  , module Halogen.Query.HalogenQ
+  ) where
+
+import Halogen.Query.HalogenM (HalogenF(..), HalogenM(..))
+import Halogen.Query.HalogenQ (HalogenQ(..))
+import Halogen.Query.Input (RefLabel(..))
+",
+        "\
+module Halogen
+  ( module Halogen.Query
+  ) where
+
+import Halogen.Query (HalogenF(..), HalogenM(..), HalogenQ(..), RefLabel(..))
+",
+        "\
+module Main where
+
+import Halogen as H
+
+useAction :: forall q a. q -> a -> H.HalogenQ q a
+useAction f b = H.Action f b
+
+handle :: forall q a. H.HalogenQ q a -> a
+handle = case _ of
+  H.Initialize a -> a
+  H.Receive _ a -> a
+  H.Action _ a -> a
+",
+    ]);
+}
+
+/// Real-shape regression for `case _ of` with the layered re-export.
+/// Mirrors Halogen.Hooks.Internal.Eval's `mkEval inputEq … = case _ of
+/// H.Initialize a -> …; H.Action act a -> …`. The case-sugar `_`
+/// desugars to a fresh lambda binder; pattern matches against
+/// `H.Initialize` and `H.Action` MUST pin the scrutinee to
+/// `HalogenQ`, not `Input`.
+#[test]
+fn diag_reexport_ctor_case_pattern_disambig() {
+    assert_typechecks_multi(&[
+        "\
+module Halogen.Query.Input where
+
+data RefLabel = RefLabel
+data Input action = RefUpdate | Action action
+",
+        "\
+module Halogen.Query.HalogenQ where
+
+data HalogenQ q a = Initialize a | Receive q a | Action q a
+",
+        "\
+module Halogen
+  ( module Halogen.Query.Input
+  , module Halogen.Query.HalogenQ
+  ) where
+
+import Halogen.Query.Input (RefLabel(..))
+import Halogen.Query.HalogenQ (HalogenQ(..))
+",
+        "\
+module Main where
+
+import Halogen as H
+
+handle :: forall q a. H.HalogenQ q a -> a
+handle = case _ of
+  H.Initialize a -> a
+  H.Receive _ a -> a
+  H.Action _ a -> a
+",
+    ]);
+}
