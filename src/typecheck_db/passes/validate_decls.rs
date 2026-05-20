@@ -1681,6 +1681,47 @@ fn check_variance_field(
                     }
                 }
             };
+            // When the App's head is a non-local Constructor we
+            // can't expand (an imported type alias / data type),
+            // we don't know its true variance signature. The
+            // reference compiler handles this by being lenient:
+            // it doesn't reject tracked-var occurrences inside
+            // unfamiliar Constructors, leaning on the kind /
+            // generated-code phase to catch real violations.
+            // Foreign types are flagged separately by
+            // `field_passes_tracked_through_foreign`; known-
+            // contravariant heads (Predicate/Op/...) get an
+            // explicit `cur.flip()` above. For everything else,
+            // skip the recursion into `arg` rather than risk a
+            // false positive on type aliases like `Dispatch a =
+            // a -> Effect Unit`, where `a` is double-contra and
+            // ends up covariant after expansion.
+            // If the head is a Constructor we don't know
+            // anything about (not a built-in contravariant head,
+            // not a local data/newtype that the surrounding
+            // module declared), we can't decide whether the arg
+            // is in covariant or contravariant position. The
+            // reference compiler is lenient here: it skips
+            // recursing into the arg rather than risk false
+            // positives on type aliases like `Dispatch a = a ->
+            // Effect Unit` (where `a` is double-contra and
+            // ultimately covariant after expansion). Foreign
+            // types are still caught by
+            // `field_passes_tracked_through_foreign`.
+            let head_is_unknown = matches!(
+                peel_parens(constructor),
+                cst::TypeExpr::Constructor { .. },
+            ) && !is_contravariant_head(constructor);
+            if head_is_unknown {
+                return check_variance_field(
+                    constructor,
+                    tracked,
+                    var_variance,
+                    passed_through,
+                    cur,
+                    strict_forall,
+                );
+            }
             check_variance_field(
                 constructor,
                 tracked,
