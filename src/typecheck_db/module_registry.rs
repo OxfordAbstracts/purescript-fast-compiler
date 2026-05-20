@@ -1209,7 +1209,17 @@ pub fn expand_module_reexports(
                     .collect::<Vec<_>>()
                     .join(".");
                 let ctor_filter = build_ctor_reexport_filter(&imp.imports);
-                if imp_target == re_exported_name {
+                // `module M` re-export sources from `import M`
+                // (UNQUALIFIED only). `import M as Q` brings
+                // names in only under `Q.foo`; their bare names
+                // are accessible via `module Q` re-exports
+                // instead (handled below). Without this guard a
+                // single module imported BOTH `import M (foo)`
+                // and `import M as Q` would have `module M`
+                // surface every name from M (via the qualified
+                // branch's wider implicit filter), defeating the
+                // explicit-list filter on the unqualified arm.
+                if imp_target == re_exported_name && imp.qualified.is_none() {
                     target_modules.push((imp_target, ctor_filter));
                     continue;
                 }

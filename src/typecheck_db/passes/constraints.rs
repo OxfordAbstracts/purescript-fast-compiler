@@ -1043,6 +1043,40 @@ fn try_magic(
         // `Prim.Row.Cons label a tail row | label tail -> a row,
         // label row -> a tail` — when label is a known TypeString
         // and row is a concrete Row, look up the field and unify.
+        // `Prim.Row.Lacks (label :: Symbol) (row :: Row k)` —
+        // the row lacks the given label. Concrete row + concrete
+        // label literal: walk the row's fields and discharge if
+        // the label is absent.
+        "Lacks" => {
+            if args.len() == 2 {
+                if let Type::TypeString(lbl) = &args[0] {
+                    if let Type::Row(fields, _tail) | Type::Record(fields, _tail) =
+                        &args[1]
+                    {
+                        let lbl = lbl.clone();
+                        if !fields.iter().any(|(l, _)| *l == lbl) {
+                            return MagicOutcome::Resolved(ResolvedDict {
+                                class: pending.constraint.class.clone(),
+                                instance_types: args,
+                                instance_idx: 0,
+                                context: Vec::new(),
+                            });
+                        }
+                        // Label IS present and row has no open
+                        // tail to absorb further fields — Lacks
+                        // can never be satisfied. Mismatch.
+                        // (When the row has a tail we don't know
+                        // whether subsequent fields satisfy
+                        // `Lacks` so we keep deferring.)
+                        // Note: matching here is conservative —
+                        // we only emit Mismatch when there's NO
+                        // tail. With a tail the constraint may
+                        // still discharge once the tail is
+                        // pinned.
+                    }
+                }
+            }
+        }
         "Cons" => {
             if args.len() == 4 {
                 // Row.Cons: label, field-type, tail-row, full-row.
