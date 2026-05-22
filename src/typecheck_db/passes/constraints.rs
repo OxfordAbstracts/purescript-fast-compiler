@@ -786,8 +786,22 @@ fn contains_rigid_var(ty: &Type, state: &crate::typecheck_db::unify::UnifyState)
 /// True when `ty` zonks to a `Type::Unif`. Those can't be used to
 /// pick an instance yet — the solver defers until inference either
 /// solves them or proves they're polymorphic.
+///
+/// Walks the unif binding chain via `state.probe` instead of calling
+/// `state.zonk`, which would allocate a fresh `Type` at every step.
+/// Hot for solver-heavy modules where the bare-unif check runs once
+/// per arg per `solve_one` call (hundreds of thousands of calls).
 fn is_bare_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> bool {
-    matches!(state.zonk(ty), Type::Unif(_))
+    let mut cur = ty;
+    loop {
+        match cur {
+            Type::Unif(id) => match state.probe(*id) {
+                None => return true,
+                Some(bound) => cur = bound,
+            },
+            _ => return false,
+        }
+    }
 }
 
 /// True when `ty` structurally contains a `Type::Unif` anywhere
@@ -1371,17 +1385,18 @@ pub fn solve_all(
 ) -> SolveReport {
     let mut report = SolveReport::default();
     // Each item is `(constraint, optional watch state)`. The watch
-    // state caches the set of unif ids the constraint's zonked args
-    // mention plus the binding-trail length at the moment of its
-    // last defer. On a later iteration, if NONE of those unifs got
-    // bound between [last_trail_len, current trail length],
-    // `solve_one` would defer for the same reason — we skip it
-    // entirely. For solver-heavy modules like
+    // state stores the unif IDs the constraint's zonked args
+    // mentioned at defer time AND that were still UNBOUND then. On
+    // a later visit, we check (O(deps)) whether any of those unifs
+    // is now bound — if not, `solve_one` would defer for the same
+    // reason and we skip the call. For solver-heavy modules like
     // `AdminDashboard.Pages.Submissions.View` this collapses
     // ~3 million redundant `solve_one` calls into a few thousand.
+    // Storing only the still-unbound subset (rather than all unif
+    // ids in the args) is what makes the per-skip check O(deps)
+    // rather than O(trail_range × deps).
     struct WatchState {
-        last_trail_len: usize,
-        deps: std::collections::HashSet<u32>,
+        unbound_deps: std::collections::HashSet<u32>,
     }
     let mut queue: Vec<(PendingConstraint, Option<WatchState>)> =
         pending.iter().cloned().map(|p| (p, None)).collect();
@@ -1394,6 +1409,8 @@ pub fn solve_all(
         String,
         (u64, std::time::Duration),
     > = std::collections::HashMap::new();
+    let mut _skip_count: u64 = 0;
+    let mut _solve_one_count: u64 = 0;
 
     // Track whether the last iteration made progress. If the loop
     // exits at the depth limit while still making progress, the
@@ -1422,17 +1439,23 @@ pub fn solve_all(
         let mut made_progress = false;
         for (pc, watch) in current {
             // Watch-list skip: if the constraint was deferred earlier
-            // and no unif it depends on has been bound since, skip
-            // solve_one entirely — the verdict would be the same.
+            // and none of the unifs that were unbound at defer time
+            // has been bound since, solve_one would defer for the
+            // same reason — skip it entirely. The probe is O(deps)
+            // (HashMap lookup per dep id) regardless of how long the
+            // binding trail has grown in the meantime.
             if let Some(w) = &watch {
-                let trail_now = state.binding_trail_len();
-                let any_dep_bound = (w.last_trail_len..trail_now)
-                    .any(|i| w.deps.contains(&state.binding_trail_slot_at(i)));
-                if !any_dep_bound {
+                let any_now_bound = w
+                    .unbound_deps
+                    .iter()
+                    .any(|id| state.probe(*id).is_some());
+                if !any_now_bound {
+                    _skip_count += 1;
                     carry_forward.push((pc, watch));
                     continue;
                 }
             }
+            _solve_one_count += 1;
             let owner = match &pc.decl_name {
                 Some(n) => n.clone(),
                 None => continue,
@@ -1557,18 +1580,24 @@ pub fn solve_all(
                         });
                 }
                 SolveOutcome::Deferred => {
-                    // Capture the constraint's current dependent
-                    // unifs so the next iteration can skip this
-                    // solve_one if none of them is bound in between.
-                    let mut deps: std::collections::HashSet<u32> =
+                    // Capture the subset of unifs in the constraint
+                    // args that are STILL UNBOUND right now. On the
+                    // next visit, if none of those has been bound,
+                    // solve_one would defer for the same reason.
+                    // Restricting to unbound at defer time (rather
+                    // than all mentioned unifs) keeps the watch set
+                    // small AND makes the next-visit check O(deps).
+                    let mut all_deps: std::collections::HashSet<u32> =
                         std::collections::HashSet::new();
                     for a in &pc.constraint.args {
-                        collect_unif_ids(state, a, &mut deps);
+                        collect_unif_ids(state, a, &mut all_deps);
                     }
-                    let new_watch = WatchState {
-                        last_trail_len: state.binding_trail_len(),
-                        deps,
-                    };
+                    let unbound_deps: std::collections::HashSet<u32> =
+                        all_deps
+                            .into_iter()
+                            .filter(|id| state.probe(*id).is_none())
+                            .collect();
+                    let new_watch = WatchState { unbound_deps };
                     carry_forward.push((pc, Some(new_watch)));
                 }
             }
@@ -1622,9 +1651,11 @@ pub fn solve_all(
         let mut entries: Vec<_> = _per_class.into_iter().collect();
         entries.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
         eprintln!(
-            "  [solve_all profile, total {} ms, {} entries]",
+            "  [solve_all profile, total {} ms, {} entries, {} solve_one, {} skipped]",
             _profile_start.elapsed().as_millis(),
             entries.len(),
+            _solve_one_count,
+            _skip_count,
         );
         let mut accumulated_ms: u128 = 0;
         for (cls, (count, dur)) in entries.iter().take(40) {
