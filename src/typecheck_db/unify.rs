@@ -1373,7 +1373,7 @@ fn max_skolem_in(ty: &Type) -> Option<u32> {
 /// (the common case for non-polymorphic typeclass dispatch over
 /// `Type::Con` heads). Skipping the clone-walk that zonk performs
 /// on those inputs measurably speeds up large solver runs.
-fn has_any_unif(ty: &Type) -> bool {
+pub fn has_any_unif(ty: &Type) -> bool {
     match ty {
         Type::Unif(_) => true,
         Type::App(f, a) => has_any_unif(f) || has_any_unif(a),

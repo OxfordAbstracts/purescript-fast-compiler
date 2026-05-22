@@ -362,8 +362,17 @@ pub fn solve_one(
             .args
             .iter()
             .map(|a| {
-                let z = state.zonk(a);
-                app_spine_head_arity(&z).map(|(qn, ar)| (qn.clone(), ar))
+                // Skip zonk for fully-concrete args — the only reason
+                // to zonk here is to expose a bound unif's structural
+                // head, which doesn't exist if no unif is present.
+                // For solver-heavy modules this fires for the bulk of
+                // constraint args (concrete Type::Con-headed shapes).
+                if crate::typecheck_db::unify::has_any_unif(a) {
+                    let z = state.zonk(a);
+                    app_spine_head_arity(&z).map(|(qn, ar)| (qn.clone(), ar))
+                } else {
+                    app_spine_head_arity(a).map(|(qn, ar)| (qn.clone(), ar))
+                }
             })
             .collect();
     // Overlap-aware deferral. When the target contains a unif AND
