@@ -172,6 +172,29 @@ pub fn package_modules_by_name() -> HashMap<String, ModuleInput> {
     out
 }
 
+/// Parse every `.purs` source matched by `tests/sources.txt` (the
+/// OA `application-copy/application` corpus) and index by module
+/// name. First-wins on duplicate names, mirroring the dedup rule
+/// in the `build_from_sources_typecheck` sweep.
+pub fn application_modules_by_name() -> HashMap<String, ModuleInput> {
+    let files = gather_application_sources();
+    let mut out = HashMap::with_capacity(files.len());
+    for file in files {
+        let src = match fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let module = match parse(&src) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let name = module_name_of(&module);
+        out.entry(name.clone())
+            .or_insert(ModuleInput::new(name, src, module));
+    }
+    out
+}
+
 /// Compute the transitive import closure of a single target module
 /// against a parsed-package map. Returns fresh `ModuleInput`s
 /// (cloned), suitable for feeding to `check_many_modules`.

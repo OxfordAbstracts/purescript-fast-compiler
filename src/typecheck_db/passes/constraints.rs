@@ -1316,6 +1316,15 @@ pub fn solve_all(
     let mut report = SolveReport::default();
     let mut queue: Vec<PendingConstraint> = pending.to_vec();
 
+    // Profiling: count + cumulative time per class name. Printed
+    // at end of solve_all when TYPECHECK_DB_PROFILE_SLOW is set.
+    let _profile_slow = std::env::var_os("TYPECHECK_DB_PROFILE_SLOW").is_some();
+    let _profile_start = std::time::Instant::now();
+    let mut _per_class: std::collections::HashMap<
+        String,
+        (u64, std::time::Duration),
+    > = std::collections::HashMap::new();
+
     // Track whether the last iteration made progress. If the loop
     // exits at the depth limit while still making progress, the
     // remaining queue is almost certainly a self-referential instance
@@ -1345,7 +1354,22 @@ pub fn solve_all(
                 Some(n) => n.clone(),
                 None => continue,
             };
-            match solve_one(state, instances, &pc) {
+            // Profile per-constraint solve_one time, bucketed by class.
+            let _t = if _profile_slow {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let _outcome = solve_one(state, instances, &pc);
+            if let Some(t0) = _t {
+                let dur = t0.elapsed();
+                let entry = _per_class
+                    .entry(pc.constraint.class.name.clone())
+                    .or_insert((0, std::time::Duration::ZERO));
+                entry.0 += 1;
+                entry.1 += dur;
+            }
+            match _outcome {
                 SolveOutcome::Resolved(dict) => {
                     made_progress = true;
                     // Push every context entry back onto the queue as
@@ -1490,6 +1514,53 @@ pub fn solve_all(
         queue = legitimately_deferred;
     }
     report.deferred = queue;
+
+    // Profile summary: classes whose cumulative solve_one time
+    // exceeded 100ms. Sorted descending by duration.
+    if _profile_slow
+        && _profile_start.elapsed() >= std::time::Duration::from_millis(500)
+    {
+        let mut entries: Vec<_> = _per_class.into_iter().collect();
+        entries.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        eprintln!(
+            "  [solve_all profile, total {} ms, {} entries]",
+            _profile_start.elapsed().as_millis(),
+            entries.len(),
+        );
+        let mut accumulated_ms: u128 = 0;
+        for (cls, (count, dur)) in entries.iter().take(40) {
+            accumulated_ms += dur.as_millis();
+            eprintln!(
+                "    {:>8} ms  {:>6}x  {:>8} ms/c  {}",
+                dur.as_millis(),
+                count,
+                if *count > 0 {
+                    dur.as_millis() as u64 / count
+                } else {
+                    0
+                },
+                cls,
+            );
+        }
+        let remaining_classes = entries.len().saturating_sub(40);
+        let total_classes_ms: u128 = entries
+            .iter()
+            .map(|(_, (_, d))| d.as_millis())
+            .sum();
+        let total_constraints: u64 = entries.iter().map(|(_, (c, _))| c).sum();
+        eprintln!(
+            "    (top {} accounted for {} ms of {} ms; {} classes total, {} constraints)",
+            entries.len().min(40),
+            accumulated_ms,
+            total_classes_ms,
+            entries.len(),
+            total_constraints,
+        );
+        if remaining_classes > 0 {
+            eprintln!("    ... {} more classes not shown", remaining_classes);
+        }
+    }
+
     report
 }
 

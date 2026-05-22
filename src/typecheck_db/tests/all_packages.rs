@@ -18,8 +18,9 @@ use crate::typecheck_db::driver_multi::{
     check_many_modules, ModuleInput, MultiModuleError,
 };
 use crate::typecheck_db::test_support::{
-    extract_panic_msg, gather_application_sources, gather_package_src_sources,
-    module_name_of, package_modules_by_name, transitive_closure_of,
+    application_modules_by_name, extract_panic_msg, gather_application_sources,
+    gather_package_src_sources, module_name_of, package_modules_by_name,
+    transitive_closure_of,
 };
 
 const FIXTURES_ROOT: &str = "tests/fixtures";
@@ -773,6 +774,78 @@ fn run_all_packages_check() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Focused reproducer for `Submission.Update` — during the
+/// `build_from_sources_typecheck` sweep this single module took
+/// 657 seconds. The function is a 723-line Halogen-style update
+/// with ~30 case branches, each doing record updates and
+/// pattern guards.
+///
+/// Drives Submission.Update + its transitive closure through
+/// `check_many_modules` with `TYPECHECK_DB_PROFILE_SLOW=1` so the
+/// per-pass breakdown points at the dominating phase. Asserts
+/// the wall time stays under a (permissive) 60s budget — once
+/// that holds the assertion can be tightened.
+#[test]
+#[ignore = "perf regression target — 657s in initial sweep, gap-closing"]
+fn repro_submission_update_perf() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("repro_submission_update".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Force profile-slow on so we get a per-phase
+                // breakdown printed for any module exceeding 5s.
+                std::env::set_var("TYPECHECK_DB_PROFILE_SLOW", "1");
+                let pkgs = application_modules_by_name();
+                if !pkgs.contains_key("Submission.Update") {
+                    return Err(
+                        "Submission.Update missing from application sources \
+                         (is application-copy present?)"
+                            .to_string(),
+                    );
+                }
+                let closure = transitive_closure_of("Submission.Update", &pkgs);
+                eprintln!(
+                    "[repro] Submission.Update closure: {} modules",
+                    closure.len(),
+                );
+                let started = std::time::Instant::now();
+                let report = check_many_modules(closure);
+                let elapsed = started.elapsed();
+                eprintln!("[repro] closure check finished in {elapsed:.2?}");
+                for e in &report.errors {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                let budget = std::time::Duration::from_secs(60);
+                if elapsed > budget {
+                    return Err(format!(
+                        "Submission.Update closure took {elapsed:?} — exceeds {budget:?} budget"
+                    ));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn repro thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_submission_update_perf: {msg}");
+    }
 }
 
 #[test]
