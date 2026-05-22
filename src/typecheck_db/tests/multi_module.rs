@@ -793,6 +793,39 @@ handle = case _ of
     ]);
 }
 
+/// Nullary capability class — declared with no type args, no
+/// instances, used purely as a propagating constraint marker
+/// (`withCap :: forall a. (Cap => a) -> a` discharges locally).
+/// The OA application uses ~10 of these (`PublicEventAuth`,
+/// `AttendeeAuth`, `AdminAuth`, …) and 108/185 build-from-sources
+/// failures pivot on them.
+///
+/// Expected: `bar :: MyCap => Int` propagates `MyCap` to its
+/// inferred scheme. Calling `foo` (which also has `MyCap =>`)
+/// from inside `bar`'s body should be discharged via the sig-
+/// origin given, NOT trigger `NoInstanceFound`.
+#[test]
+fn diag_nullary_capability_class() {
+    assert_typechecks_multi(&[
+        "\
+module Cap where
+
+class MyCap
+",
+        "\
+module Main where
+
+import Cap (class MyCap)
+
+foo :: MyCap => Int -> Int
+foo x = x
+
+bar :: MyCap => Int
+bar = foo 1
+",
+    ]);
+}
+
 /// `Data.Vec` / `Data.Matrix.Reps`-shape: a use of `Succ s s'`
 /// in a sig pulls in `DivMod10 x xi xl` as a sub-constraint via
 /// the `typelevelSucc` instance's context. With concrete first

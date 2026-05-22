@@ -1158,6 +1158,42 @@ pub fn infer_value_scc_with_all(
                 } else {
                     None
                 };
+                // Push the sig's NULLARY constraints as givens for
+                // the body's inference. The OA application uses
+                // capability-marker classes — `class PublicEventAuth`,
+                // `class AttendeeAuth`, etc. — that have zero
+                // arguments AND zero instances. The ONLY way to
+                // discharge `PublicEventAuth` inside a body is via
+                // a sig-origin given. The rank-2+ `check_equation`
+                // path pushes ALL sig constraints (line ~715),
+                // which is correct under check-mode skolemisation
+                // but regresses ~115 of our rank-1 failing-fixtures
+                // (they expect a sig constraint with type-variable
+                // args to remain a wanted, not silently discharge).
+                // Limiting the push to nullary constraints captures
+                // the capability pattern without disturbing the
+                // existing rank-1 behaviour for parametric classes.
+                let sig_givens_snapshot = if let Some(scheme) = &sig_scheme_for_pin {
+                    let ty_inst = crate::typecheck_db::generalize::instantiate(
+                        &mut state,
+                        scheme,
+                    );
+                    let (cs, _) =
+                        crate::typecheck_db::passes::constraints::peel_constraints(
+                            ty_inst,
+                        );
+                    let nullary: Vec<_> = cs
+                        .into_iter()
+                        .filter(|c| c.args.is_empty())
+                        .collect();
+                    if nullary.is_empty() {
+                        None
+                    } else {
+                        Some(state.push_givens(nullary))
+                    }
+                } else {
+                    None
+                };
                 let lam_ty = infer_equation(
                     &mut state,
                     env,
@@ -1219,6 +1255,9 @@ pub fn infer_value_scc_with_all(
                         // so a mismatch here is unambiguous.
                         state.unify_here(&expected, &slot_shape)?;
                     }
+                }
+                if let Some(snap) = sig_givens_snapshot {
+                    state.pop_givens_to(snap);
                 }
                 for n in scoped_added {
                     env.scoped_tys.remove(&n);
