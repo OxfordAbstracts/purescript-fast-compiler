@@ -265,50 +265,43 @@ pub fn solve_one(
         MagicOutcome::None => {}
     }
 
-    // Fundep-aware defer: if the class declares fundeps, a position
-    // is "free to improve" when it appears in at least one fundep's
-    // determined list. Bare unifs in all other positions (keys or
-    // unmentioned) can't be discriminated by the matcher and force
-    // a defer. Without fundeps we fall back to the conservative
-    // rule (any bare unif defers).
+    // Fundep-aware defer. A position is safely improvable from the
+    // CURRENT constraint shape only when SOME fundep's determiners
+    // are ALL non-bare-unif (the fundep can fire) AND that fundep
+    // lists the position in its determined set. The earlier rule —
+    // accepting any position that appeared in some fundep's
+    // determined list — let the solver commit to instance heads
+    // before fundep improvement could fire, picking the first
+    // structural match and pinning bare unifs to its type-args.
+    // Without fundeps we fall back to the conservative rule (any
+    // bare unif defers).
     let class_info = instances.class_info(&pending.constraint.class.name);
-    let improvable: std::collections::HashSet<usize> = match class_info {
-        Some(info) if !info.fundeps.is_empty() => {
-            info.fundeps.iter().flat_map(|fd| fd.determined.iter().copied()).collect()
-        }
+    let currently_determined: std::collections::HashSet<usize> = match class_info {
+        Some(info) if !info.fundeps.is_empty() => info
+            .fundeps
+            .iter()
+            .filter(|fd| {
+                fd.determiners.iter().all(|i| {
+                    pending
+                        .constraint
+                        .args
+                        .get(*i)
+                        .map_or(false, |a| !is_bare_unif(a, state))
+                })
+            })
+            .flat_map(|fd| fd.determined.iter().copied())
+            .collect(),
         _ => std::collections::HashSet::new(),
     };
-    // For each fundep, at least one determiner must be concrete
-    // (non-bare-unif) for that fundep to fire. If EVERY fundep has
-    // only bare-unif determiners, no fundep can drive matching and
-    // the constraint must defer — otherwise trial-unifying each
-    // candidate instance speculatively binds the unifs, which for
-    // multi-instance classes with bidirectional fundeps (e.g.
-    // `class Parallel f m | m -> f, f -> m`) explodes into a
-    // self-referential `Parallel f' m'` sub-constraint chain that
-    // burns through the solver's depth budget.
-    let all_fundeps_blocked = match class_info {
-        Some(info) if !info.fundeps.is_empty() => info.fundeps.iter().all(|fd| {
-            fd.determiners.iter().all(|i| {
-                pending
-                    .constraint
-                    .args
-                    .get(*i)
-                    .map_or(true, |a| is_bare_unif(a, state))
-            })
-        }),
-        _ => false,
-    };
     let needs_defer = match class_info {
-        Some(info) if !info.fundeps.is_empty() => {
-            all_fundeps_blocked
-                || pending
-                    .constraint
-                    .args
-                    .iter()
-                    .enumerate()
-                    .any(|(i, a)| !improvable.contains(&i) && is_bare_unif(a, state))
-        }
+        Some(info) if !info.fundeps.is_empty() => pending
+            .constraint
+            .args
+            .iter()
+            .enumerate()
+            .any(|(i, a)| {
+                !currently_determined.contains(&i) && is_bare_unif(a, state)
+            }),
         _ => pending.constraint.args.iter().any(|a| is_bare_unif(a, state)),
     };
     // Spine-head defer: an arg shaped like `?u a` (a partial app
@@ -318,8 +311,8 @@ pub fn solve_one(
     // the unif head and pin it — picking the FIRST candidate that
     // structurally fits, not the right one. The reference compiler's
     // `typeHeadsAreEqual` returns `Unknown` for this case and defers
-    // the entire chain. Skip when fundeps say this position is
-    // determined by another arg (the solver has enough info).
+    // the entire chain. Skip when a currently-firing fundep marks
+    // this position as determined (the solver has enough info).
     let needs_spine_defer = match class_info {
         Some(info) if !info.fundeps.is_empty() => {
             pending
@@ -327,7 +320,10 @@ pub fn solve_one(
                 .args
                 .iter()
                 .enumerate()
-                .any(|(i, a)| !improvable.contains(&i) && has_unif_spine_head(a, state))
+                .any(|(i, a)| {
+                    !currently_determined.contains(&i)
+                        && has_unif_spine_head(a, state)
+                })
         }
         _ => pending.constraint.args.iter().any(|a| has_unif_spine_head(a, state)),
     };
@@ -335,8 +331,27 @@ pub fn solve_one(
         return SolveOutcome::Deferred;
     }
 
+    // Candidates are stored under the class's simple name. When two
+    // distinct classes share a name across modules (e.g. user-side
+    // `Typisch.Row.Lacks` vs Prim's `Prim.Row.Lacks`), look-up by
+    // simple name returns BOTH — and the solver, blind to the
+    // distinction, can match `Prim.Row.Lacks` against the user
+    // class's instance, then re-queue the instance's
+    // `Prim.Row.Lacks` context as a fresh wanted, looping forever.
+    // When the pending carries a class module qualifier, the
+    // candidate's class module must agree (or be absent — preserves
+    // the lenient match path the test suite relies on for legacy
+    // unqualified instance scans).
+    let pending_class_module = pending.constraint.class.module.as_deref();
+    let cand_matches_class_module =
+        |c: &crate::typecheck_db::passes::instance_index::Instance| -> bool {
+            match pending_class_module {
+                Some(want) => c.class.module.as_deref().map_or(true, |m| m == want),
+                None => true,
+            }
+        };
     let cands = instances.candidates(&pending.constraint.class.name);
-    let cand_count = cands.len();
+    let cand_count = cands.iter().filter(|c| cand_matches_class_module(c)).count();
     // Per-position head/arity of the (zonked) target args. Computed
     // once so the per-candidate filter below is cheap. `None` slots
     // (target is a unif / Var / row / etc.) impose no constraint —
@@ -359,15 +374,18 @@ pub fn solve_one(
     // may pin it the other way. Defer so the constraint can
     // resolve unambiguously once the unif is bound.
     //
-    // Skip when the class has fundeps (fundep-driven matching
-    // already handles improvement) or has 0/1 candidates.
+    // For fundep classes, only run this check on positions where
+    // the fundep can't fire — a currently-firing fundep already
+    // forces the unif to one value, so an "ambiguous match" there
+    // is resolved by improvement. Without this carve-out, fundep
+    // classes (e.g. `Succ x y | x -> y, y -> x` with `Succ D2 ?`)
+    // would over-defer in cases where the fundep would have
+    // pinned the answer.
     let target_has_unif =
         pending.constraint.args.iter().any(|a| contains_unif(a, state));
-    let class_has_fundeps =
-        class_info.map(|info| !info.fundeps.is_empty()).unwrap_or(false);
-    if target_has_unif && cand_count > 1 && !class_has_fundeps {
+    if target_has_unif && cand_count > 1 {
         let mut passing = 0usize;
-        for cand in cands.iter() {
+        for cand in cands.iter().filter(|c| cand_matches_class_module(c)) {
             let mut head_ok = true;
             for (i, target) in target_heads.iter().enumerate() {
                 if let Some((th, ta)) = target {
@@ -400,7 +418,11 @@ pub fn solve_one(
             }
         }
     }
-    for (instance_idx, cand) in cands.iter().enumerate() {
+    for (instance_idx, cand) in cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| cand_matches_class_module(c))
+    {
         // Cheap structural pre-filter: for every position where the
         // target has a concrete `Con`-headed spine, the candidate's
         // head at that position must either be a non-Con (type var,
@@ -498,35 +520,22 @@ pub fn solve_one(
     // already been handled by the earlier branch, so fully-
     // concrete args with empty cands is a genuine "user forgot
     // to import the instance" miss.
-    if instances
-        .candidates(&pending.constraint.class.name)
-        .is_empty()
-    {
+    if cand_count == 0 {
         let has_unif =
             pending.constraint.args.iter().any(|a| contains_unif(a, state));
         // Built-in solver-only classes — instances are NEVER
         // user-written; the type-error / coercibility / row-magic
         // / Prim.Int arithmetic machinery discharges these
         // structurally. A missing in-scope candidate just means
-        // we haven't yet reached the discharge step; defer.
-        let is_marker_class = matches!(
+        // we haven't yet reached the discharge step; defer. The
+        // qualifier check mirrors `try_magic`'s — a user-defined
+        // class sharing a simple name (`Cons`, `Lacks`, …) and
+        // qualified to a different module is NOT a marker and
+        // must surface as `NoInstance` when its candidates list
+        // is empty.
+        let is_marker_class = is_known_prim_marker(
             pending.constraint.class.name.as_str(),
-            // Type-error / partiality markers.
-            "Partial" | "Warn" | "Fail"
-            // Coercibility (Prim.Coerce).
-            | "Coercible"
-            // Row magic (Prim.Row).
-            | "Lacks" | "Nub" | "Union" | "Cons"
-            // RowList magic (Prim.RowList).
-            | "RowToList"
-            // Symbol magic (Prim.Symbol).
-            | "Append" | "Compare"
-            // Prim.Int arithmetic (literal-driven).
-            | "Add" | "Mul" | "ToString"
-            // Reflectable (Prim.Reflect) is literal-driven.
-            | "Reflectable"
-            // IsSymbol — every symbol literal auto-discharges.
-            | "IsSymbol",
+            pending.constraint.class.module.as_deref(),
         );
         if has_unif || is_marker_class {
             return SolveOutcome::Deferred;
@@ -555,7 +564,6 @@ pub fn solve_one(
         .iter()
         .map(|a| state.zonk(a))
         .collect();
-    let candidates = instances.candidates(&pending.constraint.class.name);
     // Kind-mismatch / wrong-shape defer: if any arg's App-spine
     // head + arity doesn't match any instance's head + arity,
     // the constraint can never be solved. Match on (head_qn,
@@ -564,7 +572,7 @@ pub fn solve_one(
     // → no candidate fits → defer.
     let head_shape_mismatch = zonked_args.iter().enumerate().any(|(i, arg)| {
         if let Some((arg_qn, arg_arity)) = app_spine_head_arity(arg) {
-            !candidates.iter().any(|cand| {
+            !cands.iter().filter(|c| cand_matches_class_module(c)).any(|cand| {
                 cand.types
                     .get(i)
                     .and_then(app_spine_head_arity)
@@ -818,6 +826,51 @@ fn has_unif_spine_head(
     }
 }
 
+/// True when `(class_name, class_module)` names one of the
+/// solver-only "marker" classes — Prim's type-error /
+/// coercibility / row-magic / arithmetic classes plus
+/// `Data.Symbol.IsSymbol`. The module gate (lenient on `None`)
+/// keeps a user-declared class with a colliding simple name from
+/// being mistaken for a Prim marker. Used by `solve_one`'s
+/// empty-cands branch to decide between deferring (marker — will
+/// be discharged by `try_magic` or the inline solver later) and
+/// emitting `NoInstance` (genuine user-class miss).
+fn is_known_prim_marker(class_name: &str, class_module: Option<&str>) -> bool {
+    let expected: &[&str] = match class_name {
+        // Type-error / partiality markers.
+        "Partial" => &["Prim"],
+        "Warn" | "Fail" => &["Prim.TypeError"],
+        // Coercibility (Prim.Coerce).
+        "Coercible" => &["Prim.Coerce"],
+        // Row magic (Prim.Row).
+        "Lacks" | "Nub" | "Union" => &["Prim.Row"],
+        // `Cons` appears in BOTH Prim.Row (4-arg) and Prim.Symbol
+        // (3-arg); arity disambiguates downstream.
+        "Cons" => &["Prim.Row", "Prim.Symbol"],
+        // RowList magic (Prim.RowList).
+        "RowToList" => &["Prim.RowList"],
+        // Symbol magic (Prim.Symbol).
+        "Append" => &["Prim.Symbol"],
+        // `Compare` exists in both Prim.Symbol and Prim.Int; the
+        // magic solver disambiguates via TypeString vs TypeInt args.
+        "Compare" => &["Prim.Symbol", "Prim.Int"],
+        // Prim.Int arithmetic (literal-driven).
+        "Add" | "Mul" | "ToString" => &["Prim.Int"],
+        // Reflectable lives in `Data.Reflectable` in the prelude
+        // package; it's not in prim.rs but is solver-driven (its
+        // dictionary is auto-derived from the Proxy literal). The
+        // compiler-magic dispatcher elsewhere handles it.
+        "Reflectable" => &["Data.Reflectable"],
+        // IsSymbol — user-facing class lives in `Data.Symbol`.
+        "IsSymbol" => &["Data.Symbol"],
+        _ => return false,
+    };
+    match class_module {
+        None => true,
+        Some(m) => expected.iter().any(|e| *e == m),
+    }
+}
+
 /// Result of a `try_magic` attempt.
 #[derive(Debug)]
 enum MagicOutcome {
@@ -848,6 +901,20 @@ fn try_magic(
     pending: &PendingConstraint,
 ) -> MagicOutcome {
     let class_name = pending.constraint.class.name.as_str();
+    let class_module = pending.constraint.class.module.as_deref();
+    // Each magic arm corresponds to a Prim (or `Data.Symbol`) class.
+    // Only fire when the pending's class is qualified to the canonical
+    // defining module — without this guard, a user-defined class
+    // sharing the simple name (e.g. a library `Cons`) would be
+    // mistaken for `Prim.Row.Cons` and speculatively unified against
+    // built-in semantics. Pendings with no module qualifier still
+    // fire magic (lenient — covers the legacy unqualified path).
+    let class_module_matches = |allowed: &[&str]| -> bool {
+        match class_module {
+            None => true,
+            Some(m) => allowed.iter().any(|a| *a == m),
+        }
+    };
     let args: Vec<Type> = pending
         .constraint
         .args
@@ -855,7 +922,7 @@ fn try_magic(
         .map(|a| state.zonk(a))
         .collect();
     match class_name {
-        "IsSymbol" => {
+        "IsSymbol" if class_module_matches(&["Data.Symbol"]) => {
             if let [Type::TypeString(_)] = args.as_slice() {
                 return MagicOutcome::Resolved(ResolvedDict {
                     class: pending.constraint.class.clone(),
@@ -865,7 +932,7 @@ fn try_magic(
                 });
             }
         }
-        "Nub" => {
+        "Nub" if class_module_matches(&["Prim.Row"]) => {
             if args.len() == 2 {
                 if let Type::Row(_, None) | Type::Record(_, None) = &args[0] {
                     if state.unify(&args[0], &args[1]).is_ok() {
@@ -882,7 +949,7 @@ fn try_magic(
         // `Prim.Int.ToString i sym | i -> sym` — when `i` is a
         // concrete Int literal, `sym` is determined as that
         // integer's decimal-string representation.
-        "ToString" => {
+        "ToString" if class_module_matches(&["Prim.Int"]) => {
             if args.len() == 2 {
                 if let Type::TypeInt(n) = &args[0] {
                     let expected = Type::TypeString(n.to_string());
@@ -905,7 +972,7 @@ fn try_magic(
         // `Prim.Symbol.Append left right result | left right -> result,
         // right result -> left, left result -> right` — concatenation
         // of two known symbols determines the third.
-        "Append" => {
+        "Append" if class_module_matches(&["Prim.Symbol"]) => {
             if args.len() == 3 {
                 // Forward: left + right → result.
                 if let (Type::TypeString(l), Type::TypeString(r)) =
@@ -985,7 +1052,7 @@ fn try_magic(
         // `Prim.Symbol.Compare left right ordering | left right -> ordering`
         // / `Prim.Int.Compare left right ordering | left right -> ordering`
         // — concrete operands determine the resulting Ordering.
-        "Compare" => {
+        "Compare" if class_module_matches(&["Prim.Symbol", "Prim.Int"]) => {
             if args.len() == 3 {
                 let order = match (&args[0], &args[1]) {
                     (Type::TypeString(l), Type::TypeString(r)) => {
@@ -1047,7 +1114,7 @@ fn try_magic(
         // the row lacks the given label. Concrete row + concrete
         // label literal: walk the row's fields and discharge if
         // the label is absent.
-        "Lacks" => {
+        "Lacks" if class_module_matches(&["Prim.Row"]) => {
             if args.len() == 2 {
                 if let Type::TypeString(lbl) = &args[0] {
                     if let Type::Row(fields, _tail) | Type::Record(fields, _tail) =
@@ -1078,7 +1145,7 @@ fn try_magic(
             }
         }
         "Cons" => {
-            if args.len() == 4 {
+            if args.len() == 4 && class_module_matches(&["Prim.Row"]) {
                 // Row.Cons: label, field-type, tail-row, full-row.
                 // Only fires when label is a known TypeString AND
                 // full-row is a concrete Row — otherwise falls
@@ -1126,7 +1193,7 @@ fn try_magic(
                     }
                 }
             }
-            if args.len() == 3 {
+            if args.len() == 3 && class_module_matches(&["Prim.Symbol"]) {
                 // Forward: head + tail → sym.
                 if let (Type::TypeString(h), Type::TypeString(t)) =
                     (&args[0], &args[1])

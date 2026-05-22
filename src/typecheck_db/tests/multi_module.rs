@@ -793,6 +793,291 @@ handle = case _ of
     ]);
 }
 
+/// `Data.Vec` / `Data.Matrix.Reps`-shape: a use of `Succ s s'`
+/// in a sig pulls in `DivMod10 x xi xl` as a sub-constraint via
+/// the `typelevelSucc` instance's context. With concrete first
+/// arg (e.g. `Succ D2 ?`), the chain should pick the matching
+/// `divMod10D2D0 :: DivMod10 D2 D0 D2` candidate by fundep
+/// `x -> i l`. Our solver was reporting `NoInstanceFound`
+/// because it failed to discharge the chain — fundep-driven
+/// candidate dispatch lost a beat somewhere along the recursion.
+#[test]
+fn diag_divmod10_succ_chain() {
+    assert_typechecks_multi(&[
+        "\
+module Tl where
+
+foreign import data D0 :: Type
+foreign import data D1 :: Type
+foreign import data D2 :: Type
+
+class DivMod10 x i l | i l -> x, x -> i l
+
+instance d0d0 :: DivMod10 D0 D0 D0
+else instance d1d0 :: DivMod10 D1 D0 D1
+else instance d2d0 :: DivMod10 D2 D0 D2
+
+class SuccP xi xl yi yl | xi xl -> yi yl
+
+instance sd0 :: SuccP xi D0 xi D1
+else instance sd1 :: SuccP xi D1 xi D2
+
+class Succ x y | x -> y, y -> x
+
+instance succ ::
+  ( DivMod10 x xi xl
+  , SuccP xi xl yi yl
+  , DivMod10 y yi yl
+  ) => Succ x y
+",
+        "\
+module Main where
+
+import Tl (class Succ, D1, D2)
+
+foreign import data Proxy :: forall k. k -> Type
+
+next :: forall s s'. Succ s s' => Proxy s -> Proxy s'
+next _ = mkProxy
+
+foreign import mkProxy :: forall k (a :: k). Proxy a
+
+useIt :: Proxy D2 -> Proxy D1
+useIt p = next p
+
+mk :: Proxy D2
+mk = mkProxy
+",
+    ]);
+}
+
+/// Full Data.Matrix.Reps-shape: all 10 digit DivMod10 + SuccP
+/// instances, plus the Pos / IsZero / Failure machinery, with
+/// the multi-digit `:*` rep — exercises the same instance index
+/// the real package uses. Final shape that fails:
+/// `matrix21 x11 x21 = emptyRow \\ row1 x11 \\ row1 x21`
+/// requires `Add D1 D1 D2` which expands to `Succ D1 D2` and
+/// downstream DivMod10 / SuccP discharges.
+#[test]
+fn diag_typelevel_full_matrix() {
+    assert_typechecks_multi(&[
+        "\
+module Tl where
+
+foreign import data D0 :: Type
+foreign import data D1 :: Type
+foreign import data D2 :: Type
+foreign import data D3 :: Type
+foreign import data D4 :: Type
+foreign import data D5 :: Type
+foreign import data D6 :: Type
+foreign import data D7 :: Type
+foreign import data D8 :: Type
+foreign import data D9 :: Type
+
+foreign import data False :: Type
+foreign import data True :: Type
+foreign import data Tuple :: Type -> Type -> Type
+
+class Failure t
+
+class Nat x
+instance natD0 :: Nat D0
+instance natD1 :: Nat D1
+instance natD2 :: Nat D2
+
+class Pos x
+instance posD1 :: Pos D1
+instance posD2 :: Pos D2
+
+class IsZero x b | x -> b
+instance izD0 :: IsZero D0 True
+else instance izOther :: IsZero x False
+
+foreign import data PredecessorOfZeroError :: Type -> Type
+
+class DivMod10 x i l | i l -> x, x -> i l
+
+instance d0d0 :: DivMod10 D0 D0 D0
+else instance d1d0 :: DivMod10 D1 D0 D1
+else instance d2d0 :: DivMod10 D2 D0 D2
+else instance d3d0 :: DivMod10 D3 D0 D3
+
+class SuccP xh xl yh yl yz | xh xl -> yh yl yz, yh yl yz -> xh xl
+
+instance spFail :: Failure (PredecessorOfZeroError x) => SuccP (Tuple x x) (Tuple x x) D0 D0 True
+else instance spD0 :: SuccP xi D0 xi D1 False
+else instance spD1 :: SuccP xi D1 xi D2 False
+else instance spD2 :: SuccP xi D2 xi D3 False
+else instance spD3 :: SuccP xi D3 xi D4 False
+
+class Succ x y | x -> y, y -> x
+
+instance succRel ::
+  ( Pos y
+  , IsZero y yz
+  , DivMod10 x xi xl
+  , SuccP xi xl yi yl yz
+  , DivMod10 y yi yl
+  ) => Succ x y
+
+class AddP x y z | x y -> z, z x -> y
+
+instance addPD0 :: Nat y => AddP D0 y y
+else instance addPD1 :: Succ y z => AddP D1 y z
+else instance addPD2 :: (Succ z z', AddP D1 y z) => AddP D2 y z'
+else instance addPMulti ::
+  ( Pos (Tuple xi xl)
+  , Nat z
+  , AddP xi yi zi
+  , DivMod10 y yi yl
+  , AddP xl (Tuple zi yl) z
+  ) =>
+  AddP (Tuple xi xl) y z
+
+class Add x y z | x y -> z, z x -> y, z y -> x
+instance addRel :: (AddP x y z, AddP y x z) => Add x y z
+",
+        "\
+module Main where
+
+import Tl
+
+foreign import data Matrix :: Type -> Type -> Type -> Type
+
+emptyRow :: forall a w. Nat w => Matrix D0 w a
+emptyRow = mkMatrix
+
+foreign import mkMatrix :: forall h w a. Matrix h w a
+
+row1 :: forall a. a -> Matrix D1 D1 a
+row1 _ = mkMatrix
+
+concatV :: forall h1 h2 h w a. Add h1 h2 h => Nat w => Matrix h1 w a -> Matrix h2 w a -> Matrix h w a
+concatV _ _ = mkMatrix
+
+infixr 3 concatV as \\\\
+
+matrix21 :: forall a. a -> a -> Matrix D2 D1 a
+matrix21 x11 x21 = emptyRow \\\\ row1 x11 \\\\ row1 x21
+",
+    ]);
+}
+
+/// Smaller arithmetic MRE used to verify the basic chain works.
+#[test]
+fn diag_typelevel_arithmetic_chain() {
+    assert_typechecks_multi(&[
+        "\
+module Tl where
+
+foreign import data D0 :: Type
+foreign import data D1 :: Type
+foreign import data D2 :: Type
+foreign import data D3 :: Type
+
+class Nat x
+instance natD0 :: Nat D0
+instance natD1 :: Nat D1
+instance natD2 :: Nat D2
+instance natD3 :: Nat D3
+
+class DivMod10 x i l | i l -> x, x -> i l
+
+instance d0d0 :: DivMod10 D0 D0 D0
+else instance d1d0 :: DivMod10 D1 D0 D1
+else instance d2d0 :: DivMod10 D2 D0 D2
+else instance d3d0 :: DivMod10 D3 D0 D3
+
+class SuccP xh xl yh yl yz | xh xl -> yh yl yz, yh yl yz -> xh xl
+
+instance sd0 :: SuccP xi D0 xi D1 False
+else instance sd1 :: SuccP xi D1 xi D2 False
+else instance sd2 :: SuccP xi D2 xi D3 False
+
+foreign import data False :: Type
+
+class Succ x y | x -> y, y -> x
+
+instance succRel ::
+  ( DivMod10 x xi xl
+  , SuccP xi xl yi yl yz
+  , DivMod10 y yi yl
+  ) => Succ x y
+
+class AddP x y z | x y -> z, z x -> y
+
+instance addPD0 :: Nat y => AddP D0 y y
+else instance addPD1 :: Succ y z => AddP D1 y z
+
+class Add x y z | x y -> z, z x -> y, z y -> x
+instance addRel :: (AddP x y z, AddP y x z) => Add x y z
+",
+        "\
+module Main where
+
+import Tl
+
+foreign import data Vec :: Type -> Type -> Type
+foreign import data Matrix :: Type -> Type -> Type -> Type
+
+emptyRow :: forall a w. Nat w => Matrix D0 w a
+emptyRow = mkMatrix
+
+foreign import mkMatrix :: forall h w a. Matrix h w a
+
+row1 :: forall a. a -> Matrix D1 D1 a
+row1 _ = mkMatrix
+
+concatV :: forall h1 h2 h w a. Add h1 h2 h => Nat w => Matrix h1 w a -> Matrix h2 w a -> Matrix h w a
+concatV _ _ = mkMatrix
+
+infixr 3 concatV as \\\\
+
+matrix21 :: forall a. a -> a -> Matrix D2 D1 a
+matrix21 x11 x21 = emptyRow \\\\ row1 x11 \\\\ row1 x21
+",
+    ]);
+}
+
+#[test]
+fn diag_recursive_fundep_class_with_lacks() {
+    assert_typechecks_multi(&[
+        "\
+module Tl where
+
+foreign import data Nil :: Type
+foreign import data Cons :: Type -> Type -> Type
+
+class UseFocusedFields list out | list -> out
+
+instance nilUFF :: UseFocusedFields Nil base
+
+instance consUFF ::
+  ( UseFocusedFields tail out'
+  ) => UseFocusedFields (Cons label tail) base
+",
+        "\
+module Main where
+
+import Tl (class UseFocusedFields, Nil, Cons)
+
+foreign import data Lbl :: Type
+foreign import data Anything :: Type
+foreign import data Int :: Type
+foreign import one :: forall a. a
+
+useIt :: forall list out. UseFocusedFields list out => list -> out
+useIt _ = useIt' (one :: Int)
+
+foreign import useIt' :: forall a b. a -> b
+
+go :: Anything
+go = useIt (one :: Cons Lbl (Cons Lbl Nil))
+",
+    ]);
+}
+
 /// Real-shape regression for `case _ of` with the layered re-export.
 /// Mirrors Halogen.Hooks.Internal.Eval's `mkEval inputEq … = case _ of
 /// H.Initialize a -> …; H.Action act a -> …`. The case-sugar `_`

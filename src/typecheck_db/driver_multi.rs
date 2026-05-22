@@ -2569,48 +2569,15 @@ fn detect_cross_module_instance_overlaps(
     // false-positive without this: `class Newtype t a | t -> a`
     // (one instance per newtype), `Row.Cons label ty rest row |
     // row -> ...`, `Row.Union r1 r2 r3 | r1 r2 -> r3, r1 r3 -> r2,
-    // r2 r3 -> r1`.
-    //
-    // Special case: when the class isn't registered with an entry
-    // in the InstanceIndex (e.g. an imported module's
-    // `ModuleExports` was distilled before fundep info was
-    // populated, or the class lives only in `Prim`), we
-    // conservatively skip the overlap check entirely — better to
-    // miss an overlap than wrongly flag fundep-disambiguated
-    // instances. Hardcode the known fundep-bearing classes here so
-    // we still skip them even when registry data is missing.
-    const KNOWN_FUNDEP_CLASSES: &[&str] = &[
-        "Newtype",
-        "Cons",
-        "Union",
-        "Nub",
-        "Lacks",
-        "MonadState",
-        "MonadReader",
-        "MonadWriter",
-        "MonadAsk",
-        "MonadTell",
-        "MonadEffect",
-        "MonadAff",
-        "MonadThrow",
-        "MonadError",
-        "MonadCont",
-        "MonadRec",
-        "MonadTrans",
-        "MonadGen",
-        "Compare",
-        "ToString",
-        "Append",
-        "Equals",
-    ];
+    // r2 r3 -> r1`. Source of truth: the class's declared `FunDep`
+    // list, propagated from CST or `ModuleExports.classes` into the
+    // instance index.
     let fundep_classes: std::collections::HashSet<String> = by_class
         .keys()
         .filter(|cls| {
             ix.class_info(cls.as_str())
                 .map(|info| !info.fundeps.is_empty())
-                .unwrap_or_else(|| {
-                    KNOWN_FUNDEP_CLASSES.contains(&cls.as_str())
-                })
+                .unwrap_or(false)
         })
         .cloned()
         .collect();
