@@ -15,6 +15,8 @@ use crate::parser::parse;
 use crate::typecheck_db::driver_multi::ModuleInput;
 
 const FIXTURES_ROOT: &str = "tests/fixtures";
+const APPLICATION_REL: &str = "../application-copy/application";
+const SOURCES_TXT_REL: &str = "tests/sources.txt";
 
 pub fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,6 +24,10 @@ pub fn manifest_dir() -> PathBuf {
 
 pub fn packages_root() -> PathBuf {
     manifest_dir().join(FIXTURES_ROOT).join("packages")
+}
+
+pub fn application_root() -> PathBuf {
+    manifest_dir().join(APPLICATION_REL)
 }
 
 /// Recursively gather `.purs` files under `root`, skipping spago /
@@ -75,6 +81,36 @@ pub fn gather_package_src_sources() -> Vec<PathBuf> {
         files.extend(collect_purs_files(&src_dir));
     }
     files
+}
+
+/// Expand the glob patterns in `tests/sources.txt` against
+/// `application-copy/application/`. Mirrors discovery in
+/// `tests/build.rs::build_from_sources`. Returns an empty Vec if
+/// either the application directory or sources.txt is missing — the
+/// caller decides whether that's fatal.
+pub fn gather_application_sources() -> Vec<PathBuf> {
+    let app = application_root();
+    if !app.exists() {
+        return Vec::new();
+    }
+    let sources_txt = manifest_dir().join(SOURCES_TXT_REL);
+    let patterns = match fs::read_to_string(&sources_txt) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for line in patterns.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let full = app.join(line);
+        let pat = full.to_string_lossy();
+        if let Ok(iter) = glob::glob(&pat) {
+            out.extend(iter.filter_map(|e| e.ok()));
+        }
+    }
+    out
 }
 
 pub fn module_name_of(m: &cst::Module) -> String {

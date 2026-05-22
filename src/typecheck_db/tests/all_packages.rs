@@ -18,8 +18,8 @@ use crate::typecheck_db::driver_multi::{
     check_many_modules, ModuleInput, MultiModuleError,
 };
 use crate::typecheck_db::test_support::{
-    extract_panic_msg, gather_package_src_sources, module_name_of,
-    package_modules_by_name, transitive_closure_of,
+    extract_panic_msg, gather_application_sources, gather_package_src_sources,
+    module_name_of, package_modules_by_name, transitive_closure_of,
 };
 
 const FIXTURES_ROOT: &str = "tests/fixtures";
@@ -554,7 +554,6 @@ nth xs i = unsafePartial fromJust $ xs Arr.!! i
 }
 
 #[test]
-#[ignore = "end-to-end acceptance target; gap-closing work in progress"]
 fn all_packages_typecheck() {
     // Heavy AST walks across 4800+ modules routinely overflow the
     // default 2MB thread stack. Mirror the other heavy tests and
@@ -754,6 +753,227 @@ fn run_all_packages_check() -> Result<(), String> {
             out!("  {:>4} {}", count, kind);
         }
         let limit = std::env::var("ALL_PACKAGES_SHOW").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(40);
+        out!("\nFirst {} failing modules:", limit);
+        for f in failures.iter().take(limit) {
+            out!("  {}: {}", f.name, f.reasons.join("; "));
+        }
+    }
+
+    if !driver_errors.is_empty() {
+        return Err(format!(
+            "driver errors:\n  {}",
+            driver_errors.join("\n  "),
+        ));
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "{failing}/{total} modules failed acceptance check",
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "end-to-end acceptance target; gap-closing work in progress"]
+fn build_from_sources_typecheck() {
+    // Same 512MB stack + catch_unwind wrapper as
+    // `all_packages_typecheck` — AST walks across 5740+ modules
+    // routinely overflow the default 2MB thread stack.
+    let join_result: Result<Result<(), String>, _> =
+        std::thread::Builder::new()
+            .name("build_from_sources_check".into())
+            .stack_size(512 * 1024 * 1024)
+            .spawn(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    run_build_from_sources_check,
+                ));
+                std::panic::set_hook(previous);
+                match outcome {
+                    Ok(res) => res,
+                    Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+                }
+            })
+            .expect("spawn build-from-sources thread")
+            .join();
+
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "worker thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("typecheck_db build_from_sources: {msg}");
+    }
+}
+
+fn run_build_from_sources_check() -> Result<(), String> {
+    let started = std::time::Instant::now();
+
+    let files = gather_application_sources();
+    if files.is_empty() {
+        return Err(
+            "no application sources discovered — check that \
+             application-copy/application exists and that \
+             tests/sources.txt has glob patterns"
+                .to_string(),
+        );
+    }
+    eprintln!(
+        "Discovered {} application source files in {:.2?}",
+        files.len(),
+        started.elapsed(),
+    );
+
+    // Parse every file. Bail on the first parse error — parsing
+    // is not this pass's responsibility.
+    let parse_started = std::time::Instant::now();
+    let mut parsed: Vec<ModuleInput> = Vec::with_capacity(files.len());
+    let mut seen_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for file in &files {
+        let src = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("failed to read {}: {e}", file.display())),
+        };
+        let module = match parse(&src) {
+            Ok(m) => m,
+            Err(e) => return Err(format!("parse error in {}: {e:?}", file.display())),
+        };
+        let name = module_name_of(&module);
+        // Diamond-dep duplicates: keep the first parse, skip the
+        // rest (the typechecker requires exactly one copy per name).
+        if seen_names.insert(name.clone()) {
+            parsed.push(ModuleInput::new(name, src, module));
+        }
+    }
+    let total = parsed.len();
+    eprintln!(
+        "Parsed {} modules in {:.2?}",
+        total,
+        parse_started.elapsed(),
+    );
+
+    let check_started = std::time::Instant::now();
+    let report = check_many_modules(parsed);
+    eprintln!(
+        "Multi-module check completed in {:.2?}",
+        check_started.elapsed(),
+    );
+
+    // Driver-level errors first.
+    let mut driver_errors: Vec<String> = Vec::new();
+    for e in &report.errors {
+        match e {
+            MultiModuleError::CycleInModules(cycle) => {
+                driver_errors.push(format!("cycle: {}", cycle.join(" \u{2194} ")));
+            }
+            other => driver_errors.push(format!("{other:?}")),
+        }
+    }
+
+    // Per-module diagnostics. Aggregate across results so the
+    // summary surfaces the entire gap.
+    struct ModuleFailure {
+        name: String,
+        reasons: Vec<String>,
+    }
+    let mut failures: Vec<ModuleFailure> = Vec::new();
+    let mut error_counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+
+    for result in &report.results {
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some(ve) = result.validation_errors.first() {
+            *error_counts.entry("Validation").or_default() += 1;
+            reasons.push(format!("validation: {:?}", ve.kind));
+        }
+        if let Some(ke) = result.kind_errors.first() {
+            *error_counts.entry("Kind").or_default() += 1;
+            reasons.push(format!("kind: {:?}", ke.kind));
+        }
+        if let Some(ce) = result.coercible_errors.first() {
+            *error_counts.entry("Coercible").or_default() += 1;
+            reasons.push(format!("coercible: {:?}", ce.kind));
+        }
+        if let Some(err) = &result.inference_error {
+            *error_counts.entry("Inference").or_default() += 1;
+            reasons.push(format!("infer: {err:?}"));
+        }
+        if let Some(ie) = result.import_errors.first() {
+            *error_counts.entry("Import").or_default() += 1;
+            reasons.push(format!("import: {:?}", ie.kind));
+        }
+        if let Some(ce) = result.constraint_errors.first() {
+            *error_counts.entry("Constraint").or_default() += 1;
+            reasons.push(format!(
+                "constraint {:?}: {}",
+                ce.kind, ce.constraint.class.name,
+            ));
+        }
+        // Non-exhaustive patterns are warnings in the reference
+        // compiler — mirror `build_from_sources` and don't fail
+        // on them.
+        let _ = result.exhaustiveness_errors;
+
+        if !reasons.is_empty() {
+            failures.push(ModuleFailure {
+                name: result.name.clone(),
+                reasons,
+            });
+        }
+    }
+
+    let failing = failures.len();
+    let passing = total.saturating_sub(failing);
+    let dump_path = std::env::var("BUILD_FROM_SOURCES_DUMP_FILE")
+        .unwrap_or_else(|_| "/tmp/build_from_sources_summary.txt".to_string());
+    let mut dump_file = std::fs::File::create(&dump_path).ok();
+    macro_rules! out {
+        ($($arg:tt)*) => {
+            eprintln!($($arg)*);
+            if let Some(ref mut f) = dump_file {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        };
+    }
+    out!("=== typecheck_db build-from-sources summary ===");
+    out!("modules processed: {total}");
+    out!("passing:           {passing}");
+    out!("failing:           {failing}");
+    out!("driver errors:     {}", driver_errors.len());
+    out!("total wall time:   {:.2?}", started.elapsed());
+    if !error_counts.is_empty() {
+        let mut sorted_counts: Vec<_> = error_counts.iter().collect();
+        sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+        out!("\nError distribution:");
+        for (kind, count) in &sorted_counts {
+            out!("  {:>4} {}", count, kind);
+        }
+    }
+    if !failures.is_empty() {
+        let mut detail_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for f in &failures {
+            for r in &f.reasons {
+                let key = r.split('(').next().unwrap_or(r).trim().to_string();
+                *detail_counts.entry(key).or_default() += 1;
+            }
+        }
+        let mut sorted_detail: Vec<_> = detail_counts.iter().collect();
+        sorted_detail.sort_by(|a, b| b.1.cmp(a.1));
+        out!("\nDetailed error breakdown:");
+        for (kind, count) in &sorted_detail {
+            out!("  {:>4} {}", count, kind);
+        }
+        let limit = std::env::var("BUILD_FROM_SOURCES_SHOW")
+            .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(40);
         out!("\nFirst {} failing modules:", limit);
