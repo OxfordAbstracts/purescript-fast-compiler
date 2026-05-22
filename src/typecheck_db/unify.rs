@@ -849,6 +849,14 @@ impl UnifyState {
         self.unify_depth += 1;
         let result = if self.unify_depth > 1024 {
             Err(UnifyError::Mismatch(a.clone(), b.clone()))
+        } else if !has_any_unif(a) && !has_any_unif(b) {
+            // Fast path: when neither side mentions a Unif, zonk is a
+            // pure clone-walk. Skip it. Two O(N) walks (one per arg)
+            // replace one O(N) walk-plus-clone per arg — net win
+            // because the clone allocates fresh boxes for every node
+            // and shows up as the dominant cost in solver-heavy
+            // modules.
+            self.unify_inner(a, b)
         } else {
             let a = self.zonk(a);
             let b = self.zonk(b);
@@ -1220,7 +1228,10 @@ fn unify_fields(
                     state.unify(&inst, other)?;
                 }
                 _ => {
-                    state.unify(t1v, t2v)?;
+                    // Pass the already-zonked versions so unify's
+                    // top-level zonk has no work (`has_any_unif`
+                    // fast-path returns).
+                    state.unify(&z1, &z2)?;
                 }
             }
         }
@@ -1354,6 +1365,29 @@ fn max_skolem_in(ty: &Type) -> Option<u32> {
             }
         }
         _ => None,
+    }
+}
+
+/// True iff `ty` mentions any `Type::Unif(_)` anywhere. Used to
+/// short-circuit `unify`'s top-level zonk on fully-concrete inputs
+/// (the common case for non-polymorphic typeclass dispatch over
+/// `Type::Con` heads). Skipping the clone-walk that zonk performs
+/// on those inputs measurably speeds up large solver runs.
+fn has_any_unif(ty: &Type) -> bool {
+    match ty {
+        Type::Unif(_) => true,
+        Type::App(f, a) => has_any_unif(f) || has_any_unif(a),
+        Type::Fun(a, b) => has_any_unif(a) || has_any_unif(b),
+        Type::Forall(_, body) => has_any_unif(body),
+        Type::Constrained(cs, b) => {
+            cs.iter().any(|c| c.args.iter().any(has_any_unif)) || has_any_unif(b)
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            fs.iter().any(|(_, t)| has_any_unif(t))
+                || tail.as_ref().map_or(false, |t| has_any_unif(t))
+        }
+        Type::Kinded(t, k) => has_any_unif(t) || has_any_unif(k),
+        _ => false,
     }
 }
 
