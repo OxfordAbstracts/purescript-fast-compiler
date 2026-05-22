@@ -573,6 +573,23 @@ impl UnifyState {
     /// loop to reject a candidate without leaking partial bindings
     /// into the outer state. O(1) — only records lengths, not a
     /// clone of the bindings vector.
+    /// Current length of the undo trail. Used as a watermark by
+    /// `solve_all` to detect whether new bindings were made
+    /// between two probes: if the length is unchanged, no
+    /// `assign` happened.
+    pub fn binding_trail_len(&self) -> usize {
+        self.binding_trail.len()
+    }
+
+    /// Slot id of the trail entry at `idx`. Used by `solve_all` to
+    /// iterate `[old_len..new_len)` and learn which unifs were
+    /// newly bound, so deferred constraints whose dependent unifs
+    /// are disjoint from the newly-bound set can skip a redundant
+    /// `solve_one`.
+    pub fn binding_trail_slot_at(&self, idx: usize) -> u32 {
+        self.binding_trail[idx].0 as u32
+    }
+
     pub fn snapshot_bindings(&self) -> BindingSnapshot {
         BindingSnapshot {
             trail_len: self.binding_trail.len(),

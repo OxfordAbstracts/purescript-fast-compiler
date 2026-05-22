@@ -812,6 +812,53 @@ fn contains_unif(ty: &Type, state: &crate::typecheck_db::unify::UnifyState) -> b
     walk(&state.zonk(ty))
 }
 
+/// Collect every `Type::Unif(id)` reachable in `ty` (zonked first)
+/// into `out`. Used by `solve_all` to compute the dependency set
+/// of a deferred constraint: if none of these ids gets newly
+/// bound before the constraint's next visit, `solve_one` would
+/// defer for the same reason and can be skipped entirely.
+fn collect_unif_ids(
+    state: &crate::typecheck_db::unify::UnifyState,
+    ty: &Type,
+    out: &mut std::collections::HashSet<u32>,
+) {
+    fn walk(t: &Type, out: &mut std::collections::HashSet<u32>) {
+        match t {
+            Type::Unif(id) => {
+                out.insert(*id);
+            }
+            Type::App(f, a) | Type::Fun(f, a) => {
+                walk(f, out);
+                walk(a, out);
+            }
+            Type::Forall(_, body) => walk(body, out),
+            Type::Constrained(cs, body) => {
+                for c in cs {
+                    for a in &c.args {
+                        walk(a, out);
+                    }
+                }
+                walk(body, out);
+            }
+            Type::Record(fs, tail) | Type::Row(fs, tail) => {
+                for (_, t) in fs {
+                    walk(t, out);
+                }
+                if let Some(t) = tail.as_deref() {
+                    walk(t, out);
+                }
+            }
+            Type::Kinded(t, k) => {
+                walk(t, out);
+                walk(k, out);
+            }
+            _ => {}
+        }
+    }
+    let zonked = state.zonk(ty);
+    walk(&zonked, out);
+}
+
 /// True when `ty`'s App-spine head is a unif var (so the structural
 /// shape `App(?u, _)` cannot yet be pinned to a specific
 /// constructor). Mirrors the reference compiler's
@@ -1323,7 +1370,21 @@ pub fn solve_all(
     pending: &[PendingConstraint],
 ) -> SolveReport {
     let mut report = SolveReport::default();
-    let mut queue: Vec<PendingConstraint> = pending.to_vec();
+    // Each item is `(constraint, optional watch state)`. The watch
+    // state caches the set of unif ids the constraint's zonked args
+    // mention plus the binding-trail length at the moment of its
+    // last defer. On a later iteration, if NONE of those unifs got
+    // bound between [last_trail_len, current trail length],
+    // `solve_one` would defer for the same reason — we skip it
+    // entirely. For solver-heavy modules like
+    // `AdminDashboard.Pages.Submissions.View` this collapses
+    // ~3 million redundant `solve_one` calls into a few thousand.
+    struct WatchState {
+        last_trail_len: usize,
+        deps: std::collections::HashSet<u32>,
+    }
+    let mut queue: Vec<(PendingConstraint, Option<WatchState>)> =
+        pending.iter().cloned().map(|p| (p, None)).collect();
 
     // Profiling: count + cumulative time per class name. Printed
     // at end of solve_all when TYPECHECK_DB_PROFILE_SLOW is set.
@@ -1356,9 +1417,22 @@ pub fn solve_all(
             break;
         }
         let current = std::mem::take(&mut queue);
-        let mut carry_forward: Vec<PendingConstraint> = Vec::new();
+        let mut carry_forward: Vec<(PendingConstraint, Option<WatchState>)> =
+            Vec::new();
         let mut made_progress = false;
-        for pc in current {
+        for (pc, watch) in current {
+            // Watch-list skip: if the constraint was deferred earlier
+            // and no unif it depends on has been bound since, skip
+            // solve_one entirely — the verdict would be the same.
+            if let Some(w) = &watch {
+                let trail_now = state.binding_trail_len();
+                let any_dep_bound = (w.last_trail_len..trail_now)
+                    .any(|i| w.deps.contains(&state.binding_trail_slot_at(i)));
+                if !any_dep_bound {
+                    carry_forward.push((pc, watch));
+                    continue;
+                }
+            }
             let owner = match &pc.decl_name {
                 Some(n) => n.clone(),
                 None => continue,
@@ -1387,16 +1461,19 @@ pub fn solve_all(
                     // same way the top-level ones were seen this
                     // round.
                     for ctx in &dict.context {
-                        carry_forward.push(PendingConstraint {
-                            decl_name: Some(owner.clone()),
-                            span: pc.span,
-                            constraint: Constraint {
-                                class: ctx.class.clone(),
-                                args: ctx.args.iter().map(|a| state.zonk(a)).collect(),
+                        carry_forward.push((
+                            PendingConstraint {
+                                decl_name: Some(owner.clone()),
+                                span: pc.span,
+                                constraint: Constraint {
+                                    class: ctx.class.clone(),
+                                    args: ctx.args.iter().map(|a| state.zonk(a)).collect(),
+                                },
+                                origin: ConstraintOrigin::InstanceContext,
+                                givens: pc.givens.clone(),
                             },
-                            origin: ConstraintOrigin::InstanceContext,
-                            givens: pc.givens.clone(),
-                        });
+                            None,
+                        ));
                     }
                     // Record the outer dict at the call site's span
                     // *only* for Signature-origin constraints —
@@ -1480,7 +1557,19 @@ pub fn solve_all(
                         });
                 }
                 SolveOutcome::Deferred => {
-                    carry_forward.push(pc);
+                    // Capture the constraint's current dependent
+                    // unifs so the next iteration can skip this
+                    // solve_one if none of them is bound in between.
+                    let mut deps: std::collections::HashSet<u32> =
+                        std::collections::HashSet::new();
+                    for a in &pc.constraint.args {
+                        collect_unif_ids(state, a, &mut deps);
+                    }
+                    let new_watch = WatchState {
+                        last_trail_len: state.binding_trail_len(),
+                        deps,
+                    };
+                    carry_forward.push((pc, Some(new_watch)));
                 }
             }
         }
@@ -1502,8 +1591,9 @@ pub fn solve_all(
     // so the failure is visible, then drop those entries from the
     // deferred list — they can't be productively re-driven.
     if last_made_progress && !queue.is_empty() {
-        let mut legitimately_deferred = Vec::new();
-        for pc in std::mem::take(&mut queue) {
+        let mut legitimately_deferred: Vec<(PendingConstraint, Option<WatchState>)> =
+            Vec::new();
+        for (pc, watch) in std::mem::take(&mut queue) {
             match &pc.decl_name {
                 Some(n) => {
                     report
@@ -1517,12 +1607,12 @@ pub fn solve_all(
                             kind: ConstraintErrorKind::SolverDepthExceeded,
                         });
                 }
-                None => legitimately_deferred.push(pc),
+                None => legitimately_deferred.push((pc, watch)),
             }
         }
         queue = legitimately_deferred;
     }
-    report.deferred = queue;
+    report.deferred = queue.into_iter().map(|(pc, _)| pc).collect();
 
     // Profile summary: classes whose cumulative solve_one time
     // exceeded 100ms. Sorted descending by duration.
