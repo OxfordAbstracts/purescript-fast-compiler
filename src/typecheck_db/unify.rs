@@ -322,6 +322,27 @@ pub struct UnifyState {
     /// so the `Timeout` error variant can surface what was exceeded
     /// rather than re-deriving from `Instant`.
     deadline_budget_ms: u64,
+    /// Undo trail for `bindings` mutations. Every assignment that
+    /// overwrites a slot pushes `(slot, previous_value)` so a
+    /// later `restore_bindings` can replay them in reverse. This
+    /// is what makes snapshot O(1) and restore O(delta) — the
+    /// instance-trial loop snapshots once per candidate, and
+    /// without a trail the previous full-`bindings.clone()` cost
+    /// dominated for big modules (e.g. one decl's solver bill of
+    /// 6000 constraints × 446 EncodeOa candidates × ~50k-slot
+    /// state was 600+ seconds in the OA application sweep).
+    binding_trail: Vec<(usize, Option<Type>)>,
+}
+
+/// Captures the union-find state at a point so a later
+/// `restore_bindings` undoes every assignment performed between
+/// the two calls — restoring slot values via the trail and
+/// shrinking any fresh allocations.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingSnapshot {
+    trail_len: usize,
+    bindings_len: usize,
+    skolem_levels_len: usize,
 }
 
 impl UnifyState {
@@ -342,6 +363,7 @@ impl UnifyState {
             current_decl_span: None,
             deadline: None,
             deadline_budget_ms: 0,
+            binding_trail: Vec::new(),
         }
     }
 
@@ -545,20 +567,38 @@ impl UnifyState {
             .collect()
     }
 
-    /// Capture the current union-find bindings so a later
+    /// Capture the current union-find state so a later
     /// `restore_bindings` call can undo every unification performed
     /// between the two points. Used by the instance-match trial
     /// loop to reject a candidate without leaking partial bindings
-    /// into the outer state.
-    pub fn snapshot_bindings(&self) -> Vec<Option<Type>> {
-        self.bindings.clone()
+    /// into the outer state. O(1) — only records lengths, not a
+    /// clone of the bindings vector.
+    pub fn snapshot_bindings(&self) -> BindingSnapshot {
+        BindingSnapshot {
+            trail_len: self.binding_trail.len(),
+            bindings_len: self.bindings.len(),
+            skolem_levels_len: self.unif_skolem_levels.len(),
+        }
     }
 
     /// Restore bindings previously captured via `snapshot_bindings`.
     /// Safe only when the caller has kept the snapshot's lifetime
-    /// scoped to a single unification attempt.
-    pub fn restore_bindings(&mut self, snapshot: Vec<Option<Type>>) {
-        self.bindings = snapshot;
+    /// scoped to a single unification attempt. O(delta) — pops the
+    /// trail back to the snapshot's watermark, restoring each
+    /// slot's previous value, then shrinks any fresh allocations
+    /// from `assign`'s resize / `fresh`'s push.
+    pub fn restore_bindings(&mut self, snapshot: BindingSnapshot) {
+        while self.binding_trail.len() > snapshot.trail_len {
+            let (slot, prev) = self.binding_trail.pop().unwrap();
+            if slot < snapshot.bindings_len {
+                self.bindings[slot] = prev;
+            }
+            // Slots beyond `bindings_len` were allocated AFTER the
+            // snapshot; they're discarded by the `truncate` below,
+            // so the trail entry can be ignored.
+        }
+        self.bindings.truncate(snapshot.bindings_len);
+        self.unif_skolem_levels.truncate(snapshot.skolem_levels_len);
     }
 
     /// Scope-bind the "currently inferring" decl name. Used by
@@ -712,6 +752,10 @@ impl UnifyState {
             // any skolem introduction.
             self.unif_skolem_levels.resize(slot + 1, 0);
         }
+        // Record the prior value on the undo trail so a snapshot
+        // taken before this point can roll back the assignment.
+        let prev = self.bindings[slot].take();
+        self.binding_trail.push((slot, prev));
         self.bindings[slot] = Some(ty);
     }
 
