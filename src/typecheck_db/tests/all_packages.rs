@@ -776,6 +776,68 @@ fn run_all_packages_check() -> Result<(), String> {
     Ok(())
 }
 
+/// Focused reproducer for the next-worst module after Submission.Update.
+/// `AdminDashboard.Pages.Submissions.View` took 68 seconds in the
+/// sweep — a 555-line View module with 12 case branches. Used to
+/// find the next solver / inference perf bottleneck.
+#[test]
+#[ignore = "perf regression target — 68s in sweep, gap-closing"]
+fn repro_admin_submissions_view_perf() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("repro_admin_submissions_view".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::env::set_var("TYPECHECK_DB_PROFILE_SLOW", "1");
+                let pkgs = application_modules_by_name();
+                let target = "AdminDashboard.Pages.Submissions.View";
+                if !pkgs.contains_key(target) {
+                    return Err(format!(
+                        "{target} missing from application sources",
+                    ));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!(
+                    "[repro] {target} closure: {} modules",
+                    closure.len(),
+                );
+                let started = std::time::Instant::now();
+                let report = check_many_modules(closure);
+                let elapsed = started.elapsed();
+                eprintln!("[repro] closure check finished in {elapsed:.2?}");
+                for e in &report.errors {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                let budget = std::time::Duration::from_secs(20);
+                if elapsed > budget {
+                    return Err(format!(
+                        "{target} closure took {elapsed:?} — exceeds {budget:?} budget",
+                    ));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn repro thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_admin_submissions_view_perf: {msg}");
+    }
+}
+
 /// Focused reproducer for `Submission.Update` — during the
 /// `build_from_sources_typecheck` sweep this single module took
 /// 657 seconds. The function is a 723-line Halogen-style update
