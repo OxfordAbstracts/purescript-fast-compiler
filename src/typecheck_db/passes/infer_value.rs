@@ -939,6 +939,24 @@ pub fn infer_value_scc_with_all(
     ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
 ) -> Result<Vec<InferredScheme>, InferError> {
+    // Sub-phase profiling for slow SCCs. Gated on TYPECHECK_DB_PROFILE_SLOW
+    // so production runs see no overhead. Logged as a single line at function
+    // return when the SCC total exceeds 200ms. Splits SCC time across body
+    // inference, exhaustiveness, the two solve_all passes (main + sig-driven
+    // redrive), and generalize so the dominating phase is obvious.
+    let scc_profile_slow = std::env::var_os("TYPECHECK_DB_PROFILE_SLOW").is_some();
+    let scc_start = std::time::Instant::now();
+    let mut t_body_infer = std::time::Duration::ZERO;
+    let mut t_solve_all_main = std::time::Duration::ZERO;
+    let mut t_solve_all_redrive = std::time::Duration::ZERO;
+    let mut t_generalize_loop = std::time::Duration::ZERO;
+    let mut t_exhaust = std::time::Duration::ZERO;
+    let solve_one_at_start = crate::typecheck_db::passes::constraints
+        ::SOLVE_ONE_CALLS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let try_match_at_start = crate::typecheck_db::passes::constraints
+        ::TRY_MATCH_ATTEMPTS
+        .load(std::sync::atomic::Ordering::Relaxed);
     // Pre-register each SCC member with a fresh unif var so mutual
     // references within the SCC type-check. After inference, we generalize.
     let mut state = UnifyState::new();
@@ -1012,6 +1030,7 @@ pub fn infer_value_scc_with_all(
     // Infer each decl's body against its pre-registered slot. The
     // "current decl" marker on state lets `infer_case` stamp each
     // pending exhaustiveness record with its owning decl.
+    let _body_infer_start = std::time::Instant::now();
     for (decl, name) in &decl_refs {
         if let Decl::Value { span: decl_span, binders, guarded, where_clause, .. } = decl {
             let expected = slot_of.get(name).cloned().unwrap();
@@ -1265,6 +1284,7 @@ pub fn infer_value_scc_with_all(
             }
         }
     }
+    t_body_infer = _body_infer_start.elapsed();
     state.set_current_decl(None);
     state.set_current_decl_span(None);
     // Re-arm the deadline for the post-body SCC phases. `solve_all`,
@@ -1446,6 +1466,7 @@ pub fn infer_value_scc_with_all(
     let mut errors_by_decl: HashMap<String, Vec<
         crate::typecheck_db::passes::exhaustiveness::NonExhaustive,
     >> = HashMap::new();
+    let _exhaust_start = std::time::Instant::now();
     for p in pending {
         let owner = match &p.decl_name {
             Some(n) => n.clone(),
@@ -1495,6 +1516,7 @@ pub fn infer_value_scc_with_all(
             }
         }
     }
+    t_exhaust = _exhaust_start.elapsed();
 
     // Run the Phase B solver over every pending constraint now that
     // inference has settled. The solver reads bindings out of `state`
@@ -1508,11 +1530,13 @@ pub fn infer_value_scc_with_all(
         .flatten()
         .cloned()
         .collect();
+    let _solve_all_main_start = std::time::Instant::now();
     let report = crate::typecheck_db::passes::constraints::solve_all(
         &mut state,
         instances,
         &all_pending,
     );
+    t_solve_all_main = _solve_all_main_start.elapsed();
     // `solve_all` swallows errors into its report struct, so a
     // timeout that fires mid-solve needs to be surfaced here.
     // Bail the whole SCC with a located `Timeout` if the deadline
@@ -1589,11 +1613,13 @@ pub fn infer_value_scc_with_all(
         }
         // Re-run the solver on the still-deferred constraints with
         // the (possibly improved) state.
+        let _solve_all_redrive_start = std::time::Instant::now();
         let report2 = crate::typecheck_db::passes::constraints::solve_all(
             &mut state,
             instances,
             &deferred,
         );
+        t_solve_all_redrive = _solve_all_redrive_start.elapsed();
         if state.deadline_exceeded() {
             let budget = state.deadline_budget_ms();
             state.clear_deadline();
@@ -1628,6 +1654,7 @@ pub fn infer_value_scc_with_all(
     }
 
     let mut out = Vec::new();
+    let _generalize_start = std::time::Instant::now();
     for (_, name) in &decl_refs {
         let ty = slot_of.get(name).cloned().unwrap();
         let exhaustiveness_errors = errors_by_decl.remove(name).unwrap_or_default();
@@ -1762,6 +1789,7 @@ pub fn infer_value_scc_with_all(
         });
     }
 
+    t_generalize_loop = _generalize_start.elapsed();
     // Restore env — callers may reuse it. First wipe every slot
     // this SCC added to `env.locals` (their `Type::Unif` ids
     // belong to THIS state and would dangle once we drop it —
@@ -1775,6 +1803,35 @@ pub fn infer_value_scc_with_all(
         env.bind_local(name, v);
     }
 
+    let scc_total = scc_start.elapsed();
+    if scc_profile_slow && scc_total >= std::time::Duration::from_millis(200) {
+        let solve_one_delta = crate::typecheck_db::passes::constraints
+            ::SOLVE_ONE_CALLS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(solve_one_at_start);
+        let try_match_delta = crate::typecheck_db::passes::constraints
+            ::TRY_MATCH_ATTEMPTS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(try_match_at_start);
+        let scc_names: Vec<&str> = decl_refs.iter().map(|(_, n)| n.as_str()).collect();
+        let scc_label = scc_names.first().copied().unwrap_or("<empty>");
+        let extra = if scc_names.len() > 1 {
+            format!(" (+{} more)", scc_names.len() - 1)
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  [scc:{scc_label}{extra}] total {ttot}ms = body {tb} + exhaust {tex} + solve_main {tsm} + redrive {tsr} + generalize {tg} | solve_one={so1} try_match={tm}",
+            ttot = scc_total.as_millis(),
+            tb = t_body_infer.as_millis(),
+            tex = t_exhaust.as_millis(),
+            tsm = t_solve_all_main.as_millis(),
+            tsr = t_solve_all_redrive.as_millis(),
+            tg = t_generalize_loop.as_millis(),
+            so1 = solve_one_delta,
+            tm = try_match_delta,
+        );
+    }
     Ok(out)
 }
 
