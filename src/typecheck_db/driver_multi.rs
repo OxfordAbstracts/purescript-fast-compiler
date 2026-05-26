@@ -148,17 +148,58 @@ pub fn check_many_modules_with_db(
     db: &mut TypecheckDb,
     modules: Vec<ModuleInput>,
 ) -> ModuleCheckReport {
+    let mut registry = ModuleRegistry::new();
+    let mut results: Vec<ModuleCheckResult> = Vec::new();
+    let errors =
+        check_many_modules_inner(db, &mut registry, modules, |r| results.push(r));
+    ModuleCheckReport { registry, results, errors }
+}
+
+/// Streaming variant: process each module's result via `on_result` as
+/// soon as it's produced, then drop it. Memory stays bounded by one
+/// in-flight `ModuleCheckResult` plus the internal `ModuleRegistry`
+/// (whose size is bounded by exported names, not body details).
+///
+/// Use this for sweeps over many thousand modules where retaining
+/// every `ModuleCheckResult` would cost 100s of GB — the standard
+/// `check_many_modules` returns a `Vec<ModuleCheckResult>` that
+/// duplicates every resolved dict and every InferredScheme.
+pub fn check_many_modules_streaming(
+    modules: Vec<ModuleInput>,
+    on_result: impl FnMut(ModuleCheckResult),
+) -> Vec<MultiModuleError> {
+    let mut db = TypecheckDb::open_in_memory().expect("in-memory TypecheckDb");
+    let mut registry = ModuleRegistry::new();
+    check_many_modules_inner(&mut db, &mut registry, modules, on_result)
+}
+
+/// Streaming + caller-owned `db` for incremental scenarios.
+pub fn check_many_modules_streaming_with_db(
+    db: &mut TypecheckDb,
+    modules: Vec<ModuleInput>,
+    on_result: impl FnMut(ModuleCheckResult),
+) -> Vec<MultiModuleError> {
+    let mut registry = ModuleRegistry::new();
+    check_many_modules_inner(db, &mut registry, modules, on_result)
+}
+
+/// Shared core: drives the topo-sorted check loop, forwarding each
+/// module's result through `on_result` so the caller decides whether
+/// to collect them all or drop after consuming. Returns driver-level
+/// errors (cycles, dup module names, Prim namespace abuse).
+fn check_many_modules_inner(
+    db: &mut TypecheckDb,
+    registry: &mut ModuleRegistry,
+    modules: Vec<ModuleInput>,
+    mut on_result: impl FnMut(ModuleCheckResult),
+) -> Vec<MultiModuleError> {
     let name_index: HashMap<String, usize> = modules
         .iter()
         .enumerate()
         .map(|(i, m)| (m.name.clone(), i))
         .collect();
 
-    let mut report = ModuleCheckReport {
-        registry: ModuleRegistry::new(),
-        results: Vec::new(),
-        errors: Vec::new(),
-    };
+    let mut errors: Vec<MultiModuleError> = Vec::new();
 
     // Reject build units that declare the same module name in two
     // different source files. The HashMap above silently dedupes by
@@ -173,9 +214,7 @@ pub fn check_many_modules_with_db(
         }
     }
     for name in &duplicate_names {
-        report
-            .errors
-            .push(MultiModuleError::DuplicateModule(name.clone()));
+        errors.push(MultiModuleError::DuplicateModule(name.clone()));
     }
 
     // User modules may not declare a name in the `Prim` namespace —
@@ -183,15 +222,13 @@ pub fn check_many_modules_with_db(
     // terms. The reference compiler's `CannotDefinePrimModules`.
     for m in &modules {
         if m.name == "Prim" || m.name.starts_with("Prim.") {
-            report
-                .errors
-                .push(MultiModuleError::CannotDefinePrimModules(m.name.clone()));
+            errors.push(MultiModuleError::CannotDefinePrimModules(m.name.clone()));
         }
     }
 
     let (order, cycles) = topo_sort_modules(&modules, &name_index);
     for cycle in cycles {
-        report.errors.push(MultiModuleError::CycleInModules(cycle));
+        errors.push(MultiModuleError::CycleInModules(cycle));
     }
 
     let trace = std::env::var_os("TYPECHECK_DB_TRACE").is_some();
@@ -213,7 +250,7 @@ pub fn check_many_modules_with_db(
             );
         }
         let started = std::time::Instant::now();
-        let result = check_one_module(db, input, &mut report.registry);
+        let result = check_one_module(db, input, registry);
         let elapsed_ms = started.elapsed().as_millis();
         if timing_trace || elapsed_ms >= slow_threshold_ms {
             eprintln!(
@@ -223,14 +260,14 @@ pub fn check_many_modules_with_db(
                 elapsed_ms,
             );
         }
-        report.results.push(result);
+        on_result(result);
     }
 
     if std::env::var_os("TYPECHECK_DB_TIMING").is_some() {
         phase_timing::dump();
     }
 
-    report
+    errors
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ use std::fs;
 
 use crate::parser::parse;
 use crate::typecheck_db::driver_multi::{
-    check_many_modules, ModuleInput, MultiModuleError,
+    check_many_modules, check_many_modules_streaming, ModuleInput, MultiModuleError,
 };
 use crate::typecheck_db::test_support::{
     application_modules_by_name, extract_panic_msg, gather_application_sources,
@@ -1058,25 +1058,12 @@ fn run_build_from_sources_check() -> Result<(), String> {
     );
 
     let check_started = std::time::Instant::now();
-    let report = check_many_modules(parsed);
-    eprintln!(
-        "Multi-module check completed in {:.2?}",
-        check_started.elapsed(),
-    );
-
-    // Driver-level errors first.
-    let mut driver_errors: Vec<String> = Vec::new();
-    for e in &report.errors {
-        match e {
-            MultiModuleError::CycleInModules(cycle) => {
-                driver_errors.push(format!("cycle: {}", cycle.join(" \u{2194} ")));
-            }
-            other => driver_errors.push(format!("{other:?}")),
-        }
-    }
-
-    // Per-module diagnostics. Aggregate across results so the
-    // summary surfaces the entire gap.
+    // Stream per-module results so memory stays bounded by one
+    // in-flight `ModuleCheckResult` + the registry. Retaining every
+    // ModuleCheckResult across 5740 modules costs 100+ GB because
+    // each carries every InferredScheme's resolved_dicts /
+    // constraint_dicts; the test only reads the first error of each
+    // category, so we extract what we need and drop the rest.
     struct ModuleFailure {
         name: String,
         reasons: Vec<String>,
@@ -1085,7 +1072,7 @@ fn run_build_from_sources_check() -> Result<(), String> {
     let mut error_counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
 
-    for result in &report.results {
+    let multi_errors = check_many_modules_streaming(parsed, |result| {
         let mut reasons: Vec<String> = Vec::new();
         if let Some(ve) = result.validation_errors.first() {
             *error_counts.entry("Validation").or_default() += 1;
@@ -1117,13 +1104,24 @@ fn run_build_from_sources_check() -> Result<(), String> {
         // Non-exhaustive patterns are warnings in the reference
         // compiler — mirror `build_from_sources` and don't fail
         // on them.
-        let _ = result.exhaustiveness_errors;
 
         if !reasons.is_empty() {
-            failures.push(ModuleFailure {
-                name: result.name.clone(),
-                reasons,
-            });
+            failures.push(ModuleFailure { name: result.name, reasons });
+        }
+    });
+    eprintln!(
+        "Multi-module check completed in {:.2?}",
+        check_started.elapsed(),
+    );
+
+    // Driver-level errors first.
+    let mut driver_errors: Vec<String> = Vec::new();
+    for e in &multi_errors {
+        match e {
+            MultiModuleError::CycleInModules(cycle) => {
+                driver_errors.push(format!("cycle: {}", cycle.join(" \u{2194} ")));
+            }
+            other => driver_errors.push(format!("{other:?}")),
         }
     }
 
