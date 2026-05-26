@@ -488,6 +488,14 @@ impl UnifyState {
         self.givens.clone()
     }
 
+    /// `true` when no givens are in scope. Cheap peek over
+    /// `givens_snapshot` for hot paths that early-exit when the
+    /// live givens stack is empty (e.g. `given_discharges_pending`
+    /// inside the solver's `solve_one`).
+    pub fn givens_is_empty(&self) -> bool {
+        self.givens.is_empty()
+    }
+
     fn zonk_constraint(&self, c: &Constraint) -> Constraint {
         Constraint {
             class: c.class.clone(),

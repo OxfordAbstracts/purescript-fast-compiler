@@ -629,6 +629,12 @@ fn given_discharges_pending(
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> bool {
+    // No givens to check against → can't discharge. Skips the zonk
+    // + snapshot clone; this is the bulk of `solve_one`'s deferred
+    // path for view modules (no class constraint in scope).
+    if pending.givens.is_empty() && state.givens_is_empty() {
+        return false;
+    }
     let zp = Constraint {
         class: pending.constraint.class.clone(),
         args: pending.constraint.args.iter().map(|a| state.zonk(a)).collect(),
@@ -885,12 +891,17 @@ fn has_unif_spine_head(
     ty: &Type,
     state: &crate::typecheck_db::unify::UnifyState,
 ) -> bool {
-    let z = state.zonk(ty);
-    let mut cur: &Type = &z;
+    // Walk the App spine via probe, no zonk clone: we only follow
+    // the leftmost child, so cloning the full type just to read its
+    // head is pure waste. Called once per arg per `solve_one`.
+    let mut cur = ty;
     loop {
         match cur {
             Type::App(f, _) => cur = f,
-            Type::Unif(_) => return true,
+            Type::Unif(id) => match state.probe(*id) {
+                None => return true,
+                Some(bound) => cur = bound,
+            },
             _ => return false,
         }
     }
