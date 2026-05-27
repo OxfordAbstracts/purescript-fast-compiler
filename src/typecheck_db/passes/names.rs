@@ -654,6 +654,22 @@ impl Collector {
                 for f in fields {
                     if let Some(v) = &f.value {
                         self.visit_expr(v);
+                    } else {
+                        // Record pun `{ x }` ≡ `{ x: x }`: the field
+                        // value is an implicit unqualified reference to
+                        // `x`. Record it (unless locally bound) so the
+                        // SCC dep graph links the punned name. Without
+                        // this, a sig-less top-level value referenced
+                        // ONLY via a pun gets no dep edge, is ordered
+                        // after its user, and fails with UnboundVar.
+                        let name_str = sym_to_string(f.label.value.symbol());
+                        if !self.is_value_bound(&name_str) {
+                            self.emit(Reference {
+                                kind: NameKind::Value,
+                                module: None,
+                                name: name_str,
+                            });
+                        }
                     }
                     if let Some(ty) = &f.type_ann {
                         self.visit_type(ty);

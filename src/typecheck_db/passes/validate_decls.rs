@@ -5839,6 +5839,14 @@ fn detect_instance_member_sig_mismatch(
             {
                 continue;
             }
+            // Skip when the instance sig carries a type wildcard `_`:
+            // PureScript infers it, so it matches any type and a
+            // structural alpha-eq comparison would spuriously reject
+            // it (e.g. Halogen.Portal's
+            // `toPortalAff :: _ (NT (StoreT act r m) Aff)`).
+            if type_expr_has_wildcard(inst_sig) {
+                continue;
+            }
             if !type_expr_alpha_eq(&expected, inst_sig) {
                 errors.push(ValidationError {
                     span: *span,
@@ -12717,3 +12725,55 @@ fn scan_for_self_app(te: &cst::TypeExpr, errors: &mut Vec<ValidationError>) {
     }
 }
 
+
+#[cfg(test)]
+mod instance_member_sig_tests {
+    use super::*;
+    use crate::parser::parse;
+
+    fn sig_mismatches(src: &str) -> Vec<String> {
+        let module = parse(src).expect("parse");
+        validate_module(&module)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                ValidationErrorKind::InstanceMemberSigMismatch(n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A per-instance method signature that uses a type wildcard `_`
+    // for the head (PureScript infers it) must NOT be flagged as a
+    // mismatch against the class's substituted sig. Mirrors
+    // Halogen.Portal's `toPortalAff :: _ (NT (StoreT act r m) Aff)`.
+    #[test]
+    fn wildcard_head_instance_sig_not_flagged() {
+        let src = "module Test where\n\
+                   \n\
+                   class PortalM m where\n\
+                  \x20 toPortalAff :: m Int\n\
+                   \n\
+                   instance PortalM (StoreT a) where\n\
+                  \x20 toPortalAff :: _ Int\n\
+                  \x20 toPortalAff = go\n\
+                   \n\
+                   foreign import go :: forall a. a\n";
+        assert_eq!(sig_mismatches(src), Vec::<String>::new());
+    }
+
+    // A genuinely-mismatched concrete instance sig is still flagged.
+    #[test]
+    fn concrete_mismatch_still_flagged() {
+        let src = "module Test where\n\
+                   \n\
+                   class C a where\n\
+                  \x20 m :: a -> Int\n\
+                   \n\
+                   instance C Boolean where\n\
+                  \x20 m :: Boolean -> String\n\
+                  \x20 m = go\n\
+                   \n\
+                   foreign import go :: forall a. a\n";
+        assert_eq!(sig_mismatches(src), vec!["m".to_string()]);
+    }
+}

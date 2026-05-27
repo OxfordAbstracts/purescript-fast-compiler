@@ -8,6 +8,14 @@
 use super::harness::assert_typechecks;
 
 #[test]
+fn record_pun_references_sigless_toplevel_value() {
+    // Regression: a record pun must contribute a dependency edge to
+    // the punned name so a sig-less top-level value it references is
+    // ordered before its user (otherwise UnboundVar).
+    assert_typechecks(include_str!("fixtures/single_succeeds/record_pun_sigless_toplevel.purs"));
+}
+
+#[test]
 fn literals_and_lambda() {
     // Int / Number / String / Char / Boolean literals + `identity`
     // + two-arg `const`.
