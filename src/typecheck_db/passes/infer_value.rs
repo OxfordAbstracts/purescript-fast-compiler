@@ -1213,12 +1213,19 @@ pub fn infer_value_scc_with_all(
                 } else {
                     None
                 };
-                let lam_ty = infer_equation(
+                // Seed ONLY constrained-argument positions from the
+                // sig so a rank-2 `(C => T)` parameter carries its
+                // constraint into the body (capability pattern).
+                // Ordinary params stay fresh unifs.
+                let arg_hints =
+                    constrained_arg_hints(env, name, &mut state, binders.len());
+                let lam_ty = infer_equation_with_hints(
                     &mut state,
                     env,
                     type_ops,
                     binders,
                     &guarded_with_where,
+                    arg_hints.as_deref(),
                 )?;
                 state.unify_here(&expected, &lam_ty)?;
                 if let Some(scheme) = sig_scheme_for_pin {
@@ -2121,7 +2128,22 @@ fn infer_app(
             let arg_ty_res = infer_expr(state, env, type_ops, arg);
             state.pop_givens_to(snapshot);
             let arg_ty = arg_ty_res?;
-            state.unify_here(body, &arg_ty)?;
+            // If the argument is itself a constrained value — its type
+            // is `C => U` (e.g. a binder seeded from a `(C => T)` sig,
+            // the capability pattern `withCap inner`) — match
+            // constrained-to-constrained: unify the WHOLE expected
+            // `C => body` with the arg type so the constraints align
+            // and `body` unifies with the arg's body. Unifying only
+            // `body` here would collapse the function's argument and
+            // result and surface a spurious wanted at the sig-pin.
+            // A non-constrained arg keeps the body-unify path: it's a
+            // plain expression checked under `cs` as givens
+            // (`unsafePartial expr`, ctor field `X (Proxy :: _ Int)`).
+            if matches!(state.zonk(&arg_ty), Type::Constrained(_, _)) {
+                state.unify_here(&expected_arg_zonked, &arg_ty)?;
+            } else {
+                state.unify_here(body, &arg_ty)?;
+            }
             return Ok(*ret);
         }
     }
@@ -3304,20 +3326,20 @@ fn infer_equation(
     infer_equation_with_hints(state, env, type_ops, binders, guarded, None)
 }
 
-/// Like `infer_equation` but also unifies each binder's slot
-/// against an optional signature-hinted type. The hints come
-/// from `sig_param_types`, which instantiates the decl's
-/// signature once per SCC and splits out the arrow arguments.
-/// Threading the signature in here is what lets a parameter
-/// like `m :: { return :: forall a. a -> m a }` carry its
-/// polymorphic field types into the body.
+/// Like `infer_equation` but also unifies a binder's slot against a
+/// signature-hinted type at any position where `hints[i]` is `Some`.
+/// Positions with `None` keep their fresh-unif slot (the default
+/// rank-1 behaviour). Used to seed ONLY constrained-argument
+/// positions from the sig — see `constrained_arg_hints` — so a
+/// rank-2 `(C => T)` parameter carries its constraint into the body
+/// (capability pattern) without early-pinning ordinary parameters.
 fn infer_equation_with_hints(
     state: &mut UnifyState,
     env: &mut Env,
     type_ops: &TypeOpMap,
     binders: &[Binder],
     guarded: &ir::GuardedExpr,
-    hints: Option<&[Type]>,
+    hints: Option<&[Option<Type>]>,
 ) -> Result<Type, InferError> {
     if binders.is_empty() {
         return infer_guarded(state, env, type_ops, guarded);
@@ -3327,7 +3349,7 @@ fn infer_equation_with_hints(
     let mut param_tys = Vec::with_capacity(binders.len());
     for (i, b) in binders.iter().enumerate() {
         let ty = bind_pattern(state, env, type_ops, b)?;
-        if let Some(h) = hints.and_then(|hs| hs.get(i)) {
+        if let Some(h) = hints.and_then(|hs| hs.get(i)).and_then(|o| o.as_ref()) {
             state.unify_here(&ty, h)?;
         }
         param_tys.push(ty);
@@ -3721,6 +3743,55 @@ fn sig_param_types(
         }
     }
     Some(args)
+}
+
+/// Build per-binder seeding hints that carry ONLY constrained
+/// argument types from `name`'s signature. Returns `Some(hints)`
+/// (with `hints[i] = Some(ty)` exactly when sig arg `i` is a
+/// `Constrained` type, else `None`) when the decl is signed and at
+/// least one argument position is constrained; otherwise `None`.
+///
+/// This is the seed for the rank-2 capability pattern
+/// (`f :: (C => a) -> a`): without it the binder is a bare unif and
+/// `infer_app`'s constrained-arg branch collapses the function's
+/// argument and result. Only constrained positions are seeded —
+/// pinning ordinary argument types early regresses ~400 ratchets
+/// (the rank-1 body is supposed to infer freely, then pin via the
+/// sig). Constraints are NOT recorded here
+/// (`instantiate_scheme_no_constraints`), so the decl's own
+/// constraints aren't double-counted.
+fn constrained_arg_hints(
+    env: &Env,
+    name: &str,
+    state: &mut UnifyState,
+    arity: usize,
+) -> Option<Vec<Option<Type>>> {
+    if arity == 0 || !env.local_signed.contains(name) {
+        return None;
+    }
+    let scheme = env
+        .top_level
+        .get(&QName { module: None, name: name.to_string() })
+        .map(|arc| arc.as_ref().clone())?;
+    let mono = instantiate_scheme_no_constraints(state, &scheme);
+    let mut hints: Vec<Option<Type>> = Vec::with_capacity(arity);
+    let mut cur = mono;
+    let mut any = false;
+    for _ in 0..arity {
+        match cur {
+            Type::Fun(a, b) => {
+                if matches!(state.zonk(&a), Type::Constrained(_, _)) {
+                    hints.push(Some(*a));
+                    any = true;
+                } else {
+                    hints.push(None);
+                }
+                cur = *b;
+            }
+            _ => return None,
+        }
+    }
+    if any { Some(hints) } else { None }
 }
 
 /// Does the env's scheme for `name` carry a `Partial` constraint?

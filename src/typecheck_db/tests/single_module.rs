@@ -764,12 +764,11 @@ lcm a b =
 }
 
 #[test]
-#[ignore = "known gap: rank-2 constraint in argument position (capability \
-            pattern). The rank-1 infer path doesn't seed binders from \
-            their sig, so `withCap inner` collapses the arg/result unifs \
-            and the sig-pin surfaces a spurious NoInstanceFound. A correct \
-            fix needs binder-seeding/check-mode for constrained-arg sigs; a \
-            surgical infer_app tweak regressed 17 unsafePartial-style cases."]
 fn capability_constrained_argument_discharge() {
+    // Rank-2 constraint in argument position (capability pattern):
+    // `withCap :: (Cap => a) -> a` applied to a binder whose sig type
+    // is `(Cap => Component)`. Constrained-arg binders are seeded from
+    // the sig so the constraint matches instead of surfacing a
+    // spurious NoInstanceFound.
     assert_typechecks(include_str!("fixtures/single_succeeds/capability_constrained_arg.purs"));
 }
