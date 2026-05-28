@@ -473,7 +473,9 @@ pub fn solve_one(
         }
         TRY_MATCH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapshot = state.snapshot_bindings();
-        if let Some((head, context)) = try_match(state, cand, &pending.constraint.args) {
+        if let Some((head, context)) =
+            try_match(state, cand, &pending.constraint.args, instances.aliases())
+        {
             return SolveOutcome::Resolved(ResolvedDict {
                 class: pending.constraint.class.clone(),
                 instance_types: head,
@@ -1354,6 +1356,7 @@ fn try_match(
     state: &mut crate::typecheck_db::unify::UnifyState,
     instance: &crate::typecheck_db::passes::instance_index::Instance,
     target_args: &[Type],
+    aliases: &crate::typecheck_db::types::AliasMap,
 ) -> Option<(Vec<Type>, Vec<Constraint>)> {
     if instance.types.len() != target_args.len() {
         return None;
@@ -1369,8 +1372,30 @@ fn try_match(
         .map(|t| crate::typecheck_db::generalize::apply_var_subst(t, &subst))
         .collect();
     for (inst_ty, target) in head.iter().zip(target_args.iter()) {
+        let per_arg_snap = state.snapshot_bindings();
         if state.unify(inst_ty, target).is_err() {
-            return None;
+            // Retry with the target alias-expanded. Instance heads
+            // were unfolded via `expand_aliases_in_place` at index
+            // registration (including nested aliases like `Schema`
+            // inside a `client` field), but `convert_type_expr`
+            // doesn't expand aliases on the wanted side — so a
+            // wanted's `Con(Schema)` won't unify against a fully-
+            // expanded instance head until we expand it here. Only
+            // retry on FAILURE (so cases that already unify without
+            // expansion are untouched, avoiding the Webb.AffList
+            // / `Refer ShowRef Thread` regression we saw with eager
+            // wanted-side expansion).
+            state.restore_bindings(per_arg_snap);
+            if aliases.is_empty() {
+                return None;
+            }
+            let target_expanded = crate::typecheck_db::types::expand_aliases(
+                target.clone(),
+                aliases,
+            );
+            if state.unify(inst_ty, &target_expanded).is_err() {
+                return None;
+            }
         }
     }
     // Freshen the context with the same subst so constraint args

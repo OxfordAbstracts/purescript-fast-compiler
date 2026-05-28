@@ -99,6 +99,14 @@ pub struct InstanceIndex {
     /// registration time so buggy instances can't corrupt matching.
     #[serde(default)]
     coverage_errors: Vec<CoverageError>,
+    /// Module-level alias map captured at `expand_aliases_in_place`
+    /// time. The solver consults it when initial per-arg unification
+    /// in `try_match` fails, retrying with the target arg
+    /// alias-expanded so a wanted's `Con(Schema)` (unexpanded by
+    /// `convert_type_expr`) can still match an instance head whose
+    /// nested `Schema` got fully unfolded during index registration.
+    #[serde(default)]
+    aliases: crate::typecheck_db::types::AliasMap,
 }
 
 /// Fundep coverage-rule violation: an instance's determined
@@ -177,10 +185,19 @@ impl InstanceIndex {
     /// form (e.g. a `SynString` → `String` alias in the
     /// importing module canonicalizes instance heads that came
     /// through unexpanded).
+    /// Access the alias map captured at the last
+    /// `expand_aliases_in_place` call. Empty when no expansion ran.
+    pub fn aliases(&self) -> &crate::typecheck_db::types::AliasMap {
+        &self.aliases
+    }
+
     pub fn expand_aliases_in_place(
         &mut self,
         aliases: &crate::typecheck_db::types::AliasMap,
     ) {
+        // Stash the alias map so `try_match` can retry on per-arg
+        // failure with the target alias-expanded.
+        self.aliases = aliases.clone();
         if aliases.is_empty() {
             return;
         }
