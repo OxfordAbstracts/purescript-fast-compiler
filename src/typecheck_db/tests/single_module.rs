@@ -772,3 +772,13 @@ fn capability_constrained_argument_discharge() {
     // spurious NoInstanceFound.
     assert_typechecks(include_str!("fixtures/single_succeeds/capability_constrained_arg.purs"));
 }
+
+#[test]
+fn capability_marker_carried_into_scheme() {
+    // A nullary class with zero instances appearing as a sig
+    // constraint on a check_equation-path decl (sig has inner forall)
+    // must DEFER and carry into the scheme, not surface NoInstance at
+    // the definer. Mirrors OaVirtual.Component.Program.GroupedLists's
+    // PublicEventAuth handling.
+    assert_typechecks(include_str!("fixtures/single_succeeds/capability_marker_carried.purs"));
+}

@@ -546,7 +546,20 @@ pub fn solve_one(
             pending.constraint.class.name.as_str(),
             pending.constraint.class.module.as_deref(),
         );
-        if has_unif || is_marker_class {
+        // Capability-marker classes: a NULLARY user class with zero
+        // instances (e.g. PublicEventAuth, AttendeeAuth, AdminAuth)
+        // can only be discharged structurally (via FFI / a sig-origin
+        // given). At the definer, the sig-pin records the decl's own
+        // sig constraint as a pending — those would otherwise emit
+        // NoInstance even though the user's declared sig CARRIES the
+        // constraint. Defer so the constraint propagates into the
+        // inferred scheme (matching reference-compiler semantics: an
+        // unsatisfiable constraint at a sig site stays in the scheme;
+        // the error surfaces only at a use site that can't carry it).
+        let is_capability_marker =
+            pending.constraint.args.is_empty()
+                && pending.origin == ConstraintOrigin::Signature;
+        if has_unif || is_marker_class || is_capability_marker {
             return SolveOutcome::Deferred;
         }
         return SolveOutcome::NoInstance;
