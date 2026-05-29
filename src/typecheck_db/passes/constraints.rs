@@ -1349,6 +1349,41 @@ fn try_magic(
     MagicOutcome::None
 }
 
+/// True when `ty` structurally contains any `Type::Con` whose
+/// (module, name) pair is present in `aliases`. Used by
+/// `try_match`'s alias-expansion retry as a cheap pre-check: if the
+/// target carries no alias-named Cons anywhere, `expand_aliases`
+/// would be a structural no-op (it'd recurse the whole tree just to
+/// allocate a deep clone identical to the input), so we can short-
+/// circuit before paying the clone. Walking is O(n) lookups,
+/// allocation-free.
+fn type_has_alias_con(
+    ty: &Type,
+    aliases: &crate::typecheck_db::types::AliasMap,
+) -> bool {
+    match ty {
+        Type::Con(qn) => {
+            aliases.contains_key(&(qn.module.clone(), qn.name.clone()))
+                || (qn.module.is_some()
+                    && aliases.contains_key(&(None, qn.name.clone())))
+        }
+        Type::App(f, a) | Type::Fun(f, a) | Type::Kinded(f, a) => {
+            type_has_alias_con(f, aliases) || type_has_alias_con(a, aliases)
+        }
+        Type::Forall(_, b) => type_has_alias_con(b, aliases),
+        Type::Constrained(cs, b) => {
+            cs.iter()
+                .any(|c| c.args.iter().any(|x| type_has_alias_con(x, aliases)))
+                || type_has_alias_con(b, aliases)
+        }
+        Type::Record(fs, t) | Type::Row(fs, t) => {
+            fs.iter().any(|(_, v)| type_has_alias_con(v, aliases))
+                || t.as_ref().map_or(false, |t| type_has_alias_con(t, aliases))
+        }
+        _ => false,
+    }
+}
+
 /// Freshen an instance's quantified vars, unify its head with the
 /// target args, and (on success) return the freshened head + context
 /// so the caller can package a `ResolvedDict`.
@@ -1395,6 +1430,17 @@ fn try_match(
             // before retry; intervening solve_ones may have bound the
             // unifs in this target arg).
             let target_zonked = state.zonk(target);
+            // Pre-check: skip the (deep-cloning) `expand_aliases` call
+            // when the target contains NO alias-named Cons. Expansion
+            // would be a structural no-op, and the retry's unify would
+            // fail identically to the first. Critical for performance —
+            // types containing many `<>`-resolved `HookAppend` chains
+            // (no aliases anywhere) would otherwise pay an O(n) clone
+            // per per-arg failure per candidate per module. Walking
+            // for alias-Cons is O(n) lookups, allocation-free.
+            if !type_has_alias_con(&target_zonked, aliases) {
+                return None;
+            }
             let target_expanded = crate::typecheck_db::types::expand_aliases(
                 target_zonked,
                 aliases,
