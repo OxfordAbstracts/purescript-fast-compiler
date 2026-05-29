@@ -1389,8 +1389,14 @@ fn try_match(
             if aliases.is_empty() {
                 return None;
             }
+            // Zonk first so any unif vars that bound to alias names
+            // since `pending.constraint.args` was last zonked become
+            // visible (constraints often defer multiple iterations
+            // before retry; intervening solve_ones may have bound the
+            // unifs in this target arg).
+            let target_zonked = state.zonk(target);
             let target_expanded = crate::typecheck_db::types::expand_aliases(
-                target.clone(),
+                target_zonked,
                 aliases,
             );
             if state.unify(inst_ty, &target_expanded).is_err() {
