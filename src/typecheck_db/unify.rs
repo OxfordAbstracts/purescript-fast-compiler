@@ -800,6 +800,18 @@ impl UnifyState {
             // crashing the process.
             return ty.clone();
         }
+        // Fast path: when `ty` has no Unif anywhere, zonk is a
+        // pure clone-walk that allocates O(N) fresh Arcs only to
+        // produce a structurally-identical tree. With Arc<Type>
+        // recursive fields, `ty.clone()` is O(1) per node (refcount
+        // bump on each Arc field) — vastly cheaper than the walk.
+        // The `has_any_unif` check is itself O(N), but allocation-
+        // free; net win whenever zonk's input is already-resolved
+        // (the common case during constraint-solver retries on
+        // deep `<>`-chains).
+        if !has_any_unif(ty) {
+            return ty.clone();
+        }
         match ty {
             Type::Unif(id) => match self.probe(*id) {
                 Some(bound) => self.zonk_depth(&bound.clone(), depth + 1),
