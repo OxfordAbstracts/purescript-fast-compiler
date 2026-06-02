@@ -1587,6 +1587,7 @@ pub fn infer_value_scc_with_all(
             .iter()
             .filter_map(|pc| pc.decl_name.clone())
             .collect();
+        let trail_before_sig_pin = state.binding_trail_len();
         for n in &signed_decls_with_deferred {
             if !env.local_signed.contains(n) {
                 continue;
@@ -1626,14 +1627,31 @@ pub fn infer_value_scc_with_all(
                 }
             }
         }
+        let sig_pin_bound_anything = state.binding_trail_len() != trail_before_sig_pin;
         // Re-run the solver on the still-deferred constraints with
-        // the (possibly improved) state.
+        // the (possibly improved) state. Skip the redrive entirely
+        // when the sig-pin loop didn't bind anything — without new
+        // bindings, every solve_one would defer for the same reason
+        // it deferred in solve_main, just with a fresh (and empty)
+        // watch. Costs ~50% of solve_all in HasuraActions.Main-shaped
+        // modules (4.8s redrive on top of 4.9s solve_main, exclusively
+        // for an unsigned `handlers` decl whose deferred constraints
+        // can't possibly resolve without external improvement).
         let _solve_all_redrive_start = std::time::Instant::now();
-        let report2 = crate::typecheck_db::passes::constraints::solve_all(
-            &mut state,
-            instances,
-            &deferred,
-        );
+        let report2 = if sig_pin_bound_anything {
+            crate::typecheck_db::passes::constraints::solve_all(
+                &mut state,
+                instances,
+                &deferred,
+            )
+        } else {
+            crate::typecheck_db::passes::constraints::SolveReport {
+                dicts: std::collections::HashMap::new(),
+                dicts_by_span: std::collections::HashMap::new(),
+                errors: std::collections::HashMap::new(),
+                deferred: deferred.clone(),
+            }
+        };
         t_solve_all_redrive = _solve_all_redrive_start.elapsed();
         if state.deadline_exceeded() {
             let budget = state.deadline_budget_ms();
