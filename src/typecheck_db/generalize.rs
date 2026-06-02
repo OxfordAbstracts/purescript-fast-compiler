@@ -270,6 +270,46 @@ fn var_name(n: usize) -> String {
     }
 }
 
+/// True when `ty` contains any `Type::Var(name)` whose name appears as a
+/// key in `subst`. Used as a cheap pre-check in [`apply_var_subst`] so
+/// the by-value walk skips re-allocating an identical tree.
+fn any_var_matches(ty: &Type, subst: &HashMap<String, Type>) -> bool {
+    match ty {
+        Type::Var(name) => subst.contains_key(name),
+        Type::App(f, a) | Type::Fun(f, a) => {
+            any_var_matches(f, subst) || any_var_matches(a, subst)
+        }
+        Type::Forall(vars, body) => {
+            // Quantified vars shadow outer bindings — they're locally
+            // bound, not substituted. Treat the body as if `vars` were
+            // removed from `subst`. Cheap because the body usually
+            // doesn't reference the quantified names directly.
+            let any_kind_match = vars.iter().any(|(_, _, k)| {
+                k.as_ref().map_or(false, |kk| any_var_matches(kk, subst))
+            });
+            if any_kind_match {
+                return true;
+            }
+            // If every quantified var shadows a subst key, the body
+            // can't see any of those keys — bail on body walk only
+            // when there's a key NOT shadowed.
+            let any_unshadowed = subst.keys().any(|k| !vars.iter().any(|(n, _, _)| n == k));
+            any_unshadowed && any_var_matches(body, subst)
+        }
+        Type::Constrained(cs, body) => {
+            cs.iter()
+                .any(|c| c.args.iter().any(|a| any_var_matches(a, subst)))
+                || any_var_matches(body, subst)
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            fs.iter().any(|(_, t)| any_var_matches(t, subst))
+                || tail.as_ref().map_or(false, |t| any_var_matches(t, subst))
+        }
+        Type::Kinded(t, k) => any_var_matches(t, subst) || any_var_matches(k, subst),
+        _ => false,
+    }
+}
+
 /// Substitute unification variables using `subst`.
 pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
     match ty {
@@ -327,6 +367,23 @@ pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
 
 /// Substitute rigid type variables using `subst` (keyed by variable name).
 pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    // Fast path: an empty subst is a no-op. With Arc<Type>, `ty.clone()`
+    // is O(1) per node (Arc refcount bumps) — vastly cheaper than the
+    // walk that allocates fresh Arcs at every node.
+    if subst.is_empty() {
+        return ty.clone();
+    }
+    // Fast path: when no Var in `ty` matches any key in `subst`, the
+    // walk reconstructs an identical tree. Allocation-free check first,
+    // then bail with the same Arc-cheap `ty.clone()`. Critical for the
+    // constraint solver's `try_match`, which calls `apply_var_subst`
+    // once per instance.type per candidate per solve_one — for
+    // Newtype-heavy modules (~1000 Newtype constraints × ~10
+    // candidates with concrete body types), the walks dominated
+    // solve_all time.
+    if !any_var_matches(ty, subst) {
+        return ty.clone();
+    }
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::App(f, a) => Type::app(

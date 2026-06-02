@@ -356,23 +356,20 @@ pub fn solve_one(
     // once so the per-candidate filter below is cheap. `None` slots
     // (target is a unif / Var / row / etc.) impose no constraint —
     // any candidate at that position is a structural match.
+    //
+    // Uses the probe-based `app_spine_head_arity_probing` so a deep
+    // Record/Row arg with internal Unifs (common for solver-heavy
+    // record-record Newtype constraints) isn't zonked just to read
+    // its outer head — the Unifs are deep in field types, not on
+    // the App-spine head, so zonking allocates O(N) for nothing.
     let target_heads: Vec<Option<(crate::typecheck_db::types::QName, usize)>> =
         pending
             .constraint
             .args
             .iter()
             .map(|a| {
-                // Skip zonk for fully-concrete args — the only reason
-                // to zonk here is to expose a bound unif's structural
-                // head, which doesn't exist if no unif is present.
-                // For solver-heavy modules this fires for the bulk of
-                // constraint args (concrete Type::Con-headed shapes).
-                if crate::typecheck_db::unify::has_any_unif(a) {
-                    let z = state.zonk(a);
-                    app_spine_head_arity(&z).map(|(qn, ar)| (qn.clone(), ar))
-                } else {
-                    app_spine_head_arity(a).map(|(qn, ar)| (qn.clone(), ar))
-                }
+                app_spine_head_arity_probing(a, state)
+                    .map(|(qn, ar)| (qn.clone(), ar))
             })
             .collect();
     // Overlap-aware deferral. When the target contains a unif AND
@@ -593,20 +590,19 @@ pub fn solve_one(
     // `Type → Type → Type` but Apply expects `Type → Type`),
     // or `Unfoldable1 (Tuple a)` (only `Unfoldable1 Array` /
     // `Maybe` instances exist; Tuple doesn't fit).
-    let zonked_args: Vec<Type> = pending
-        .constraint
-        .args
-        .iter()
-        .map(|a| state.zonk(a))
-        .collect();
     // Kind-mismatch / wrong-shape defer: if any arg's App-spine
     // head + arity doesn't match any instance's head + arity,
     // the constraint can never be solved. Match on (head_qn,
     // app_spine_arity) — `Apply Tuple` has arity 0 (no apps),
     // `Apply (Tuple a)` instance has arity 1. Different keys
     // → no candidate fits → defer.
-    let head_shape_mismatch = zonked_args.iter().enumerate().any(|(i, arg)| {
-        if let Some((arg_qn, arg_arity)) = app_spine_head_arity(arg) {
+    //
+    // Uses the probe-based head walker rather than zonking every
+    // arg — for deep `Record`/`Row` args with internal `Unif`s
+    // (Newtype-record constraints in solver-heavy modules), zonk
+    // would allocate O(N) just to read the outer head.
+    let head_shape_mismatch = pending.constraint.args.iter().enumerate().any(|(i, arg)| {
+        if let Some((arg_qn, arg_arity)) = app_spine_head_arity_probing(arg, state) {
             !cands.iter().filter(|c| cand_matches_class_module(c)).any(|cand| {
                 cand.types
                     .get(i)
@@ -942,6 +938,34 @@ fn has_unif_spine_head(
                 Some(bound) => cur = bound,
             },
             _ => return false,
+        }
+    }
+}
+
+/// Walk an App-spine following bound `Unif`s at each level. Returns
+/// `(head_qname, arity)` when the head reduces to a `Con`. Same
+/// shape as [`app_spine_head_arity`] but probe-based: never clones
+/// or allocates, just follows bindings. Used by `solve_one` to
+/// compute `target_heads` without zonking deep `Record`/`Row` args
+/// whose internal `Unif`s are irrelevant to head matching.
+fn app_spine_head_arity_probing<'a>(
+    ty: &'a Type,
+    state: &'a crate::typecheck_db::unify::UnifyState,
+) -> Option<(&'a crate::typecheck_db::types::QName, usize)> {
+    let mut cur = ty;
+    let mut arity: usize = 0;
+    loop {
+        match cur {
+            Type::App(f, _) => {
+                arity += 1;
+                cur = f;
+            }
+            Type::Con(qn) => return Some((qn, arity)),
+            Type::Unif(id) => match state.probe(*id) {
+                Some(bound) => cur = bound,
+                None => return None,
+            },
+            _ => return None,
         }
     }
 }

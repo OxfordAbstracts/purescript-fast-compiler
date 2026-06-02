@@ -849,6 +849,75 @@ fn hookappend_cluster_typechecks() {
     }
 }
 
+/// Profiler reproducer for `HasuraActions.Main`'s 10s decl-timeout.
+/// The module has a single ~100-field record literal (`handlers`)
+/// whose fields are mostly bare names plus ~25 explicit type
+/// ascriptions of shape `name: name :: _ -> AppM _`. Inference of
+/// the whole record blows the 10s per-decl budget. Used for
+/// `TYPECHECK_DB_PROFILE_SLOW=1` triage.
+#[test]
+#[ignore = "perf regression target — HasuraActions.Main 10s decl timeout"]
+fn repro_hasura_actions_main_perf() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("repro_hasura_actions_main".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::env::set_var("TYPECHECK_DB_PROFILE_SLOW", "1");
+                let pkgs = application_modules_by_name();
+                let target = "HasuraActions.Main";
+                if !pkgs.contains_key(target) {
+                    return Err(format!("{target} missing from application sources"));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!("[repro] {target} closure: {} modules", closure.len());
+                let started = std::time::Instant::now();
+                let mut hits: Vec<String> = Vec::new();
+                let multi = check_many_modules_streaming(closure, |result| {
+                    if result.name == "HasuraActions.Main"
+                        && (result.inference_error.is_some()
+                            || !result.constraint_errors.is_empty())
+                    {
+                        hits.push(format!(
+                            "{}: infer={:?} constraints={}",
+                            result.name,
+                            result.inference_error,
+                            result.constraint_errors.len(),
+                        ));
+                    }
+                });
+                let elapsed = started.elapsed();
+                eprintln!("[repro] closure check finished in {elapsed:.2?}");
+                for e in &multi {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                if !hits.is_empty() {
+                    return Err(format!("HasuraActions.Main failed:\n  {}", hits.join("\n  ")));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn repro thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_hasura_actions_main_perf: {msg}");
+    }
+}
+
 /// Verifies the `Query.Event.*` cluster typechecks clean — guards
 /// against regression of the Puregres.Select solver-depth fix. The
 /// 4 affected modules (SelectEvent, SelectAllEvents,
