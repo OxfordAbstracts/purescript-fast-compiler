@@ -849,6 +849,72 @@ fn hookappend_cluster_typechecks() {
     }
 }
 
+/// Reproducer for the `Query.Event.*` SolverDepthExceeded cluster
+/// (4 modules: SelectEvent, SelectAllEvents, SelectEventsFromEventIds,
+/// SelectEventsFromClientId — all using `Puregres.Select`'s
+/// typeclass chains). Currently fails with SolverDepthExceeded on
+/// Coercible / Semigroupoid; tracked here while triaging.
+#[test]
+#[ignore = "diagnostic — Puregres.Select solver depth cluster"]
+fn query_event_select_event_typechecks() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("query_event_select_event".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pkgs = application_modules_by_name();
+                let target = "Query.Event.SelectEvent";
+                if !pkgs.contains_key(target) {
+                    return Err(format!("{target} missing from application sources"));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!("[repro] {target} closure: {} modules", closure.len());
+                let mut hits: Vec<String> = Vec::new();
+                let multi = check_many_modules_streaming(closure, |result| {
+                    if (result.name.starts_with("Query.Event.")
+                        || result.name == target)
+                        && (result.inference_error.is_some()
+                            || !result.constraint_errors.is_empty())
+                    {
+                        hits.push(format!(
+                            "{}: infer={:?} constraints={:?}",
+                            result.name, result.inference_error, result.constraint_errors,
+                        ));
+                    }
+                });
+                for e in &multi {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                if !hits.is_empty() {
+                    return Err(format!(
+                        "Query.Event modules failed:\n  {}",
+                        hits.join("\n  "),
+                    ));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn query_event thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("query_event_select_event_typechecks: {msg}");
+    }
+}
+
 /// Focused reproducer for the slowest module in the OA sweep:
 /// `AdminDashboard.Pages.ProgramBuilder.Session.View` — 2155 lines,
 /// 68 imports, 24+ top-level decls. Took 64.8s in the latest sweep.
