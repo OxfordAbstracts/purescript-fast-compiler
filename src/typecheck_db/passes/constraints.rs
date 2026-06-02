@@ -1493,8 +1493,15 @@ fn try_match(
 
 /// Maximum number of solver iterations before giving up. Guards
 /// against pathological self-referential instances like
-/// `instance Loop a => Loop a`.
-const MAX_SOLVER_DEPTH: usize = 128;
+/// `instance Loop a => Loop a`. Each iteration unwinds at most one
+/// level of any single constraint chain (sub-wanteds emitted by a
+/// resolved instance go to `carry_forward` and are processed on the
+/// NEXT pass), so very long inductive chains need a budget that
+/// scales with the chain depth. 256 fits Puregres.Select's
+/// `Show (ColCons _ (ColCons _ (… × ~150)) → ColNil)` chains
+/// without raising the cap for genuine self-referential loops
+/// (those would still exceed any practical bound).
+const MAX_SOLVER_DEPTH: usize = 256;
 
 /// Drain a list of pending constraints and emit per-decl
 /// resolutions + errors. Runs a fixed-point loop: each match may

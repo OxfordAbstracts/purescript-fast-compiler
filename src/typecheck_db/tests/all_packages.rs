@@ -849,13 +849,16 @@ fn hookappend_cluster_typechecks() {
     }
 }
 
-/// Reproducer for the `Query.Event.*` SolverDepthExceeded cluster
-/// (4 modules: SelectEvent, SelectAllEvents, SelectEventsFromEventIds,
-/// SelectEventsFromClientId — all using `Puregres.Select`'s
-/// typeclass chains). Currently fails with SolverDepthExceeded on
-/// Coercible / Semigroupoid; tracked here while triaging.
+/// Verifies the `Query.Event.*` cluster typechecks clean — guards
+/// against regression of the Puregres.Select solver-depth fix. The
+/// 4 affected modules (SelectEvent, SelectAllEvents,
+/// SelectEventsFromEventIds, SelectEventsFromClientId) used to fail
+/// SolverDepthExceeded on Semigroupoid / Coercible / Show chains;
+/// closed by commit 07cf12a6 (`(->)/Function` head-shape alias) plus
+/// MAX_SOLVER_DEPTH 128 → 256 (inductive ColCons chains need >150
+/// iterations to fully unwind).
 #[test]
-#[ignore = "diagnostic — Puregres.Select solver depth cluster"]
+#[ignore = "requires application-copy sources"]
 fn query_event_select_event_typechecks() {
     let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
         .name("query_event_select_event".into())
