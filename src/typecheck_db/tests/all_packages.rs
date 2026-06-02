@@ -776,6 +776,79 @@ fn run_all_packages_check() -> Result<(), String> {
     Ok(())
 }
 
+/// Verifies the `OaVirtual.Hooks.DOM.Keypress` closure typechecks
+/// clean — guards the qualified type-op fix (driver_multi.rs's
+/// registration of `H.<>` → `HookAppend` for `import M as Q`).
+/// Without that fix, the module fails with
+/// `Mismatch(Con(HookAppend), Con(Some("Hooks"), "<>"))`. Cheap to
+/// run (~few-second closure) so it RED-confirms the cluster
+/// without the full `build_from_sources_typecheck` sweep.
+#[test]
+#[ignore = "requires application-copy sources"]
+fn hookappend_cluster_typechecks() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("hookappend_cluster".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pkgs = application_modules_by_name();
+                let target = "OaVirtual.Hooks.DOM.Keypress";
+                if !pkgs.contains_key(target) {
+                    return Err(format!(
+                        "{target} missing from application sources",
+                    ));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!("[repro] {target} closure: {} modules", closure.len());
+                let mut hook_errors: Vec<String> = Vec::new();
+                let multi = check_many_modules_streaming(closure, |result| {
+                    if (result.name == "OaVirtual.Hooks.DOM.Keypress"
+                        || result.name == "OaVirtual.Hooks.DOM.Click"
+                        || result.name == "Review.Hooks.DOM.Keypress")
+                        && (result.inference_error.is_some()
+                            || !result.constraint_errors.is_empty())
+                    {
+                        hook_errors.push(format!(
+                            "{}: infer={:?} constraints={:?}",
+                            result.name,
+                            result.inference_error,
+                            result.constraint_errors,
+                        ));
+                    }
+                });
+                for e in &multi {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                if !hook_errors.is_empty() {
+                    return Err(format!(
+                        "HookAppend cluster modules failed:\n  {}",
+                        hook_errors.join("\n  "),
+                    ));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn hookappend thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("hookappend_cluster_typechecks: {msg}");
+    }
+}
+
 /// Focused reproducer for the slowest module in the OA sweep:
 /// `AdminDashboard.Pages.ProgramBuilder.Session.View` — 2155 lines,
 /// 68 imports, 24+ top-level decls. Took 64.8s in the latest sweep.

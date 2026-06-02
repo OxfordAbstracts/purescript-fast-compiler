@@ -544,12 +544,6 @@ fn check_one_module(
     // start dropping entries like Type.Row's `+` → RowApply and
     // Type.Function's `$` → Apply, so we no longer apply it here.
     for imp in &module.imports {
-        // Qualified-only imports (`import M as Q`) put type operators
-        // under `Q./\` only — they don't make the operator
-        // available as bare `/\`. Skip such imports here.
-        if imp.qualified.is_some() {
-            continue;
-        }
         let mod_name = imp
             .module
             .parts
@@ -557,6 +551,54 @@ fn check_one_module(
             .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
             .collect::<Vec<_>>()
             .join(".");
+        // Qualified-only imports (`import M as Q`) make type
+        // operators available ONLY under `Q.<op>`, not bare `<op>`.
+        // Register every imported type fixity under the
+        // (Some(qualifier), op) key so `convert_type_expr`'s
+        // qualified-op lookup finds it. Without this, `H.<>`
+        // (where `H` aliases Halogen.Hooks) stays as
+        // `Con(Some("H"), "<>")` and mismatches against the
+        // qualified target reached via a different code path.
+        // Closes the HookAppend cluster (OaVirtual.Hooks.DOM.{Keypress,
+        // Click}, Review.Hooks.DOM.Keypress).
+        if let Some(qualifier) = &imp.qualified {
+            if let Some(exports) = registry.get(&mod_name) {
+                if exports.type_fixities.is_empty() {
+                    continue;
+                }
+                let qualifier_str = qualifier
+                    .parts
+                    .iter()
+                    .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                for (op_name, decl) in &exports.type_fixities {
+                    let imported = match &imp.imports {
+                        None => true,
+                        Some(cst::ImportList::Hiding(list)) => {
+                            !list.iter().any(|item| matches!(item,
+                                cst::Import::TypeOp(n)
+                                if crate::typecheck_db::util::resolve_symbol(n.value.symbol()) == *op_name))
+                        }
+                        Some(cst::ImportList::Explicit(list)) => {
+                            list.iter().any(|item| matches!(item,
+                                cst::Import::TypeOp(n)
+                                if crate::typecheck_db::util::resolve_symbol(n.value.symbol()) == *op_name))
+                        }
+                    };
+                    if imported {
+                        let target = crate::typecheck_db::types::QName {
+                            module: decl.target_module.clone(),
+                            name: decl.target_name.clone(),
+                        };
+                        type_ops
+                            .entry((Some(qualifier_str.clone()), op_name.clone()))
+                            .or_insert(target);
+                    }
+                }
+            }
+            continue;
+        }
         if let Some(exports) = registry.get(&mod_name) {
             if exports.type_fixities.is_empty() {
                 continue;
