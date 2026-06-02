@@ -97,7 +97,7 @@ fn strip_forall(ty: Type) -> (Vec<String>, Type) {
     match ty {
         Type::Forall(qs, body) => {
             let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
-            (names, *body)
+            (names, std::sync::Arc::unwrap_or_clone(body))
         }
         other => (Vec::new(), other),
     }
@@ -364,7 +364,7 @@ pub mod check_class {
                                 .collect(),
                         };
                         let constrained =
-                            Type::Constrained(vec![constraint], Box::new(method_body));
+                            Type::Constrained(vec![constraint], std::sync::Arc::new(method_body));
                         let mut all_vars = vars.clone();
                         all_vars.extend(method_vars);
                         (mname, Scheme { vars: all_vars, ty: constrained })

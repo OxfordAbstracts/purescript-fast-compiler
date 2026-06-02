@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -290,24 +291,32 @@ impl fmt::Display for Type {
 /// The `Unif` variant is only meaningful *during* inference. Any `Type`
 /// stored in a cache blob must be fully zonked — no remaining unification
 /// variables.
+// Recursive type-tree nodes use `Arc` so cloning a `Type` is O(1)
+// per child (refcount bump) rather than a deep structural clone. The
+// typechecker clones Types VERY heavily (every `unify`, `zonk`,
+// `expand_aliases`, `apply_var_subst` walks and may re-materialize a
+// tree); with `Box`, modules whose types are deep (e.g. the
+// `HookAppend`-chain-resolved trees in `AdminDashboard.Pages.*`)
+// blew memory to 90+ GB in the build_from_sources sweep. With `Arc`,
+// unchanged subtrees are shared across clones and zonks.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Type {
     Var(String),
     Con(QName),
-    App(Box<Type>, Box<Type>),
-    Fun(Box<Type>, Box<Type>),
+    App(Arc<Type>, Arc<Type>),
+    Fun(Arc<Type>, Arc<Type>),
     /// Quantifier vars: `(name, visible, optional_kind)`.
-    Forall(Vec<(String, bool, Option<Box<Type>>)>, Box<Type>),
-    Constrained(Vec<Constraint>, Box<Type>),
+    Forall(Vec<(String, bool, Option<Arc<Type>>)>, Arc<Type>),
+    Constrained(Vec<Constraint>, Arc<Type>),
     /// Closed or open record type: `{ l1 :: T1, l2 :: T2 | r }`.
-    Record(Vec<(String, Type)>, Option<Box<Type>>),
+    Record(Vec<(String, Type)>, Option<Arc<Type>>),
     /// Row type: `( l1 :: T1, l2 :: T2 | r )`.
-    Row(Vec<(String, Type)>, Option<Box<Type>>),
+    Row(Vec<(String, Type)>, Option<Arc<Type>>),
     Hole(String),
     Wildcard,
     TypeString(String),
     TypeInt(i64),
-    Kinded(Box<Type>, Box<Type>),
+    Kinded(Arc<Type>, Arc<Type>),
     /// A mutable unification variable; resolved during inference.
     /// Must not appear in any serialized output.
     Unif(u32),
@@ -329,7 +338,7 @@ impl Type {
     }
 
     pub fn fun(from: Type, to: Type) -> Type {
-        Type::Fun(Box::new(from), Box::new(to))
+        Type::Fun(Arc::new(from), Arc::new(to))
     }
 
     pub fn app(f: Type, arg: Type) -> Type {
@@ -345,11 +354,11 @@ impl Type {
         if let Type::App(inner_f, inner_a) = &f {
             if let Type::Con(qn) = inner_f.as_ref() {
                 if qn.name == "->" || qn.name == "Function" {
-                    return Type::Fun(Box::new(inner_a.as_ref().clone()), Box::new(arg));
+                    return Type::Fun(Arc::clone(inner_a), Arc::new(arg));
                 }
             }
         }
-        Type::App(Box::new(f), Box::new(arg))
+        Type::App(Arc::new(f), Arc::new(arg))
     }
 }
 
@@ -418,16 +427,24 @@ pub fn expand_aliases(ty: Type, aliases: &AliasMap) -> Type {
     // give up after `MAX_EXPANSIONS` so a broken user alias
     // can't hang the typechecker. 64 is generous; most real
     // alias chains are 1–3 deep.
+    //
+    // Iteration uses `Arc<Type>` + `Arc::ptr_eq` so each pass
+    // shares unchanged subtrees with the input rather than
+    // deep-cloning the whole tree. Critical for hot paths like
+    // `try_match`'s alias-expansion retry: a target like
+    // `H.UseEffect <> H.Pure <> …` (deeply nested
+    // `App(App(Con(HookAppend), …), …)` chain) doesn't allocate
+    // new Arcs for every internal node when no alias matches.
     const MAX_EXPANSIONS: usize = 64;
-    let mut current = ty;
+    let mut current = Arc::new(ty);
     for _ in 0..MAX_EXPANSIONS {
-        let expanded = expand_once(&current, aliases);
-        if expanded == current {
-            return expanded;
+        let expanded = expand_once_arc(&current, aliases);
+        if Arc::ptr_eq(&expanded, &current) {
+            return Arc::unwrap_or_clone(expanded);
         }
         current = expanded;
     }
-    current
+    Arc::unwrap_or_clone(current)
 }
 
 /// True when `ty` structurally contains `Con(name)` (module
@@ -547,6 +564,197 @@ fn body_mentions_qname(ty: &Type, module: &Option<String>, name: &str) -> bool {
     }
 }
 
+/// Like [`Type::app`] but Arc-native: takes ownership of Arc'd children
+/// and performs the `(->) a b → Fun(a, b)` normalisation without
+/// unwrapping/recloning the inner Arc.
+fn arc_app(f: Arc<Type>, a: Arc<Type>) -> Arc<Type> {
+    if let Type::App(inner_f, inner_a) = f.as_ref() {
+        if let Type::Con(qn) = inner_f.as_ref() {
+            if qn.name == "->" || qn.name == "Function" {
+                return Arc::new(Type::Fun(Arc::clone(inner_a), a));
+            }
+        }
+    }
+    Arc::new(Type::App(f, a))
+}
+
+/// Arc-native alias expansion. Returns `Arc::clone(input)` (pointer-equal)
+/// when no subterm of `ty` matched an alias — caller uses `Arc::ptr_eq`
+/// to detect the fixed point cheaply. The expansion path itself
+/// (substituting alias body, walking new structure) still allocates,
+/// but the no-op walk is allocation-free which is the common case
+/// during constraint-solver retries on deep `<>`-chains.
+fn expand_once_arc(ty: &Arc<Type>, aliases: &AliasMap) -> Arc<Type> {
+    // Alias-match path: try the head + spine.
+    let spine = collect_app_spine(ty);
+    if let Some((Type::Con(qn), args)) = spine {
+        let entry = if qn.module.is_some() {
+            aliases.get(&(qn.module.clone(), qn.name.clone()))
+        } else {
+            aliases.get(&(None, qn.name.clone()))
+        };
+        if let Some((vars, body)) = entry {
+            if !body_mentions_qname(body, &qn.module, &qn.name) {
+                let n_args = args.len();
+                let n_vars = vars.len();
+                if n_vars == n_args {
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::with_capacity(n_vars);
+                    for (v, a) in vars.iter().zip(args.iter()) {
+                        subst.insert(v.clone(), expand_once(a, aliases));
+                    }
+                    return Arc::new(
+                        crate::typecheck_db::generalize::apply_var_subst(body, &subst),
+                    );
+                } else if n_args > n_vars {
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::with_capacity(n_vars);
+                    for (v, a) in vars.iter().zip(args.iter()) {
+                        subst.insert(v.clone(), expand_once(a, aliases));
+                    }
+                    let expanded =
+                        crate::typecheck_db::generalize::apply_var_subst(body, &subst);
+                    return Arc::new(args[n_vars..].iter().fold(expanded, |acc, a| {
+                        Type::app(acc, expand_once(a, aliases))
+                    }));
+                } else if let Some(eta_body) = try_eta_reduce(body, &vars[n_args..])
+                {
+                    let mut subst: std::collections::HashMap<String, Type> =
+                        std::collections::HashMap::with_capacity(n_args);
+                    for (v, a) in vars[..n_args].iter().zip(args.iter()) {
+                        subst.insert(v.clone(), expand_once(a, aliases));
+                    }
+                    return Arc::new(
+                        crate::typecheck_db::generalize::apply_var_subst(
+                            &eta_body, &subst,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // No alias match — walk children. The Arc::ptr_eq fast path
+    // returns Arc::clone(ty) when EVERY child's recursive call was
+    // a no-op, propagating "unchanged" up the tree. For trees that
+    // contain no aliases at all (the common retry-path case), this
+    // avoids ALL allocation.
+    match ty.as_ref() {
+        Type::App(f, a) => {
+            let f2 = expand_once_arc(f, aliases);
+            let a2 = expand_once_arc(a, aliases);
+            if Arc::ptr_eq(&f2, f) && Arc::ptr_eq(&a2, a) {
+                return Arc::clone(ty);
+            }
+            arc_app(f2, a2)
+        }
+        Type::Fun(a, b) => {
+            let a2 = expand_once_arc(a, aliases);
+            let b2 = expand_once_arc(b, aliases);
+            if Arc::ptr_eq(&a2, a) && Arc::ptr_eq(&b2, b) {
+                return Arc::clone(ty);
+            }
+            Arc::new(Type::Fun(a2, b2))
+        }
+        Type::Forall(vars, body) => {
+            let body2 = expand_once_arc(body, aliases);
+            if Arc::ptr_eq(&body2, body) {
+                return Arc::clone(ty);
+            }
+            Arc::new(Type::Forall(vars.clone(), body2))
+        }
+        Type::Constrained(cs, body) => {
+            let body2 = expand_once_arc(body, aliases);
+            // Constraint.args is Vec<Type> (not Arc), so we use the
+            // by-value `expand_once` and compare via PartialEq. For
+            // the no-op case the comparison is cheap (Type structural
+            // equality short-circuits on first difference); for the
+            // common case where constraints carry NO aliases at all,
+            // it's equivalent to a walk.
+            let mut cs_changed = false;
+            let cs2: Vec<Constraint> = cs
+                .iter()
+                .map(|c| {
+                    let args2: Vec<Type> = c
+                        .args
+                        .iter()
+                        .map(|x| {
+                            let e = expand_once(x, aliases);
+                            if e != *x {
+                                cs_changed = true;
+                            }
+                            e
+                        })
+                        .collect();
+                    Constraint { class: c.class.clone(), args: args2 }
+                })
+                .collect();
+            if Arc::ptr_eq(&body2, body) && !cs_changed {
+                return Arc::clone(ty);
+            }
+            Arc::new(Type::Constrained(cs2, body2))
+        }
+        Type::Record(fs, tail) => {
+            let mut fs_changed = false;
+            let fs2: Vec<(String, Type)> = fs
+                .iter()
+                .map(|(l, t)| {
+                    let e = expand_once(t, aliases);
+                    if e != *t {
+                        fs_changed = true;
+                    }
+                    (l.clone(), e)
+                })
+                .collect();
+            let (tail2, tail_changed) = match tail {
+                Some(t) => {
+                    let t2 = expand_once_arc(t, aliases);
+                    let changed = !Arc::ptr_eq(&t2, t);
+                    (Some(t2), changed)
+                }
+                None => (None, false),
+            };
+            if !fs_changed && !tail_changed {
+                return Arc::clone(ty);
+            }
+            Arc::new(Type::Record(fs2, tail2))
+        }
+        Type::Row(fs, tail) => {
+            let mut fs_changed = false;
+            let fs2: Vec<(String, Type)> = fs
+                .iter()
+                .map(|(l, t)| {
+                    let e = expand_once(t, aliases);
+                    if e != *t {
+                        fs_changed = true;
+                    }
+                    (l.clone(), e)
+                })
+                .collect();
+            let (tail2, tail_changed) = match tail {
+                Some(t) => {
+                    let t2 = expand_once_arc(t, aliases);
+                    let changed = !Arc::ptr_eq(&t2, t);
+                    (Some(t2), changed)
+                }
+                None => (None, false),
+            };
+            if !fs_changed && !tail_changed {
+                return Arc::clone(ty);
+            }
+            Arc::new(Type::Row(fs2, tail2))
+        }
+        Type::Kinded(t, k) => {
+            let t2 = expand_once_arc(t, aliases);
+            let k2 = expand_once_arc(k, aliases);
+            if Arc::ptr_eq(&t2, t) && Arc::ptr_eq(&k2, k) {
+                return Arc::clone(ty);
+            }
+            Arc::new(Type::Kinded(t2, k2))
+        }
+        _ => Arc::clone(ty),
+    }
+}
+
 fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
     // Collect the Con head + its App spine so we can try to
     // match the whole applied form against an alias. Anything
@@ -632,7 +840,7 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
         Type::App(f, a) => Type::app(expand_once(f, aliases), expand_once(a, aliases)),
         Type::Fun(a, b) => Type::fun(expand_once(a, aliases), expand_once(b, aliases)),
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_once(body, aliases)))
+            Type::Forall(vars.clone(), Arc::new(expand_once(body, aliases)))
         }
         Type::Constrained(cs, body) => {
             let cs = cs
@@ -642,23 +850,23 @@ fn expand_once(ty: &Type, aliases: &AliasMap) -> Type {
                     args: c.args.iter().map(|x| expand_once(x, aliases)).collect(),
                 })
                 .collect();
-            Type::Constrained(cs, Box::new(expand_once(body, aliases)))
+            Type::Constrained(cs, Arc::new(expand_once(body, aliases)))
         }
         Type::Record(fs, tail) => Type::Record(
             fs.iter()
                 .map(|(l, t)| (l.clone(), expand_once(t, aliases)))
                 .collect(),
-            tail.as_ref().map(|t| Box::new(expand_once(t, aliases))),
+            tail.as_ref().map(|t| Arc::new(expand_once(t, aliases))),
         ),
         Type::Row(fs, tail) => Type::Row(
             fs.iter()
                 .map(|(l, t)| (l.clone(), expand_once(t, aliases)))
                 .collect(),
-            tail.as_ref().map(|t| Box::new(expand_once(t, aliases))),
+            tail.as_ref().map(|t| Arc::new(expand_once(t, aliases))),
         ),
         Type::Kinded(t, k) => Type::Kinded(
-            Box::new(expand_once(t, aliases)),
-            Box::new(expand_once(k, aliases)),
+            Arc::new(expand_once(t, aliases)),
+            Arc::new(expand_once(k, aliases)),
         ),
         other => other.clone(),
     }
@@ -673,8 +881,8 @@ fn collect_app_spine(ty: &Type) -> Option<(Type, Vec<Type>)> {
     loop {
         match cursor {
             Type::App(f, a) => {
-                args.push(*a);
-                cursor = *f;
+                args.push(Arc::unwrap_or_clone(a));
+                cursor = Arc::unwrap_or_clone(f);
             }
             other => {
                 if args.is_empty() {
@@ -839,11 +1047,11 @@ pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
                     (
                         resolve(v.value.symbol()),
                         *visible,
-                        kind.as_ref().map(|k| Box::new(convert_type_expr(k, type_ops))),
+                        kind.as_ref().map(|k| Arc::new(convert_type_expr(k, type_ops))),
                     )
                 })
                 .collect();
-            Type::Forall(vs, Box::new(convert_type_expr(ty, type_ops)))
+            Type::Forall(vs, Arc::new(convert_type_expr(ty, type_ops)))
         }
         TE::Constrained { constraints, ty, .. } => {
             let cs = constraints
@@ -856,7 +1064,7 @@ pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
                     args: c.args.iter().map(|a| convert_type_expr(a, type_ops)).collect(),
                 })
                 .collect();
-            Type::Constrained(cs, Box::new(convert_type_expr(ty, type_ops)))
+            Type::Constrained(cs, Arc::new(convert_type_expr(ty, type_ops)))
         }
         TE::Record { fields, .. } => Type::Record(
             fields
@@ -870,7 +1078,7 @@ pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
                 .iter()
                 .map(|f| (resolve(f.label.value.symbol()), convert_type_expr(&f.ty, type_ops)))
                 .collect();
-            let t = tail.as_ref().map(|t| Box::new(convert_type_expr(t, type_ops)));
+            let t = tail.as_ref().map(|t| Arc::new(convert_type_expr(t, type_ops)));
             if *is_record {
                 Type::Record(fs, t)
             } else {
@@ -896,8 +1104,8 @@ pub fn convert_type_expr(ty: &cst::TypeExpr, type_ops: &TypeOpMap) -> Type {
             )
         }
         TE::Kinded { ty, kind, .. } => Type::Kinded(
-            Box::new(convert_type_expr(ty, type_ops)),
-            Box::new(convert_type_expr(kind, type_ops)),
+            Arc::new(convert_type_expr(ty, type_ops)),
+            Arc::new(convert_type_expr(kind, type_ops)),
         ),
         TE::StringLiteral { value, .. } => Type::TypeString(value.clone()),
         TE::IntLiteral { value, .. } => Type::TypeInt(*value),
@@ -995,7 +1203,7 @@ mod tests {
         );
         let t = convert_type_expr(&ty, &TypeOpMap::default());
         let body = match t {
-            Type::Forall(_, body) => *body,
+            Type::Forall(_, body) => Arc::unwrap_or_clone(body),
             _ => panic!("expected outer forall"),
         };
         match body {

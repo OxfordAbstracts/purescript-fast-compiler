@@ -1640,7 +1640,7 @@ fn check_one_module(
                 while let crate::typecheck_db::types::Type::Constrained(_, body) =
                     peeled
                 {
-                    peeled = *body;
+                    peeled = std::sync::Arc::unwrap_or_clone(body);
                 }
                 // Re-quantify any method-only vars from full_scheme.vars
                 // that aren't class vars.
@@ -1668,7 +1668,7 @@ fn check_one_module(
                 } else {
                     crate::typecheck_db::types::Type::Constrained(
                         inst_context_constraints.clone(),
-                        Box::new(peeled),
+                        std::sync::Arc::new(peeled),
                     )
                 };
                 let with_inner_forall = if instance_head_vars.is_empty() {
@@ -1679,7 +1679,7 @@ fn check_one_module(
                             .into_iter()
                             .map(|n| (n, false, None))
                             .collect(),
-                        Box::new(with_ctx),
+                        std::sync::Arc::new(with_ctx),
                     )
                 };
                 let class_synthesized_sig = crate::typecheck_db::types::Scheme {
@@ -1707,7 +1707,7 @@ fn check_one_module(
                         crate::typecheck_db::types::Type::Forall(qs, body) => {
                             let names: Vec<String> =
                                 qs.into_iter().map(|(n, _, _)| n).collect();
-                            (names, *body)
+                            (names, std::sync::Arc::unwrap_or_clone(body))
                         }
                         other => (Vec::new(), other),
                     };
@@ -1734,7 +1734,7 @@ fn check_one_module(
                     } else {
                         crate::typecheck_db::types::Type::Constrained(
                             inst_context_constraints.clone(),
-                            Box::new(body),
+                            std::sync::Arc::new(body),
                         )
                     };
                     let body_with_inner_forall = if head_vars.is_empty() {
@@ -1742,7 +1742,7 @@ fn check_one_module(
                     } else {
                         crate::typecheck_db::types::Type::Forall(
                             head_vars.into_iter().map(|n| (n, false, None)).collect(),
-                            Box::new(body_with_ctx),
+                            std::sync::Arc::new(body_with_ctx),
                         )
                     };
                     crate::typecheck_db::types::Scheme {
@@ -4962,7 +4962,7 @@ fn bind_local_ctors(
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {
                         let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
-                        (names, *body)
+                        (names, std::sync::Arc::unwrap_or_clone(body))
                     }
                     other => (Vec::new(), other),
                 };
@@ -5000,7 +5000,7 @@ fn bind_local_ctors(
                 let (vars, body) = match declared {
                     Type::Forall(qs, body) => {
                         let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
-                        (names, *body)
+                        (names, std::sync::Arc::unwrap_or_clone(body))
                     }
                     other => (Vec::new(), other),
                 };
@@ -5077,7 +5077,7 @@ fn bind_local_ctors(
                         Type::Forall(qs, body) => {
                             let ns: Vec<String> =
                                 qs.into_iter().map(|(n, _, _)| n).collect();
-                            (ns, *body)
+                            (ns, std::sync::Arc::unwrap_or_clone(body))
                         }
                         other => (Vec::new(), other),
                     };
@@ -5096,7 +5096,7 @@ fn bind_local_ctors(
                             .collect(),
                     };
                     let constrained_body =
-                        Type::Constrained(vec![constraint], Box::new(method_body));
+                        Type::Constrained(vec![constraint], std::sync::Arc::new(method_body));
                     let mut all_vars = class_vars.clone();
                     all_vars.extend(method_vars);
                     let scheme = Scheme { vars: all_vars, ty: constrained_body };

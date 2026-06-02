@@ -50,7 +50,7 @@ fn scheme_of(ty: Type) -> Scheme {
     match ty {
         Type::Forall(vars, body) => Scheme {
             vars: vars.into_iter().map(|(n, _, _)| n).collect(),
-            ty: *body,
+            ty: std::sync::Arc::unwrap_or_clone(body),
         },
         other => Scheme::mono(other),
     }

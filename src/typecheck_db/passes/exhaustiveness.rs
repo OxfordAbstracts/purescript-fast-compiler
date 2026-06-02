@@ -319,7 +319,7 @@ fn substitute_type_vars(ty: &Type, vars: &[String], args: &[Type]) -> Type {
                 .map(|(l, t)| (l.clone(), substitute_type_vars(t, vars, args)))
                 .collect(),
             tail.as_ref()
-                .map(|t| Box::new(substitute_type_vars(t, vars, args))),
+                .map(|t| std::sync::Arc::new(substitute_type_vars(t, vars, args))),
         ),
         Type::Row(fields, tail) => Type::Row(
             fields
@@ -327,7 +327,7 @@ fn substitute_type_vars(ty: &Type, vars: &[String], args: &[Type]) -> Type {
                 .map(|(l, t)| (l.clone(), substitute_type_vars(t, vars, args)))
                 .collect(),
             tail.as_ref()
-                .map(|t| Box::new(substitute_type_vars(t, vars, args))),
+                .map(|t| std::sync::Arc::new(substitute_type_vars(t, vars, args))),
         ),
         _ => ty.clone(),
     }

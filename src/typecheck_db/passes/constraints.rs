@@ -109,7 +109,7 @@ pub fn peel_constraints(ty: Type) -> (Vec<Constraint>, Type) {
         match cur {
             Type::Constrained(cs, body) => {
                 all.extend(cs);
-                cur = *body;
+                cur = std::sync::Arc::unwrap_or_clone(body);
             }
             other => return (all, other),
         }
@@ -1866,7 +1866,7 @@ mod tests {
                     class: QName::unqualified("Eq"),
                     args: vec![a.clone()],
                 }],
-                Box::new(Type::fun(a.clone(), Type::fun(a, bool_ty()))),
+                std::sync::Arc::new(Type::fun(a.clone(), Type::fun(a, bool_ty()))),
             ),
         }
     }
@@ -1891,7 +1891,7 @@ mod tests {
                 class: QName::unqualified("Eq"),
                 args: vec![int_ty()],
             }],
-            Box::new(Type::fun(int_ty(), bool_ty())),
+            std::sync::Arc::new(Type::fun(int_ty(), bool_ty())),
         ));
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0].class.name, "Eq");
@@ -1906,7 +1906,7 @@ mod tests {
                 Constraint { class: QName::unqualified("Eq"), args: vec![a.clone()] },
                 Constraint { class: QName::unqualified("Show"), args: vec![a.clone()] },
             ],
-            Box::new(a.clone()),
+            std::sync::Arc::new(a.clone()),
         ));
         assert_eq!(cs.len(), 2);
         assert_eq!(body, a);
@@ -1956,7 +1956,7 @@ mod tests {
                     Constraint { class: QName::unqualified("Eq"), args: vec![a.clone()] },
                     Constraint { class: QName::unqualified("Show"), args: vec![a.clone()] },
                 ],
-                Box::new(Type::fun(a, bool_ty())),
+                std::sync::Arc::new(Type::fun(a, bool_ty())),
             ),
         };
         let mut env = Env::new();

@@ -385,7 +385,7 @@ pub fn distill_exports(
                         Type::Forall(qs, body) => {
                             let ns: Vec<String> =
                                 qs.into_iter().map(|(n, _, _)| n).collect();
-                            (ns, *body)
+                            (ns, std::sync::Arc::unwrap_or_clone(body))
                         }
                         other => (Vec::new(), other),
                     };
@@ -406,7 +406,7 @@ pub fn distill_exports(
                             .collect(),
                     };
                     let constrained =
-                        Type::Constrained(vec![constraint], Box::new(method_body));
+                        Type::Constrained(vec![constraint], std::sync::Arc::new(method_body));
                     let mut all_vars = class_vars.clone();
                     all_vars.extend(method_vars);
                     scheme_by_name.insert(
@@ -422,7 +422,7 @@ pub fn distill_exports(
                     Type::Forall(qs, body) => {
                         let ns: Vec<String> =
                             qs.into_iter().map(|(n, _, _)| n).collect();
-                        (ns, *body)
+                        (ns, std::sync::Arc::unwrap_or_clone(body))
                     }
                     other => (Vec::new(), other),
                 };
@@ -435,7 +435,7 @@ pub fn distill_exports(
                     Type::Forall(qs, body) => {
                         let ns: Vec<String> =
                             qs.into_iter().map(|(n, _, _)| n).collect();
-                        (ns, *body)
+                        (ns, std::sync::Arc::unwrap_or_clone(body))
                     }
                     other => (Vec::new(), other),
                 };

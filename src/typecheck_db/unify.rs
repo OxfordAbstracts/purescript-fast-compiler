@@ -6,6 +6,7 @@
 //! the fully-resolved form of a type.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -424,7 +425,7 @@ impl UnifyState {
             Type::App(f, a) => Type::app(self.deskolemise(f), self.deskolemise(a)),
             Type::Fun(a, b) => Type::fun(self.deskolemise(a), self.deskolemise(b)),
             Type::Forall(vs, body) => {
-                Type::Forall(vs.clone(), Box::new(self.deskolemise(body)))
+                Type::Forall(vs.clone(), Arc::new(self.deskolemise(body)))
             }
             Type::Constrained(cs, body) => Type::Constrained(
                 cs.iter()
@@ -433,23 +434,23 @@ impl UnifyState {
                         args: c.args.iter().map(|a| self.deskolemise(a)).collect(),
                     })
                     .collect(),
-                Box::new(self.deskolemise(body)),
+                Arc::new(self.deskolemise(body)),
             ),
             Type::Record(fs, tail) => Type::Record(
                 fs.iter()
                     .map(|(l, t)| (l.clone(), self.deskolemise(t)))
                     .collect(),
-                tail.as_ref().map(|t| Box::new(self.deskolemise(t))),
+                tail.as_ref().map(|t| Arc::new(self.deskolemise(t))),
             ),
             Type::Row(fs, tail) => Type::Row(
                 fs.iter()
                     .map(|(l, t)| (l.clone(), self.deskolemise(t)))
                     .collect(),
-                tail.as_ref().map(|t| Box::new(self.deskolemise(t))),
+                tail.as_ref().map(|t| Arc::new(self.deskolemise(t))),
             ),
             Type::Kinded(t, k) => Type::Kinded(
-                Box::new(self.deskolemise(t)),
-                Box::new(self.deskolemise(k)),
+                Arc::new(self.deskolemise(t)),
+                Arc::new(self.deskolemise(k)),
             ),
             other => other.clone(),
         }
@@ -809,8 +810,8 @@ impl UnifyState {
                 self.zonk_depth(a, depth + 1),
             ),
             Type::Fun(a, b) => Type::Fun(
-                Box::new(self.zonk_depth(a, depth + 1)),
-                Box::new(self.zonk_depth(b, depth + 1)),
+                Arc::new(self.zonk_depth(a, depth + 1)),
+                Arc::new(self.zonk_depth(b, depth + 1)),
             ),
             Type::Forall(vars, body) => {
                 let vars = vars
@@ -819,11 +820,11 @@ impl UnifyState {
                         (
                             n.clone(),
                             *v,
-                            k.as_ref().map(|k| Box::new(self.zonk_depth(k, depth + 1))),
+                            k.as_ref().map(|k| Arc::new(self.zonk_depth(k, depth + 1))),
                         )
                     })
                     .collect();
-                Type::Forall(vars, Box::new(self.zonk_depth(body, depth + 1)))
+                Type::Forall(vars, Arc::new(self.zonk_depth(body, depth + 1)))
             }
             Type::Constrained(cs, body) => {
                 let cs = cs
@@ -833,7 +834,7 @@ impl UnifyState {
                         args: c.args.iter().map(|a| self.zonk_depth(a, depth + 1)).collect(),
                     })
                     .collect();
-                Type::Constrained(cs, Box::new(self.zonk_depth(body, depth + 1)))
+                Type::Constrained(cs, Arc::new(self.zonk_depth(body, depth + 1)))
             }
             Type::Record(fields, tail) => {
                 let fs = fields
@@ -842,7 +843,7 @@ impl UnifyState {
                     .collect();
                 let t = tail
                     .as_ref()
-                    .map(|t| Box::new(self.zonk_depth(t, depth + 1)));
+                    .map(|t| Arc::new(self.zonk_depth(t, depth + 1)));
                 Type::Record(fs, t)
             }
             Type::Row(fields, tail) => {
@@ -852,12 +853,12 @@ impl UnifyState {
                     .collect();
                 let t = tail
                     .as_ref()
-                    .map(|t| Box::new(self.zonk_depth(t, depth + 1)));
+                    .map(|t| Arc::new(self.zonk_depth(t, depth + 1)));
                 Type::Row(fs, t)
             }
             Type::Kinded(t, k) => Type::Kinded(
-                Box::new(self.zonk_depth(t, depth + 1)),
-                Box::new(self.zonk_depth(k, depth + 1)),
+                Arc::new(self.zonk_depth(t, depth + 1)),
+                Arc::new(self.zonk_depth(k, depth + 1)),
             ),
             _ => ty.clone(),
         }
@@ -993,7 +994,7 @@ impl UnifyState {
                     let arrow = crate::typecheck_db::types::prim_function();
                     self.unify(
                         outer_f,
-                        &Type::App(Box::new(arrow), Box::new((**fa).clone())),
+                        &Type::App(Arc::new(arrow), Arc::new((**fa).clone())),
                     )?;
                     return self.unify(outer_a, fb);
                 }
@@ -1124,7 +1125,7 @@ impl UnifyState {
                     self.unify(f, &crate::typecheck_db::types::prim_record())?;
                 }
                 let empty: Vec<(String, Type)> = Vec::new();
-                let tail_box: Option<Box<Type>> = Some(Box::new((**row).clone()));
+                let tail_box: Option<Arc<Type>> = Some(Arc::new((**row).clone()));
                 // Canonical order: `Record` side as the first arg
                 // keeps diagnostic messages consistent.
                 unify_fields(self, &empty, &tail_box, fields, tail)
@@ -1214,9 +1215,9 @@ impl Default for UnifyState {
 fn unify_fields(
     state: &mut UnifyState,
     f1: &[(String, Type)],
-    t1: &Option<Box<Type>>,
+    t1: &Option<Arc<Type>>,
     f2: &[(String, Type)],
-    t2: &Option<Box<Type>>,
+    t2: &Option<Arc<Type>>,
 ) -> Result<(), UnifyError> {
     use std::collections::HashMap;
 
@@ -1308,16 +1309,16 @@ fn unify_fields(
                 }
             }
             let fresh = state.fresh();
-            absorb_extras(state, t1, only2, Some(Box::new(fresh.clone())))?;
-            absorb_extras(state, t2, only1, Some(Box::new(fresh)))
+            absorb_extras(state, t1, only2, Some(Arc::new(fresh.clone())))?;
+            absorb_extras(state, t2, only1, Some(Arc::new(fresh)))
         }
     }
 }
 
 fn unify_opt_tails(
     state: &mut UnifyState,
-    t1: &Option<Box<Type>>,
-    t2: &Option<Box<Type>>,
+    t1: &Option<Arc<Type>>,
+    t2: &Option<Arc<Type>>,
 ) -> Result<(), UnifyError> {
     match (t1, t2) {
         (None, None) => Ok(()),
@@ -1333,9 +1334,9 @@ fn unify_opt_tails(
 /// are no extras and `rest` is also closed.
 fn absorb_extras(
     state: &mut UnifyState,
-    t: &Option<Box<Type>>,
+    t: &Option<Arc<Type>>,
     extras: Vec<(String, Type)>,
-    rest: Option<Box<Type>>,
+    rest: Option<Arc<Type>>,
 ) -> Result<(), UnifyError> {
     match t {
         Some(tail) => state.unify(tail, &Type::Record(extras, rest)),

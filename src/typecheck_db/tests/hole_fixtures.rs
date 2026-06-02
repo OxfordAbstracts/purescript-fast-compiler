@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ntest_timeout::timeout;
 
@@ -522,7 +522,7 @@ fn canonicalize_type(ty: &Type) -> Type {
                 if qn.name == "Record" {
                     let mut merged: Vec<(String, Type)> =
                         fields.iter().map(|(l, t)| (l.clone(), t.clone())).collect();
-                    let mut rest: Option<Box<Type>> = tail.clone();
+                    let mut rest: Option<Arc<Type>> = tail.clone();
                     loop {
                         match rest {
                             None => break,
@@ -545,17 +545,17 @@ fn canonicalize_type(ty: &Type) -> Type {
                     merged.sort_by(|a, b| a.0.cmp(&b.0));
                     return Type::Record(
                         merged.into_iter().map(|(l, t)| (l, canonicalize_type(&t))).collect(),
-                        rest.map(|t| Box::new(canonicalize_type(t.as_ref()))),
+                        rest.map(|t| Arc::new(canonicalize_type(t.as_ref()))),
                     );
                 }
             }
-            Type::App(Box::new(cf), Box::new(ca))
+            Type::App(Arc::new(cf), Arc::new(ca))
         }
         Type::Record(fields, tail) => {
             // Flatten tail if it's a Row or another Record extension.
             let mut merged: Vec<(String, Type)> =
                 fields.iter().map(|(l, t)| (l.clone(), t.clone())).collect();
-            let mut rest: Option<Box<Type>> = tail.clone();
+            let mut rest: Option<Arc<Type>> = tail.clone();
             loop {
                 match rest {
                     None => break,
@@ -569,7 +569,7 @@ fn canonicalize_type(ty: &Type) -> Type {
                             rest = next_tail.clone();
                         }
                         _ => {
-                            rest = Some(Box::new(canonicalize_type(box_ty.as_ref())));
+                            rest = Some(Arc::new(canonicalize_type(box_ty.as_ref())));
                             break;
                         }
                     },
@@ -583,13 +583,13 @@ fn canonicalize_type(ty: &Type) -> Type {
         }
         Type::Row(fields, tail) => Type::Row(
             fields.iter().map(|(l, t)| (l.clone(), canonicalize_type(t))).collect(),
-            tail.as_ref().map(|t| Box::new(canonicalize_type(t.as_ref()))),
+            tail.as_ref().map(|t| Arc::new(canonicalize_type(t.as_ref()))),
         ),
         Type::Fun(a, b) => {
-            Type::Fun(Box::new(canonicalize_type(a)), Box::new(canonicalize_type(b)))
+            Type::Fun(Arc::new(canonicalize_type(a)), Arc::new(canonicalize_type(b)))
         }
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(canonicalize_type(body)))
+            Type::Forall(vars.clone(), Arc::new(canonicalize_type(body)))
         }
         Type::Constrained(cs, body) => {
             let ccs: Vec<Constraint> = cs
@@ -599,7 +599,7 @@ fn canonicalize_type(ty: &Type) -> Type {
                     args: c.args.iter().map(canonicalize_type).collect(),
                 })
                 .collect();
-            Type::Constrained(ccs, Box::new(canonicalize_type(body)))
+            Type::Constrained(ccs, Arc::new(canonicalize_type(body)))
         }
         _ => ty.clone(),
     }

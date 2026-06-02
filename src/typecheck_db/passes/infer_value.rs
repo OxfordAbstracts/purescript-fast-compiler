@@ -247,22 +247,27 @@ fn walk_replace(
             unif
         }
         Type::App(f, a) => Type::app(
-            walk_replace(state, *f, iter, env),
-            walk_replace(state, *a, iter, env),
+            walk_replace(state, Arc::unwrap_or_clone(f), iter, env),
+            walk_replace(state, Arc::unwrap_or_clone(a), iter, env),
         ),
         Type::Fun(a, b) => Type::Fun(
-            Box::new(walk_replace(state, *a, iter, env)),
-            Box::new(walk_replace(state, *b, iter, env)),
+            Arc::new(walk_replace(state, Arc::unwrap_or_clone(a), iter, env)),
+            Arc::new(walk_replace(state, Arc::unwrap_or_clone(b), iter, env)),
         ),
         Type::Forall(vs, body) => {
             let new_vs = vs
                 .into_iter()
                 .map(|(n, vis, k)| {
-                    let k = k.map(|k| Box::new(walk_replace(state, *k, iter, env)));
+                    let k = k.map(|k| {
+                        Arc::new(walk_replace(state, Arc::unwrap_or_clone(k), iter, env))
+                    });
                     (n, vis, k)
                 })
                 .collect();
-            Type::Forall(new_vs, Box::new(walk_replace(state, *body, iter, env)))
+            Type::Forall(
+                new_vs,
+                Arc::new(walk_replace(state, Arc::unwrap_or_clone(body), iter, env)),
+            )
         }
         Type::Constrained(cs, body) => {
             let new_cs = cs
@@ -276,23 +281,26 @@ fn walk_replace(
                         .collect(),
                 })
                 .collect();
-            Type::Constrained(new_cs, Box::new(walk_replace(state, *body, iter, env)))
+            Type::Constrained(
+                new_cs,
+                Arc::new(walk_replace(state, Arc::unwrap_or_clone(body), iter, env)),
+            )
         }
         Type::Record(fs, tail) => Type::Record(
             fs.into_iter()
                 .map(|(l, t)| (l, walk_replace(state, t, iter, env)))
                 .collect(),
-            tail.map(|t| Box::new(walk_replace(state, *t, iter, env))),
+            tail.map(|t| Arc::new(walk_replace(state, Arc::unwrap_or_clone(t), iter, env))),
         ),
         Type::Row(fs, tail) => Type::Row(
             fs.into_iter()
                 .map(|(l, t)| (l, walk_replace(state, t, iter, env)))
                 .collect(),
-            tail.map(|t| Box::new(walk_replace(state, *t, iter, env))),
+            tail.map(|t| Arc::new(walk_replace(state, Arc::unwrap_or_clone(t), iter, env))),
         ),
         Type::Kinded(t, k) => Type::Kinded(
-            Box::new(walk_replace(state, *t, iter, env)),
-            Box::new(walk_replace(state, *k, iter, env)),
+            Arc::new(walk_replace(state, Arc::unwrap_or_clone(t), iter, env)),
+            Arc::new(walk_replace(state, Arc::unwrap_or_clone(k), iter, env)),
         ),
         other => other,
     }
@@ -713,7 +721,7 @@ fn check_equation(
                 }
                 Type::Constrained(cs, body) => {
                     state.push_givens(cs);
-                    cur = *body;
+                    cur = Arc::unwrap_or_clone(body);
                 }
                 other => break other,
             }
@@ -749,14 +757,14 @@ fn check_equation(
                 }
                 Type::Constrained(cs, body) => {
                     state.push_givens(cs);
-                    rest = *body;
+                    rest = Arc::unwrap_or_clone(body);
                 }
                 _ => break,
             }
         }
         let zonked = state.zonk(&rest);
         let (arg, new_rest) = match zonked {
-            Type::Fun(a, r) => (*a, *r),
+            Type::Fun(a, r) => (Arc::unwrap_or_clone(a), Arc::unwrap_or_clone(r)),
             _ => break,
         };
         match b {
@@ -857,14 +865,14 @@ fn check_lambda(
                 }
                 Type::Constrained(cs, body) => {
                     state.push_givens(cs);
-                    rest = *body;
+                    rest = Arc::unwrap_or_clone(body);
                 }
                 _ => break,
             }
         }
         let zonked = state.zonk(&rest);
         let (arg, new_rest) = match zonked {
-            Type::Fun(a, r) => (*a, *r),
+            Type::Fun(a, r) => (Arc::unwrap_or_clone(a), Arc::unwrap_or_clone(r)),
             _ => break,
         };
         match b {
@@ -1082,7 +1090,7 @@ pub fn infer_value_scc_with_all(
                             .cloned()
                             .map(|n| (n, false, None))
                             .collect(),
-                        Box::new(scheme.ty.clone()),
+                        Arc::new(scheme.ty.clone()),
                     )
                 };
                 // Type-level holes in the sig: rewrite each
@@ -1252,7 +1260,7 @@ pub fn infer_value_scc_with_all(
                                     .cloned()
                                     .map(|n| (n, false, None))
                                     .collect(),
-                                Box::new(scheme.ty.clone()),
+                                Arc::new(scheme.ty.clone()),
                             )
                         };
                         let prepared = if let Some(sites) = hole_sites {
@@ -1393,7 +1401,7 @@ pub fn infer_value_scc_with_all(
             let binders = decl_binder_count.get(n).copied().unwrap_or(0);
             for _ in 0..binders {
                 match ty {
-                    Type::Fun(_, ret) => ty = *ret,
+                    Type::Fun(_, ret) => ty = Arc::unwrap_or_clone(ret),
                     other => { ty = other; break; }
                 }
             }
@@ -1604,7 +1612,7 @@ pub fn infer_value_scc_with_all(
                         .cloned()
                         .map(|nm| (nm, false, None))
                         .collect(),
-                    Box::new(scheme.ty.clone()),
+                    Arc::new(scheme.ty.clone()),
                 )
             };
             if sig_ty_unsafe_to_pin(&full_sig) {
@@ -1755,7 +1763,7 @@ pub fn infer_value_scc_with_all(
                                     .cloned()
                                     .map(|n| (n, false, None))
                                     .collect(),
-                                Box::new(s.ty.clone()),
+                                Arc::new(s.ty.clone()),
                             )
                         };
                         if sig_ty_unsafe_to_pin(&full) {
@@ -2107,11 +2115,11 @@ fn infer_app(
             && type_contains_forall(&expected_arg_zonked)
         {
             check_expr(state, env, type_ops, arg, &expected_arg_zonked)?;
-            return Ok(*ret);
+            return Ok(Arc::unwrap_or_clone(ret));
         }
         if matches!(&expected_arg_zonked, Type::Forall(_, _)) {
             check_expr(state, env, type_ops, arg, &expected_arg_zonked)?;
-            return Ok(*ret);
+            return Ok(Arc::unwrap_or_clone(ret));
         }
         // Constrained-in-arg-position: a ctor field like
         // `data X a = X (Y a => Proxy a)` produces a func type
@@ -2144,7 +2152,7 @@ fn infer_app(
             } else {
                 state.unify_here(body, &arg_ty)?;
             }
-            return Ok(*ret);
+            return Ok(Arc::unwrap_or_clone(ret));
         }
     }
     let arg_ty = infer_expr(state, env, type_ops, arg)?;
@@ -2212,7 +2220,7 @@ fn infer_record_update_from_fields(
     }
     // Constrain the base expression to have at least the updated labels.
     let tail = state.fresh();
-    let base_expected = Type::Record(old_fields.clone(), Some(Box::new(tail.clone())));
+    let base_expected = Type::Record(old_fields.clone(), Some(Arc::new(tail.clone())));
     state.unify_here(&expr_ty, &base_expected)?;
     // For NESTED update specs (e.g. `r { bar { x = 1 } }`): after outer
     // unification binds old field types, unify new_val ~ old_val to close
@@ -2229,7 +2237,7 @@ fn infer_record_update_from_fields(
         state.unify_here_with_expected(expr.span(), &new_val, &old_val)?;
     }
     // Result has new field types but the same tail (preserving non-updated fields).
-    Ok(Type::Record(new_fields, Some(Box::new(tail))))
+    Ok(Type::Record(new_fields, Some(Arc::new(tail))))
 }
 
 fn infer_lambda(
@@ -2341,7 +2349,7 @@ fn bind_record_pattern(
         field_tys.push((label, ty));
     }
     let tail = state.fresh();
-    Ok(Type::Record(field_tys, Some(Box::new(tail))))
+    Ok(Type::Record(field_tys, Some(Arc::new(tail))))
 }
 
 /// Match a constructor pattern against its constructor's scheme.
@@ -2431,7 +2439,7 @@ fn infer_record(
     // (`init { bar { baz = 1 } }`) can unify with whatever extra
     // fields the surrounding record already has.
     let tail = if is_update_section {
-        Some(Box::new(state.fresh()))
+        Some(Arc::new(state.fresh()))
     } else {
         None
     };
@@ -2451,7 +2459,7 @@ fn infer_record_access(
     let tail = state.fresh();
     let expected = Type::Record(
         vec![(label, field_ty.clone())],
-        Some(Box::new(tail)),
+        Some(Arc::new(tail)),
     );
     state.unify_here(&expr_ty, &expected)?;
     // If the field's declared type is polymorphic (a nested
@@ -2486,9 +2494,9 @@ fn infer_record_update(
         new_fields.push((label, new_val_ty));
     }
     let tail = state.fresh();
-    let base_expected = Type::Record(old_fields, Some(Box::new(tail.clone())));
+    let base_expected = Type::Record(old_fields, Some(Arc::new(tail.clone())));
     state.unify_here(&expr_ty, &base_expected)?;
-    Ok(Type::Record(new_fields, Some(Box::new(tail))))
+    Ok(Type::Record(new_fields, Some(Arc::new(tail))))
 }
 
 // ============================================================================
@@ -3055,7 +3063,7 @@ fn infer_do(
                 }
                 let expr_ty = infer_expr(state, env, type_ops, expr)?;
                 let a = state.fresh();
-                let expected = Type::App(Box::new(m.clone()), Box::new(a.clone()));
+                let expected = Type::App(Arc::new(m.clone()), Arc::new(a.clone()));
                 state.unify_here(&expr_ty, &expected)?;
                 let pat_ty = bind_pattern(state, env, type_ops, binder)?;
                 state.unify_here(&pat_ty, &a)?;
@@ -3074,12 +3082,12 @@ fn infer_do(
                     // must be `m r` for some r — force-unify to pin the
                     // shape and feed the surrounding context.
                     let r = state.fresh();
-                    let expected = Type::App(Box::new(m.clone()), Box::new(r.clone()));
+                    let expected = Type::App(Arc::new(m.clone()), Arc::new(r.clone()));
                     state.unify_here(&expr_ty, &expected)?;
                     result_ty = Some(expr_ty);
                 } else {
                     let any = state.fresh();
-                    let expected = Type::App(Box::new(m.clone()), Box::new(any));
+                    let expected = Type::App(Arc::new(m.clone()), Arc::new(any));
                     state.unify_here(&expr_ty, &expected)?;
                 }
             }
@@ -3116,7 +3124,7 @@ fn infer_ado(
             ir::DoStatement::Bind { binder, expr, .. } => {
                 let expr_ty = infer_expr(state, &mut expr_env, type_ops, expr)?;
                 let a = state.fresh();
-                let expected = Type::App(Box::new(m.clone()), Box::new(a.clone()));
+                let expected = Type::App(Arc::new(m.clone()), Arc::new(a.clone()));
                 state.unify_here(&expr_ty, &expected)?;
                 let pat_ty = bind_pattern(state, env, type_ops, binder)?;
                 state.unify_here(&pat_ty, &a)?;
@@ -3133,7 +3141,7 @@ fn infer_ado(
                 // `_ <- expr`.
                 let expr_ty = infer_expr(state, &mut expr_env, type_ops, expr)?;
                 let a = state.fresh();
-                let expected = Type::App(Box::new(m.clone()), Box::new(a));
+                let expected = Type::App(Arc::new(m.clone()), Arc::new(a));
                 state.unify_here(&expr_ty, &expected)?;
             }
         }
@@ -3142,7 +3150,7 @@ fn infer_ado(
     let result_a = infer_expr(state, env, type_ops, result)?;
     env.pop_scope();
     // ado yields `m <result>`.
-    Ok(Type::App(Box::new(m), Box::new(result_a)))
+    Ok(Type::App(Arc::new(m), Arc::new(result_a)))
 }
 
 /// Shared helper: add `LetBinding`s from a do/ado `let` statement into
@@ -3437,7 +3445,7 @@ fn sig_to_scheme(sig_ty: Type) -> Scheme {
     match sig_ty {
         Type::Forall(qs, body) => {
             let vars = qs.into_iter().map(|(n, _, _)| n).collect();
-            Scheme { vars, ty: *body }
+            Scheme { vars, ty: Arc::unwrap_or_clone(body) }
         }
         other => Scheme { vars: Vec::new(), ty: other },
     }
@@ -3498,8 +3506,8 @@ fn instantiate_scheme_no_constraints(
     let mut ty = apply_var_subst(&scheme.ty, &subst);
     loop {
         match ty {
-            Type::Constrained(_, body) => ty = *body,
-            Type::Forall(_, body) => ty = *body,
+            Type::Constrained(_, body) => ty = Arc::unwrap_or_clone(body),
+            Type::Forall(_, body) => ty = Arc::unwrap_or_clone(body),
             other => break other,
         }
     }
@@ -3562,16 +3570,16 @@ fn replace_wildcards_with_fresh_unifs(state: &mut UnifyState, ty: Type) -> Type 
     match ty {
         Type::Wildcard => state.fresh(),
         Type::App(f, a) => Type::App(
-            Box::new(replace_wildcards_with_fresh_unifs(state, *f)),
-            Box::new(replace_wildcards_with_fresh_unifs(state, *a)),
+            Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(f))),
+            Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(a))),
         ),
         Type::Fun(f, a) => Type::fun(
-            replace_wildcards_with_fresh_unifs(state, *f),
-            replace_wildcards_with_fresh_unifs(state, *a),
+            replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(f)),
+            replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(a)),
         ),
         Type::Forall(vs, body) => Type::Forall(
             vs,
-            Box::new(replace_wildcards_with_fresh_unifs(state, *body)),
+            Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(body))),
         ),
         Type::Constrained(cs, body) => {
             let cs = cs
@@ -3587,24 +3595,28 @@ fn replace_wildcards_with_fresh_unifs(state: &mut UnifyState, ty: Type) -> Type 
                 .collect();
             Type::Constrained(
                 cs,
-                Box::new(replace_wildcards_with_fresh_unifs(state, *body)),
+                Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(body))),
             )
         }
         Type::Record(fs, tail) => Type::Record(
             fs.into_iter()
                 .map(|(l, t)| (l, replace_wildcards_with_fresh_unifs(state, t)))
                 .collect(),
-            tail.map(|t| Box::new(replace_wildcards_with_fresh_unifs(state, *t))),
+            tail.map(|t| {
+                Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(t)))
+            }),
         ),
         Type::Row(fs, tail) => Type::Row(
             fs.into_iter()
                 .map(|(l, t)| (l, replace_wildcards_with_fresh_unifs(state, t)))
                 .collect(),
-            tail.map(|t| Box::new(replace_wildcards_with_fresh_unifs(state, *t))),
+            tail.map(|t| {
+                Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(t)))
+            }),
         ),
         Type::Kinded(t, k) => Type::Kinded(
-            Box::new(replace_wildcards_with_fresh_unifs(state, *t)),
-            Box::new(replace_wildcards_with_fresh_unifs(state, *k)),
+            Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(t))),
+            Arc::new(replace_wildcards_with_fresh_unifs(state, Arc::unwrap_or_clone(k))),
         ),
         other => other,
     }
@@ -3641,15 +3653,15 @@ fn deep_instantiate_positive(
                         });
                     }
                 }
-                *body
+                Arc::unwrap_or_clone(body)
             }
             Type::Fun(arg, ret) => {
                 let ret_inst = deep_instantiate_positive(
                     state,
-                    *ret,
+                    Arc::unwrap_or_clone(ret),
                     record_constraints,
                 );
-                return Type::fun(*arg, ret_inst);
+                return Type::fun(Arc::unwrap_or_clone(arg), ret_inst);
             }
             other => return other,
         };
@@ -3681,12 +3693,13 @@ fn deep_skolemise_positive(
             }
             Type::Constrained(cs, body) => {
                 givens.extend(cs);
-                *body
+                Arc::unwrap_or_clone(body)
             }
             Type::Fun(arg, ret) => {
-                let (ret_s, ret_g) = deep_skolemise_positive(state, *ret);
+                let (ret_s, ret_g) =
+                    deep_skolemise_positive(state, Arc::unwrap_or_clone(ret));
                 givens.extend(ret_g);
-                return (Type::fun(*arg, ret_s), givens);
+                return (Type::fun(Arc::unwrap_or_clone(arg), ret_s), givens);
             }
             other => return (other, givens),
         };
@@ -3729,15 +3742,15 @@ fn sig_param_types(
             .cloned()
             .map(|n| (n, false, None))
             .collect(),
-        Box::new(scheme.ty),
+        Arc::new(scheme.ty),
     ));
     let mut args: Vec<Type> = Vec::new();
     let mut cur = mono;
     for _ in 0..arity {
         match cur {
             Type::Fun(a, b) => {
-                args.push(*a);
-                cur = *b;
+                args.push(Arc::unwrap_or_clone(a));
+                cur = Arc::unwrap_or_clone(b);
             }
             _ => return None,
         }
@@ -3781,12 +3794,12 @@ fn constrained_arg_hints(
         match cur {
             Type::Fun(a, b) => {
                 if matches!(state.zonk(&a), Type::Constrained(_, _)) {
-                    hints.push(Some(*a));
+                    hints.push(Some(Arc::unwrap_or_clone(a)));
                     any = true;
                 } else {
                     hints.push(None);
                 }
-                cur = *b;
+                cur = Arc::unwrap_or_clone(b);
             }
             _ => return None,
         }

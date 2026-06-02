@@ -8,6 +8,7 @@
 //! sites.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::typecheck_db::env::Env;
 use crate::typecheck_db::types::{Constraint, Scheme, Type};
@@ -96,7 +97,7 @@ pub fn generalize_with_constraints(
         .collect();
     Scheme {
         vars: names,
-        ty: Type::Constrained(lifted_constraints, Box::new(body)),
+        ty: Type::Constrained(lifted_constraints, Arc::new(body)),
     }
 }
 
@@ -278,8 +279,8 @@ pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
             apply_unif_subst(a, subst),
         ),
         Type::Fun(a, b) => Type::Fun(
-            Box::new(apply_unif_subst(a, subst)),
-            Box::new(apply_unif_subst(b, subst)),
+            Arc::new(apply_unif_subst(a, subst)),
+            Arc::new(apply_unif_subst(b, subst)),
         ),
         Type::Forall(vars, body) => {
             let vars = vars
@@ -288,11 +289,11 @@ pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
                     (
                         n.clone(),
                         *v,
-                        k.as_ref().map(|k| Box::new(apply_unif_subst(k, subst))),
+                        k.as_ref().map(|k| Arc::new(apply_unif_subst(k, subst))),
                     )
                 })
                 .collect();
-            Type::Forall(vars, Box::new(apply_unif_subst(body, subst)))
+            Type::Forall(vars, Arc::new(apply_unif_subst(body, subst)))
         }
         Type::Constrained(cs, body) => {
             let cs = cs
@@ -302,23 +303,23 @@ pub fn apply_unif_subst(ty: &Type, subst: &HashMap<u32, Type>) -> Type {
                     args: c.args.iter().map(|a| apply_unif_subst(a, subst)).collect(),
                 })
                 .collect();
-            Type::Constrained(cs, Box::new(apply_unif_subst(body, subst)))
+            Type::Constrained(cs, Arc::new(apply_unif_subst(body, subst)))
         }
         Type::Record(fs, tail) => Type::Record(
             fs.iter()
                 .map(|(l, t)| (l.clone(), apply_unif_subst(t, subst)))
                 .collect(),
-            tail.as_ref().map(|t| Box::new(apply_unif_subst(t, subst))),
+            tail.as_ref().map(|t| Arc::new(apply_unif_subst(t, subst))),
         ),
         Type::Row(fs, tail) => Type::Row(
             fs.iter()
                 .map(|(l, t)| (l.clone(), apply_unif_subst(t, subst)))
                 .collect(),
-            tail.as_ref().map(|t| Box::new(apply_unif_subst(t, subst))),
+            tail.as_ref().map(|t| Arc::new(apply_unif_subst(t, subst))),
         ),
         Type::Kinded(t, k) => Type::Kinded(
-            Box::new(apply_unif_subst(t, subst)),
-            Box::new(apply_unif_subst(k, subst)),
+            Arc::new(apply_unif_subst(t, subst)),
+            Arc::new(apply_unif_subst(k, subst)),
         ),
         _ => ty.clone(),
     }
@@ -333,8 +334,8 @@ pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             apply_var_subst(a, subst),
         ),
         Type::Fun(a, b) => Type::Fun(
-            Box::new(apply_var_subst(a, subst)),
-            Box::new(apply_var_subst(b, subst)),
+            Arc::new(apply_var_subst(a, subst)),
+            Arc::new(apply_var_subst(b, subst)),
         ),
         Type::Forall(vars, body) => {
             // Quantified vars *shadow* outer bindings — strip them from
@@ -355,7 +356,7 @@ pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                 collect_var_names(v, &mut subst_free);
             }
             let mut rename: HashMap<String, Type> = HashMap::new();
-            let mut new_vars: Vec<(String, bool, Option<Box<Type>>)> =
+            let mut new_vars: Vec<(String, bool, Option<Arc<Type>>)> =
                 Vec::with_capacity(vars.len());
             let mut taken: std::collections::HashSet<String> = subst_free;
             // Body's other forall vars also need to stay disjoint
@@ -392,7 +393,7 @@ pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             };
             Type::Forall(
                 new_vars,
-                Box::new(apply_var_subst(&renamed_body, &inner)),
+                Arc::new(apply_var_subst(&renamed_body, &inner)),
             )
         }
         Type::Constrained(cs, body) => {
@@ -403,23 +404,23 @@ pub fn apply_var_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                     args: c.args.iter().map(|a| apply_var_subst(a, subst)).collect(),
                 })
                 .collect();
-            Type::Constrained(cs, Box::new(apply_var_subst(body, subst)))
+            Type::Constrained(cs, Arc::new(apply_var_subst(body, subst)))
         }
         Type::Record(fs, tail) => Type::Record(
             fs.iter()
                 .map(|(l, t)| (l.clone(), apply_var_subst(t, subst)))
                 .collect(),
-            tail.as_ref().map(|t| Box::new(apply_var_subst(t, subst))),
+            tail.as_ref().map(|t| Arc::new(apply_var_subst(t, subst))),
         ),
         Type::Row(fs, tail) => Type::Row(
             fs.iter()
                 .map(|(l, t)| (l.clone(), apply_var_subst(t, subst)))
                 .collect(),
-            tail.as_ref().map(|t| Box::new(apply_var_subst(t, subst))),
+            tail.as_ref().map(|t| Arc::new(apply_var_subst(t, subst))),
         ),
         Type::Kinded(t, k) => Type::Kinded(
-            Box::new(apply_var_subst(t, subst)),
-            Box::new(apply_var_subst(k, subst)),
+            Arc::new(apply_var_subst(t, subst)),
+            Arc::new(apply_var_subst(k, subst)),
         ),
         _ => ty.clone(),
     }
