@@ -453,7 +453,18 @@ pub fn solve_one(
                             head_ok = false;
                             break;
                         }
-                        if ch.name != th.name {
+                        // Recognise `(->)` and `Function` as aliases — the
+                        // (->) instance is registered with type-head
+                        // `Con(None, "->")` but wanteds resolved through
+                        // the Prim helpers carry `Con(Some("Prim"),
+                        // "Function")`. Without this, `Semigroupoid
+                        // Function` finds no head-matching candidate and
+                        // SolverDepthExceeds via the head_shape_mismatch
+                        // defer cycle.
+                        let names_equiv = ch.name == th.name
+                            || ((ch.name == "->" || ch.name == "Function")
+                                && (th.name == "->" || th.name == "Function"));
+                        if !names_equiv {
                             head_ok = false;
                             break;
                         }
@@ -600,7 +611,20 @@ pub fn solve_one(
                 cand.types
                     .get(i)
                     .and_then(app_spine_head_arity)
-                    .map_or(false, |(h, a)| h == arg_qn && a == arg_arity)
+                    .map_or(false, |(h, a)| {
+                        // Same lenient comparison as the per-candidate
+                        // pre-filter (above): match names with the
+                        // `(->)` / `Function` alias rule + tolerant
+                        // module qualifier (one side None is OK).
+                        let names_equiv = h.name == arg_qn.name
+                            || ((h.name == "->" || h.name == "Function")
+                                && (arg_qn.name == "->"
+                                    || arg_qn.name == "Function"));
+                        let modules_ok = h.module.is_none()
+                            || arg_qn.module.is_none()
+                            || h.module == arg_qn.module;
+                        names_equiv && modules_ok && a == arg_arity
+                    })
             })
         } else {
             false

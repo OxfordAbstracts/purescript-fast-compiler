@@ -774,6 +774,23 @@ fn capability_constrained_argument_discharge() {
 }
 
 #[test]
+#[ignore = "RED: Puregres.Select cluster — Coercible/Newtype Unif-Unif depth limit"]
+fn select_newtype_wrap_chain_typechecks() {
+    // Reproducer for the Puregres.Select cluster (Query.Event.* — 4
+    // modules failing in build_from_sources with SolverDepthExceeded
+    // on Coercible / Newtype / Semigroupoid). The shape:
+    //
+    //   wrapm $ runSelect $ selectColumns
+    //
+    // where wrapm has `Newtype a b => f1 (f2 b) -> f1 (f2 a)` and
+    // the caller's sig pins the outer functor + innermost newtype.
+    // The wantings stay as `Newtype Unif Unif` / `Coercible Unif Unif`
+    // because the inner `b` doesn't get pinned before the solver
+    // tries to discharge the constraint.
+    assert_typechecks(include_str!("fixtures/single_succeeds/select_newtype_wrap_chain.purs"));
+}
+
+#[test]
 fn capability_marker_carried_into_scheme() {
     // A nullary class with zero instances appearing as a sig
     // constraint on a check_equation-path decl (sig has inner forall)
