@@ -2240,22 +2240,137 @@ fn infer_record_update_from_fields(
     let tail = state.fresh();
     let base_expected = Type::Record(old_fields.clone(), Some(Arc::new(tail.clone())));
     state.unify_here(&expr_ty, &base_expected)?;
-    // For NESTED update specs (e.g. `r { bar { x = 1 } }`): after outer
-    // unification binds old field types, unify new_val ~ old_val to close
-    // open tails and surface type mismatches. Non-nested fields skip this
-    // so top-level type-changing updates (e.g. mapTextProps) still work.
+    // For NESTED update specs (e.g. `r { bar { x = 1 } }`): the inner
+    // `Expr::Record` has been inferred as `{ x :: NEW_ty | inner_tail }`
+    // (open row, since `infer_record` treats `is_update_section` fields
+    // as open). Without further constraints, `inner_tail` is free —
+    // downstream uses may not pin it, surfacing as a polymorphic field
+    // type that's wrong if the surrounding context expects the original
+    // shape. PureScript reference compiler's semantics: a nested update
+    // preserves the original record's non-updated fields. Express that
+    // by recursively aligning each nested level's tail with the OLD
+    // field's "rest after removing the inner update's labels". The
+    // alignment pins inner tails to their structural shape WITHOUT
+    // forcing the updated labels themselves to keep their old types —
+    // valid type-changing nested updates like
+    // `r { bar { x = "hi" } }` (where `bar.x :: Int` becomes `String`)
+    // still typecheck.
     for (i, f) in fields.iter().enumerate() {
         if !f.is_nested {
             continue;
         }
-        let old_val = state.zonk(&old_fields[i].1);
-        let new_val = state.zonk(&new_fields[i].1);
-        // The outer record expression supplies the expected
-        // shape — so a nested-update mismatch reports back to it.
-        state.unify_here_with_expected(expr.span(), &new_val, &old_val)?;
+        let inner_fields = match &f.value {
+            Some(Expr::Record { fields: inner_fields, .. }) => inner_fields,
+            _ => continue,
+        };
+        align_nested_record_update(
+            state,
+            &old_fields[i].1,
+            &new_fields[i].1,
+            inner_fields,
+            expr.span(),
+        )?;
     }
     // Result has new field types but the same tail (preserving non-updated fields).
     Ok(Type::Record(new_fields, Some(Arc::new(tail))))
+}
+
+/// Align a nested record update's inferred type with the original
+/// field's type. Pins the inner record's open tail to the original
+/// field's "rest after removing the inner update's labels", and
+/// recurses into each inner nested field. Type-changing updates are
+/// preserved — only the row STRUCTURE is constrained, not the
+/// updated label's types.
+fn align_nested_record_update(
+    state: &mut UnifyState,
+    old_field_ty: &Type,
+    new_field_ty: &Type,
+    inner_fields: &[ir::RecordField],
+    span: crate::span::Span,
+) -> Result<(), InferError> {
+    let old_zonked = state.zonk(old_field_ty);
+    let new_zonked = state.zonk(new_field_ty);
+    let (old_fs, old_tail) = match &old_zonked {
+        Type::Record(fs, t) => (fs, t),
+        _ => return Ok(()),
+    };
+    let (_new_fs_for_extras, _) = match &new_zonked {
+        Type::Record(fs, Some(t)) => (fs, t),
+        _ => return Ok(()),
+    };
+    let inner_labels: std::collections::HashSet<String> = inner_fields
+        .iter()
+        .map(|f| crate::typecheck_db::util::resolve_symbol(f.label.value.symbol()))
+        .collect();
+    // Build the EXPECTED shape of the new value: every label that old
+    // had, with updated labels taking the new value's inferred type
+    // and non-updated labels keeping old's type. Then unify the new
+    // record's inferred type with this expected shape — that pins
+    // the open tail to old's structure (closing it) while allowing
+    // updated labels to have any type (type-changing updates
+    // succeed because we use the NEW value's type for those slots,
+    // not old's).
+    let new_field_by_label: std::collections::HashMap<&str, &Type> =
+        if let Type::Record(fs, _) = &new_zonked {
+            fs.iter().map(|(l, t)| (l.as_str(), t)).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+    let target_fields: Vec<(String, Type)> = old_fs
+        .iter()
+        .map(|(l, old_t)| {
+            if inner_labels.contains(l) {
+                // Updated label — use new value's type if available,
+                // else fall back to old (defensive).
+                let t = new_field_by_label
+                    .get(l.as_str())
+                    .map(|t| (*t).clone())
+                    .unwrap_or_else(|| old_t.clone());
+                (l.clone(), t)
+            } else {
+                (l.clone(), old_t.clone())
+            }
+        })
+        .collect();
+    // If any of the inner_labels isn't in old_fs (it lives in
+    // old_tail's row), we can't fully construct the expected shape
+    // here — bail and let downstream constraints handle it. Forcing
+    // a partial alignment in this case produces a target that's
+    // missing labels both sides have, causing absorb_extras-style
+    // failures at unify time.
+    let all_inner_labels_in_old_fs = inner_labels
+        .iter()
+        .all(|l| old_fs.iter().any(|(ol, _)| ol == l));
+    if !all_inner_labels_in_old_fs {
+        return Ok(());
+    }
+    let target = Type::Record(target_fields, old_tail.clone());
+    state.unify_here_with_expected(span, &new_zonked, &target)?;
+    // Recurse into any nested inner field: its own value is also a
+    // record-update spec, and its inferred type also has an open
+    // tail that needs to be closed against the corresponding old
+    // sub-field type.
+    for inner_f in inner_fields {
+        if !inner_f.is_nested {
+            continue;
+        }
+        let label =
+            crate::typecheck_db::util::resolve_symbol(inner_f.label.value.symbol());
+        let sub_old = match old_fs.iter().find(|(l, _)| l == &label) {
+            Some((_, t)) => t.clone(),
+            None => continue,
+        };
+        let sub_new = match new_field_by_label.get(label.as_str()) {
+            Some(t) => (*t).clone(),
+            None => continue,
+        };
+        let sub_inner = match &inner_f.value {
+            Some(Expr::Record { fields, .. }) => fields,
+            _ => continue,
+        };
+        align_nested_record_update(state, &sub_old, &sub_new, sub_inner, span)?;
+    }
+    Ok(())
 }
 
 fn infer_lambda(
