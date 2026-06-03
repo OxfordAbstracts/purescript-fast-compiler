@@ -774,6 +774,15 @@ fn capability_constrained_argument_discharge() {
 }
 
 #[test]
+fn do_let_shadowing_newtype() {
+    // Probe for a suspected shadowing bug seen in
+    // DrStripeRefundAttendee: outer let binds `total :: ToAddTotal`,
+    // a case-branch inner let rebinds `total :: Int`. The inner uses
+    // should see the Int, not the ToAddTotal.
+    assert_typechecks(include_str!("fixtures/single_succeeds/do_let_shadowing_newtype.purs"));
+}
+
+#[test]
 #[ignore = "RED: Puregres.Select cluster — Coercible/Newtype Unif-Unif depth limit"]
 fn select_newtype_wrap_chain_typechecks() {
     // Reproducer for the Puregres.Select cluster (Query.Event.* — 4

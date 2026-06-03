@@ -849,6 +849,70 @@ fn hookappend_cluster_typechecks() {
     }
 }
 
+/// Profiler reproducer for `OaVirtual.Layout`'s 10s decl-timeout.
+/// `component` decl is 1700+ lines. Used for
+/// `TYPECHECK_DB_PROFILE_SLOW=1` triage.
+#[test]
+#[ignore = "perf regression target — OaVirtual.Layout 22s"]
+fn repro_oa_virtual_layout_perf() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("repro_oa_virtual_layout".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::env::set_var("TYPECHECK_DB_PROFILE_SLOW", "1");
+                let pkgs = application_modules_by_name();
+                let target = "OaVirtual.Layout";
+                if !pkgs.contains_key(target) {
+                    return Err(format!("{target} missing from application sources"));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!("[repro] {target} closure: {} modules", closure.len());
+                let started = std::time::Instant::now();
+                let mut hits: Vec<String> = Vec::new();
+                let multi = check_many_modules_streaming(closure, |result| {
+                    if result.name == target
+                        && (result.inference_error.is_some()
+                            || !result.constraint_errors.is_empty())
+                    {
+                        hits.push(format!(
+                            "{}: infer={:?}",
+                            result.name, result.inference_error,
+                        ));
+                    }
+                });
+                let elapsed = started.elapsed();
+                eprintln!("[repro] closure check finished in {elapsed:.2?}");
+                for e in &multi {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                if !hits.is_empty() {
+                    return Err(format!("{target} failed:\n  {}", hits.join("\n  ")));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn repro thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_oa_virtual_layout_perf: {msg}");
+    }
+}
+
 /// Verifies the nested-record-update type-changing cluster typechecks
 /// — guards against regression of the row-poly nested-update fix.
 /// Modules cover the most common pattern: `r { outer { inner = NEW } }`
