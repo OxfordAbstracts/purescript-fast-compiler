@@ -849,6 +849,79 @@ fn hookappend_cluster_typechecks() {
     }
 }
 
+/// Dumps the errors for every module currently on the allowlist —
+/// so they can be reviewed (the spans are visible in the printed
+/// kind via the recent `CycleInDeclaration` / `ScopeConflict`
+/// variants that now carry spans). Failure expected; meant to be
+/// inspected via `--nocapture` rather than asserted clean.
+#[test]
+#[ignore = "diagnostic — dumps current allowlist failures with spans"]
+fn dump_allowlist_failures() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("dump_allowlist".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pkgs = application_modules_by_name();
+                let targets = [
+                    "Record.Format",
+                    "ManageReviewers.App.Page.Reviewers.Table.Emails.Modal",
+                    "SpeakerManagement.Speakers.Table.Emails.Modal",
+                    "OaComponents.V1.Dashboard.SelectorCard",
+                ];
+                // Pick the largest closure that covers ALL targets.
+                // Build a union closure covering every target. Each
+                // target's closure overlaps significantly so the union
+                // is much smaller than running each independently.
+                let mut union: std::collections::HashMap<String, ModuleInput> =
+                    std::collections::HashMap::new();
+                for t in &targets {
+                    if !pkgs.contains_key(*t) {
+                        continue;
+                    }
+                    for m in transitive_closure_of(t, &pkgs) {
+                        union.entry(m.name.clone()).or_insert(m);
+                    }
+                }
+                let closure: Vec<ModuleInput> = union.into_values().collect();
+                eprintln!("[allowlist-dump] union closure: {} modules", closure.len());
+                let targets_set: std::collections::HashSet<&str> =
+                    targets.iter().copied().collect();
+                let _multi = check_many_modules_streaming(closure, |result| {
+                    if targets_set.contains(result.name.as_str()) {
+                        eprintln!("=== {} ===", result.name);
+                        for ve in &result.validation_errors {
+                            eprintln!("  validation: {:?}", ve);
+                        }
+                        for ie in &result.import_errors {
+                            eprintln!("  import: {:?}", ie);
+                        }
+                    }
+                });
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn dump thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("dump_allowlist_failures: {msg}");
+    }
+}
+
 /// Profiler reproducer for `OaVirtual.Layout`'s 10s decl-timeout.
 /// `component` decl is 1700+ lines. Used for
 /// `TYPECHECK_DB_PROFILE_SLOW=1` triage.

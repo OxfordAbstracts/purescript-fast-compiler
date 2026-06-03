@@ -63,6 +63,8 @@ pub enum ImportErrorKind {
         name: String,
         first_module: String,
         second_module: String,
+        first_import: crate::span::Span,
+        second_import: crate::span::Span,
     },
 }
 
@@ -106,7 +108,7 @@ pub fn build_env_from_imports(
     // doesn't flag (matches `passing/PendingConflictingImports.purs`).
     let mut name_origins: std::collections::HashMap<
         (Option<String>, String),
-        (String, bool),
+        (String, bool, crate::span::Span),
     > = std::collections::HashMap::new();
     // Qualified-import-only conflicts deferred to use-site. The
     // reference compiler defers `import A as X; import B as X` (no
@@ -118,6 +120,7 @@ pub fn build_env_from_imports(
         String,
         String,
         String,
+        crate::span::Span,
     )> = Vec::new();
     for imp in &module.imports {
         let target_name = module_name_string(&imp.module);
@@ -160,7 +163,7 @@ pub fn build_env_from_imports(
                 .cloned()
                 .unwrap_or_else(|| target_name.clone());
             match name_origins.get(&key) {
-                Some((prev_origin, prev_explicit))
+                Some((prev_origin, prev_explicit, prev_span))
                     if *prev_origin != origin
                         && *prev_explicit
                         && is_explicit_list =>
@@ -173,10 +176,12 @@ pub fn build_env_from_imports(
                             name: n,
                             first_module: prev_origin.clone(),
                             second_module: origin.clone(),
+                            first_import: *prev_span,
+                            second_import: imp.span,
                         },
                     });
                 }
-                Some((prev_origin, _))
+                Some((prev_origin, _, prev_span))
                     if *prev_origin != origin && qualifier.is_some() =>
                 {
                     // Qualified conflict — defer to use-site. Only
@@ -188,10 +193,11 @@ pub fn build_env_from_imports(
                         n,
                         prev_origin.clone(),
                         origin.clone(),
+                        *prev_span,
                     ));
                 }
                 _ => {
-                    name_origins.insert(key, (origin, is_explicit_list));
+                    name_origins.insert(key, (origin, is_explicit_list, imp.span));
                 }
             }
         }
@@ -223,7 +229,7 @@ pub fn build_env_from_imports(
                 }
             }
         }
-        for (span, q, n, m1, m2) in deferred_qualified_conflicts {
+        for (span, q, n, m1, m2, first_span) in deferred_qualified_conflicts {
             let q_re_exported = q
                 .as_ref()
                 .map_or(false, |qn| reexported_qualifiers.contains(qn));
@@ -236,6 +242,8 @@ pub fn build_env_from_imports(
                         name: n,
                         first_module: m1,
                         second_module: m2,
+                        first_import: first_span,
+                        second_import: span,
                     },
                 });
             }
@@ -426,7 +434,7 @@ fn detect_local_explicit_import_conflicts(
     // Collect (namespace, name → source module) from unqualified
     // explicit imports. Qualified imports (`import M as Q`) don't
     // bring names into the unqualified namespace.
-    let mut imported: Map<(Ns, String), String> = Map::new();
+    let mut imported: Map<(Ns, String), (String, crate::span::Span)> = Map::new();
     for imp in &module.imports {
         if imp.qualified.is_some() {
             continue;
@@ -463,7 +471,7 @@ fn detect_local_explicit_import_conflicts(
                     _ => continue,
                 };
                 let _ = target;
-                imported.insert((ns, name), target_name.clone());
+                imported.insert((ns, name), (target_name.clone(), imp.span));
             }
         }
     }
@@ -494,13 +502,15 @@ fn detect_local_explicit_import_conflicts(
             // explicit import. Skip value / foreign decls here.
             _ => continue,
         };
-        if let Some(src) = imported.get(&(ns, decl_name.clone())) {
+        if let Some((src, src_span)) = imported.get(&(ns, decl_name.clone())) {
             errors.push(ImportError {
                 span,
                 kind: ImportErrorKind::ScopeConflict {
                     name: decl_name,
                     first_module: src.clone(),
                     second_module: module_name_string(&module.name.value),
+                    first_import: *src_span,
+                    second_import: span,
                 },
             });
         }

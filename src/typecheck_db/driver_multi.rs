@@ -3394,6 +3394,8 @@ fn detect_use_site_scope_conflict(
             name: String::new(),
             first_module: String::new(),
             second_module: String::new(),
+            first_import: crate::span::Span::new(0, 0),
+            second_import: crate::span::Span::new(0, 0),
         },
     };
 }
@@ -3443,6 +3445,8 @@ fn walk_expr_for_ambig(
                         name: n,
                         first_module: String::new(),
                         second_module: String::new(),
+                        first_import: span,
+                        second_import: span,
                     },
                 });
             }
@@ -3547,6 +3551,8 @@ fn walk_expr_for_ambig(
             name: String::new(),
             first_module: String::new(),
             second_module: String::new(),
+            first_import: crate::span::Span::new(0, 0),
+            second_import: crate::span::Span::new(0, 0),
         },
     };
 }

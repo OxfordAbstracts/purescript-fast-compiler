@@ -43,7 +43,10 @@ pub enum ValidationErrorKind {
     CycleInTypeSynonym(Vec<String>),
     CycleInTypeClassDeclaration(Vec<String>),
     CycleInKindDeclaration(Vec<String>),
-    CycleInDeclaration(Vec<String>),
+    /// Mutually-recursive value declarations that form a cycle.
+    /// Each entry pairs the declared name with its CST span so
+    /// diagnostics can point at each offending declaration.
+    CycleInDeclaration(Vec<(String, crate::span::Span)>),
     PartiallyAppliedSynonym(String),
     OrphanInstance(String),
     DeclConflict(String),
@@ -3909,7 +3912,16 @@ fn detect_value_cycles(decls: &[cst::Decl], errors: &mut Vec<ValidationError>) {
         errors.push(ValidationError {
             span,
             kind: ValidationErrorKind::CycleInDeclaration(
-                cycle.iter().map(|s| resolve(*s)).collect(),
+                cycle
+                    .iter()
+                    .map(|s| {
+                        let entry_span = zero_arity
+                            .get(s)
+                            .map(|(sp, _)| *sp)
+                            .unwrap_or(Span::new(0, 0));
+                        (resolve(*s), entry_span)
+                    })
+                    .collect(),
             ),
         });
     }
@@ -6676,7 +6688,7 @@ fn check_let_block_self_cycle(
                     errors.push(ValidationError {
                         span: *span,
                         kind: ValidationErrorKind::CycleInDeclaration(vec![
-                            resolve(sym),
+                            (resolve(sym), *span),
                         ]),
                     });
                 }
@@ -11405,7 +11417,7 @@ fn detect_instance_method_caf_cycle(
                         errors.push(ValidationError {
                             span: *span,
                             kind: ValidationErrorKind::CycleInDeclaration(vec![
-                                resolve(name.value.symbol()),
+                                (resolve(name.value.symbol()), *span),
                             ]),
                         });
                         continue;
@@ -11428,7 +11440,7 @@ fn detect_instance_method_caf_cycle(
                             errors.push(ValidationError {
                                 span: *span,
                                 kind: ValidationErrorKind::CycleInDeclaration(vec![
-                                    resolve(name.value.symbol()),
+                                    (resolve(name.value.symbol()), *span),
                                 ]),
                             });
                         }
