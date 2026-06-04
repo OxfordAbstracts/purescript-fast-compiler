@@ -11392,16 +11392,17 @@ fn detect_instance_method_caf_cycle(
         let Some(methods) = class_methods.get(&cqi.name) else {
             continue;
         };
-        // Whether this instance has a constraint with the SAME class
-        // as the instance head. If so, sibling method references in
-        // method bodies could legitimately come through that
-        // constraint's dictionary (e.g. `instance Eq a => Eq (Array
-        // a) where eq = eqArrayImpl eq`). If not, sibling references
-        // MUST come from the current dict — a CAF cycle.
-        let has_same_class_constraint = constraints.iter().any(|c| {
-            let qi = c.class.to_qi();
-            qi.module.is_none() && qi.name == cqi.name
-        });
+        // Whether this instance has ANY constraint. If yes, the JS
+        // codegen wraps the dict in a function that takes the
+        // constraint dicts, so the dict body itself isn't evaluated
+        // at module init — sibling method references are safe even
+        // for nullary members. Empirically verified against the
+        // reference PureScript compiler (0.15.15):
+        //   `instance Helper a => C a where h2 = g2 ...`  → OK
+        //   `instance C String where h2 = g2 ...`         → CycleInDeclaration
+        // See issue purescript/purescript#365 for the underlying
+        // JS-codegen reason (unconstrained dicts construct eagerly).
+        let has_constraint = !constraints.is_empty();
         for m in members {
             if let cst::Decl::Value { name, binders, guarded, span, .. } = m {
                 if !binders.is_empty() {
@@ -11411,6 +11412,15 @@ fn detect_instance_method_caf_cycle(
                     cst::GuardedExpr::Unconditional(e) => e.as_ref(),
                     _ => continue,
                 };
+                // Both the direct-rename `g = f` and the cross-method
+                // head-reference `size = fold (...) 0.0` checks are
+                // skipped when the instance carries any constraint —
+                // the dict is then a function value, evaluated lazily,
+                // so sibling references can't form a construction-time
+                // cycle.
+                if has_constraint {
+                    continue;
+                }
                 // Direct rename `g = f` always flags.
                 if let Some(sym) = direct_var_ref(body) {
                     if methods.contains(&sym) {
@@ -11426,24 +11436,16 @@ fn detect_instance_method_caf_cycle(
                 // Cross-method head reference: `size = fold (...) 0.0`
                 // where the HEAD of the body's App chain IS a sibling
                 // method. The sibling is immediately called at dictionary
-                // construction time (partial application in JS). Only
-                // fire when there's no same-class constraint (which would
-                // mean `fold` comes from the constraint, not the dict).
-                // Note: `exl = linearPropagation exl exl` is OK because
-                // `linearPropagation` is the head (external), and `exl`
-                // appears only in argument position — the closure captures
-                // it lazily.
-                if !has_same_class_constraint {
-                    let head = peel_app_head_for_method_ref(body);
-                    if let Some(sym) = head {
-                        if methods.contains(&sym) {
-                            errors.push(ValidationError {
-                                span: *span,
-                                kind: ValidationErrorKind::CycleInDeclaration(vec![
-                                    (resolve(name.value.symbol()), *span),
-                                ]),
-                            });
-                        }
+                // construction time (partial application in JS).
+                let head = peel_app_head_for_method_ref(body);
+                if let Some(sym) = head {
+                    if methods.contains(&sym) {
+                        errors.push(ValidationError {
+                            span: *span,
+                            kind: ValidationErrorKind::CycleInDeclaration(vec![
+                                (resolve(name.value.symbol()), *span),
+                            ]),
+                        });
                     }
                 }
             }

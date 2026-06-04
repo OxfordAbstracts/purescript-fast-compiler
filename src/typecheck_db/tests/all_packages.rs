@@ -1695,15 +1695,7 @@ fn run_build_from_sources_check() -> Result<(), String> {
     // uncertain). The test passes when every NON-allowlisted module
     // typechecks clean — failures within the allowlist are still
     // dumped to the summary for visibility but don't fail the test.
-    let allowlist: std::collections::HashSet<&str> = [
-        // CycleInDeclaration — reference rule uncertain; set aside.
-        // (`format = format' (Proxy :: Proxy string)` in
-        // Record.Format's `formatParsedFormat` instance.)
-        "Record.Format",
-    ]
-    .iter()
-    .copied()
-    .collect();
+    let allowlist: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     let non_allowlisted: Vec<&ModuleFailure> = failures
         .iter()
