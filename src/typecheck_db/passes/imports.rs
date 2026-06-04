@@ -478,10 +478,20 @@ fn detect_local_explicit_import_conflicts(
     if imported.is_empty() {
         return;
     }
-    // Walk local decls; flag any whose (namespace, name) is in
-    // `imported`. A `data Cons` (type) doesn't conflict with an
-    // `import M (class Cons)` (class) because they're in different
-    // namespaces.
+    // Walk local decls; collect any whose (namespace, name) is in
+    // `imported` as a CANDIDATE conflict. A `data Cons` (type)
+    // doesn't conflict with an `import M (class Cons)` (class)
+    // because they're in different namespaces.
+    //
+    // The reference compiler has a quirk: a local type/class decl
+    // that collides with an unqualified explicit import is OK so
+    // long as the conflicting name is NEVER referenced unqualified
+    // in the module body. The conflict only matters at the use
+    // site — without a use, there's no ambiguity to resolve. So we
+    // collect candidates here, then check use-sites below, and
+    // only emit ScopeConflict for candidates that ARE used.
+    let mut candidates: Vec<(Ns, String, String, crate::span::Span, crate::span::Span)> =
+        Vec::new();
     for d in &module.decls {
         let (ns, decl_name, span) = match d {
             cst::Decl::TypeAlias { name, span, .. }
@@ -503,17 +513,196 @@ fn detect_local_explicit_import_conflicts(
             _ => continue,
         };
         if let Some((src, src_span)) = imported.get(&(ns, decl_name.clone())) {
-            errors.push(ImportError {
-                span,
-                kind: ImportErrorKind::ScopeConflict {
-                    name: decl_name,
-                    first_module: src.clone(),
-                    second_module: module_name_string(&module.name.value),
-                    first_import: *src_span,
-                    second_import: span,
-                },
-            });
+            candidates.push((ns, decl_name, src.clone(), *src_span, span));
         }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    // Collect unqualified type-constructor references and
+    // unqualified constraint-class references from every type
+    // expression in the module's decls. The declaration's own LHS
+    // (the binder name on `data X`, `type X`, etc.) is NOT a
+    // reference and is excluded by virtue of only visiting
+    // TypeExpr positions, not Decl-name positions.
+    let mut type_refs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut class_refs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for d in &module.decls {
+        collect_unqualified_refs_decl(d, &mut type_refs, &mut class_refs);
+    }
+    for (ns, name, src, src_span, span) in candidates {
+        let referenced = match ns {
+            Ns::Type => type_refs.contains(&name),
+            Ns::Class => class_refs.contains(&name),
+            Ns::Value => false,
+        };
+        if !referenced {
+            continue;
+        }
+        errors.push(ImportError {
+            span,
+            kind: ImportErrorKind::ScopeConflict {
+                name,
+                first_module: src,
+                second_module: module_name_string(&module.name.value),
+                first_import: src_span,
+                second_import: span,
+            },
+        });
+    }
+}
+
+/// Walk a decl's type expressions, collecting unqualified
+/// references — split by namespace. Type-constructor refs go in
+/// `type_refs`; constraint class refs go in `class_refs`. The
+/// decl's own LHS-bound name is skipped automatically (we only
+/// visit TypeExpr nodes, never Decl.name).
+fn collect_unqualified_refs_decl(
+    d: &cst::Decl,
+    type_refs: &mut std::collections::HashSet<String>,
+    class_refs: &mut std::collections::HashSet<String>,
+) {
+    match d {
+        cst::Decl::TypeAlias { ty, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::Decl::Data { constructors, .. } => {
+            for ctor in constructors {
+                for f in &ctor.fields {
+                    walk_typeexpr_unqualified(f, type_refs, class_refs);
+                }
+            }
+        }
+        cst::Decl::Newtype { ty, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::Decl::Class { constraints, members, .. } => {
+            for c in constraints {
+                if c.class.module.is_none() {
+                    class_refs.insert(
+                        crate::typecheck_db::util::resolve_symbol(c.class.name.symbol()),
+                    );
+                }
+                for arg in &c.args {
+                    walk_typeexpr_unqualified(arg, type_refs, class_refs);
+                }
+            }
+            for m in members {
+                walk_typeexpr_unqualified(&m.ty, type_refs, class_refs);
+            }
+        }
+        cst::Decl::TypeSignature { ty, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::Decl::Foreign { ty, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::Decl::Instance { class_name, types, constraints, members, .. } => {
+            if class_name.module.is_none() {
+                class_refs.insert(
+                    crate::typecheck_db::util::resolve_symbol(
+                        class_name.name.symbol(),
+                    ),
+                );
+            }
+            for t in types {
+                walk_typeexpr_unqualified(t, type_refs, class_refs);
+            }
+            for c in constraints {
+                if c.class.module.is_none() {
+                    class_refs.insert(
+                        crate::typecheck_db::util::resolve_symbol(c.class.name.symbol()),
+                    );
+                }
+                for arg in &c.args {
+                    walk_typeexpr_unqualified(arg, type_refs, class_refs);
+                }
+            }
+            for m in members {
+                collect_unqualified_refs_decl(m, type_refs, class_refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_typeexpr_unqualified(
+    te: &cst::TypeExpr,
+    type_refs: &mut std::collections::HashSet<String>,
+    class_refs: &mut std::collections::HashSet<String>,
+) {
+    match te {
+        cst::TypeExpr::Constructor { name, .. } => {
+            if name.module.is_none() {
+                type_refs.insert(
+                    crate::typecheck_db::util::resolve_symbol(name.name.symbol()),
+                );
+            }
+        }
+        cst::TypeExpr::App { constructor, arg, .. } => {
+            walk_typeexpr_unqualified(constructor, type_refs, class_refs);
+            walk_typeexpr_unqualified(arg, type_refs, class_refs);
+        }
+        cst::TypeExpr::Function { from, to, .. } => {
+            walk_typeexpr_unqualified(from, type_refs, class_refs);
+            walk_typeexpr_unqualified(to, type_refs, class_refs);
+        }
+        cst::TypeExpr::Forall { vars, ty, .. } => {
+            for (_, _, k) in vars {
+                if let Some(k) = k {
+                    walk_typeexpr_unqualified(k, type_refs, class_refs);
+                }
+            }
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                if c.class.module.is_none() {
+                    class_refs.insert(
+                        crate::typecheck_db::util::resolve_symbol(c.class.name.symbol()),
+                    );
+                }
+                for arg in &c.args {
+                    walk_typeexpr_unqualified(arg, type_refs, class_refs);
+                }
+            }
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                walk_typeexpr_unqualified(&f.ty, type_refs, class_refs);
+            }
+        }
+        cst::TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                walk_typeexpr_unqualified(&f.ty, type_refs, class_refs);
+            }
+            if let Some(t) = tail {
+                walk_typeexpr_unqualified(t, type_refs, class_refs);
+            }
+        }
+        cst::TypeExpr::Parens { ty, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        cst::TypeExpr::Kinded { ty, kind, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+            walk_typeexpr_unqualified(kind, type_refs, class_refs);
+        }
+        cst::TypeExpr::TypeOp { left, right, .. } => {
+            walk_typeexpr_unqualified(left, type_refs, class_refs);
+            walk_typeexpr_unqualified(right, type_refs, class_refs);
+        }
+        cst::TypeExpr::ArrayPattern { elements, .. } => {
+            for e in elements {
+                walk_typeexpr_unqualified(e, type_refs, class_refs);
+            }
+        }
+        cst::TypeExpr::AsPattern { ty, .. } => {
+            walk_typeexpr_unqualified(ty, type_refs, class_refs);
+        }
+        _ => {}
     }
 }
 

@@ -1696,13 +1696,9 @@ fn run_build_from_sources_check() -> Result<(), String> {
     // typechecks clean — failures within the allowlist are still
     // dumped to the summary for visibility but don't fail the test.
     let allowlist: std::collections::HashSet<&str> = [
-        // ScopeConflict — local-decl + explicit-import of the same
-        // name; reference compiler also rejects (see fixture
-        // failing/2197-shouldFail.purs).
-        "ManageReviewers.App.Page.Reviewers.Table.Emails.Modal",
-        "OaComponents.V1.Dashboard.SelectorCard",
-        "SpeakerManagement.Speakers.Table.Emails.Modal",
         // CycleInDeclaration — reference rule uncertain; set aside.
+        // (`format = format' (Proxy :: Proxy string)` in
+        // Record.Format's `formatParsedFormat` instance.)
         "Record.Format",
     ]
     .iter()
