@@ -86,7 +86,7 @@ pub fn generalize_with_constraints(
     }
     let body = apply_unif_subst(&zonked_ty, &subst);
     if zonked_constraints.is_empty() {
-        return Scheme { vars: names, ty: body };
+        return Scheme::new(names, body);
     }
     let lifted_constraints: Vec<Constraint> = zonked_constraints
         .iter()
@@ -95,10 +95,7 @@ pub fn generalize_with_constraints(
             args: c.args.iter().map(|a| apply_unif_subst(a, &subst)).collect(),
         })
         .collect();
-    Scheme {
-        vars: names,
-        ty: Type::Constrained(lifted_constraints, Arc::new(body)),
-    }
+    Scheme::new(names, Type::Constrained(lifted_constraints, Arc::new(body)))
 }
 
 /// Instantiate a scheme: replace each quantified variable with a fresh
@@ -111,8 +108,20 @@ pub fn generalize_with_constraints(
 /// survive instantiation so post-zonking surfaces the inferred type.
 pub fn instantiate(state: &mut UnifyState, scheme: &Scheme) -> Type {
     let mut var_subst: HashMap<String, Type> = HashMap::new();
-    for v in &scheme.vars {
-        var_subst.insert(v.clone(), state.fresh());
+    for (i, v) in scheme.vars.iter().enumerate() {
+        // Use `fresh_with_kind` when the scheme carried a kind
+        // annotation for this var (populated by `sig_to_scheme`,
+        // the class-method scheme builders in driver_multi /
+        // module_registry / check_nonvalue from each Forall var's
+        // optional kind). Without this, the fresh unif has no
+        // kind constraint and `bind_var` would accept any binding,
+        // including a Type-kind value into a `Type -> Type`-kind
+        // slot.
+        let fresh = match scheme.vars_kinds.get(i).and_then(|k| k.as_ref()) {
+            Some(k) => state.fresh_with_kind(k.clone()),
+            None => state.fresh(),
+        };
+        var_subst.insert(v.clone(), fresh);
     }
     let body = if var_subst.is_empty() {
         scheme.ty.clone()
@@ -495,10 +504,10 @@ mod tests {
     #[test]
     fn instantiate_fresh_vars_for_each_quantifier() {
         let mut s = UnifyState::new();
-        let scheme = Scheme {
-            vars: vec!["a".into()],
-            ty: Type::fun(Type::Var("a".into()), Type::Var("a".into())),
-        };
+        let scheme = Scheme::new(
+            vec!["a".into()],
+            Type::fun(Type::Var("a".into()), Type::Var("a".into())),
+        );
         let t1 = instantiate(&mut s, &scheme);
         let t2 = instantiate(&mut s, &scheme);
         assert_ne!(t1, t2);
@@ -564,10 +573,10 @@ mod tests {
     #[test]
     fn instantiated_scheme_unifies_with_concrete() {
         let mut s = UnifyState::new();
-        let id_scheme = Scheme {
-            vars: vec!["a".into()],
-            ty: Type::fun(Type::Var("a".into()), Type::Var("a".into())),
-        };
+        let id_scheme = Scheme::new(
+            vec!["a".into()],
+            Type::fun(Type::Var("a".into()), Type::Var("a".into())),
+        );
         let inst = instantiate(&mut s, &id_scheme);
         // `id @ Int` → `Int -> Int`
         s.unify(&inst, &Type::fun(int_ty(), int_ty())).unwrap();

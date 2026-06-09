@@ -365,7 +365,7 @@ pub fn distill_exports(
     let mut scheme_by_name: HashMap<String, std::sync::Arc<Scheme>> = HashMap::new();
     for d in &module.decls {
         match d {
-            Decl::Class { name, type_vars, members, .. } => {
+            Decl::Class { name, type_vars, type_var_kind_anns, members, .. } => {
                 // Class methods get a constrained scheme:
                 // `forall (class + method vars). C <class vars>
                 //  => <method type>`. Without this they never
@@ -377,17 +377,67 @@ pub fn distill_exports(
                     .iter()
                     .map(|v| crate::typecheck_db::util::resolve_symbol(v.value.symbol()))
                     .collect();
+                // Class-quantified vars' kinds, parallel to `class_vars`.
+                // Empty annotation → None (kind defaults to Type at
+                // use sites that need a default; the unifier just
+                // skips the check for None-kinded unifs).
+                let mut class_var_kinds: Vec<Option<Type>> = type_vars
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        type_var_kind_anns
+                            .get(i)
+                            .and_then(|o| o.as_ref())
+                            .map(|k| {
+                                crate::typecheck_db::types::expand_aliases(
+                                    crate::typecheck_db::types::convert_type_expr(k, type_ops),
+                                    alias_map,
+                                )
+                            })
+                    })
+                    .collect();
+                // Infer higher-kindedness from method bodies for vars
+                // the source didn't annotate. e.g. `class Parallel f g`
+                // doesn't annotate `f`/`g`, but `parallel :: g a -> f a`
+                // applies them — so they must be at least `Type -> Type`.
+                // Without this, `instantiate` would call `fresh()` (not
+                // `fresh_with_kind`) on those vars, and `bind_var`
+                // wouldn't refuse a `Type`-kind binding.
+                for (i, var_name) in class_vars.iter().enumerate() {
+                    if class_var_kinds[i].is_some() {
+                        continue;
+                    }
+                    let mut max_args: usize = 0;
+                    for m in members {
+                        let mty = conv(&m.ty);
+                        infer_max_app_args(&mty, var_name, &mut max_args);
+                    }
+                    if max_args > 0 {
+                        let mut k = crate::typecheck_db::types::prim_kind_type();
+                        for _ in 0..max_args {
+                            k = Type::Fun(
+                                std::sync::Arc::new(
+                                    crate::typecheck_db::types::prim_kind_type(),
+                                ),
+                                std::sync::Arc::new(k),
+                            );
+                        }
+                        class_var_kinds[i] = Some(k);
+                    }
+                }
                 for m in members {
                     let method_name =
                         crate::typecheck_db::util::resolve_symbol(m.name.value.symbol());
                     let method_ty = conv(&m.ty);
-                    let (method_vars, method_body) = match method_ty {
+                    let (method_vars, method_var_kinds, method_body) = match method_ty {
                         Type::Forall(qs, body) => {
-                            let ns: Vec<String> =
-                                qs.into_iter().map(|(n, _, _)| n).collect();
-                            (ns, std::sync::Arc::unwrap_or_clone(body))
+                            let (ns, ks): (Vec<String>, Vec<Option<Type>>) = qs
+                                .into_iter()
+                                .map(|(n, _, k)| (n, k.map(|arc| (*arc).clone())))
+                                .unzip();
+                            (ns, ks, std::sync::Arc::unwrap_or_clone(body))
                         }
-                        other => (Vec::new(), other),
+                        other => (Vec::new(), Vec::new(), other),
                     };
                     let constraint = crate::typecheck_db::types::Constraint {
                         // Use the DEFINING module's qualifier (this is
@@ -409,39 +459,50 @@ pub fn distill_exports(
                         Type::Constrained(vec![constraint], std::sync::Arc::new(method_body));
                     let mut all_vars = class_vars.clone();
                     all_vars.extend(method_vars);
+                    let mut all_kinds = class_var_kinds.clone();
+                    all_kinds.extend(method_var_kinds);
                     scheme_by_name.insert(
                         method_name,
-                        std::sync::Arc::new(Scheme { vars: all_vars, ty: constrained }),
+                        std::sync::Arc::new(Scheme::with_kinds(all_vars, all_kinds, constrained)),
                     );
                 }
             }
             Decl::Foreign { name, ty, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let declared = conv(ty);
-                let (vars, body) = match declared {
+                let (vars, vars_kinds, body) = match declared {
                     Type::Forall(qs, body) => {
-                        let ns: Vec<String> =
-                            qs.into_iter().map(|(n, _, _)| n).collect();
-                        (ns, std::sync::Arc::unwrap_or_clone(body))
+                        let (ns, ks): (Vec<String>, Vec<Option<Type>>) = qs
+                            .into_iter()
+                            .map(|(n, _, k)| (n, k.map(|arc| (*arc).clone())))
+                            .unzip();
+                        (ns, ks, std::sync::Arc::unwrap_or_clone(body))
                     }
-                    other => (Vec::new(), other),
+                    other => (Vec::new(), Vec::new(), other),
                 };
-                scheme_by_name.insert(n, std::sync::Arc::new(Scheme { vars, ty: body }));
+                scheme_by_name.insert(
+                    n,
+                    std::sync::Arc::new(Scheme::with_kinds(vars, vars_kinds, body)),
+                );
             }
             Decl::TypeSignature { name, ty, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
                 let declared = conv(ty);
-                let (vars, body) = match declared {
+                let (vars, vars_kinds, body) = match declared {
                     Type::Forall(qs, body) => {
-                        let ns: Vec<String> =
-                            qs.into_iter().map(|(n, _, _)| n).collect();
-                        (ns, std::sync::Arc::unwrap_or_clone(body))
+                        let (ns, ks): (Vec<String>, Vec<Option<Type>>) = qs
+                            .into_iter()
+                            .map(|(n, _, k)| (n, k.map(|arc| (*arc).clone())))
+                            .unzip();
+                        (ns, ks, std::sync::Arc::unwrap_or_clone(body))
                     }
-                    other => (Vec::new(), other),
+                    other => (Vec::new(), Vec::new(), other),
                 };
                 scheme_by_name
                     .entry(n)
-                    .or_insert_with(|| std::sync::Arc::new(Scheme { vars, ty: body }));
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(Scheme::with_kinds(vars, vars_kinds, body))
+                    });
             }
             _ => {}
         }
@@ -1390,6 +1451,57 @@ fn qualified_kind_head(
     }
 }
 
+/// Walk `ty` and update `max_args` with the longest App-spine count
+/// whose head is `Type::Var(var_name)`. Used by the class-method
+/// scheme builder to infer a kind shape (`Type -> ... -> Type`) for
+/// class-quantified vars the source didn't annotate.
+fn infer_max_app_args(ty: &Type, var_name: &str, max_args: &mut usize) {
+    fn spine_args(t: &Type, var_name: &str, args_seen: usize) -> Option<usize> {
+        match t {
+            Type::App(f, _) => spine_args(f, var_name, args_seen + 1),
+            Type::Var(n) if n == var_name => Some(args_seen),
+            _ => None,
+        }
+    }
+    if let Some(args) = spine_args(ty, var_name, 0) {
+        if args > *max_args {
+            *max_args = args;
+        }
+    }
+    match ty {
+        Type::App(f, a) => {
+            infer_max_app_args(f, var_name, max_args);
+            infer_max_app_args(a, var_name, max_args);
+        }
+        Type::Fun(a, b) => {
+            infer_max_app_args(a, var_name, max_args);
+            infer_max_app_args(b, var_name, max_args);
+        }
+        Type::Forall(_, body) => infer_max_app_args(body, var_name, max_args),
+        Type::Constrained(cs, body) => {
+            for c in cs {
+                for a in &c.args {
+                    infer_max_app_args(a, var_name, max_args);
+                }
+            }
+            infer_max_app_args(body, var_name, max_args);
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            for (_, t) in fs {
+                infer_max_app_args(t, var_name, max_args);
+            }
+            if let Some(t) = tail {
+                infer_max_app_args(t, var_name, max_args);
+            }
+        }
+        Type::Kinded(t, k) => {
+            infer_max_app_args(t, var_name, max_args);
+            infer_max_app_args(k, var_name, max_args);
+        }
+        _ => {}
+    }
+}
+
 fn is_operator_in_export_list(exports: &[crate::cst::Export], op: &str) -> bool {
     exports.iter().any(|e| match e {
         crate::cst::Export::Value(v) => {
@@ -1661,13 +1773,13 @@ class Eq a where
         );
         // Method scheme as it would appear after inference.
         let a = Type::Var("a".into());
-        let method_scheme = Scheme {
-            vars: vec!["a".into()],
-            ty: Type::fun(
+        let method_scheme = Scheme::new(
+            vec!["a".into()],
+            Type::fun(
                 a.clone(),
                 Type::fun(a, Type::Con(QName::unqualified("Boolean"))),
             ),
-        };
+        );
         let schemes = vec![InferredScheme {
             name: "eq".into(),
             scheme: method_scheme,
@@ -1740,10 +1852,8 @@ infixl 6 add as +
 ",
         );
         let a = Type::Var("a".into());
-        let add_scheme = Scheme {
-            vars: vec!["a".into()],
-            ty: Type::fun(a.clone(), Type::fun(a.clone(), a)),
-        };
+        let add_scheme =
+            Scheme::new(vec!["a".into()], Type::fun(a.clone(), Type::fun(a.clone(), a)));
         let schemes = vec![InferredScheme {
             name: "add".into(),
             scheme: add_scheme,

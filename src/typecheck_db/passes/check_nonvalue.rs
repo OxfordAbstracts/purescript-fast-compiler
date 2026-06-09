@@ -94,12 +94,23 @@ pub struct ForeignDataShape {
 // ============================================================================
 
 fn strip_forall(ty: Type) -> (Vec<String>, Type) {
+    let (vars, _, body) = strip_forall_with_kinds(ty);
+    (vars, body)
+}
+
+/// Like `strip_forall` but also returns per-var kind annotations
+/// (parallel to vars; `None` per var when the source carried no
+/// `forall (a :: k)` annotation).
+fn strip_forall_with_kinds(ty: Type) -> (Vec<String>, Vec<Option<Type>>, Type) {
     match ty {
         Type::Forall(qs, body) => {
-            let names: Vec<String> = qs.into_iter().map(|(n, _, _)| n).collect();
-            (names, std::sync::Arc::unwrap_or_clone(body))
+            let (names, kinds): (Vec<String>, Vec<Option<Type>>) = qs
+                .into_iter()
+                .map(|(n, _, k)| (n, k.map(|arc| (*arc).clone())))
+                .unzip();
+            (names, kinds, std::sync::Arc::unwrap_or_clone(body))
         }
-        other => (Vec::new(), other),
+        other => (Vec::new(), Vec::new(), other),
     }
 }
 
@@ -318,11 +329,29 @@ pub mod check_class {
         type_ops: &TypeOpMap,
     ) -> Result<(ClassShape, OutputHash, CacheOutcome), DriverError> {
         let shape = match decl {
-            Decl::Class { name, type_vars, fundeps, constraints, members, .. } => {
+            Decl::Class {
+                name,
+                type_vars,
+                type_var_kind_anns,
+                fundeps,
+                constraints,
+                members,
+                ..
+            } => {
                 let class_name = util::resolve_symbol(name.value.symbol());
                 let vars: Vec<String> = type_vars
                     .iter()
                     .map(|v| util::resolve_symbol(v.value.symbol()))
+                    .collect();
+                let var_kinds: Vec<Option<Type>> = type_vars
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        type_var_kind_anns
+                            .get(i)
+                            .and_then(|o| o.as_ref())
+                            .map(|k| convert_type_expr(k, type_ops))
+                    })
                     .collect();
                 let fundeps_pos: Vec<FunDep> = fundeps
                     .iter()
@@ -355,7 +384,8 @@ pub mod check_class {
                     .map(|m| {
                         let mname = util::resolve_symbol(m.name.value.symbol());
                         let method_ty = convert_type_expr(&m.ty, type_ops);
-                        let (method_vars, method_body) = strip_forall(method_ty);
+                        let (method_vars, method_var_kinds, method_body) =
+                            strip_forall_with_kinds(method_ty);
                         let constraint = Constraint {
                             class: QName::unqualified(&class_name),
                             args: vars
@@ -367,7 +397,9 @@ pub mod check_class {
                             Type::Constrained(vec![constraint], std::sync::Arc::new(method_body));
                         let mut all_vars = vars.clone();
                         all_vars.extend(method_vars);
-                        (mname, Scheme { vars: all_vars, ty: constrained })
+                        let mut all_kinds = var_kinds.clone();
+                        all_kinds.extend(method_var_kinds);
+                        (mname, Scheme::with_kinds(all_vars, all_kinds, constrained))
                     })
                     .collect();
                 ClassShape {
@@ -615,8 +647,11 @@ pub mod check_foreign {
             Decl::Foreign { name, ty, .. } => {
                 let n = util::resolve_symbol(name.value.symbol());
                 let declared = convert_type_expr(ty, type_ops);
-                let (vars, body) = strip_forall(declared);
-                ForeignShape { name: n, scheme: Scheme { vars, ty: body } }
+                let (vars, vars_kinds, body) = strip_forall_with_kinds(declared);
+                ForeignShape {
+                    name: n,
+                    scheme: Scheme::with_kinds(vars, vars_kinds, body),
+                }
             }
             _ => unreachable!("check_foreign only handles Foreign"),
         };

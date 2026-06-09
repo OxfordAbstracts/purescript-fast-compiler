@@ -234,6 +234,12 @@ impl std::fmt::Display for LocatedUnifyError {
 pub struct UnifyState {
     // bindings[i] = Some(ty) when ?i is solved, None when fresh.
     bindings: Vec<Option<Type>>,
+    // Per-unif declared kind, parallel to `bindings`. `None` when
+    // the kind is unknown (no annotation propagated to fresh()).
+    // `Some(kind)` populated by `fresh_with_kind`. Used by
+    // `bind_var` to refuse a kind-mismatched binding (e.g. a
+    // higher-kinded unif being pinned to a Type-kind value).
+    unif_kinds: Vec<Option<Type>>,
     // Skolem ids are monotonically allocated from `next_skolem`.
     // Each unification variable records the skolem-counter value
     // AT ITS ALLOCATION TIME (`unif_skolem_levels[i]`): the unif
@@ -350,6 +356,7 @@ impl UnifyState {
     pub fn new() -> Self {
         Self {
             bindings: Vec::new(),
+            unif_kinds: Vec::new(),
             unif_skolem_levels: Vec::new(),
             next_skolem: 0,
             pending_exhaust: Vec::new(),
@@ -624,6 +631,7 @@ impl UnifyState {
             // so the trail entry can be ignored.
         }
         self.bindings.truncate(snapshot.bindings_len);
+        self.unif_kinds.truncate(snapshot.bindings_len);
         self.unif_skolem_levels.truncate(snapshot.skolem_levels_len);
     }
 
@@ -741,12 +749,33 @@ impl UnifyState {
         std::mem::take(&mut self.pending_exhaust)
     }
 
-    /// Allocate a fresh unification variable.
+    /// Allocate a fresh unification variable with unknown kind.
     pub fn fresh(&mut self) -> Type {
         let id = self.bindings.len() as u32;
         self.bindings.push(None);
+        self.unif_kinds.push(None);
         self.unif_skolem_levels.push(self.next_skolem);
         Type::Unif(id)
+    }
+
+    /// Allocate a fresh unification variable with a declared kind.
+    /// Used by `instantiate` for Forall vars carrying explicit
+    /// kind annotations, and by ad-hoc call sites that know the
+    /// kind they're slotting (e.g. an App-head fresh that must be
+    /// `Type -> Type`).
+    pub fn fresh_with_kind(&mut self, kind: Type) -> Type {
+        let id = self.bindings.len() as u32;
+        self.bindings.push(None);
+        self.unif_kinds.push(Some(kind));
+        self.unif_skolem_levels.push(self.next_skolem);
+        Type::Unif(id)
+    }
+
+    /// Read a unif's declared kind, if known.
+    pub fn unif_kind(&self, id: u32) -> Option<&Type> {
+        self.unif_kinds
+            .get(id as usize)
+            .and_then(|o| o.as_ref())
     }
 
     /// Number of unification variables currently allocated. Used by
@@ -1153,9 +1182,66 @@ impl UnifyState {
             if *j == id {
                 return Ok(());
             }
+            // Kind propagation between unifs: when we bind one
+            // unif to another, the resulting equivalence class
+            // shares whatever kind either side knew. Copy from the
+            // known side into the unknown side BEFORE the bind so
+            // a subsequent `bind_var(j, Record(...))` (or a fresh
+            // App-head unification) sees the inherited kind and
+            // can refuse a kind-mismatched value.
+            if std::env::var("TYPECHECK_DB_KIND_CHECK").is_ok() {
+                let id_kind = self
+                    .unif_kinds
+                    .get(id as usize)
+                    .and_then(|o| o.as_ref())
+                    .cloned();
+                let j_kind = self
+                    .unif_kinds
+                    .get(*j as usize)
+                    .and_then(|o| o.as_ref())
+                    .cloned();
+                match (id_kind, j_kind) {
+                    (Some(k), None) => {
+                        if (*j as usize) < self.unif_kinds.len() {
+                            self.unif_kinds[*j as usize] = Some(k);
+                        }
+                    }
+                    (None, Some(k)) => {
+                        if (id as usize) < self.unif_kinds.len() {
+                            self.unif_kinds[id as usize] = Some(k);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         if occurs_in(id, other) {
             return Err(UnifyError::Infinite { var: id, ty: other.clone() });
+        }
+        // Kind-discipline check. Gated by env var while we validate
+        // the structural rules don't over-reject. When enabled:
+        // refuse a higher-kinded unif (`Type -> Type`+) from being
+        // unified with a `Type`-kind concrete value (Record, known
+        // Type-kind Con). This catches the parallel cluster bug
+        // where `f :: Type -> Type` got pinned to a Record.
+        if std::env::var("TYPECHECK_DB_KIND_CHECK").is_ok() {
+            if let Some(expected_kind) = self
+                .unif_kinds
+                .get(id as usize)
+                .and_then(|o| o.as_ref())
+                .cloned()
+            {
+                if is_higher_kind(&expected_kind) {
+                    if let Some(actual_kind) = kind_of_value(self, other) {
+                        if !kinds_compatible(&expected_kind, &actual_kind) {
+                            return Err(UnifyError::Mismatch(
+                                Type::Unif(id),
+                                other.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
         }
         // Skolem-level reconciliation. `id`'s skolem boundary is the
         // skolem counter value at its allocation time; `other` may
@@ -1534,6 +1620,191 @@ fn type_eq(a: &Type, b: &Type) -> bool {
         (Type::Hole(x), Type::Hole(y)) => x == y,
         (Type::Wildcard, Type::Wildcard) => true,
         _ => false,
+    }
+}
+
+/// True when `kind` is shape `_ -> _` (a function kind, i.e. the
+/// var ranges over a higher-kinded thing like `Type -> Type`).
+/// The Parallel cluster bug needs this distinction: parallel's
+/// `f` is higher-kinded and must NOT be bound to a `Type`-kind
+/// value. Lower-kinded vars (kind `Type`) bind freely.
+fn is_higher_kind(kind: &Type) -> bool {
+    match kind {
+        Type::Fun(_, _) => true,
+        Type::Kinded(t, _) => is_higher_kind(t),
+        _ => false,
+    }
+}
+
+/// Compute the kind of a concrete-shaped type — `Type` for value-
+/// kind shapes (Record, Row-of-Type, Fun, TypeString, TypeInt,
+/// known type Cons), and `kind_of_app_head(...) - 1 arg` for
+/// applications (decompose the spine). Returns `None` for opaque
+/// shapes (variables, skolems, unifs whose kind we don't track,
+/// unknown Cons heads) — `bind_var` skips its kind check in those
+/// cases. Deliberately conservative: we'd rather miss a kind error
+/// than reject a legitimate binding.
+fn kind_of_value(state: &UnifyState, ty: &Type) -> Option<Type> {
+    use crate::typecheck_db::types::{prim_kind_type, prim_int, prim_symbol};
+    match ty {
+        // Records and rows of value types are kind Type. Open rows
+        // with a tail still resolve to Type if the tail does.
+        Type::Record(_, _) => Some(prim_kind_type()),
+        // A Row literal is kind `Row k` for some k. Without
+        // tracking the element kind we conservatively return None
+        // — we don't want to refuse a row-vs-rowish bind on weak
+        // inference.
+        Type::Row(_, _) => None,
+        // Functions are kind Type.
+        Type::Fun(_, _) => Some(prim_kind_type()),
+        // Type-level literals.
+        Type::TypeString(_) => Some(prim_symbol()),
+        Type::TypeInt(_) => Some(prim_int()),
+        // A Kinded annotation publishes the kind directly.
+        Type::Kinded(_, k) => Some((**k).clone()),
+        // Application: decompose the spine. The HEAD's kind must
+        // be of shape `k1 -> ... -> kn -> result`; we apply n args
+        // (concrete spine length) and return the result kind.
+        Type::App(_, _) => {
+            let (head, args) = decompose_app(ty);
+            let head_kind = kind_of_head(state, &head)?;
+            apply_kind(&head_kind, args.len())
+        }
+        Type::Con(qn) => {
+            // Only recognise the small set of Prim Type-kind
+            // constructors here. Unknown Cons heads fall through to
+            // None (no check); the kind tracker would need a
+            // registry to know about user types' kinds.
+            if is_known_type_kind_con(qn) {
+                Some(prim_kind_type())
+            } else {
+                None
+            }
+        }
+        Type::Unif(id) => state.unif_kind(*id).cloned(),
+        // Skolems / Vars / Forall / Constrained / Hole / Wildcard:
+        // not enough info to decide a concrete kind here.
+        _ => None,
+    }
+}
+
+/// Walk an App spine to its head + args (left-to-right).
+fn decompose_app(ty: &Type) -> (Type, Vec<Type>) {
+    let mut args: Vec<Type> = Vec::new();
+    let mut cur = ty.clone();
+    loop {
+        match cur {
+            Type::App(f, a) => {
+                args.push((*a).clone());
+                cur = (*f).clone();
+            }
+            other => {
+                args.reverse();
+                return (other, args);
+            }
+        }
+    }
+}
+
+/// Kind of an App spine's head. For Con heads, we look up the
+/// kind from a small set of well-known constructors. Returns None
+/// for unknowns.
+fn kind_of_head(state: &UnifyState, head: &Type) -> Option<Type> {
+    match head {
+        Type::Con(qn) => kind_of_known_con(qn),
+        Type::Unif(id) => state.unif_kind(*id).cloned(),
+        _ => None,
+    }
+}
+
+/// Apply a kind to `n` arguments by peeling outer arrows. Returns
+/// the residual kind, or None if there aren't enough arrows.
+fn apply_kind(kind: &Type, n: usize) -> Option<Type> {
+    if n == 0 {
+        return Some(kind.clone());
+    }
+    match kind {
+        Type::Fun(_, ret) => apply_kind(ret, n - 1),
+        _ => None,
+    }
+}
+
+/// `true` when `qn` names a Prim constructor that has kind `Type`.
+fn is_known_type_kind_con(qn: &crate::typecheck_db::types::QName) -> bool {
+    let module = qn.module.as_deref();
+    let name = qn.name.as_str();
+    matches!(module, Some("Prim"))
+        && matches!(
+            name,
+            "Int" | "Number" | "String" | "Char" | "Boolean" | "Partial"
+        )
+}
+
+/// Kind of a small set of well-known constructors. None for the
+/// rest — we'd need a full kind registry for user types.
+fn kind_of_known_con(qn: &crate::typecheck_db::types::QName) -> Option<Type> {
+    use crate::typecheck_db::types::{prim_kind_type, prim_symbol};
+    let module = qn.module.as_deref();
+    let name = qn.name.as_str();
+    let type_kind = || prim_kind_type();
+    let row_kind = || Type::Fun(
+        Arc::new(type_kind()),
+        Arc::new(type_kind()),
+    );
+    match (module, name) {
+        (Some("Prim"), "Array") | (Some("Prim"), "Record") => {
+            // `Array :: Type -> Type`, `Record :: Row Type -> Type`.
+            // We approximate both as `Type -> Type` for the bind-time
+            // check (treats Record's arg as Type-kind, conservative).
+            Some(row_kind())
+        }
+        (Some("Prim"), "Function") => Some(Type::Fun(
+            Arc::new(type_kind()),
+            Arc::new(Type::Fun(Arc::new(type_kind()), Arc::new(type_kind()))),
+        )),
+        (Some("Prim"), "Int" | "Number" | "String" | "Char" | "Boolean")
+        | (Some("Prim"), "Partial") => Some(type_kind()),
+        (Some("Prim"), "Symbol") => Some(type_kind()),
+        (Some("Prim"), "Type") => Some(type_kind()),
+        (_, _) if qn == &crate::typecheck_db::types::QName::qualified("Effect.Aff", "Aff") => {
+            Some(row_kind())
+        }
+        (_, _) if qn == &crate::typecheck_db::types::QName::qualified("Effect", "Effect") => {
+            Some(row_kind())
+        }
+        (_, _) if name == "Symbol" && module == Some("Prim") => Some(prim_symbol()),
+        _ => None,
+    }
+}
+
+/// `true` when two kinds are compatible enough for a bind. We use
+/// structural equality after stripping outer Kinded wrappers, with
+/// one relaxation: `Type::Var(_)` and `Type::Unif(_)` on either
+/// side are treated as "unknown / agrees" (conservative). The aim
+/// is to catch egregious mismatches (Type vs Type -> Type) without
+/// false-rejecting on partial-info kinds.
+fn kinds_compatible(expected: &Type, actual: &Type) -> bool {
+    match (expected, actual) {
+        // Any side being a kind variable / unif → accept.
+        (Type::Var(_), _) | (_, Type::Var(_)) => true,
+        (Type::Unif(_), _) | (_, Type::Unif(_)) => true,
+        // Strip Kinded wrappers.
+        (Type::Kinded(t, _), other) | (other, Type::Kinded(t, _)) => {
+            kinds_compatible(t, other)
+        }
+        // Function kinds: arrows align.
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            kinds_compatible(a1, a2) && kinds_compatible(b1, b2)
+        }
+        // App: zip spine.
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            kinds_compatible(f1, f2) && kinds_compatible(a1, a2)
+        }
+        // Cons: structural equality.
+        (Type::Con(qn1), Type::Con(qn2)) => qn1 == qn2,
+        // Everything else falls back to structural equality, which
+        // is safe — kind types are tiny in practice.
+        (e, a) => type_eq(e, a),
     }
 }
 

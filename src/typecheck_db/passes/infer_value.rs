@@ -3577,10 +3577,13 @@ fn wrap_guarded_with_where(
 fn sig_to_scheme(sig_ty: Type) -> Scheme {
     match sig_ty {
         Type::Forall(qs, body) => {
-            let vars = qs.into_iter().map(|(n, _, _)| n).collect();
-            Scheme { vars, ty: Arc::unwrap_or_clone(body) }
+            let (vars, vars_kinds): (Vec<String>, Vec<Option<Type>>) = qs
+                .into_iter()
+                .map(|(n, _, k)| (n, k.map(|arc| (*arc).clone())))
+                .unzip();
+            Scheme::with_kinds(vars, vars_kinds, Arc::unwrap_or_clone(body))
         }
-        other => Scheme { vars: Vec::new(), ty: other },
+        other => Scheme::new(Vec::new(), other),
     }
 }
 
@@ -4048,7 +4051,7 @@ mod tests {
         let mut env = Env::new();
         env.bind_scheme(
             QName::unqualified("foo"),
-            Scheme { vars: vec!["a".into()], ty: Type::Var("a".into()) },
+            Scheme::new(vec!["a".into()], Type::Var("a".into())),
         );
         let ops = TypeOpMap::default();
         let e = parse_expr_from_val("module M where\nx = foo\n");
@@ -4089,10 +4092,10 @@ mod tests {
         let mut env = Env::new();
         env.bind_scheme(
             QName::unqualified("ident"),
-            Scheme {
-                vars: vec!["a".into()],
-                ty: Type::fun(Type::Var("a".into()), Type::Var("a".into())),
-            },
+            Scheme::new(
+                vec!["a".into()],
+                Type::fun(Type::Var("a".into()), Type::Var("a".into())),
+            ),
         );
         let ops = TypeOpMap::default();
 
@@ -4157,16 +4160,16 @@ mod tests {
         let mut env = Env::new();
         env.bind_scheme(
             QName::unqualified("Just"),
-            Scheme {
-                vars: vec!["a".into()],
-                ty: Type::fun(
+            Scheme::new(
+                vec!["a".into()],
+                Type::fun(
                     Type::Var("a".into()),
                     Type::app(
                         Type::Con(QName::unqualified("Maybe")),
                         Type::Var("a".into()),
                     ),
                 ),
-            },
+            ),
         );
         let ops = TypeOpMap::default();
 
@@ -4344,11 +4347,11 @@ foo =
         let maybe_a = Type::app(Type::Con(QName::unqualified("Maybe")), a.clone());
         env.bind_scheme(
             QName::unqualified("Just"),
-            Scheme { vars: vec!["a".into()], ty: Type::fun(a.clone(), maybe_a.clone()) },
+            Scheme::new(vec!["a".into()], Type::fun(a.clone(), maybe_a.clone())),
         );
         env.bind_scheme(
             QName::unqualified("Nothing"),
-            Scheme { vars: vec!["a".into()], ty: maybe_a },
+            Scheme::new(vec!["a".into()], maybe_a),
         );
     }
 
@@ -4493,10 +4496,7 @@ foo x | isOk x = 1
         let mut env = Env::new();
         env.bind_scheme(
             QName::unqualified("isOk"),
-            Scheme {
-                vars: vec!["a".into()],
-                ty: Type::fun(Type::Var("a".into()), bool_ty()),
-            },
+            Scheme::new(vec!["a".into()], Type::fun(Type::Var("a".into()), bool_ty())),
         );
         env.bind_scheme(QName::unqualified("true"), Scheme::mono(bool_ty()));
         let schemes = infer_value_scc(&ops, &mut env, &decls).unwrap();
@@ -4865,11 +4865,11 @@ foo x | x = 1
         let maybe_a = Type::app(Type::Con(QName::unqualified("Maybe")), a.clone());
         env.bind_scheme(
             QName::unqualified("Just"),
-            Scheme { vars: vec!["a".into()], ty: Type::fun(a.clone(), maybe_a.clone()) },
+            Scheme::new(vec!["a".into()], Type::fun(a.clone(), maybe_a.clone())),
         );
         env.bind_scheme(
             QName::unqualified("Nothing"),
-            Scheme { vars: vec!["a".into()], ty: maybe_a },
+            Scheme::new(vec!["a".into()], maybe_a),
         );
     }
 

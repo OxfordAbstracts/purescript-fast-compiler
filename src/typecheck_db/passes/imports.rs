@@ -1167,7 +1167,7 @@ pub(crate) fn synth_ctor_scheme(
     for field in info.fields.iter().rev() {
         ty = Type::fun(field.clone(), ty);
     }
-    Scheme { vars: info.type_vars.clone(), ty }
+    Scheme::new(info.type_vars.clone(), ty)
 }
 
 fn module_name_string(m: &cst::ModuleName) -> String {

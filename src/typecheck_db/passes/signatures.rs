@@ -48,10 +48,13 @@ pub fn compute(decl: &Decl, type_ops: &TypeOpMap) -> SignatureOutput {
 /// scheme. Nested quantification stays in the body.
 fn scheme_of(ty: Type) -> Scheme {
     match ty {
-        Type::Forall(vars, body) => Scheme {
-            vars: vars.into_iter().map(|(n, _, _)| n).collect(),
-            ty: std::sync::Arc::unwrap_or_clone(body),
-        },
+        Type::Forall(vars, body) => {
+            let (vs, ks): (Vec<String>, Vec<Option<Type>>) = vars
+                .into_iter()
+                .map(|(n, _, k)| (n, k.map(|arc| (*arc).clone())))
+                .unzip();
+            Scheme::with_kinds(vs, ks, std::sync::Arc::unwrap_or_clone(body))
+        }
         other => Scheme::mono(other),
     }
 }

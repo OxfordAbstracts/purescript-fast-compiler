@@ -373,11 +373,41 @@ pub struct Constraint {
 pub struct Scheme {
     pub vars: Vec<String>,
     pub ty: Type,
+    /// Optional kind annotation per var, parallel to `vars`. `None`
+    /// when the kind is unknown (most ad-hoc generalised schemes —
+    /// no kind inferred). `Some(kind)` when the source had an
+    /// explicit `forall (a :: k).` annotation or the class-method
+    /// builder propagated a class-quantified var's kind.
+    ///
+    /// Consumed by `instantiate` (calls `fresh_with_kind` on the
+    /// fresh unif) so `bind_var` can refuse a kind-mismatched bind
+    /// later. The Vec may be SHORTER than `vars`; missing entries
+    /// (including the all-empty case) are treated as `None` —
+    /// equivalent to "all kinds unknown" — preserving the legacy
+    /// behaviour where no kind info was tracked.
+    #[serde(default)]
+    pub vars_kinds: Vec<Option<Type>>,
 }
 
 impl Scheme {
     pub fn mono(ty: Type) -> Self {
-        Self { vars: Vec::new(), ty }
+        Self { vars: Vec::new(), ty, vars_kinds: Vec::new() }
+    }
+
+    /// Build a scheme without kind annotations. Use when the source
+    /// of `vars` doesn't carry kinds (post-generalisation, foreign
+    /// imports without explicit `forall (a :: k)`, etc.). Equivalent
+    /// to `Scheme { vars, ty, vars_kinds: vec![] }`.
+    pub fn new(vars: Vec<String>, ty: Type) -> Self {
+        Self { vars, ty, vars_kinds: Vec::new() }
+    }
+
+    /// Build a scheme with explicit kinds per var. `vars` and
+    /// `vars_kinds` must have the same length; this is enforced at
+    /// the instantiate site (a length mismatch falls back to
+    /// "unknown kind" for the trailing positions).
+    pub fn with_kinds(vars: Vec<String>, vars_kinds: Vec<Option<Type>>, ty: Type) -> Self {
+        Self { vars, ty, vars_kinds }
     }
 }
 

@@ -1966,16 +1966,16 @@ mod tests {
     fn eq_a_a_to_bool() -> Scheme {
         // `forall a. Eq a => a -> a -> Boolean`
         let a = Type::Var("a".into());
-        Scheme {
-            vars: vec!["a".into()],
-            ty: Type::Constrained(
+        Scheme::new(
+            vec!["a".into()],
+            Type::Constrained(
                 vec![Constraint {
                     class: QName::unqualified("Eq"),
                     args: vec![a.clone()],
                 }],
                 std::sync::Arc::new(Type::fun(a.clone(), Type::fun(a, bool_ty()))),
             ),
-        }
+        )
     }
 
     fn infer(src: &str, env: &mut Env) -> Vec<InferredScheme> {
@@ -2056,16 +2056,16 @@ mod tests {
     #[test]
     fn multiple_constraints_recorded_at_one_site() {
         let a = Type::Var("a".into());
-        let scheme = Scheme {
-            vars: vec!["a".into()],
-            ty: Type::Constrained(
+        let scheme = Scheme::new(
+            vec!["a".into()],
+            Type::Constrained(
                 vec![
                     Constraint { class: QName::unqualified("Eq"), args: vec![a.clone()] },
                     Constraint { class: QName::unqualified("Show"), args: vec![a.clone()] },
                 ],
                 std::sync::Arc::new(Type::fun(a, bool_ty())),
             ),
-        };
+        );
         let mut env = Env::new();
         env.bind_scheme(QName::unqualified("p"), scheme);
         let schemes = infer("module M where\ng y = p y\n", &mut env);
