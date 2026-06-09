@@ -331,6 +331,21 @@ pub fn solve_one(
         return SolveOutcome::Deferred;
     }
 
+    // Fundep-driven improvement. For each fundep on this class
+    // whose determiner positions are all concrete in the pending,
+    // try to find a UNIQUE matching candidate instance. When found,
+    // unify the pending's determined positions with that instance's
+    // determined positions BEFORE try_match runs — so a constraint
+    // like `Parallel ?f Aff` (fundep g -> f) gets `?f := ParAff`
+    // from the sole `Parallel ParAff Aff` instance even when other
+    // unification paths could have pinned `?f` to a wrong value
+    // later. Matches the reference compiler's improvement step.
+    if let Some(info) = class_info {
+        if !info.fundeps.is_empty() {
+            try_fundep_improvement(state, instances, pending, info);
+        }
+    }
+
     // Candidates are stored under the class's simple name. When two
     // distinct classes share a name across modules (e.g. user-side
     // `Typisch.Row.Lacks` vs Prim's `Prim.Row.Lacks`), look-up by
@@ -1481,6 +1496,254 @@ fn type_has_alias_con(
                 || t.as_ref().map_or(false, |t| type_has_alias_con(t, aliases))
         }
         _ => false,
+    }
+}
+
+/// Fundep-driven improvement. For each fundep `(det, desd)` on the
+/// class where the pending's determiner positions are all concrete:
+///
+///   1. Walk every in-scope candidate instance, snapshot+unify the
+///      determiner positions of the pending with the candidate's
+///      head. Restore after each test — we're checking matchability
+///      without committing.
+///   2. If EXACTLY ONE candidate's determiners unify, that
+///      candidate is the unique improver. Run a coverage check:
+///      every type variable that appears in the candidate's
+///      determined positions must also appear in its determiner
+///      positions (otherwise applying the improvement would pin a
+///      free var to a fresh unif — invalid).
+///   3. On coverage success, unify the pending's determined
+///      positions with the candidate's determined positions. The
+///      improvement is now committed; downstream solver work sees
+///      the pinned values.
+///
+/// Returns true when at least one fundep produced an improvement
+/// (currently advisory — caller proceeds to try_match either way).
+fn try_fundep_improvement(
+    state: &mut crate::typecheck_db::unify::UnifyState,
+    instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    pending: &PendingConstraint,
+    class_info: &crate::typecheck_db::passes::instance_index::ClassInfo,
+) -> bool {
+    let pending_class_module = pending.constraint.class.module.as_deref();
+    // Fundep improvement requires STRICT class-module matching:
+    // instances stored under the same simple name can belong to
+    // different user-defined classes across modules (e.g. many
+    // user libraries declare their own `Parallel`-named class).
+    // Allowing None-module candidates through would let an
+    // unrelated class's instance "improve" our pending. The
+    // pending always carries the canonical module qualifier
+    // (resolver-emitted), so we can demand a strict match.
+    let cands: Vec<&crate::typecheck_db::passes::instance_index::Instance> = instances
+        .candidates(&pending.constraint.class.name)
+        .iter()
+        .filter(|c| match (pending_class_module, c.class.module.as_deref()) {
+            (Some(want), Some(have)) => want == have,
+            (None, _) => true,
+            (Some(_), None) => false,
+        })
+        .collect();
+    if cands.is_empty() {
+        return false;
+    }
+    let mut any_improved = false;
+    for fd in &class_info.fundeps {
+        // Skip when any determiner / determined position is out of
+        // range for the pending's args (class_info arity disagrees
+        // with the concrete constraint shape — possible when an
+        // instance carries an outdated arity through a stale cache
+        // or partial application).
+        let max_pos = fd
+            .determiners
+            .iter()
+            .chain(fd.determined.iter())
+            .max()
+            .copied()
+            .unwrap_or(0);
+        if max_pos >= pending.constraint.args.len() {
+            continue;
+        }
+        // Skip when any determiner is still a bare unif — we can't
+        // match against instance heads with unknown determiners.
+        let all_det_concrete = fd.determiners.iter().all(|i| {
+            pending
+                .constraint
+                .args
+                .get(*i)
+                .map_or(false, |a| !is_bare_unif(a, state))
+        });
+        if !all_det_concrete {
+            continue;
+        }
+        // Pass 1: enumerate matching candidates. For each, freshen
+        // its quantified vars (per-attempt) so the snapshot test
+        // doesn't leak fresh unifs into the state on a non-match.
+        let mut matches: Vec<usize> = Vec::new();
+        for (cand_idx, cand) in cands.iter().enumerate() {
+            if cand.types.len() != pending.constraint.args.len() {
+                continue;
+            }
+            if max_pos >= cand.types.len() {
+                continue;
+            }
+            let snapshot = state.snapshot_bindings();
+            let mut subst: std::collections::HashMap<String, Type> =
+                std::collections::HashMap::new();
+            for v in &cand.vars {
+                subst.insert(v.clone(), state.fresh());
+            }
+            let mut det_ok = true;
+            for &i in &fd.determiners {
+                let inst_ty = crate::typecheck_db::generalize::apply_var_subst(
+                    &cand.types[i],
+                    &subst,
+                );
+                if state
+                    .unify(&inst_ty, &pending.constraint.args[i])
+                    .is_err()
+                {
+                    det_ok = false;
+                    break;
+                }
+            }
+            state.restore_bindings(snapshot);
+            if det_ok {
+                matches.push(cand_idx);
+            }
+        }
+        // Deduplicate matches by structural equality of the
+        // candidate's types + vars. The instance index can hold the
+        // same logical instance multiple times when it's reached
+        // through different import paths (e.g. via Prelude
+        // re-exports plus a direct import). Two matches that name
+        // the same instance head should count as ONE for the
+        // ambiguity check.
+        let mut dedup: Vec<usize> = Vec::new();
+        for &mi in &matches {
+            let cm = cands[mi];
+            let already = dedup.iter().any(|&di| {
+                let cd = cands[di];
+                cm.types == cd.types && cm.vars == cd.vars
+            });
+            if !already {
+                dedup.push(mi);
+            }
+        }
+        if dedup.len() != 1 {
+            // Zero matches → nothing to improve from. Multiple
+            // DISTINCT matches → ambiguous, let try_match's
+            // standard rules handle it.
+            continue;
+        }
+        let cand = cands[dedup[0]];
+        // Coverage check: every var in the candidate's determined
+        // positions must also appear in its determiner positions.
+        // Without this, an instance like `instance Foo Int x` (with
+        // fundep `a -> b` and free var `x` in determined) would
+        // pin the pending's b-position to a fresh unif — not a
+        // valid improvement.
+        let mut det_vars: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for &i in &fd.determiners {
+            collect_type_vars(&cand.types[i], &mut det_vars);
+        }
+        let mut desd_vars: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for &i in &fd.determined {
+            collect_type_vars(&cand.types[i], &mut desd_vars);
+        }
+        let coverage_ok = desd_vars.is_subset(&det_vars);
+        if !coverage_ok {
+            continue;
+        }
+        // Apply improvement: freshen the instance and unify BOTH
+        // determiner AND determined positions. The determiner re-
+        // unify is needed because the instantiation creates fresh
+        // unifs for the instance's quantified vars; the determined
+        // positions reference those same vars, so we need them
+        // bound consistently.
+        let snapshot = state.snapshot_bindings();
+        let mut subst: std::collections::HashMap<String, Type> =
+            std::collections::HashMap::new();
+        for v in &cand.vars {
+            subst.insert(v.clone(), state.fresh());
+        }
+        let mut all_ok = true;
+        for &i in &fd.determiners {
+            let inst_ty = crate::typecheck_db::generalize::apply_var_subst(
+                &cand.types[i],
+                &subst,
+            );
+            if state
+                .unify(&inst_ty, &pending.constraint.args[i])
+                .is_err()
+            {
+                all_ok = false;
+                break;
+            }
+        }
+        if all_ok {
+            for &i in &fd.determined {
+                let inst_ty = crate::typecheck_db::generalize::apply_var_subst(
+                    &cand.types[i],
+                    &subst,
+                );
+                if state
+                    .unify(&inst_ty, &pending.constraint.args[i])
+                    .is_err()
+                {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if !all_ok {
+            state.restore_bindings(snapshot);
+            continue;
+        }
+        any_improved = true;
+    }
+    any_improved
+}
+
+/// Collect every `Type::Var(name)` reference inside `ty`. Helper
+/// for `try_fundep_improvement`'s coverage check.
+fn collect_type_vars(ty: &Type, out: &mut std::collections::HashSet<String>) {
+    match ty {
+        Type::Var(n) => {
+            out.insert(n.clone());
+        }
+        Type::App(f, a) | Type::Fun(f, a) | Type::Kinded(f, a) => {
+            collect_type_vars(f, out);
+            collect_type_vars(a, out);
+        }
+        Type::Forall(qs, b) => {
+            // Don't capture vars bound by inner foralls.
+            let bound: std::collections::HashSet<String> =
+                qs.iter().map(|(n, _, _)| n.clone()).collect();
+            let mut inner = std::collections::HashSet::new();
+            collect_type_vars(b, &mut inner);
+            for v in inner.difference(&bound) {
+                out.insert(v.clone());
+            }
+        }
+        Type::Constrained(cs, b) => {
+            for c in cs {
+                for a in &c.args {
+                    collect_type_vars(a, out);
+                }
+            }
+            collect_type_vars(b, out);
+        }
+        Type::Record(fs, tail) | Type::Row(fs, tail) => {
+            for (_, t) in fs {
+                collect_type_vars(t, out);
+            }
+            if let Some(t) = tail {
+                collect_type_vars(t, out);
+            }
+        }
+        _ => {}
     }
 }
 
