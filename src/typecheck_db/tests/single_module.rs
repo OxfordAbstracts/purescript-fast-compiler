@@ -783,6 +783,137 @@ fn do_let_shadowing_newtype() {
 }
 
 #[test]
+fn row_to_list_magic_discharges_concrete_row() {
+    // Regression for the RowToList magic arm in
+    // `passes::constraints::try_magic`. Without it, a function whose
+    // body needs `RowToList r rl` where `r` is a concrete record row
+    // would leak that constraint (plus all its downstream classes —
+    // FoldlRecord, VarsTypeChecked, GqlQuery, …) into the exported
+    // scheme. With it, the magic builds Cons/Nil mechanically from
+    // the sorted field list and discharges the constraint locally.
+    //
+    // Pattern: a class whose only instance fires via `RowToList r rl`
+    // requires the magic to discharge for concrete record arguments.
+    assert_typechecks(
+        "\
+module M where
+
+import Prim.RowList (class RowToList, RowList, Cons, Nil)
+
+class ToInt rl where
+  toInt :: forall a. a -> Int
+
+instance ToInt Nil where
+  toInt _ = 0
+
+instance ToInt rest => ToInt (Cons l t rest) where
+  toInt _ = 1
+
+class FromRow r where
+  fromRow :: Record r -> Int
+
+instance (RowToList r rl, ToInt rl) => FromRow r where
+  fromRow _ = toInt (0 :: Int)
+
+example :: Int
+example = fromRow { foo: 1, bar: \"hi\" }
+",
+    );
+}
+
+#[test]
+fn cap_rank2_with_do_notation() {
+    // Extends `cap_rank2_constraint_discharge` with a do-block
+    // inside the rank-2 arg — closer to the runGqlAdminDashboard
+    // pattern. Mimics:
+    //   init = runGqlAdminDashboard do
+    //     x <- gqlQueryAdminDashboard ...
+    //     pure ...
+    // Both `Cap` (from rank-2) and `Other Result` (from each
+    // call's constraint) should discharge inside `test`.
+    assert_typechecks(
+        "\
+module M where
+
+class Cap
+
+class Other a where
+  other :: a -> a
+
+class M m where
+  bnd :: forall a b. m a -> (a -> m b) -> m b
+  pur :: forall a. a -> m a
+
+data Aff a = Aff
+
+instance M Aff where
+  bnd _ _ = Aff
+  pur _ = Aff
+
+instance Other (Aff Result) where
+  other x = x
+
+data Result = Result
+
+makeQuery :: Cap => Other (Aff Result) => Aff Result
+makeQuery = other (Aff)
+
+run :: forall a. (Cap => a) -> a
+run x = x
+
+test :: Aff Result
+test = run (bnd makeQuery (\\_ -> pur Result))
+",
+    );
+}
+
+#[test]
+fn cap_rank2_constraint_discharge() {
+    // Mimics `runGqlAdminDashboard`: nullary cap class discharged
+    // via rank-2 arg type `(Cap => a) -> a`. When applied to a
+    // value `doWork :: Cap => Other Result => Result`, both
+    // constraints should discharge here (Cap via the rank-2 given,
+    // Other Result via the instance) and the call `run doWork`
+    // should have type `Result` with NO leaked constraints.
+    assert_typechecks(
+        "\
+module M where
+
+class Cap
+
+class Other a where
+  other :: a -> a
+
+data Result = Result
+
+instance Other Result where
+  other r = r
+
+doWork :: Cap => Other Result => Result
+doWork = other Result
+
+run :: forall a. (Cap => a) -> a
+run x = x
+
+test :: Result
+test = run doWork
+",
+    );
+}
+
+#[test]
+fn parallel_ado_fundep() {
+    // Repro of the AdminDashboard.RouteToPage failure cluster.
+    // Pattern: `sequential ado page <- parallel $ x # init <#> Wrap
+    // in page` where `init :: a -> Aff PageModel`, `PageModel` is a
+    // record, and `Wrap :: PageModel -> Page`. The fundep `g -> f`
+    // on `Parallel f g` (combined with `g = Aff`) should pin `f =
+    // ParAff`; the bug observed in the wild was `f` getting
+    // unified with the PageModel record itself.
+    assert_typechecks(include_str!("fixtures/single_succeeds/parallel_ado_funep.purs"));
+}
+
+#[test]
 #[ignore = "RED: Puregres.Select cluster — Coercible/Newtype Unif-Unif depth limit"]
 fn select_newtype_wrap_chain_typechecks() {
     // Reproducer for the Puregres.Select cluster (Query.Event.* — 4

@@ -922,6 +922,155 @@ fn dump_allowlist_failures() {
     }
 }
 
+/// Reproducer for the `Parallel` cluster — `AdminDashboard.
+/// RouteToPage` + its 4 cascade-fail callers (EventPage.Update,
+/// SymposiaTable.Update, SymposiaDecisions.Update, AdminDashboard.
+/// Update). The root failure is `NoInstanceFound: Parallel` for
+/// `parallel @ ParAff @ Aff` in `sequential ado` blocks. The
+/// `parallelAff :: Parallel ParAff Aff` instance lives in
+/// `.spago/aff/src/Effect/Aff.purs`.
+#[test]
+#[ignore = "diagnostic — Parallel cluster"]
+fn parallel_cluster_typechecks() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("parallel_cluster".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pkgs = application_modules_by_name();
+                let target = "AdminDashboard.RouteToPage";
+                if !pkgs.contains_key(target) {
+                    return Err(format!("{target} missing from application sources"));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!("[repro] {target} closure: {} modules", closure.len());
+                let mut hits: Vec<String> = Vec::new();
+                let multi = check_many_modules_streaming(closure, |result| {
+                    if result.name == target
+                        && (result.inference_error.is_some()
+                            || !result.constraint_errors.is_empty())
+                    {
+                        for ce in &result.constraint_errors {
+                            hits.push(format!(
+                                "{}: {:?}: {} {:?}",
+                                result.name,
+                                ce.kind,
+                                ce.constraint.class,
+                                ce.constraint.args,
+                            ));
+                        }
+                        if let Some(err) = &result.inference_error {
+                            hits.push(format!("{}: infer {err:?}", result.name));
+                        }
+                    }
+                });
+                for e in &multi {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                if !hits.is_empty() {
+                    return Err(format!(
+                        "{} failed:\n  {}",
+                        target,
+                        hits.join("\n  "),
+                    ));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn parallel cluster thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("parallel_cluster_typechecks: {msg}");
+    }
+}
+
+/// Diagnostic: dump the inferred scheme for the `init` decl in each
+/// `AdminDashboard.Pages.*.Model` module. Hypothesis: SoaaControls.init
+/// (or another Pages init) is being inferred without its `Aff` wrapper
+/// when typechecked as part of the RouteToPage closure, causing the
+/// `f` slot of `Parallel f Aff` to be pinned to the bare PageModel
+/// record at the use-site in RouteToPage.
+#[test]
+#[ignore = "diagnostic — dump Pages init schemes"]
+fn dump_pages_init_schemes() {
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("dump_pages_init".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pkgs = application_modules_by_name();
+                let target = "AdminDashboard.RouteToPage";
+                if !pkgs.contains_key(target) {
+                    return Err(format!("{target} missing"));
+                }
+                let closure = transitive_closure_of(target, &pkgs);
+                eprintln!("[dump_pages_init] closure: {} modules", closure.len());
+                let mut hits: Vec<String> = Vec::new();
+                let _multi = check_many_modules_streaming(closure, |result| {
+                    let is_pages_model = result.name.starts_with("AdminDashboard.Pages.")
+                        && result.name.ends_with(".Model");
+                    if !is_pages_model {
+                        return;
+                    }
+                    let init_count = result
+                        .schemes
+                        .iter()
+                        .filter(|s| s.name == "init")
+                        .count();
+                    let n_constraint_errs = result.constraint_errors.len();
+                    let has_infer_err = result.inference_error.is_some();
+                    hits.push(format!(
+                        "{} schemes={} init={} constraint_errs={} infer_err={}",
+                        result.name,
+                        result.schemes.len(),
+                        init_count,
+                        n_constraint_errs,
+                        has_infer_err,
+                    ));
+                    for s in &result.schemes {
+                        if s.name == "init" {
+                            hits.push(format!(
+                                "  {}::init :: {:?}",
+                                result.name, s.scheme
+                            ));
+                        }
+                    }
+                });
+                for line in &hits {
+                    eprintln!("{line}");
+                }
+                Ok(())
+            }));
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn dump_pages_init thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(_) => Err("thread lost".to_string()),
+    };
+    if let Err(msg) = inner {
+        panic!("dump_pages_init_schemes: {msg}");
+    }
+}
+
 /// Profiler reproducer for `OaVirtual.Layout`'s 10s decl-timeout.
 /// `component` decl is 1700+ lines. Used for
 /// `TYPECHECK_DB_PROFILE_SLOW=1` triage.

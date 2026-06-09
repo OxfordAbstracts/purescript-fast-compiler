@@ -526,6 +526,26 @@ fn importer_uses_imported_data_ctors() {
 }
 
 #[test]
+fn parallel_ado_cross_module() {
+    // Multi-module repro of AdminDashboard.RouteToPage. Five
+    // modules: shared Prelude, InitA + InitB each defining their own
+    // `type PageModel = …` (DIFFERENT shapes, same bare name —
+    // mirrors the 40+ `type PageModel` aliases across
+    // AdminDashboard.Pages.*), a shared Model with a Page sum type
+    // whose constructors wrap each module's PageModel via qualified
+    // names, and Main running the `case _ of ... sequential ado
+    // page <- parallel $ model # InitX.init <#> CtorX in page`
+    // pattern across multiple branches.
+    assert_typechecks_multi(&[
+        include_str!("fixtures/multi_succeeds/parallel_prelude.purs"),
+        include_str!("fixtures/multi_succeeds/parallel_init_a.purs"),
+        include_str!("fixtures/multi_succeeds/parallel_init_b.purs"),
+        include_str!("fixtures/multi_succeeds/parallel_model.purs"),
+        include_str!("fixtures/multi_succeeds/parallel_main.purs"),
+    ]);
+}
+
+#[test]
 fn unknown_module_reports_import_error() {
     let report = check_multi(&[include_str!("fixtures/multi_fails/unknown_module.purs")]);
     let result = report

@@ -89,6 +89,26 @@ pub fn build_env_from_imports(
     if let Some(prim) = prims.get("Prim") {
         import_all("Prim", prim, /*qualifier=*/ None, &mut env, &mut ix);
     }
+    // The solver looks up class_info by simple name. Prim
+    // sub-modules (Prim.RowList, Prim.Row, Prim.Symbol, Prim.Coerce,
+    // …) carry the fundeps the solver needs to fire fundep-
+    // improvement on their classes. Their VALUES/TYPES aren't
+    // auto-imported (user code must qualify them), but their CLASSES'
+    // metadata must be available to the solver regardless of import
+    // status — otherwise a transitively-induced constraint like
+    // `RowToList r rl` (from an imported instance's context) defers
+    // forever because `class_info` returns None and the solver
+    // falls back to "any bare unif defers" with no determined set
+    // to consult. This mirrors the reference compiler, which treats
+    // Prim fundeps as built-in.
+    for (mod_name, exp) in &prims {
+        if mod_name == "Prim" {
+            continue;
+        }
+        for (class_name, info) in &exp.classes {
+            ix.insert_class(class_name.clone(), info.clone());
+        }
+    }
 
     // Track each (qualifier, name) pair against the *origin* module
     // (the module that declared the value, not the re-exporter).

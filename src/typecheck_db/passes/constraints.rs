@@ -1392,6 +1392,58 @@ fn try_magic(
                 }
             }
         }
+        // `Prim.RowList.RowToList row list | row -> list` — when
+        // `row` is a concrete closed row (no open tail), the
+        // rowlist is determined: sort the fields lexically and
+        // build `Cons label type tail` ending in `Nil`. Without
+        // this, downstream classes that depend on RowToList (e.g.
+        // `FoldlRecord`, `GqlQuery`'s `VarsTypeChecked`,
+        // `DecodeOaFields`) all defer, propagating bogus
+        // constraints into the exported scheme of any signed decl
+        // whose body uses heterogeneous-record machinery.
+        "RowToList" if class_module_matches(&["Prim.RowList"]) => {
+            if args.len() == 2 {
+                if let Type::Row(fields, None) | Type::Record(fields, None) = &args[0] {
+                    let mut sorted: Vec<(String, Type)> = fields.clone();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    let cons_qn = crate::typecheck_db::types::QName {
+                        module: Some("Prim.RowList".into()),
+                        name: "Cons".into(),
+                    };
+                    let nil_qn = crate::typecheck_db::types::QName {
+                        module: Some("Prim.RowList".into()),
+                        name: "Nil".into(),
+                    };
+                    let mut rl = Type::Con(nil_qn);
+                    for (label, ty) in sorted.into_iter().rev() {
+                        let cons = Type::Con(cons_qn.clone());
+                        let with_label = Type::App(
+                            std::sync::Arc::new(cons),
+                            std::sync::Arc::new(Type::TypeString(label)),
+                        );
+                        let with_ty = Type::App(
+                            std::sync::Arc::new(with_label),
+                            std::sync::Arc::new(ty),
+                        );
+                        rl = Type::App(
+                            std::sync::Arc::new(with_ty),
+                            std::sync::Arc::new(rl),
+                        );
+                    }
+                    let snapshot = state.snapshot_bindings();
+                    if state.unify(&args[1], &rl).is_ok() {
+                        return MagicOutcome::Resolved(ResolvedDict {
+                            class: pending.constraint.class.clone(),
+                            instance_types: vec![args[0].clone(), rl],
+                            instance_idx: 0,
+                            context: Vec::new(),
+                        });
+                    }
+                    state.restore_bindings(snapshot);
+                    return MagicOutcome::Mismatch;
+                }
+            }
+        }
         _ => {}
     }
     MagicOutcome::None
