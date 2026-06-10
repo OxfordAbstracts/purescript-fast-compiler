@@ -1695,6 +1695,20 @@ fn try_fundep_improvement(
             continue;
         }
         let cand = cands[dedup[0]];
+        // Restrict improvement to candidates with NO free type vars
+        // (fully concrete heads like `Parallel ParAff Aff`). Without
+        // this restriction, applying an improvement against an
+        // instance with `cand.vars = [m, ...]` would freshen those
+        // vars and leave the fresh unifs PERMANENTLY in state
+        // (the successful apply path doesn't restore — that's the
+        // whole point), accumulating unbounded memory across the
+        // sweep. The conservative version still fires for the
+        // common reference-compiler-style "concrete instance pins
+        // the determined" cases, which is enough for the parallel
+        // cluster fix.
+        if !cand.vars.is_empty() {
+            continue;
+        }
         // Coverage check: every var in the candidate's determined
         // positions must also appear in its determiner positions.
         // Without this, an instance like `instance Foo Int x` (with
