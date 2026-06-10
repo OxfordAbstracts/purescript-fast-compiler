@@ -1578,12 +1578,71 @@ fn try_fundep_improvement(
         // Pass 1: enumerate matching candidates. For each, freshen
         // its quantified vars (per-attempt) so the snapshot test
         // doesn't leak fresh unifs into the state on a non-match.
+        // Pre-compute the pending's head/arity at each determiner
+        // position. Reused as a cheap structural filter across every
+        // candidate so we don't allocate fresh unifs + run a full
+        // unify on candidates that obviously can't match.
+        //
+        // Per-position rule (mirrors `solve_one`'s head pre-filter):
+        // - target has a `Con`-headed App-spine? Cand must have the
+        //   same (qname, arity) at that position, OR a non-Con head
+        //   (type var) which unifies with anything.
+        // - target has no Con head at this position? Skip the
+        //   pre-filter for this position (let the unify decide).
+        let target_heads_at_det: Vec<
+            Option<(crate::typecheck_db::types::QName, usize)>,
+        > = fd
+            .determiners
+            .iter()
+            .map(|&i| {
+                app_spine_head_arity_probing(&pending.constraint.args[i], state)
+                    .map(|(qn, ar)| (qn.clone(), ar))
+            })
+            .collect();
         let mut matches: Vec<usize> = Vec::new();
         for (cand_idx, cand) in cands.iter().enumerate() {
             if cand.types.len() != pending.constraint.args.len() {
                 continue;
             }
             if max_pos >= cand.types.len() {
+                continue;
+            }
+            // Cheap structural head pre-filter — avoids the
+            // snapshot+freshen+unify roundtrip for candidates whose
+            // determiner position heads can't match the pending's.
+            // This is the difference between O(485 candidates) of
+            // expensive work per Parallel constraint and O(485) of
+            // pointer-compare-cheap work.
+            let mut head_ok = true;
+            for (dix, &i) in fd.determiners.iter().enumerate() {
+                if let Some((th, ta)) = &target_heads_at_det[dix] {
+                    if let Some((ch, ca)) = app_spine_head_arity(&cand.types[i]) {
+                        if ca != *ta {
+                            head_ok = false;
+                            break;
+                        }
+                        let names_equiv = ch.name == th.name
+                            || ((ch.name == "->" || ch.name == "Function")
+                                && (th.name == "->" || th.name == "Function"));
+                        if !names_equiv {
+                            head_ok = false;
+                            break;
+                        }
+                        if ch.module.is_some()
+                            && th.module.is_some()
+                            && ch.module != th.module
+                        {
+                            head_ok = false;
+                            break;
+                        }
+                    }
+                    // Cand has non-Con head at this position
+                    // (type var) — could unify with the target's
+                    // Con head, so keep this candidate as a
+                    // possible match.
+                }
+            }
+            if !head_ok {
                 continue;
             }
             let snapshot = state.snapshot_bindings();
