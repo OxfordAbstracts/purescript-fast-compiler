@@ -9,6 +9,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod memstats;
 pub mod span;
 pub mod lexer;
 pub mod cst;

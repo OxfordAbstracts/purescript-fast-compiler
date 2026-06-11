@@ -38,6 +38,7 @@ bincode = "1"
 zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }
 blake3 = "1"
+libc = "0.2"
 
 [build-dependencies]
 lalrpop = "0.22"

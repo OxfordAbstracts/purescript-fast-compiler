@@ -250,7 +250,9 @@ fn check_many_modules_inner(
             );
         }
         let started = std::time::Instant::now();
+        crate::memstats::checkpoint(&format!("module:{}:start", input.name));
         let result = check_one_module(db, input, registry);
+        crate::memstats::checkpoint(&format!("module:{}:end", input.name));
         let elapsed_ms = started.elapsed().as_millis();
         if timing_trace || elapsed_ms >= slow_threshold_ms {
             eprintln!(
