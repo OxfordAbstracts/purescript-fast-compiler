@@ -120,17 +120,31 @@ impl Env {
         }
     }
 
-    /// Look up an unqualified name: monomorphic locals first (walked
-    /// inner-to-outer), then local schemes (inner-to-outer), then top-level
-    /// with the unqualified key.
+    /// Look up an unqualified name. Walks scopes inner-to-outer, and
+    /// at EACH scope checks both `locals` (monomorphic) and
+    /// `local_schemes` (let-generalised) before moving to the
+    /// outer scope. This is what lets a `let total = …` in an inner
+    /// `do` properly shadow an outer `let { total, … } = …` even
+    /// when `infer_let`'s Pass 4 has moved the inner binding from
+    /// `locals` to `local_schemes` while the outer is still in
+    /// `locals` — without per-scope interleaving, the outer
+    /// `locals` would win and the shadowing leak (caught as
+    /// Mismatch(Int, ToAddTotal) in DrStripeRefundAttendee-shape
+    /// fixtures).
     pub fn lookup_unqualified(&self, name: &str) -> Lookup<'_> {
-        for scope in self.locals.iter().rev() {
-            if let Some(ty) = scope.get(name) {
+        // locals and local_schemes are always pushed/popped together
+        // via push_scope / pop_scope, so they have the same length.
+        // Defensive zip for the same-length invariant.
+        let scope_iter = self
+            .locals
+            .iter()
+            .rev()
+            .zip(self.local_schemes.iter().rev());
+        for (loc, sch) in scope_iter {
+            if let Some(ty) = loc.get(name) {
                 return Lookup::Local(ty);
             }
-        }
-        for scope in self.local_schemes.iter().rev() {
-            if let Some(s) = scope.get(name) {
+            if let Some(s) = sch.get(name) {
                 return Lookup::Scheme(s);
             }
         }

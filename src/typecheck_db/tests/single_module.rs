@@ -774,6 +774,18 @@ fn capability_constrained_argument_discharge() {
 }
 
 #[test]
+fn do_case_do_let_shadowing() {
+    // Reproducer for the DrStripeRefundAttendee mismatch
+    // (Mismatch Int vs ToAddTotal): outer `do` binds total ::
+    // ToAddTotal via let, a `case` arm has its own inner `do`
+    // that re-binds `let total = ... :: Int`, and the inner uses
+    // expect the Int. If shadowing leaks across the case-arm +
+    // nested do boundary, the inner `total` resolves to the
+    // outer ToAddTotal.
+    assert_typechecks(include_str!("fixtures/single_succeeds/do_case_do_let_shadowing.purs"));
+}
+
+#[test]
 fn do_let_shadowing_newtype() {
     // Probe for a suspected shadowing bug seen in
     // DrStripeRefundAttendee: outer let binds `total :: ToAddTotal`,
