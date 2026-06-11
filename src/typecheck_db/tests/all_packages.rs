@@ -1046,8 +1046,23 @@ fn repro_one_module() {
                 }
                 let closure = transitive_closure_of(&target, &pkgs);
                 eprintln!("[repro] {target} closure: {} modules", closure.len());
+                // Optional: PFC_REPRO_DUMP_DECL=<decl name> prints the
+                // inferred scheme for that decl in EVERY module of the
+                // closure — used to inspect a dependency's exported
+                // scheme when the target's error implicates it.
+                let dump_decl = std::env::var("PFC_REPRO_DUMP_DECL").ok();
                 let mut hits: Vec<String> = Vec::new();
                 let multi = check_many_modules_streaming(closure, |result| {
+                    if let Some(decl) = &dump_decl {
+                        for s in &result.schemes {
+                            if &s.name == decl {
+                                eprintln!(
+                                    "[dump] {}::{} :: {:?}",
+                                    result.name, s.name, s.scheme,
+                                );
+                            }
+                        }
+                    }
                     if result.name == target
                         && (result.inference_error.is_some()
                             || !result.constraint_errors.is_empty())

@@ -972,16 +972,16 @@ pub fn infer_value_scc_with_all(
     // Per-decl typecheck deadline. Read the env var once per SCC
     // (cheap — single getenv) so a pathological declaration can't
     // stall the run. `0` disables the deadline entirely; the
-    // default is 10000ms (ten seconds per decl, plus ten seconds
-    // for the post-body SCC phases). 10s leaves enough headroom
-    // for legitimately heavy fixtures like `BigFunction` (whose
-    // `Main` takes ~4.6s standalone, more under parallel test
-    // load) while still bounding pathological cases that would
-    // otherwise hang the all_packages acceptance run.
+    // default is 30000ms (thirty seconds per decl, plus the same
+    // again for the post-body SCC phases). The known-heavy OA
+    // application decls (OaVirtual.Layout's 1700-line `component`
+    // at ~21s, Route.Routes' ~300-element `routesAndHandlers`)
+    // legitimately need 10-25s; a decl that exceeds 30s is far
+    // more likely a solver loop than a slow-but-finite check.
     let decl_timeout_ms: u64 = std::env::var("TYPECHECK_DECL_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10000);
+        .unwrap_or(30000);
     let fresh_deadline = || -> Option<std::time::Instant> {
         if decl_timeout_ms == 0 {
             None

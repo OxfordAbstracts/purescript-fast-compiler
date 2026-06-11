@@ -1575,6 +1575,25 @@ fn try_fundep_improvement(
         if !all_det_concrete {
             continue;
         }
+        // Skip when NO determined position is a bare unif — there is
+        // nothing left for this fundep to improve. Without this, the
+        // candidate scan below re-runs (snapshot + freshen + unify
+        // per candidate) on EVERY solver iteration for every
+        // deferred constraint of a fundep class whose determined
+        // side is already pinned. OaVirtual.Layout's `component`
+        // SCC makes 12k+ MonadState solve_one calls; the redundant
+        // re-scans cost ~9s of its solve budget and pushed the decl
+        // past its timeout.
+        let any_determined_bare = fd.determined.iter().any(|i| {
+            pending
+                .constraint
+                .args
+                .get(*i)
+                .map_or(false, |a| is_bare_unif(a, state))
+        });
+        if !any_determined_bare {
+            continue;
+        }
         // Pass 1: enumerate matching candidates. For each, freshen
         // its quantified vars (per-attempt) so the snapshot test
         // doesn't leak fresh unifs into the state on a non-match.
