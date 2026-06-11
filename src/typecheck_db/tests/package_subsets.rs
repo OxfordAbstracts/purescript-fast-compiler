@@ -71,6 +71,56 @@ fn check_closure(anchor: &str, max_size: usize) {
     }
 }
 
+/// Typecheck synthetic module SOURCES against the real package
+/// fixtures (Prelude, Aff, …). Each source is parsed and inserted
+/// into the package map under its own module name; the LAST
+/// source's transitive closure (real library code + all synthetic
+/// modules it imports) is run through the driver. Panics on any
+/// synthetic module's first error. Use to reproduce
+/// application-shaped failures without needing the whole OA corpus.
+fn check_synthetic_modules(sources: &[&str]) {
+    let mut pkgs = package_modules_by_name();
+    let mut names: Vec<String> = Vec::new();
+    for source in sources {
+        let module = crate::parser::parse(source).expect("synthetic module parses");
+        let name = crate::typecheck_db::test_support::module_name_of(&module);
+        names.push(name.clone());
+        pkgs.insert(
+            name.clone(),
+            ModuleInput::new(name, source.to_string(), module),
+        );
+    }
+    let target = names.last().expect("at least one source").clone();
+    let closure = transitive_closure_of(&target, &pkgs);
+    eprintln!("[synthetic] {target}: closure {} modules", closure.len());
+    let report = check_many_modules(closure);
+    for err in &report.errors {
+        panic!("{target}: driver error {err:?}");
+    }
+    for result in &report.results {
+        if !names.contains(&result.name) {
+            continue;
+        }
+        if let Some(err) = &result.inference_error {
+            panic!("{}: inference {err:?}", result.name);
+        }
+        if let Some(ce) = result.constraint_errors.first() {
+            panic!(
+                "{}: constraint {:?} on {} args={:?} span={:?}",
+                result.name, ce.kind, ce.constraint.class.name, ce.constraint.args, ce.span,
+            );
+        }
+        if let Some(ie) = result.import_errors.first() {
+            panic!("{}: import {:?} at span {:?}", result.name, ie.kind, ie.span);
+        }
+    }
+}
+
+/// Single-module convenience wrapper over [`check_synthetic_modules`].
+fn check_synthetic_module(source: &str) {
+    check_synthetic_modules(&[source]);
+}
+
 // ---------------------------------------------------------------------------
 // Tiny closures (≤ 25 modules) — fast smoke tests over core libraries.
 // Any of these failing means something deeply load-bearing broke.
@@ -157,4 +207,265 @@ fn subset_lumi_components_styles() {
 #[test]
 fn subset_halogen_xshell_commandline() {
     check_closure("Halogen.XShell.CommandLine", 500);
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic application-shaped repros.
+// ---------------------------------------------------------------------------
+
+/// Repro candidate for the EventPage.Update / Components.Dialog.
+/// Symposium `Mismatch(Maybe, Aff)` cluster. A big `case` whose arms
+/// build `{ newState, effects :: Array (Aff (Maybe msg)) }` records
+/// using the application's idioms:
+///   * generic first arm via a `noEffects` helper,
+///   * `# effects [ handleError "…" <=< try $ someAff … ]`
+///     (Kleisli-composed error handler over `try`),
+///   * `liftEffect … *> pure Nothing`,
+///   * `Nothing <$ do liftEffect …`,
+///   * an Aff do-block ending `pure Nothing`.
+#[test]
+fn synthetic_effmodel_case_arms() {
+    check_synthetic_module(
+        r#"module Test.Synthetic.EffModelArms where
+
+import Prelude
+
+import Data.Bifunctor (lmap)
+import Data.Either (Either(..))
+import Data.Maybe (Maybe(..))
+import Effect (Effect)
+import Effect.Aff (Aff, try)
+import Effect.Class (liftEffect)
+
+type UpdateResult st msg = { newState :: st, effects :: Array (Aff (Maybe msg)) }
+
+data Msg = A | B | C | D | E
+
+noEffects :: forall st msg. st -> UpdateResult st msg
+noEffects st = { newState: st, effects: [] }
+
+someEffect :: Effect Unit
+someEffect = pure unit
+
+someAff :: Int -> Aff Int
+someAff = pure
+
+update :: Msg -> Int -> UpdateResult Int Msg
+update msg state = case msg of
+  A -> noEffects state
+
+  B ->
+    noEffects state
+      # effects [ handleError "failed" <=< try $ someAff 1 ]
+
+  C ->
+    { newState: state
+    , effects: [ liftEffect someEffect *> pure Nothing ]
+    }
+
+  D ->
+    { newState: state
+    , effects: [ Nothing <$ do liftEffect someEffect ]
+    }
+
+  E ->
+    { newState: state
+    , effects:
+        [ do
+            void $ someAff 2
+            pure Nothing
+        ]
+    }
+
+  where
+
+  effects :: Array (Aff (Maybe Msg)) -> UpdateResult Int Msg -> UpdateResult Int Msg
+  effects effs result = result { effects = result.effects <> effs }
+
+  handleError :: forall a b. String -> Either a b -> Aff (Maybe Msg)
+  handleError errorMsg res =
+    case lmap (const errorMsg) res of
+      Left _ -> pure $ Just A
+      Right _ -> pure Nothing
+"#,
+    );
+}
+
+/// Minimal repro of the EventPage.Update / Components.Dialog.
+/// Symposium `Mismatch(Maybe, Aff)` failures, isolated by bisecting
+/// the real module: an `Array (Aff (Maybe msg))` element of shape
+///
+///   Nothing <$ do
+///     liftEffect $ polyEffectFn $ arg
+///
+/// where `polyEffectFn :: MonadEffect m => … -> m Unit` is
+/// POLYMORPHIC in its monad (the real one is
+/// `OaBrowserGlobal.upgradeOpenData`). With a concrete
+/// `Effect Unit` argument the same shape typechecks; the
+/// polymorphic version mis-pins the `<$` functor to `Maybe`
+/// (from `Nothing`) instead of `Aff`.
+#[test]
+fn synthetic_voidright_poly_lifteffect() {
+    check_synthetic_module(
+        r#"module Test.Synthetic.VoidRightPoly where
+
+import Prelude
+
+import Data.Maybe (Maybe(..))
+import Effect.Aff (Aff)
+import Effect.Class (class MonadEffect, liftEffect)
+
+upgrade :: forall m. MonadEffect m => Int -> m Unit
+upgrade _ = liftEffect (pure unit)
+
+effects :: Array (Aff (Maybe Int))
+effects =
+  [ Nothing <$ do
+      liftEffect $ upgrade $ 1
+  ]
+"#,
+    );
+}
+
+/// Two-module variant of `synthetic_effmodel_case_arms`, closer to
+/// the real EventPage.Update shape:
+///   * `init` lives in a SEPARATE module (its scheme travels via
+///     ModuleExports, like AdminDashboard.Pages.EventPage.Model),
+///   * 3-arg `update msg state pageModel@{ ui }` with an as-pattern
+///     record binder,
+///   * `let selectedStage = … in case msg of …` wrapper,
+///   * a record-pattern do-bind `{ loadable } <- init …` from the
+///     imported Aff function,
+///   * where-helpers (`updateStage`, `setUi`, `effects`,
+///     `handleError`) closing over the outer binders.
+#[test]
+fn synthetic_effmodel_two_module() {
+    check_synthetic_modules(&[
+        r#"module Test.Synthetic.PageModel where
+
+import Prelude
+
+import Data.Maybe (Maybe(..))
+import Effect.Aff (Aff)
+
+type PageUi = { expandStageSelection :: Boolean, error :: Maybe String }
+
+type PageModel = { loadable :: Int, ui :: PageUi }
+
+type ModelExt r = { stageId :: Int, eventId :: Int | r }
+
+init :: forall r. ModelExt r -> Aff PageModel
+init model = pure
+  { loadable: model.stageId
+  , ui: { expandStageSelection: false, error: Nothing }
+  }
+"#,
+        r#"module Test.Synthetic.PageUpdate where
+
+import Prelude
+
+import Data.Bifunctor (lmap)
+import Data.Either (Either(..))
+import Data.Maybe (Maybe(..))
+import Effect (Effect)
+import Effect.Aff (Aff, try)
+import Effect.Class (liftEffect)
+import Test.Synthetic.PageModel (PageModel, PageUi, init)
+
+type Model = { stageId :: Int, eventId :: Int, firstStage :: Stage }
+
+type Stage = { stage_id :: Int, reviews_open :: Boolean }
+
+type UpdateResult model pageModel msg =
+  { newState :: model
+  , newPageState :: pageModel
+  , effects :: Array (Aff (Maybe msg))
+  }
+
+data Msg
+  = Nav
+  | ToggleExpand
+  | FailedRequest String PageModel
+  | ToggleReviews
+  | SetStageId Int
+  | ReloadPage Int
+  | Copy String
+
+type UpdateResult_ = UpdateResult Model PageModel Msg
+
+noEffects :: forall model pageModel msg. model -> pageModel -> UpdateResult model pageModel msg
+noEffects st pm = { newState: st, newPageState: pm, effects: [] }
+
+getStage :: Model -> Stage
+getStage model = model.firstStage
+
+adminUpdateStage :: Int -> Int -> Boolean -> Aff Int
+adminUpdateStage _ _ _ = pure 0
+
+copyToClipboard :: String -> Effect Unit
+copyToClipboard _ = pure unit
+
+update :: Msg -> Model -> PageModel -> UpdateResult_
+update msg state pageModel@{ ui } =
+  let
+    selectedStage = getStage state
+  in
+    case msg of
+      Nav ->
+        noEffects state pageModel
+
+      ToggleExpand ->
+        setUi $ ui { expandStageSelection = not ui.expandStageSelection }
+
+      FailedRequest errorString newPageModel@{ ui: newUi } ->
+        noEffects state $ newPageModel { ui = newUi { error = Just errorString } }
+
+      ToggleReviews ->
+        updateStage (\stage -> stage { reviews_open = not stage.reviews_open })
+          # effects
+              [ handleError "Failed to update submission review status" <=< try
+                  $ adminUpdateStage state.eventId selectedStage.stage_id
+                  $ not selectedStage.reviews_open
+              ]
+
+      SetStageId stageId ->
+        { newState: state { stageId = stageId }
+        , newPageState: pageModel { ui = pageModel.ui { expandStageSelection = false } }
+        , effects:
+            [ do
+                { loadable } <- init $ state { stageId = stageId }
+                pure $ Just $ ReloadPage loadable
+            ]
+        }
+
+      ReloadPage loaded ->
+        { newState: state
+        , newPageState: pageModel { loadable = loaded }
+        , effects: []
+        }
+
+      Copy str ->
+        { newState: state
+        , newPageState: pageModel
+        , effects: [ liftEffect (copyToClipboard str) *> pure Nothing ]
+        }
+
+  where
+
+  updateStage :: (Stage -> Stage) -> UpdateResult_
+  updateStage f = noEffects (state { firstStage = f state.firstStage }) pageModel
+
+  setUi :: PageUi -> UpdateResult_
+  setUi newUi = noEffects state (pageModel { ui = newUi })
+
+  effects :: Array (Aff (Maybe Msg)) -> UpdateResult_ -> UpdateResult_
+  effects effs result = result { effects = result.effects <> effs }
+
+  handleError :: forall a b. String -> Either a b -> Aff (Maybe Msg)
+  handleError errorMsg res =
+    case lmap (const errorMsg) res of
+      Left s -> pure $ Just $ FailedRequest s pageModel
+      Right _ -> pure Nothing
+"#,
+    ]);
 }

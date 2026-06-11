@@ -94,6 +94,19 @@ fn desugar_do(span: Span, module: Option<ModuleQualifier>, statements: Vec<DoSta
     for s in it {
         acc = wrap_do_stmt(module, s, acc);
     }
+    // A single-Discard `do` flattens to its bare expression. If that
+    // expression is an operator chain, wrap it in Parens: this pass
+    // runs BEFORE `rebracket`, and rebracket's `flatten_chain` walks
+    // the right spine merging nested Op operands — without the parens,
+    // `Nothing <$ do f $ x` would splice into the chain
+    // `Nothing <$ f $ x` and reassociate as `(Nothing <$ f) $ x`
+    // (`$` binds loosest), silently changing the program. The
+    // do-block is a hard operand boundary in the source; Parens
+    // preserves it. Multi-statement blocks return App-headed exprs
+    // and never hit this.
+    if matches!(acc, Expr::Op { .. } | Expr::BacktickApp { .. }) {
+        acc = Expr::Parens { span, expr: Box::new(acc) };
+    }
     acc
 }
 

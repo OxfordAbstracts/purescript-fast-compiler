@@ -998,6 +998,102 @@ fn parallel_cluster_typechecks() {
     }
 }
 
+/// Generic diagnostic: typecheck ONE application module's transitive
+/// closure and dump its errors. Target comes from the
+/// `PFC_REPRO_MODULE` env var so no recompile is needed per module:
+///
+///   PFC_REPRO_MODULE=Components.Dialog.Symposium cargo test \
+///     --release --lib repro_one_module -- --ignored --nocapture
+#[test]
+#[ignore = "diagnostic — env-var-driven single-module repro"]
+fn repro_one_module() {
+    let target = match std::env::var("PFC_REPRO_MODULE") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("PFC_REPRO_MODULE unset — skipping");
+            return;
+        }
+    };
+    let join_result: Result<Result<(), String>, _> = std::thread::Builder::new()
+        .name("repro_one_module".into())
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut pkgs = application_modules_by_name();
+                if !pkgs.contains_key(target.as_str()) {
+                    return Err(format!("{target} missing from application sources"));
+                }
+                // Optional bisection hook: PFC_REPRO_REPLACE names a
+                // file whose contents REPLACE the target module's
+                // source. Lets us shrink a failing application module
+                // without touching the corpus on disk.
+                if let Ok(replacement_path) = std::env::var("PFC_REPRO_REPLACE") {
+                    let src = std::fs::read_to_string(&replacement_path)
+                        .map_err(|e| format!("read {replacement_path}: {e}"))?;
+                    let module = crate::parser::parse(&src)
+                        .map_err(|e| format!("parse {replacement_path}: {e:?}"))?;
+                    pkgs.insert(
+                        target.clone(),
+                        crate::typecheck_db::driver_multi::ModuleInput::new(
+                            target.clone(),
+                            src,
+                            module,
+                        ),
+                    );
+                    eprintln!("[repro] {target} source replaced from {replacement_path}");
+                }
+                let closure = transitive_closure_of(&target, &pkgs);
+                eprintln!("[repro] {target} closure: {} modules", closure.len());
+                let mut hits: Vec<String> = Vec::new();
+                let multi = check_many_modules_streaming(closure, |result| {
+                    if result.name == target
+                        && (result.inference_error.is_some()
+                            || !result.constraint_errors.is_empty())
+                    {
+                        for ce in &result.constraint_errors {
+                            hits.push(format!(
+                                "{}: {:?}: {} {:?}",
+                                result.name,
+                                ce.kind,
+                                ce.constraint.class,
+                                ce.constraint.args,
+                            ));
+                        }
+                        if let Some(err) = &result.inference_error {
+                            hits.push(format!("{}: infer {err:?}", result.name));
+                        }
+                    }
+                });
+                for e in &multi {
+                    return Err(format!("driver error: {e:?}"));
+                }
+                if !hits.is_empty() {
+                    return Err(format!("{} failed:\n  {}", target, hits.join("\n  ")));
+                }
+                Ok(())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(res) => res,
+                Err(payload) => Err(format!("panicked: {}", extract_panic_msg(payload))),
+            }
+        })
+        .expect("spawn repro_one_module thread")
+        .join();
+    let inner = match join_result {
+        Ok(r) => r,
+        Err(payload) => Err(format!(
+            "thread lost at top level: {}",
+            extract_panic_msg(payload),
+        )),
+    };
+    if let Err(msg) = inner {
+        panic!("repro_one_module: {msg}");
+    }
+}
+
 /// Diagnostic: dump the inferred scheme for the `init` decl in each
 /// `AdminDashboard.Pages.*.Model` module. Hypothesis: SoaaControls.init
 /// (or another Pages init) is being inferred without its `Aff` wrapper
