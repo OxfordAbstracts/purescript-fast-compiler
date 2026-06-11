@@ -96,7 +96,15 @@ pub struct ModuleExports {
     /// Every instance declared in this module. PureScript
     /// instances are globally visible, so import resolution
     /// forwards this whole list regardless of export clauses.
-    pub instances: Vec<Instance>,
+    ///
+    /// `Arc`-shared so transitive re-exports clone an Arc handle
+    /// (8 bytes + atomic refcount bump) instead of deep-cloning
+    /// the whole `Instance` struct. For modules that re-export
+    /// through long Prelude/library chains, this is the dominant
+    /// per-module-exports memory cost — without Arc-sharing,
+    /// each level in the chain duplicates the full Instance.
+    #[serde(default)]
+    pub instances: Vec<std::sync::Arc<Instance>>,
 
     /// Value-level operator fixities: op name → declaration.
     pub value_fixities: HashMap<String, FixityDecl>,
@@ -715,7 +723,12 @@ pub fn distill_exports(
     let mut out = ModuleExports::default();
 
     // Always: instances are globally visible in PureScript.
-    out.instances = instances.to_vec();
+    // Wrap each local instance in `Arc` so transitively-re-exporting
+    // modules clone the handle (8 bytes) instead of the whole struct.
+    out.instances = instances
+        .iter()
+        .map(|i| std::sync::Arc::new(i.clone()))
+        .collect();
 
     // Origin for every value this module defines — used by import
     // resolution to bind the scheme under its origin-qualified key
@@ -1379,8 +1392,16 @@ pub fn expand_module_reexports(
                     out.class_origins.entry(k.clone()).or_insert(origin);
                 }
                 for inst in &target_exports.instances {
-                    if !out.instances.iter().any(|i| i == inst) {
-                        out.instances.push(inst.clone());
+                    // Fast path: Arc pointer equality — most
+                    // transitively-shared instances will alias the
+                    // same Arc. Slow path: structural equality for
+                    // local-vs-imported instances that share
+                    // structure but not Arc identity.
+                    let already = out.instances.iter().any(|i| {
+                        std::sync::Arc::ptr_eq(i, inst) || **i == **inst
+                    });
+                    if !already {
+                        out.instances.push(std::sync::Arc::clone(inst));
                     }
                 }
                 for (k, v) in &target_exports.value_fixities {

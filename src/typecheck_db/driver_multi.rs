@@ -2444,7 +2444,7 @@ fn check_one_module(
     let mut existing: std::collections::HashSet<u64> = exports
         .instances
         .iter()
-        .map(&inst_fingerprint)
+        .map(|arc| inst_fingerprint(arc.as_ref()))
         .collect();
     for imp in &module.imports {
         let imp_name = join_module_name(&imp.module);
@@ -2456,9 +2456,10 @@ fn check_one_module(
             },
         };
         for inst in &source.instances {
-            let fp = inst_fingerprint(inst);
+            let fp = inst_fingerprint(inst.as_ref());
             if existing.insert(fp) {
-                exports.instances.push(inst.clone());
+                // Arc::clone is a refcount bump — no deep copy.
+                exports.instances.push(std::sync::Arc::clone(inst));
             }
         }
     }

@@ -1136,7 +1136,9 @@ fn merge_instances_and_classes(target: &ModuleExports, ix: &mut InstanceIndex) {
         ix.insert_class(class_name.clone(), info.clone());
     }
     for inst in &target.instances {
-        ix.insert(inst.clone());
+        // `inst` is an `Arc<Instance>`; deref + clone the inner
+        // struct for InstanceIndex's by-value storage.
+        ix.insert((**inst).clone());
     }
 }
 
@@ -1378,13 +1380,13 @@ mod tests {
             "Eq".into(),
             ClassInfo { type_vars: vec!["a".into()], fundeps: vec![], superclasses: vec![] },
         );
-        exp.instances.push(Instance {
+        exp.instances.push(std::sync::Arc::new(Instance {
             class: QName::unqualified("Eq"),
             types: vec![int_ty()],
             context: vec![],
             vars: vec![],
             chained: false,
-        });
+        }));
         r.insert("Data.Eq", exp);
         let module = parse_mod("module M where\nimport Data.Eq\n");
         let (_env, ix, errs) = build_env_from_imports(&module, &r);
@@ -1399,13 +1401,13 @@ mod tests {
         let mut r = ModuleRegistry::new();
         let mut exp = ModuleExports::default();
         exp.values.insert("foo".into(), std::sync::Arc::new(Scheme::mono(int_ty())));
-        exp.instances.push(Instance {
+        exp.instances.push(std::sync::Arc::new(Instance {
             class: QName::unqualified("Eq"),
             types: vec![int_ty()],
             context: vec![],
             vars: vec![],
             chained: false,
-        });
+        }));
         r.insert("Data.Foo", exp);
         let module = parse_mod("module M where\nimport Data.Foo (foo)\n");
         let (_env, ix, errs) = build_env_from_imports(&module, &r);
