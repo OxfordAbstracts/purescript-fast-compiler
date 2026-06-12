@@ -1421,7 +1421,14 @@ fn check_one_module(
                     &instance_index,
                 ) {
                     Ok(schemes) => {
-                        let scheme_oh = put_cached(
+                        // Cache write is best-effort: a pathological
+                        // scheme (constraint-leak blowup in a decl
+                        // that ran long under a generous deadline)
+                        // can exceed SQLite's max blob size
+                        // (SQLITE_TOOBIG). Treat any store failure
+                        // as a cache skip — the schemes are still
+                        // valid for THIS run; only re-use is lost.
+                        let scheme_oh = match put_cached(
                             db,
                             &name,
                             &scc_key,
@@ -1429,9 +1436,16 @@ fn check_one_module(
                             &dep_output_hashes,
                             module_context_hash,
                             &schemes,
-                        )
-                        .expect("typecheck_db put_cached");
-                        (schemes, CacheOutcome::Miss, Some(scheme_oh))
+                        ) {
+                            Ok(oh) => Some(oh),
+                            Err(e) => {
+                                eprintln!(
+                                    "[typecheck_db] cache write skipped for {name}::{scc_label}: {e:?}",
+                                );
+                                None
+                            }
+                        };
+                        (schemes, CacheOutcome::Miss, scheme_oh)
                     }
                     Err(e) => {
                         inference_error.get_or_insert(e);
