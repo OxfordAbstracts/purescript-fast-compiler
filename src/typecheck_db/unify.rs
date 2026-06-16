@@ -339,6 +339,17 @@ pub struct UnifyState {
     /// 6000 constraints × 446 EncodeOa candidates × ~50k-slot
     /// state was 600+ seconds in the OA application sweep).
     binding_trail: Vec<(usize, Option<Type>)>,
+    /// Pendings that already received a successful fundep
+    /// improvement, keyed by `(span.start, class name)`. The
+    /// improvement apply can pin a determined position to a type
+    /// that itself contains bare unifs (e.g. `Newtype (NT ?u) ?a`
+    /// pins `?a := ?u`); the "determined still bare" check then
+    /// re-runs the full match+apply — including a structural unify
+    /// over the (possibly huge) determiner types — on EVERY solver
+    /// iteration. Marking the pending after its first apply makes
+    /// improvement once-per-pending. Improvement is an
+    /// optimisation; skipping repeats can't lose solutions.
+    improved_pendings: std::collections::HashSet<(u32, String)>,
 }
 
 /// Captures the union-find state at a point so a later
@@ -372,7 +383,22 @@ impl UnifyState {
             deadline: None,
             deadline_budget_ms: 0,
             binding_trail: Vec::new(),
+            improved_pendings: std::collections::HashSet::new(),
         }
+    }
+
+    /// Record that `pending` (identified by its span start + class
+    /// name) received a successful fundep improvement. See the
+    /// field docs on `improved_pendings`.
+    pub fn mark_improved(&mut self, span_start: usize, class: &str) {
+        self.improved_pendings
+            .insert((span_start as u32, class.to_string()));
+    }
+
+    /// Was a fundep improvement already applied for this pending?
+    pub fn was_improved(&self, span_start: usize, class: &str) -> bool {
+        self.improved_pendings
+            .contains(&(span_start as u32, class.to_string()))
     }
 
     /// Arm the per-decl typecheck deadline. Callers pass the

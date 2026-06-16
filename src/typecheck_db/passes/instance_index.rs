@@ -92,6 +92,18 @@ pub struct FunDep {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceIndex {
     by_class: HashMap<String, Vec<Instance>>,
+    /// Per-class set of structural fingerprints already inserted, so
+    /// `insert` can drop duplicates in O(1). A module that imports N
+    /// dependencies — each of whose `ModuleExports.instances` carries
+    /// the FULL transitive instance set — would otherwise accumulate
+    /// the same instance N times: Route.Routes imports ~300 endpoint
+    /// modules and ended up with 2.1 MILLION identical `Newtype`
+    /// instances, turning every fundep candidate scan into a
+    /// multi-second walk. Structurally-identical instances ARE the
+    /// same instance, so deduping is sound (overlap detection cares
+    /// about DISTINCT overlapping heads, which this preserves).
+    #[serde(default, skip)]
+    seen: HashMap<String, std::collections::HashSet<u64>>,
     classes: HashMap<String, ClassInfo>,
     /// Coverage-check findings from `from_decls`. An instance whose
     /// head violates its class's fundep coverage lands here rather
@@ -107,6 +119,27 @@ pub struct InstanceIndex {
     /// nested `Schema` got fully unfolded during index registration.
     #[serde(default)]
     aliases: crate::typecheck_db::types::AliasMap,
+}
+
+/// Structural fingerprint of an instance for dedup. Hashes the
+/// class (name + module), head types, context, vars, and chain
+/// flag — everything `PartialEq` compares. Collisions only cause a
+/// missed dedup (a duplicate survives), never a wrong drop, since
+/// the cost is just one extra candidate.
+fn instance_fingerprint(inst: &Instance) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    inst.class.name.hash(&mut h);
+    inst.class.module.hash(&mut h);
+    inst.types.hash(&mut h);
+    for c in &inst.context {
+        c.class.name.hash(&mut h);
+        c.class.module.hash(&mut h);
+        c.args.hash(&mut h);
+    }
+    inst.vars.hash(&mut h);
+    inst.chained.hash(&mut h);
+    h.finish()
 }
 
 /// Fundep coverage-rule violation: an instance's determined
@@ -130,7 +163,17 @@ impl InstanceIndex {
     /// Insert one instance under its declared class key. The index
     /// is keyed by the class's simple name (without module prefix);
     /// canonicalization across module aliases happens at solve time.
+    ///
+    /// Structurally-identical instances are deduplicated (see the
+    /// `seen` field docs) — re-inserting the same instance is a
+    /// no-op, which is what keeps transitively-re-exported instances
+    /// from multiplying across a module's import list.
     pub fn insert(&mut self, instance: Instance) {
+        let fp = instance_fingerprint(&instance);
+        let seen = self.seen.entry(instance.class.name.clone()).or_default();
+        if !seen.insert(fp) {
+            return;
+        }
         self.by_class
             .entry(instance.class.name.clone())
             .or_default()

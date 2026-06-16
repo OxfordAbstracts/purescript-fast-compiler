@@ -42,6 +42,22 @@ pub static SOLVE_ONE_CALLS: std::sync::atomic::AtomicU64 =
 pub static TRY_MATCH_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// Per-phase nanosecond accumulators inside `solve_one`, enabled by
+// `TYPECHECK_DB_SOLVE_PHASES=1`. Read by the solve_all profile dump.
+pub static PHASE_GIVENS_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_MAGIC_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_DEFER_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_IMPROVE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_CANDLOOP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_TAIL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+
 // ---------------------------------------------------------------------------
 // Data
 // ---------------------------------------------------------------------------
@@ -228,12 +244,31 @@ pub enum ConstraintErrorKind {
 ///    target args. On success, commit and return `Resolved`; on
 ///    failure, rollback and try the next candidate.
 /// 3. Out of candidates with no match → `NoInstance`.
+/// Advance the per-phase clock: add elapsed-since-`t` to `counter`
+/// and reset `t` to now. No-op when phase timing is off (`t` None).
+#[inline]
+fn phase_mark(
+    counter: &std::sync::atomic::AtomicU64,
+    t: &mut Option<std::time::Instant>,
+) {
+    if let Some(t0) = t {
+        counter.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        *t = Some(std::time::Instant::now());
+    }
+}
+
 pub fn solve_one(
     state: &mut crate::typecheck_db::unify::UnifyState,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
 ) -> SolveOutcome {
     SOLVE_ONE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut phase_t: Option<std::time::Instant> =
+        std::env::var_os("TYPECHECK_DB_SOLVE_PHASES")
+            .map(|_| std::time::Instant::now());
     // Givens discharge before anything else: a constraint promised
     // by an enclosing sig's `Constrained` layer is already known-
     // true. Each `PendingConstraint` carries a snapshot of the
@@ -242,6 +277,7 @@ pub fn solve_one(
     // on zonked forms so a skolemised `Semigroupoid !sa` satisfies
     // a pending `Semigroupoid ?ua` once `?ua := !sa` is bound.
     if given_discharges_pending(state, instances, pending) {
+        phase_mark(&PHASE_GIVENS_NS, &mut phase_t);
         return SolveOutcome::Resolved(ResolvedDict {
             class: pending.constraint.class.clone(),
             instance_types: pending
@@ -254,12 +290,15 @@ pub fn solve_one(
             context: Vec::new(),
         });
     }
+    phase_mark(&PHASE_GIVENS_NS, &mut phase_t);
     // Compiler-magic auto-dispatch: some Prim classes discharge
     // purely from the constraint's shape and don't rely on user
     // instance declarations. Handle them up-front so a fixture
     // that only reaches these via a Prelude call-site doesn't
     // trip over a `NoInstanceFound`.
-    match try_magic(state, pending) {
+    let magic_out = try_magic(state, pending);
+    phase_mark(&PHASE_MAGIC_NS, &mut phase_t);
+    match magic_out {
         MagicOutcome::Resolved(dict) => return SolveOutcome::Resolved(dict),
         MagicOutcome::Mismatch => return SolveOutcome::HeadMismatch,
         MagicOutcome::None => {}
@@ -328,8 +367,10 @@ pub fn solve_one(
         _ => pending.constraint.args.iter().any(|a| has_unif_spine_head(a, state)),
     };
     if needs_defer || needs_spine_defer {
+        phase_mark(&PHASE_DEFER_NS, &mut phase_t);
         return SolveOutcome::Deferred;
     }
+    phase_mark(&PHASE_DEFER_NS, &mut phase_t);
 
     // Fundep-driven improvement. For each fundep on this class
     // whose determiner positions are all concrete in the pending,
@@ -345,6 +386,7 @@ pub fn solve_one(
             try_fundep_improvement(state, instances, pending, info);
         }
     }
+    phase_mark(&PHASE_IMPROVE_NS, &mut phase_t);
 
     // Candidates are stored under the class's simple name. When two
     // distinct classes share a name across modules (e.g. user-side
@@ -499,6 +541,7 @@ pub fn solve_one(
         if let Some((head, context)) =
             try_match(state, cand, &pending.constraint.args, instances.aliases())
         {
+            phase_mark(&PHASE_CANDLOOP_NS, &mut phase_t);
             return SolveOutcome::Resolved(ResolvedDict {
                 class: pending.constraint.class.clone(),
                 instance_types: head,
@@ -508,6 +551,7 @@ pub fn solve_one(
         }
         state.restore_bindings(snapshot);
     }
+    phase_mark(&PHASE_CANDLOOP_NS, &mut phase_t);
     // Rigid `Type::Var` defer FIRST. Rigid type vars come from a
     // surrounding signature (e.g. inside `default :: forall t a.
     // Reflectable t a => …`, the body sees `t` / `a` as Vars).
@@ -524,6 +568,7 @@ pub fn solve_one(
     // `InstanceHeadMismatch` (the constraint is propagating, not
     // failing).
     if pending.constraint.args.iter().any(|a| contains_rigid_var(a, state)) {
+        phase_mark(&PHASE_TAIL_NS, &mut phase_t);
         return SolveOutcome::Deferred;
     }
     // Specialised diagnostic: when the class has fundeps and the
@@ -540,6 +585,7 @@ pub fn solve_one(
             .map(|info| !info.fundeps.is_empty())
             .unwrap_or(false)
     {
+        phase_mark(&PHASE_TAIL_NS, &mut phase_t);
         return SolveOutcome::HeadMismatch;
     }
     // Classes with no in-scope candidates: defer when the
@@ -585,8 +631,10 @@ pub fn solve_one(
             pending.constraint.args.is_empty()
                 && pending.origin == ConstraintOrigin::Signature;
         if has_unif || is_marker_class || is_capability_marker {
+            phase_mark(&PHASE_TAIL_NS, &mut phase_t);
             return SolveOutcome::Deferred;
         }
+        phase_mark(&PHASE_TAIL_NS, &mut phase_t);
         return SolveOutcome::NoInstance;
     }
     // Kind-mismatch / wrong-head defer: if any arg's App-spine
@@ -641,6 +689,7 @@ pub fn solve_one(
             false
         }
     });
+    phase_mark(&PHASE_TAIL_NS, &mut phase_t);
     if head_shape_mismatch {
         return SolveOutcome::Deferred;
     }
@@ -1525,6 +1574,19 @@ fn try_fundep_improvement(
     pending: &PendingConstraint,
     class_info: &crate::typecheck_db::passes::instance_index::ClassInfo,
 ) -> bool {
+    // Once-per-pending: a successful apply can pin a determined
+    // position to a type that still CONTAINS bare unifs (e.g.
+    // `Newtype (NT ?u) ?a` pins `?a := ?u`), so the "determined
+    // still bare" gate below would re-run the full match+apply —
+    // including a structural unify over the (possibly huge)
+    // determiner types — on EVERY solver iteration. Route.Routes'
+    // `routesAndHandlers` paid 642 SECONDS for those repeats
+    // (35k Newtype solve_one calls × ~18ms). Improvement is an
+    // optimisation; repeating it can only rediscover the same
+    // equalities.
+    if state.was_improved(pending.span.start, &pending.constraint.class.name) {
+        return false;
+    }
     let pending_class_module = pending.constraint.class.module.as_deref();
     // Fundep improvement requires STRICT class-module matching:
     // instances stored under the same simple name can belong to
@@ -1546,6 +1608,26 @@ fn try_fundep_improvement(
     if cands.is_empty() {
         return false;
     }
+    // Whether every determiner across every fundep is fully ground
+    // (no unif anywhere). If improvement fails AND determiners are
+    // ground, the determiners can't refine on a later solver
+    // iteration, so re-attempting can only ever fail again — mark
+    // the pending settled to skip the (expensive) re-scan. This is
+    // the case that kept Route.Routes' `routesAndHandlers` burning:
+    // ~21k Newtype constraints whose determiner is a concrete
+    // record that matches NO `NT x` instance, re-scanned every
+    // fixpoint round. (When a determiner still has a unif, we leave
+    // the pending un-settled so a later binding can enable the
+    // improvement.)
+    let all_det_ground = class_info.fundeps.iter().all(|fd| {
+        fd.determiners.iter().all(|&i| {
+            pending
+                .constraint
+                .args
+                .get(i)
+                .map_or(true, |a| !contains_unif(a, state))
+        })
+    });
     let mut any_improved = false;
     for fd in &class_info.fundeps {
         // Skip when any determiner / determined position is out of
@@ -1597,26 +1679,67 @@ fn try_fundep_improvement(
         // Pass 1: enumerate matching candidates. For each, freshen
         // its quantified vars (per-attempt) so the snapshot test
         // doesn't leak fresh unifs into the state on a non-match.
-        // Pre-compute the pending's head/arity at each determiner
-        // position. Reused as a cheap structural filter across every
-        // candidate so we don't allocate fresh unifs + run a full
-        // unify on candidates that obviously can't match.
+        // Pre-compute a SHAPE for the pending's type at each
+        // determiner position. Reused as a cheap structural filter
+        // across every candidate so we don't allocate fresh unifs +
+        // run a full unify on candidates that obviously can't match.
         //
-        // Per-position rule (mirrors `solve_one`'s head pre-filter):
-        // - target has a `Con`-headed App-spine? Cand must have the
-        //   same (qname, arity) at that position, OR a non-Con head
+        // Per-position rule:
+        // - `Con(qname, arity)`: cand must have the same
+        //   (qname, arity) at that position, OR a non-Con head
         //   (type var) which unifies with anything.
-        // - target has no Con head at this position? Skip the
-        //   pre-filter for this position (let the unify decide).
-        let target_heads_at_det: Vec<
-            Option<(crate::typecheck_db::types::QName, usize)>,
-        > = fd
+        // - `NonCon`: target is a Record / Row / Fun / type-level
+        //   literal — a shape that can never unify with a
+        //   Con-headed instance position (except the unifier's
+        //   `Record` / `(->)` reconciliation heads, which we
+        //   allow through). Without this arm, a constraint like
+        //   `Newtype {500-field route record} ?a` ran the full
+        //   freshen+unify scan against EVERY Newtype instance in
+        //   scope: Route.Routes' `routesAndHandlers` made 35k such
+        //   solve_one calls at ~18ms each — 661 SECONDS of its
+        //   solve budget burnt on scans that can't match.
+        // - `Unknown` (free unif / Var / forall): no filtering.
+        enum DetShape {
+            Con(crate::typecheck_db::types::QName, usize),
+            NonCon,
+            Unknown,
+        }
+        let det_shape = |ty: &Type| -> DetShape {
+            if let Some((qn, ar)) = app_spine_head_arity_probing(ty, state) {
+                return DetShape::Con(qn.clone(), ar);
+            }
+            // Probe through unif bindings to the head shape.
+            let mut cur = ty;
+            loop {
+                match cur {
+                    Type::App(f, _) => cur = f,
+                    Type::Unif(id) => match state.probe(*id) {
+                        Some(bound) => cur = bound,
+                        None => return DetShape::Unknown,
+                    },
+                    Type::Record(_, _)
+                    | Type::Row(_, _)
+                    | Type::Fun(_, _)
+                    | Type::TypeString(_)
+                    | Type::TypeInt(_)
+                    // Rigid type vars and skolems only unify with
+                    // themselves — a Con-headed instance position
+                    // can never match. Without this arm, a pending
+                    // like `Newtype t ?a` (t rigid from the decl's
+                    // sig) ran the freshen+unify scan against EVERY
+                    // Newtype instance in scope — Route.Routes'
+                    // closure holds ~4600 of them, and 14k repeat
+                    // scans cost 640+ seconds.
+                    | Type::Var(_)
+                    | Type::Skolem(_) => return DetShape::NonCon,
+                    _ => return DetShape::Unknown,
+                }
+            }
+        };
+        let target_heads_at_det: Vec<DetShape> = fd
             .determiners
             .iter()
-            .map(|&i| {
-                app_spine_head_arity_probing(&pending.constraint.args[i], state)
-                    .map(|(qn, ar)| (qn.clone(), ar))
-            })
+            .map(|&i| det_shape(&pending.constraint.args[i]))
             .collect();
         let mut matches: Vec<usize> = Vec::new();
         for (cand_idx, cand) in cands.iter().enumerate() {
@@ -1634,31 +1757,49 @@ fn try_fundep_improvement(
             // pointer-compare-cheap work.
             let mut head_ok = true;
             for (dix, &i) in fd.determiners.iter().enumerate() {
-                if let Some((th, ta)) = &target_heads_at_det[dix] {
-                    if let Some((ch, ca)) = app_spine_head_arity(&cand.types[i]) {
-                        if ca != *ta {
-                            head_ok = false;
-                            break;
+                match &target_heads_at_det[dix] {
+                    DetShape::Con(th, ta) => {
+                        if let Some((ch, ca)) = app_spine_head_arity(&cand.types[i]) {
+                            if ca != *ta {
+                                head_ok = false;
+                                break;
+                            }
+                            let names_equiv = ch.name == th.name
+                                || ((ch.name == "->" || ch.name == "Function")
+                                    && (th.name == "->" || th.name == "Function"));
+                            if !names_equiv {
+                                head_ok = false;
+                                break;
+                            }
+                            if ch.module.is_some()
+                                && th.module.is_some()
+                                && ch.module != th.module
+                            {
+                                head_ok = false;
+                                break;
+                            }
                         }
-                        let names_equiv = ch.name == th.name
-                            || ((ch.name == "->" || ch.name == "Function")
-                                && (th.name == "->" || th.name == "Function"));
-                        if !names_equiv {
-                            head_ok = false;
-                            break;
-                        }
-                        if ch.module.is_some()
-                            && th.module.is_some()
-                            && ch.module != th.module
-                        {
-                            head_ok = false;
-                            break;
+                        // Cand has non-Con head at this position
+                        // (type var) — could unify with the
+                        // target's Con head, so keep this
+                        // candidate as a possible match.
+                    }
+                    DetShape::NonCon => {
+                        if let Some((ch, _)) = app_spine_head_arity(&cand.types[i]) {
+                            // A Con-headed instance position can't
+                            // unify with a Record/Row/Fun/literal
+                            // target — except the unifier's special
+                            // reconciliation heads.
+                            let reconciles = ch.name == "Record"
+                                || ch.name == "->"
+                                || ch.name == "Function";
+                            if !reconciles {
+                                head_ok = false;
+                                break;
+                            }
                         }
                     }
-                    // Cand has non-Con head at this position
-                    // (type var) — could unify with the target's
-                    // Con head, so keep this candidate as a
-                    // possible match.
+                    DetShape::Unknown => {}
                 }
             }
             if !head_ok {
@@ -1794,6 +1935,13 @@ fn try_fundep_improvement(
             continue;
         }
         any_improved = true;
+    }
+    // Mark settled on success, OR on failure when determiners are
+    // ground (a ground-determiner failure is permanent — see
+    // `all_det_ground`). A failure with unif-bearing determiners is
+    // left un-settled so a later binding can enable improvement.
+    if any_improved || all_det_ground {
+        state.mark_improved(pending.span.start, &pending.constraint.class.name);
     }
     any_improved
 }
@@ -2220,6 +2368,20 @@ pub fn solve_all(
             _solve_one_count,
             _skip_count,
         );
+        if std::env::var_os("TYPECHECK_DB_SOLVE_PHASES").is_some() {
+            let ms = |c: &std::sync::atomic::AtomicU64| {
+                c.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000
+            };
+            eprintln!(
+                "    [solve_one phases cumulative: givens={}ms magic={}ms defer={}ms improve={}ms candloop={}ms tail={}ms]",
+                ms(&PHASE_GIVENS_NS),
+                ms(&PHASE_MAGIC_NS),
+                ms(&PHASE_DEFER_NS),
+                ms(&PHASE_IMPROVE_NS),
+                ms(&PHASE_CANDLOOP_NS),
+                ms(&PHASE_TAIL_NS),
+            );
+        }
         let mut accumulated_ms: u128 = 0;
         for (cls, (count, dur)) in entries.iter().take(40) {
             accumulated_ms += dur.as_millis();
