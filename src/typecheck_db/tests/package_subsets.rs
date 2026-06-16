@@ -291,6 +291,57 @@ update msg state = case msg of
     );
 }
 
+/// Minimal repro of the DrPayPalCreateOrder `Mismatch(Record([],
+/// None), Record([(field), …], open))` failure, isolated by
+/// bisecting `existingOrderItems`. A `let`-bound, WILDCARD-annotated
+/// polymorphic helper
+///
+///   hasField = any (_.status >>> eq A) :: forall a. Array { status :: _ | a } -> Boolean
+///
+/// applied to TWO arrays whose element records have DIFFERENT field
+/// sets (`tickets` vs `addons`). The `{ status :: _ | a }`
+/// annotation carries both a row var `a` AND a wildcard `_`; each
+/// application must instantiate them FRESH. The bug pinned the
+/// shared wildcard/row across both call sites, collapsing one
+/// element type to the empty record.
+#[test]
+fn synthetic_wildcard_row_annotation_two_uses() {
+    check_synthetic_module(
+        r#"module Test.Synthetic.WildcardRowAnn where
+
+import Prelude
+
+import Data.Array (any, concatMap, filter)
+import Effect (Effect)
+
+data Status = Refund | Unpaid
+
+derive instance Eq Status
+
+type Detail =
+  { attendee_tickets :: Array { status :: Status, ticket_name :: String, price :: Int }
+  , attendee_addons :: Array { status :: Status, addon_name :: String, addon_id :: Int }
+  }
+
+fetch :: Effect Detail
+fetch = pure
+  { attendee_tickets: []
+  , attendee_addons: []
+  }
+
+go :: Effect Boolean
+go = do
+  { attendee_tickets, attendee_addons } <- fetch
+  let
+    tickets = filter (_.status >>> (eq Refund || eq Unpaid)) attendee_tickets
+    addons = filter (_.status >>> (eq Refund || eq Unpaid)) attendee_addons
+    hasRefundField = any (_.status >>> eq Refund) :: forall a. Array { status :: _ | a } -> Boolean
+    hasRefund = hasRefundField tickets || hasRefundField addons
+  pure hasRefund
+"#,
+    );
+}
+
 /// Minimal repro of the EventPage.Update / Components.Dialog.
 /// Symposium `Mismatch(Maybe, Aff)` failures, isolated by bisecting
 /// the real module: an `Array (Aff (Maybe msg))` element of shape

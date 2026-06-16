@@ -834,6 +834,42 @@ example = fromRow { foo: 1, bar: \"hi\" }
 }
 
 #[test]
+fn alias_empty_row_arg() {
+    // Reproducer for the DrPayPalCreateOrder mismatch. A
+    // record-shaped alias with an open `| ext` row tail,
+    // instantiated with the EMPTY row `()` as the ext argument
+    // (`PurchaseUnit Int () Int`). The empty-row tail must expand to
+    // a CLOSED record `{ name, unit_amount, quantity }` — record
+    // literals of that exact shape must unify against it.
+    assert_typechecks(
+        "\
+module M where
+
+type PurchaseUnit quantity ext unitExt =
+  { name :: String
+  , unit_amount :: unitExt
+  , quantity :: quantity
+  | ext
+  }
+
+type Items =
+  { tickets :: Array (PurchaseUnit Int () Int)
+  , addons :: Array (PurchaseUnit Int () Int)
+  }
+
+empty :: Items
+empty = { tickets: [], addons: [] }
+
+one :: Items
+one =
+  { tickets: [ { name: \"t\", unit_amount: 1, quantity: 1 } ]
+  , addons: [ { name: \"a\", unit_amount: 2, quantity: 1 } ]
+  }
+",
+    );
+}
+
+#[test]
 fn cap_rank2_with_do_notation() {
     // Extends `cap_rank2_constraint_discharge` with a do-block
     // inside the rank-2 arg — closer to the runGqlAdminDashboard

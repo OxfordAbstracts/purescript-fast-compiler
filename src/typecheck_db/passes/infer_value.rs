@@ -1731,6 +1731,75 @@ pub fn infer_value_scc_with_all(
                     if has_skolem { None } else { Some(zc) }
                 })
                 .collect();
+        // The user's authoritative scheme for a CLEAN, user-signed,
+        // RANK-1 decl: the declared signature itself (no inner
+        // forall, no type-hole sites, no wildcard / Partial). `None`
+        // for unsigned / rank-2 / hole / wildcard decls. Computed
+        // once and reused by both the leaked-constraint override
+        // (below) and the skolem-escape rescue (further down).
+        let clean_signed_sig = |env: &Env| -> Option<Scheme> {
+            if !env.local_signed.contains(name)
+                || env.local_signed_hole_sites.get(name).is_some()
+            {
+                return None;
+            }
+            env.top_level
+                .get(&QName { module: None, name: name.clone() })
+                .and_then(|s| {
+                    if scheme_has_inner_forall(s) {
+                        return None;
+                    }
+                    let full = if s.vars.is_empty() {
+                        s.ty.clone()
+                    } else {
+                        Type::Forall(
+                            s.vars
+                                .iter()
+                                .cloned()
+                                .map(|n| (n, false, None))
+                                .collect(),
+                            Arc::new(s.ty.clone()),
+                        )
+                    };
+                    if sig_ty_unsafe_to_pin(&full) {
+                        None
+                    } else {
+                        Some(s.as_ref().clone())
+                    }
+                })
+        };
+        // Signed-decl export contract: a clean rank-1 user-signed
+        // decl exports its SIGNATURE, not the body-inferred type
+        // with body-only leaked constraints appended. The body was
+        // checked against the sig (F2 pins the slot to the sig
+        // shape), so the sig is authoritative. Body constraints
+        // that our solver couldn't discharge — e.g. the GraphQL
+        // `QueryReturns` / `FoldlRecord` / `DecodeHasura` chain in
+        // `queryOrderAll :: … -> m (Maybe OrderDetails)` — are an
+        // implementation detail confined to this decl's own
+        // checking; they MUST NOT leak into the exported scheme,
+        // where they'd corrupt every use site (the
+        // DrPayPalCreateOrder `{ attendees } <- queryOrderAll …`
+        // collapse to an empty record). Genuine constraint errors
+        // are still emitted into `constraint_errors` during solving;
+        // this only governs the published scheme. Sig-declared
+        // constraints survive — they're in the sig's own
+        // `Constrained` layer.
+        if !constraint_args.is_empty() {
+            if let Some(sig) = clean_signed_sig(env) {
+                out.push(InferredScheme {
+                    name: name.clone(),
+                    scheme: sig,
+                    exhaustiveness_errors,
+                    pending_constraints,
+                    resolved_dicts,
+                    constraint_errors,
+                    constraint_dicts,
+                    hole_diagnostics,
+                });
+                continue;
+            }
+        }
         let generalized = crate::typecheck_db::generalize::generalize_with_constraints(
             &state,
             env,
@@ -1763,37 +1832,7 @@ pub fn infer_value_scc_with_all(
         // skolem leak is propagated as a `SkolemEscape` error
         // — matches the old eager `bind_var` behaviour.
         let scheme = if state.contains_free_skolem(&generalized.ty).is_some() {
-            let sig_override: Option<Scheme> = if env.local_signed.contains(name)
-                && env.local_signed_hole_sites.get(name).is_none()
-            {
-                env.top_level
-                    .get(&QName { module: None, name: name.clone() })
-                    .and_then(|s| {
-                        if scheme_has_inner_forall(s) {
-                            return None;
-                        }
-                        let full = if s.vars.is_empty() {
-                            s.ty.clone()
-                        } else {
-                            Type::Forall(
-                                s.vars
-                                    .iter()
-                                    .cloned()
-                                    .map(|n| (n, false, None))
-                                    .collect(),
-                                Arc::new(s.ty.clone()),
-                            )
-                        };
-                        if sig_ty_unsafe_to_pin(&full) {
-                            None
-                        } else {
-                            Some(s.as_ref().clone())
-                        }
-                    })
-            } else {
-                None
-            };
-            match sig_override {
+            match clean_signed_sig(env) {
                 Some(sig) => sig,
                 None => {
                     let zonked_slot = state.zonk(&ty);
@@ -3106,6 +3145,31 @@ fn infer_let(
                                 .clone();
                             let actual = infer_expr(state, env, type_ops, vb.expr)?;
                             state.unify_here(&slot_ty, &actual)?;
+                            // Generalize THIS binding immediately, before
+                            // inferring later bindings in the same `let`.
+                            // A later binding that references it must see
+                            // the POLYMORPHIC scheme — otherwise two uses
+                            // (`f xs || f ys` where `f :: forall a. Array
+                            // { … | a } -> _`) share the binding's mono
+                            // unifs and the second use's element type
+                            // conflicts with the first. (The `where` path
+                            // already generalizes early via SCC order; the
+                            // source-ordered `let` path didn't, which made
+                            // a forward-referenced polymorphic helper
+                            // collapse — the DrPayPalCreateOrder
+                            // `hasPartialRefund tickets || hasPartialRefund
+                            // addons` empty-record mismatch.) Mutual
+                            // recursion stays sound: a sibling slot still in
+                            // `env.locals` is free-in-env, so `generalize`
+                            // won't quantify it away.
+                            let slot_ty = env
+                                .locals
+                                .last_mut()
+                                .and_then(|s| s.remove(&n));
+                            if let Some(slot_ty) = slot_ty {
+                                let scheme = generalize(state, env, &slot_ty);
+                                env.bind_local_scheme(n.clone(), scheme);
+                            }
                         }
                     }
                 }
