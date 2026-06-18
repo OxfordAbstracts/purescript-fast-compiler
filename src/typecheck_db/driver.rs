@@ -42,6 +42,10 @@ struct MemoEntry {
 pub struct TypecheckDb {
     store: Store,
     memo: HashMap<PassKey, MemoEntry>,
+    /// When true, `check_one_module` runs the per-declaration JS codegen
+    /// (the `DeclDb` engine) and populates `ModuleCheckResult::js_module_text`.
+    /// Off by default so plain typechecking pays no codegen cost.
+    codegen_enabled: bool,
 }
 
 impl TypecheckDb {
@@ -49,6 +53,7 @@ impl TypecheckDb {
         Ok(Self {
             store: Store::open(path)?,
             memo: HashMap::new(),
+            codegen_enabled: false,
         })
     }
 
@@ -56,7 +61,18 @@ impl TypecheckDb {
         Ok(Self {
             store: Store::open_in_memory()?,
             memo: HashMap::new(),
+            codegen_enabled: false,
         })
+    }
+
+    /// Enable/disable per-declaration JS codegen for subsequent module checks.
+    pub fn set_codegen(&mut self, enabled: bool) {
+        self.codegen_enabled = enabled;
+    }
+
+    /// Whether per-declaration JS codegen is enabled.
+    pub fn codegen_enabled(&self) -> bool {
+        self.codegen_enabled
     }
 
     /// Look up a cached output for `key` and return it iff the stored

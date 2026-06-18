@@ -31,7 +31,20 @@ use crate::typecheck_db::types::{convert_type_expr, Constraint, QName, Scheme, T
 use crate::typecheck_db::unify::{LocatedUnifyError, UnifyError, UnifyState};
 
 pub const PASS_NAME: &str = "infer_value_scc";
-pub const PASS_VERSION: u32 = 1;
+// v2: constraint_dicts now stores a Vec per span (multi-constraint call sites).
+pub const PASS_VERSION: u32 = 2;
+
+/// When set, `infer_value_scc` zonks each decl's `constraint_dicts` so codegen
+/// sees concrete instance types. Off by default — plain typechecking never
+/// reads these dicts, and zonking them is measurable overhead on large modules.
+/// Set by the driver from `TypecheckDb::codegen_enabled`.
+pub static ZONK_CONSTRAINT_DICTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable zonking of `constraint_dicts` (see [`ZONK_CONSTRAINT_DICTS`]).
+pub fn set_zonk_constraint_dicts(enabled: bool) {
+    ZONK_CONSTRAINT_DICTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Error)]
 pub enum InferError {
@@ -143,7 +156,7 @@ pub struct InferredScheme {
     #[serde(default)]
     pub constraint_dicts: std::collections::HashMap<
         crate::span::Span,
-        crate::typecheck_db::passes::constraints::ResolvedDict,
+        Vec<crate::typecheck_db::passes::constraints::ResolvedDict>,
     >,
     /// Typed-hole diagnostics recorded during this decl's body. Each
     /// entry captures the hole's source name, inferred type (zonked),
@@ -1663,8 +1676,11 @@ pub fn infer_value_scc_with_all(
         for (k, mut v) in report2.dicts {
             dicts.entry(k).or_default().append(&mut v);
         }
-        for (k, mut v) in report2.dicts_by_span {
-            dicts_by_span.entry(k).or_default().extend(v.drain());
+        for (k, v) in report2.dicts_by_span {
+            let slot = dicts_by_span.entry(k).or_default();
+            for (span, mut dicts) in v {
+                slot.entry(span).or_default().append(&mut dicts);
+            }
         }
         for (k, mut v) in report2.errors {
             errors.entry(k).or_default().append(&mut v);
@@ -1694,7 +1710,25 @@ pub fn infer_value_scc_with_all(
         let resolved_dicts = dicts.remove(name).unwrap_or_default();
         let constraint_errors = errors.remove(name).unwrap_or_default();
         let pending_constraints = deferred_by_decl.remove(name).unwrap_or_default();
-        let constraint_dicts = dicts_by_span.remove(name).unwrap_or_default();
+        let mut constraint_dicts = dicts_by_span.remove(name).unwrap_or_default();
+        // Codegen needs concrete instance types in each per-call-site dict, so
+        // zonk away any residual unif vars. Gated on codegen because the zonk
+        // is pure overhead for plain typechecking (which never reads these).
+        if ZONK_CONSTRAINT_DICTS.load(std::sync::atomic::Ordering::Relaxed) {
+            for dicts in constraint_dicts.values_mut() {
+                for rd in dicts.iter_mut() {
+                    rd.instance_types = rd.instance_types.iter().map(|t| state.zonk(t)).collect();
+                    rd.context = rd
+                        .context
+                        .iter()
+                        .map(|c| crate::typecheck_db::types::Constraint {
+                            class: c.class.clone(),
+                            args: c.args.iter().map(|a| state.zonk(a)).collect(),
+                        })
+                        .collect();
+                }
+            }
+        }
         let hole_diagnostics = holes_by_decl.remove(name).unwrap_or_default();
         // Fold deferred constraints into the scheme using a single
         // shared unif→typevar substitution. Importers see the

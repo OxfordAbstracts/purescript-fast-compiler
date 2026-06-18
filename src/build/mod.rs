@@ -26,6 +26,103 @@ use crate::typechecker::error::TypeError;
 
 pub use error::BuildError;
 
+// ===== DeclDb (per-declaration codegen) build =====
+
+/// Per-module outcome of a [`build_from_sources_decldb`] run.
+pub struct DeclDbModule {
+    pub name: String,
+    /// Number of type/constraint/inference errors found in this module.
+    pub error_count: usize,
+    /// True if generated JS was written to `output_dir`.
+    pub wrote_js: bool,
+}
+
+/// Result of a DeclDb build.
+pub struct DeclDbBuildResult {
+    pub modules: Vec<DeclDbModule>,
+    /// Module-graph errors (cycles, unknown imports, duplicate modules).
+    pub graph_errors: Vec<String>,
+    /// Source files that failed to parse (path, message).
+    pub parse_errors: Vec<(String, String)>,
+}
+
+/// Build PureScript sources through the typecheck_db engine and the new
+/// per-declaration JS codegen, writing one `<Module.Name>/index.js` (plus a
+/// `foreign.js` companion for FFI modules) per module under `output_dir`.
+///
+/// `db_path` selects a persistent SQLite cache (incremental rebuilds reuse
+/// per-declaration results); `None` uses a fresh in-memory cache.
+///
+/// This is the production entry point for the DeclDb codegen, parallel to the
+/// legacy `build_from_sources_*` family (which uses the whole-module codegen).
+pub fn build_from_sources_decldb(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
+    output_dir: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> DeclDbBuildResult {
+    use crate::typecheck_db::driver_multi::{check_many_modules_with_db, ModuleInput};
+    use crate::typecheck_db::TypecheckDb;
+
+    let mut inputs: Vec<ModuleInput> = Vec::new();
+    let mut parse_errors: Vec<(String, String)> = Vec::new();
+    let mut name_by_path: HashMap<String, String> = HashMap::new();
+    for (path, src) in sources {
+        match crate::parse(src) {
+            Ok(cst) => {
+                let name = interner::resolve_module_name(&cst.name.value.parts);
+                name_by_path.insert((*path).to_string(), name.clone());
+                inputs.push(ModuleInput::new(name, (*src).to_string(), cst));
+            }
+            Err(e) => parse_errors.push(((*path).to_string(), format!("{e:?}"))),
+        }
+    }
+
+    // FFI source keyed by module name (companion `.js` of each `.purs`).
+    let mut ffi_by_module: HashMap<String, String> = HashMap::new();
+    if let Some(js) = js_sources {
+        for (path, js_src) in js {
+            if let Some(name) = name_by_path.get(*path) {
+                ffi_by_module.insert(name.clone(), (*js_src).to_string());
+            }
+        }
+    }
+
+    let mut db = match db_path {
+        Some(p) => TypecheckDb::open(p).expect("open TypecheckDb"),
+        None => TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb"),
+    };
+    db.set_codegen(true);
+    let report = check_many_modules_with_db(&mut db, inputs);
+
+    let mut modules = Vec::new();
+    for r in &report.results {
+        let error_count = r.constraint_errors.len()
+            + r.kind_errors.len()
+            + r.validation_errors.len()
+            + usize::from(r.inference_error.is_some());
+        let mut wrote_js = false;
+        if let (Some(dir), Some(js)) = (output_dir, &r.js_module_text) {
+            let mod_dir = dir.join(&r.name);
+            if std::fs::create_dir_all(&mod_dir).is_ok()
+                && std::fs::write(mod_dir.join("index.js"), js).is_ok()
+            {
+                wrote_js = true;
+                if let Some(ffi) = ffi_by_module.get(&r.name) {
+                    let _ = std::fs::write(mod_dir.join("foreign.js"), ffi);
+                }
+            }
+        }
+        modules.push(DeclDbModule { name: r.name.clone(), error_count, wrote_js });
+    }
+
+    DeclDbBuildResult {
+        modules,
+        graph_errors: report.errors.iter().map(|e| format!("{e:?}")).collect(),
+        parse_errors,
+    }
+}
+
 // ===== Build options =====
 
 /// Controls how much the build pipeline logs to stderr.

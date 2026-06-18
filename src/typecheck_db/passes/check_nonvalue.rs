@@ -760,6 +760,22 @@ pub fn instance_from_shape(
 
 /// Stable kind-prefixed decl key for a non-value decl. Instances and
 /// derives (which have no user-given name) get content-hashed keys.
+/// Content-derived `i__<hex>` key for an instance, from its class debug string
+/// (module-qualified class name) and head types. Shared between
+/// `decl_key_for_nonvalue` and codegen's defining-module lookup so both agree.
+pub fn instance_key_hex(class_debug: &str, type_tys: &[Type]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"instance_key_v1");
+    h.update(class_debug.as_bytes());
+    h.update(&[0u8]);
+    let types_bytes = bincode::serialize(&type_tys.to_vec()).unwrap_or_default();
+    h.update(&(types_bytes.len() as u32).to_le_bytes());
+    h.update(&types_bytes);
+    let digest = h.finalize();
+    let hex: String = digest.as_bytes().iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("i__{hex}")
+}
+
 pub fn decl_key_for_nonvalue(decl: &Decl) -> (String, String) {
     match decl {
         Decl::Data { name, .. } => {
@@ -794,20 +810,11 @@ pub fn decl_key_for_nonvalue(decl: &Decl) -> (String, String) {
             let type_ops = TypeOpMap::default();
             let type_tys: Vec<Type> =
                 types.iter().map(|t| convert_type_expr(t, &type_ops)).collect();
-            let mut h = blake3::Hasher::new();
-            h.update(b"instance_key_v1");
-            h.update(class_debug.as_bytes());
-            h.update(&[0u8]);
-            let types_bytes = bincode::serialize(&type_tys).unwrap_or_default();
-            h.update(&(types_bytes.len() as u32).to_le_bytes());
-            h.update(&types_bytes);
-            let digest = h.finalize();
-            let hex: String = digest.as_bytes().iter().take(8).map(|b| format!("{b:02x}")).collect();
-
+            let key = instance_key_hex(&class_debug, &type_tys);
             let types_debug: Vec<String> =
                 type_tys.iter().map(|t| format!("{t}")).collect();
             let debug = format!("instance {class_debug} {}", types_debug.join(" "));
-            (format!("i__{hex}"), debug)
+            (key, debug)
         }
         Decl::Fixity { operator, .. } => {
             let op = util::resolve_symbol(operator.value.symbol());

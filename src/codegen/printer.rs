@@ -11,6 +11,17 @@ pub fn print_module(module: &JsModule) -> String {
     p.output
 }
 
+/// Render a sequence of top-level statements to text (no module wrapper).
+/// Used by the per-declaration codegen to produce one cacheable text blob
+/// per PureScript declaration.
+pub fn print_stmts(stmts: &[JsStmt]) -> String {
+    let mut p = Printer::new();
+    for s in stmts {
+        p.print_stmt(s);
+    }
+    p.output
+}
+
 struct Printer {
     output: String,
     indent: usize,

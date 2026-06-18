@@ -253,14 +253,23 @@ fn desugar_ado(
     //   apply (prev) e2
     //   apply (prev) e3
     //   ...
+    //
+    // Each synthesized `map`/`apply` Var gets a DISTINCT zero-width span (at its
+    // operand's start) so the per-call-site `constraint_dicts` (keyed by span)
+    // records a separate dictionary for each — otherwise the `Functor` (map) and
+    // `Apply` (apply) constraints would collapse onto the shared block span.
+    let syn = |e: &Expr| -> Span {
+        let s = e.span();
+        Span { start: s.start, end: s.start }
+    };
     let mut chain = apply2(
         span,
-        prelude_fn(module, span, "map"),
+        prelude_fn(module, syn(&binds[0].1), "map"),
         lambda,
         binds[0].1.clone(),
     );
     for (_, ei) in binds.iter().skip(1) {
-        chain = apply2(span, prelude_fn(module, span, "apply"), chain, ei.clone());
+        chain = apply2(span, prelude_fn(module, syn(ei), "apply"), chain, ei.clone());
     }
 
     // Wrap with prefix lets.

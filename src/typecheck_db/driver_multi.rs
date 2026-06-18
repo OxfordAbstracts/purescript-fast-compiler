@@ -84,6 +84,10 @@ pub struct ModuleCheckResult {
     /// Coercible instances (forbidden).
     pub coercible_errors:
         Vec<crate::typecheck_db::passes::coercible_check::CoercibleError>,
+    /// Generated JavaScript for the whole module, produced by the
+    /// per-declaration codegen (`DeclDb` engine). `None` unless codegen
+    /// was enabled on the `TypecheckDb` via `set_codegen(true)`.
+    pub js_module_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +362,9 @@ fn check_one_module(
 ) -> ModuleCheckResult {
     let name = input.name.clone();
     let module = &input.module;
+    // Codegen consumes each decl's `constraint_dicts`, which must be zonked to
+    // concrete types; gate that extra work on codegen being enabled.
+    crate::typecheck_db::passes::infer_value::set_zonk_constraint_dicts(db.codegen_enabled());
     // Slow-module phase trace: when a module exceeds 5s overall,
     // dump a per-phase breakdown of where the time went. Off by
     // default; set TYPECHECK_DB_PROFILE_SLOW=1 to enable.
@@ -2510,6 +2517,27 @@ fn check_one_module(
             eprintln!("  {:>6}ms  {:>5.1}%  {}", dur.as_millis(), pct, label);
         }
     }
+    // Per-declaration JS codegen (DeclDb engine). Only when explicitly
+    // enabled, so plain typechecking pays no codegen cost.
+    let js_module_text = if db.codegen_enabled() {
+        Some(generate_module_js(
+            db,
+            &name,
+            &desugared,
+            &input.source,
+            &local_scheme_hashes,
+            module_context_hash,
+            &all_schemes,
+            &instance_method_schemes,
+            &instance_index,
+            registry,
+            &ctor_details,
+            &data_constructors,
+        ))
+    } else {
+        None
+    };
+
     ModuleCheckResult {
         name,
         schemes: all_schemes,
@@ -2524,7 +2552,284 @@ fn check_one_module(
         validation_errors,
         kind_errors,
         coercible_errors,
+        js_module_text,
     }
+}
+
+/// Generate the full ES-module JS for a checked module via the per-decl
+/// `codegen_decl` pass + trivial assembler. Phase 1: value declarations only.
+#[allow(clippy::too_many_arguments)]
+fn generate_module_js(
+    db: &mut TypecheckDb,
+    module: &str,
+    desugared: &[crate::typecheck_db::ir::Decl],
+    source: &str,
+    local_scheme_hashes: &HashMap<String, OutputHash>,
+    module_context_hash: [u8; 32],
+    all_schemes: &[InferredScheme],
+    instance_method_schemes: &[InferredScheme],
+    instance_index: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    registry: &ModuleRegistry,
+    ctor_details: &CtorRegistry,
+    data_constructors: &DataConstructors,
+) -> String {
+    use crate::codegen::common::ident_to_js;
+    use crate::codegen::decl::{instance_js_name, type_head_name, DeclCgCtx};
+    use crate::typecheck_db::ir::Decl;
+    use crate::typecheck_db::passes::codegen_decl;
+    use crate::typecheck_db::util::resolve_symbol;
+    use std::collections::HashSet;
+
+    // Instance dictionary JS name → DEFINING module, for emitting imported
+    // instance references as `Module.name`. Instances are forwarded to every
+    // re-exporter, so we can't just read the first module that exports one;
+    // instead we correlate each instance's content key (`i__hex`) with the
+    // module that DECLARED it (tracked in `registry.module_instances`).
+    let mut instance_modules: HashMap<String, String> = HashMap::new();
+    {
+        use crate::typecheck_db::passes::check_nonvalue::instance_key_hex;
+        // key (`i__hex`) → instance JS name, across every instance in scope.
+        let mut key_to_name: HashMap<String, String> = HashMap::new();
+        for (class_str, inst) in instance_index.all_instances() {
+            let heads: Vec<String> = inst.types.iter().map(type_head_name).collect();
+            if heads.iter().all(|h| h.is_empty()) {
+                continue;
+            }
+            let class_debug = match &inst.class.module {
+                Some(m) => format!("{m}.{}", inst.class.name),
+                None => inst.class.name.clone(),
+            };
+            let key = instance_key_hex(&class_debug, &inst.types);
+            key_to_name.insert(key, instance_js_name(class_str, &heads));
+        }
+        for (mod_name, _) in registry.iter() {
+            for key in registry.module_instances(mod_name) {
+                if let Some(name) = key_to_name.get(key) {
+                    instance_modules.insert(name.clone(), mod_name.clone());
+                }
+            }
+        }
+    }
+
+    // Per-decl resolved-dict maps, keyed by decl/method name.
+    let mut cd_by_name: HashMap<String, std::collections::HashMap<crate::span::Span, _>> =
+        HashMap::new();
+    let mut leading_by_name: HashMap<String, Vec<crate::typecheck_db::types::Constraint>> =
+        HashMap::new();
+    for s in all_schemes {
+        cd_by_name.insert(s.name.clone(), s.constraint_dicts.clone());
+        leading_by_name.insert(
+            s.name.clone(),
+            crate::codegen::decl::leading_constraints(&s.scheme.ty),
+        );
+    }
+    let mut method_dicts_by_name: HashMap<
+        String,
+        std::collections::HashMap<crate::span::Span, _>,
+    > = HashMap::new();
+    for s in instance_method_schemes {
+        method_dicts_by_name.insert(s.name.clone(), s.constraint_dicts.clone());
+    }
+
+    // Module-global info needed for expression translation.
+    let mut ctor_arity: HashMap<String, usize> = HashMap::new();
+    let mut newtype_ctors: HashSet<String> = HashSet::new();
+    let mut foreign_names: HashSet<String> = HashSet::new();
+    for d in desugared {
+        match d {
+            Decl::Data { constructors, .. } => {
+                for ctor in constructors {
+                    ctor_arity
+                        .insert(ident_to_js(ctor.name.value.symbol()), ctor.fields.len());
+                }
+            }
+            Decl::Newtype { constructor, .. } => {
+                newtype_ctors.insert(ident_to_js(constructor.value.symbol()));
+            }
+            Decl::Foreign { name, .. } => {
+                foreign_names.insert(resolve_symbol(name.value.symbol()));
+            }
+            _ => {}
+        }
+    }
+    // Imported constructors: arities + newtype-ness so cross-module ctor refs
+    // pick `.value`/`.create`/identity correctly. Local entries win (`or_insert`).
+    for (_, exports) in registry.iter() {
+        for (ctor_name, info) in &exports.ctors {
+            let cjs = crate::codegen::common::any_name_to_js(ctor_name);
+            ctor_arity.entry(cjs.clone()).or_insert(info.fields.len());
+            if exports.newtypes.contains(&info.parent_type) {
+                newtype_ctors.insert(cjs);
+            }
+        }
+    }
+    // Map each class method (raw PS name) to its class simple name, and to the
+    // classes of its own (method-level) constraints — the latter become leading
+    // dict params on instance method bodies (e.g. `eq1 :: Eq a => …`).
+    let mut class_methods: HashMap<String, String> = HashMap::new();
+    let mut method_leading: HashMap<String, Vec<String>> = HashMap::new();
+    for d in desugared {
+        if let Decl::Class { name, members, .. } = d {
+            let class_simple = resolve_symbol(name.value.symbol());
+            for m in members {
+                let method = resolve_symbol(m.name.value.symbol());
+                class_methods.insert(method.clone(), class_simple.clone());
+                method_leading.insert(method, crate::codegen::decl::method_dict_classes(&m.ty));
+            }
+        }
+    }
+    // Imported class methods: their own constraints (beyond the class itself)
+    // also become leading dict params on instance method bodies. The method's
+    // exported scheme is `forall. Class a => MethodCtx => …`, so we strip the
+    // class constraint and keep the rest. Needed for e.g. `instance Eq1 Maybe`
+    // whose `eq1 :: Eq a => …` comes from the imported `Eq1` class.
+    for d in desugared {
+        let (class_name, members) = match d {
+            Decl::Instance { class_name, members, .. } => (class_name, members),
+            _ => continue,
+        };
+        let class_simple = resolve_symbol(class_name.name.symbol());
+        let class_mod = resolve_symbol(class_name.module.symbol());
+        let Some(exports) = registry.get(&class_mod) else { continue };
+        for member in members {
+            if let Decl::Value { name: mname, .. } = member {
+                let method = resolve_symbol(mname.value.symbol());
+                if method_leading.contains_key(&method) {
+                    continue;
+                }
+                if let Some(scheme) = exports.values.get(&method) {
+                    let classes: Vec<String> =
+                        crate::codegen::decl::leading_constraints(&scheme.ty)
+                            .iter()
+                            .map(|c| c.class.name.clone())
+                            .filter(|c| *c != class_simple)
+                            .collect();
+                    method_leading.insert(method, classes);
+                }
+            }
+        }
+    }
+    let ctx = DeclCgCtx {
+        module,
+        ctor_arity: &ctor_arity,
+        newtype_ctors: &newtype_ctors,
+        foreign_names: &foreign_names,
+        class_methods: &class_methods,
+        instances: instance_index,
+        instance_modules: &instance_modules,
+    };
+
+    let mut outputs: Vec<codegen_decl::CodegenOutput> = Vec::new();
+
+    // 1) Constructors / foreign first, so module-level value initializers that
+    //    reference them are already bound.
+    for d in desugared {
+        let (decl_key, span) = match d {
+            Decl::Data { name, span, .. } => {
+                (format!("data__{}", resolve_symbol(name.value.symbol())), span)
+            }
+            Decl::Newtype { name, span, .. } => {
+                (format!("newtype__{}", resolve_symbol(name.value.symbol())), span)
+            }
+            Decl::Foreign { name, span, .. } => {
+                (format!("foreign__{}", resolve_symbol(name.value.symbol())), span)
+            }
+            _ => continue,
+        };
+        let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+        if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+            db, module, &decl_key, src_hash, module_context_hash, d,
+        ) {
+            outputs.push(out);
+        }
+    }
+
+    // 1b) Class method accessors.
+    for d in desugared {
+        if let Decl::Class { name, span, .. } = d {
+            let decl_key = format!("class__{}", resolve_symbol(name.value.symbol()));
+            let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+            if let Ok((out, _, _)) = codegen_decl::run_class_decl(
+                db, module, &decl_key, src_hash, module_context_hash, d,
+            ) {
+                outputs.push(out);
+            }
+        }
+    }
+
+    // Constructor layout per local type, for the deriver.
+    let mut derived_info: HashMap<String, crate::codegen::decl::DerivedTypeInfo> = HashMap::new();
+    for (ty, ctor_names) in data_constructors {
+        let ctors: Vec<_> = ctor_names
+            .iter()
+            .map(|cn| crate::codegen::decl::DerivedCtor {
+                js_name: crate::codegen::common::any_name_to_js(cn),
+                fields: ctor_details.get(cn).map(|ci| ci.fields.clone()).unwrap_or_default(),
+            })
+            .collect();
+        // All constructors of a type share its declared type variables.
+        let type_vars = ctor_names
+            .first()
+            .and_then(|cn| ctor_details.get(cn))
+            .map(|ci| ci.type_vars.clone())
+            .unwrap_or_default();
+        derived_info.insert(
+            ty.clone(),
+            crate::codegen::decl::DerivedTypeInfo { ctors, type_vars },
+        );
+    }
+
+    // 1c) Instance dictionaries + derived instances.
+    for d in desugared {
+        match d {
+            Decl::Instance { .. } => {
+                outputs.push(codegen_decl::run_instance_decl(
+                    d, &ctx, &method_dicts_by_name, &method_leading,
+                ));
+            }
+            Decl::Derive { types, .. } => {
+                let head = types
+                    .last()
+                    .map(crate::codegen::decl::type_expr_head_name)
+                    .unwrap_or_default();
+                outputs.push(codegen_decl::run_derive_decl(d, &ctx, derived_info.get(&head)));
+            }
+            _ => {}
+        }
+    }
+
+    // 2) Value declarations, grouped by name in first-seen (source) order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&Decl>> = HashMap::new();
+    let mut spans: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for d in desugared {
+        if let Decl::Value { name, span, .. } = d {
+            let n = resolve_symbol(name.value.symbol());
+            if !groups.contains_key(&n) {
+                order.push(n.clone());
+            }
+            groups.entry(n.clone()).or_default().push(d);
+            spans.entry(n).or_default().push((span.start, span.end));
+        }
+    }
+    let empty_cd = std::collections::HashMap::new();
+    let empty_leading: Vec<crate::typecheck_db::types::Constraint> = Vec::new();
+    for n in &order {
+        let eqs = &groups[n];
+        let sp = &spans[n];
+        let src_hash = codegen_decl::source_slice_hash(source, sp);
+        let scheme_dep = local_scheme_hashes.get(n).copied();
+        let decl_key = format!("value__{n}");
+        let cd = cd_by_name.get(n).unwrap_or(&empty_cd);
+        let leading = leading_by_name.get(n).unwrap_or(&empty_leading);
+        if let Ok((out, _, _)) = codegen_decl::run_value_group(
+            db, &decl_key, src_hash, module_context_hash, scheme_dep, eqs, &ctx, cd, leading,
+        ) {
+            outputs.push(out);
+        }
+    }
+
+    codegen_decl::assemble_module(&outputs)
 }
 
 // ---------------------------------------------------------------------------

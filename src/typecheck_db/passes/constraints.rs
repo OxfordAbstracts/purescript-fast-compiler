@@ -2218,7 +2218,9 @@ pub fn solve_all(
                             .dicts_by_span
                             .entry(owner.clone())
                             .or_default()
-                            .insert(pc.span, dict.clone());
+                            .entry(pc.span)
+                            .or_default()
+                            .push(dict.clone());
                     }
                     report.dicts.entry(owner).or_default().push(dict);
                 }
@@ -2426,14 +2428,15 @@ pub struct SolveReport {
     /// owning decl. Codegen iterates this for the full set of
     /// references it needs to emit.
     pub dicts: std::collections::HashMap<String, Vec<ResolvedDict>>,
-    /// Outer-only span lookup: maps each call site's span to the
-    /// `ResolvedDict` that satisfies its top-level constraint.
-    /// Sub-constraints born from instance contexts do not appear
-    /// here — they're in `dicts` and navigable via their parent's
-    /// `ResolvedDict::context`.
+    /// Per-call-site dict lookup: maps each reference's span to the
+    /// `ResolvedDict`s satisfying its top-level (`Signature`-origin)
+    /// constraints, in signature order. A reference may carry several
+    /// (e.g. `compare1 :: Ord1 f => Ord a => …`). Sub-constraints born
+    /// from instance contexts do not appear here — they're in `dicts`
+    /// and navigable via their parent's `ResolvedDict::context`.
     pub dicts_by_span: std::collections::HashMap<
         String,
-        std::collections::HashMap<crate::span::Span, ResolvedDict>,
+        std::collections::HashMap<crate::span::Span, Vec<ResolvedDict>>,
     >,
     /// Unresolved constraints: `NoInstance` for now.
     pub errors: std::collections::HashMap<String, Vec<ConstraintError>>,
@@ -3328,8 +3331,8 @@ g c = eq c c
         assert_eq!(schemes[0].constraint_dicts.len(), 1);
         // The span key should point into the source where `eq` is
         // referenced — a non-trivial one (not 0..0).
-        let (_span, dict) = schemes[0].constraint_dicts.iter().next().unwrap();
-        assert_eq!(dict.class.name, "Eq");
+        let (_span, dicts) = schemes[0].constraint_dicts.iter().next().unwrap();
+        assert_eq!(dicts[0].class.name, "Eq");
     }
 
     #[test]
