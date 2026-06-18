@@ -56,7 +56,7 @@ pub fn codegen_derive_decl(
     let empty_cd = std::collections::HashMap::new();
     let mut cg = Cg::new(ctx, &empty_cd, scope);
 
-    let dict = if *newtype {
+    let mut dict = if *newtype {
         derive_newtype(&mut cg, &class_simple, info)
     } else {
         match class_simple.as_str() {
@@ -65,13 +65,28 @@ pub fn codegen_derive_decl(
             "Ord" => derive_ord_like(&mut cg, info, "compare", false),
             "Ord1" => derive_ord_like(&mut cg, info, "compare1", true),
             "Functor" => derive_functor(&mut cg, info),
+            "Foldable" => derive_foldable(&mut cg, info),
             // Unknown class: emit an empty dict — valid JS that only errors if a
             // missing method is actually invoked at runtime.
             _ => JsExpr::ObjectLit(vec![]),
         }
     };
 
+    // Prepend superclass accessors (e.g. derived `Ord` needs `Eq0`).
+    if !*newtype {
+        if let JsExpr::ObjectLit(method_fields) = dict {
+            let inst_types: Vec<Type> = types
+                .iter()
+                .map(|t| crate::typecheck_db::types::convert_type_expr(t, &Default::default()))
+                .collect();
+            let mut all = cg.superclass_fields(&class_simple, &inst_types);
+            all.extend(method_fields);
+            dict = JsExpr::ObjectLit(all);
+        }
+    }
+
     out.external_refs = cg.take_external_refs();
+    out.local_refs = cg.take_local_refs();
     let mut body = dict;
     for p in params.iter().rev() {
         body = JsExpr::Function(None, vec![p.clone()], vec![JsStmt::Return(body)]);
@@ -243,6 +258,187 @@ fn derive_functor(cg: &mut Cg, info: Option<&DerivedTypeInfo>) -> JsExpr {
         vec![JsStmt::Return(JsExpr::Function(None, vec!["x".to_string()], stmts))],
     );
     JsExpr::ObjectLit(vec![("map".to_string(), map_fn)])
+}
+
+/// `foldl`/`foldr`/`foldMap` over the last type parameter's positions.
+fn derive_foldable(cg: &mut Cg, info: Option<&DerivedTypeInfo>) -> JsExpr {
+    let Some(info) = info else { return JsExpr::ObjectLit(vec![]) };
+    let Some(a) = info.type_vars.last().cloned() else { return JsExpr::ObjectLit(vec![]) };
+    let m = || JsExpr::Var("m".to_string());
+    let multi = info.ctors.len() > 1;
+
+    // foldl: f => z => m => { fold fields left-to-right into z }
+    let mut foldl_stmts: Vec<JsStmt> = Vec::new();
+    // foldr: f => z => m => { fold fields right-to-left into z }
+    let mut foldr_stmts: Vec<JsStmt> = Vec::new();
+    // foldMap: dictMonoid => f => m => { append field foldMaps, mempty for none }
+    let mut foldmap_stmts: Vec<JsStmt> = Vec::new();
+
+    for ctor in &info.ctors {
+        let test = || JsExpr::InstanceOf(Box::new(m()), Box::new(JsExpr::Var(ctor.js_name.clone())));
+
+        // foldl
+        let mut acc = JsExpr::Var("z".to_string());
+        for (i, fty) in ctor.fields.iter().enumerate() {
+            acc = fold_field(cg, FoldDir::Left, fty, &a, field(m(), i), acc);
+        }
+        foldl_stmts.push(JsStmt::If(test(), vec![JsStmt::Return(acc)], None));
+
+        // foldr (process fields in reverse)
+        let mut acc = JsExpr::Var("z".to_string());
+        for (i, fty) in ctor.fields.iter().enumerate().rev() {
+            acc = fold_field(cg, FoldDir::Right, fty, &a, field(m(), i), acc);
+        }
+        foldr_stmts.push(JsStmt::If(test(), vec![JsStmt::Return(acc)], None));
+
+        // foldMap: append non-empty field maps (right-associated), else mempty.
+        let mut pieces: Vec<JsExpr> = Vec::new();
+        for (i, fty) in ctor.fields.iter().enumerate() {
+            if let Some(p) = foldmap_field(cg, fty, &a, field(m(), i)) {
+                pieces.push(p);
+            }
+        }
+        let mempty = JsExpr::Indexer(
+            Box::new(JsExpr::Var("dictMonoid".to_string())),
+            Box::new(JsExpr::StringLit("mempty".to_string())),
+        );
+        let append = || {
+            JsExpr::Indexer(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::Indexer(
+                        Box::new(JsExpr::Var("dictMonoid".to_string())),
+                        Box::new(JsExpr::StringLit("Semigroup0".to_string())),
+                    )),
+                    vec![],
+                )),
+                Box::new(JsExpr::StringLit("append".to_string())),
+            )
+        };
+        let combined = match pieces.len() {
+            0 => mempty,
+            _ => {
+                let mut it = pieces.into_iter().rev();
+                let mut acc = it.next().unwrap();
+                for p in it {
+                    acc = call2(append(), p, acc);
+                }
+                acc
+            }
+        };
+        foldmap_stmts.push(JsStmt::If(test(), vec![JsStmt::Return(combined)], None));
+    }
+    if multi {
+        let fail = JsStmt::Throw(JsExpr::App(
+            Box::new(JsExpr::Var("Error".to_string())),
+            vec![JsExpr::StringLit("Failed pattern match".to_string())],
+        ));
+        foldl_stmts.push(fail.clone());
+        foldr_stmts.push(fail.clone());
+        foldmap_stmts.push(fail);
+    }
+
+    let curry3 = |a: &str, b: &str, c: &str, body: Vec<JsStmt>| {
+        JsExpr::Function(None, vec![a.to_string()], vec![JsStmt::Return(
+            JsExpr::Function(None, vec![b.to_string()], vec![JsStmt::Return(
+                JsExpr::Function(None, vec![c.to_string()], body),
+            )]),
+        )])
+    };
+    let foldmap_fn = JsExpr::Function(
+        None,
+        vec!["dictMonoid".to_string()],
+        vec![JsStmt::Return(curry2_named("f", "m", foldmap_stmts))],
+    );
+    JsExpr::ObjectLit(vec![
+        ("foldl".to_string(), curry3("f", "z", "m", foldl_stmts)),
+        ("foldr".to_string(), curry3("f", "z", "m", foldr_stmts)),
+        ("foldMap".to_string(), foldmap_fn),
+    ])
+}
+
+#[derive(Clone, Copy)]
+enum FoldDir {
+    Left,
+    Right,
+}
+
+/// Fold a field of type `fty` into `acc` (foldl/foldr), using the element fn `f`.
+fn fold_field(cg: &mut Cg, dir: FoldDir, fty: &Type, a: &str, value: JsExpr, acc: JsExpr) -> JsExpr {
+    if is_var(fty, a) {
+        // Direct: foldl → f(acc)(value); foldr → f(value)(acc).
+        return match dir {
+            FoldDir::Left => call2(JsExpr::Var("f".to_string()), acc, value),
+            FoldDir::Right => call2(JsExpr::Var("f".to_string()), value, acc),
+        };
+    }
+    if !contains_var(fty, a) {
+        return acc;
+    }
+    if let Type::App(g, inner) = fty {
+        let fdict = cg.dict_for_type("Foldable", g);
+        let method_name = match dir {
+            FoldDir::Left => "foldl",
+            FoldDir::Right => "foldr",
+        };
+        // elemStep folds an inner element into the running accumulator.
+        let step = JsExpr::Function(
+            None,
+            vec!["$x".to_string()],
+            vec![JsStmt::Return(JsExpr::Function(
+                None,
+                vec!["$a".to_string()],
+                vec![JsStmt::Return(fold_field(
+                    cg,
+                    dir,
+                    inner,
+                    a,
+                    JsExpr::Var("$x".to_string()),
+                    JsExpr::Var("$a".to_string()),
+                ))],
+            ))],
+        );
+        // dict.foldl/foldr(step)(acc)(value)
+        return JsExpr::App(
+            Box::new(call2(method(fdict, method_name), step, acc)),
+            vec![value],
+        );
+    }
+    acc
+}
+
+/// `foldMap` contribution of a field of type `fty` (None when `a` is absent).
+fn foldmap_field(cg: &mut Cg, fty: &Type, a: &str, value: JsExpr) -> Option<JsExpr> {
+    if is_var(fty, a) {
+        return Some(JsExpr::App(Box::new(JsExpr::Var("f".to_string())), vec![value]));
+    }
+    if !contains_var(fty, a) {
+        return None;
+    }
+    if let Type::App(g, inner) = fty {
+        let fdict = cg.dict_for_type("Foldable", g);
+        // dict.foldMap(dictMonoid)(innerFn)(value)
+        let inner_fn = JsExpr::Function(
+            None,
+            vec!["$x".to_string()],
+            vec![JsStmt::Return(
+                foldmap_field(cg, inner, a, JsExpr::Var("$x".to_string()))
+                    .unwrap_or_else(|| JsExpr::Var("$x".to_string())),
+            )],
+        );
+        let fm = JsExpr::App(
+            Box::new(method(fdict, "foldMap")),
+            vec![JsExpr::Var("dictMonoid".to_string())],
+        );
+        return Some(JsExpr::App(Box::new(JsExpr::App(Box::new(fm), vec![inner_fn])), vec![value]));
+    }
+    None
+}
+
+/// `function (a) { return function (b) { <stmts> }; }`
+fn curry2_named(a: &str, b: &str, stmts: Vec<JsStmt>) -> JsExpr {
+    JsExpr::Function(None, vec![a.to_string()], vec![JsStmt::Return(
+        JsExpr::Function(None, vec![b.to_string()], stmts),
+    )])
 }
 
 /// Map the functor parameter `a` within a field of type `fty`, applied to `value`.

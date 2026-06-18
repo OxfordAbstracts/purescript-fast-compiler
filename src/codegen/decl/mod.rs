@@ -109,6 +109,8 @@ pub struct GenDecl {
     pub units: Vec<GenUnit>,
     /// Module parts of every external module this decl references.
     pub external_refs: Vec<Vec<String>>,
+    /// Local (same-module) JS names referenced — for topological ordering.
+    pub local_refs: Vec<String>,
     /// (js_name, optional original-PS-name for `as` rename) to export.
     pub exports: Vec<(String, Option<String>)>,
     /// `$foreign` members referenced / re-exported.
@@ -146,6 +148,7 @@ pub fn codegen_value_group(
     let mut cg = expr::Cg::new(ctx, constraint_dicts, scope);
     let mut body_expr = cg.value_group_body(equations);
     out.external_refs = cg.take_external_refs();
+    out.local_refs = cg.take_local_refs();
 
     // A constrained value (`f :: Eq a => ...`) takes its dictionaries as
     // leading curried parameters; the body resolves givens to these names.
@@ -260,6 +263,7 @@ pub fn codegen_instance_decl(
         .collect();
 
     let mut external_refs: Vec<Vec<String>> = Vec::new();
+    let mut local_refs: Vec<String> = Vec::new();
     let mut fields: Vec<(String, JsExpr)> = Vec::new();
     for sym in &order {
         let eqs = &groups[sym];
@@ -283,10 +287,43 @@ pub fn codegen_instance_decl(
                 external_refs.push(r);
             }
         }
+        for r in cg.take_local_refs() {
+            if !local_refs.contains(&r) {
+                local_refs.push(r);
+            }
+        }
         for p in method_params.iter().rev() {
             body = JsExpr::Function(None, vec![p.clone()], vec![JsStmt::Return(body)]);
         }
         fields.push((method_ps, body));
+    }
+
+    // Superclass-accessor fields (e.g. `Semigroup0: () => semigroupX` on a
+    // Monoid instance). Resolved with the instance context in scope.
+    let inst_types: Vec<Type> = types
+        .iter()
+        .map(|t| crate::typecheck_db::types::convert_type_expr(t, &Default::default()))
+        .collect();
+    {
+        let nd = no_dicts();
+        let mut sc_cg = expr::Cg::new(ctx, &nd, scope.clone());
+        let sc_fields = sc_cg.superclass_fields(&class_simple, &inst_types);
+        if !sc_fields.is_empty() {
+            for r in sc_cg.take_external_refs() {
+                if !external_refs.contains(&r) {
+                    external_refs.push(r);
+                }
+            }
+            for r in sc_cg.take_local_refs() {
+                if !local_refs.contains(&r) {
+                    local_refs.push(r);
+                }
+            }
+            // Prepend so superclass accessors precede methods (matches reference).
+            let mut all = sc_fields;
+            all.append(&mut fields);
+            fields = all;
+        }
     }
 
     let dict_obj = JsExpr::ObjectLit(fields);
@@ -303,6 +340,7 @@ pub fn codegen_instance_decl(
     }
 
     out.external_refs = external_refs;
+    out.local_refs = local_refs;
     out.exports.push((inst_name.clone(), None));
     out.units.push(GenUnit {
         js_name: inst_name.clone(),

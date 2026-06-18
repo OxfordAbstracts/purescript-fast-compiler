@@ -2721,42 +2721,6 @@ fn generate_module_js(
 
     let mut outputs: Vec<codegen_decl::CodegenOutput> = Vec::new();
 
-    // 1) Constructors / foreign first, so module-level value initializers that
-    //    reference them are already bound.
-    for d in desugared {
-        let (decl_key, span) = match d {
-            Decl::Data { name, span, .. } => {
-                (format!("data__{}", resolve_symbol(name.value.symbol())), span)
-            }
-            Decl::Newtype { name, span, .. } => {
-                (format!("newtype__{}", resolve_symbol(name.value.symbol())), span)
-            }
-            Decl::Foreign { name, span, .. } => {
-                (format!("foreign__{}", resolve_symbol(name.value.symbol())), span)
-            }
-            _ => continue,
-        };
-        let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
-        if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
-            db, module, &decl_key, src_hash, module_context_hash, d,
-        ) {
-            outputs.push(out);
-        }
-    }
-
-    // 1b) Class method accessors.
-    for d in desugared {
-        if let Decl::Class { name, span, .. } = d {
-            let decl_key = format!("class__{}", resolve_symbol(name.value.symbol()));
-            let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
-            if let Ok((out, _, _)) = codegen_decl::run_class_decl(
-                db, module, &decl_key, src_hash, module_context_hash, d,
-            ) {
-                outputs.push(out);
-            }
-        }
-    }
-
     // Constructor layout per local type, for the deriver.
     let mut derived_info: HashMap<String, crate::codegen::decl::DerivedTypeInfo> = HashMap::new();
     for (ty, ctor_names) in data_constructors {
@@ -2767,7 +2731,6 @@ fn generate_module_js(
                 fields: ctor_details.get(cn).map(|ci| ci.fields.clone()).unwrap_or_default(),
             })
             .collect();
-        // All constructors of a type share its declared type variables.
         let type_vars = ctor_names
             .first()
             .and_then(|cn| ctor_details.get(cn))
@@ -2779,9 +2742,66 @@ fn generate_module_js(
         );
     }
 
-    // 1c) Instance dictionaries + derived instances.
+    // Group value-decl equations by name; emit the whole group at the first
+    // equation's source position.
+    let mut value_groups: HashMap<String, Vec<&Decl>> = HashMap::new();
+    let mut value_spans: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for d in desugared {
+        if let Decl::Value { name, span, .. } = d {
+            let n = resolve_symbol(name.value.symbol());
+            value_groups.entry(n.clone()).or_default().push(d);
+            value_spans.entry(n).or_default().push((span.start, span.end));
+        }
+    }
+
+    // Emit in SOURCE ORDER. Top-level value initializers and instance dict
+    // objects are eagerly evaluated at module load and may reference each other
+    // (a value uses an instance dict; an instance method calls a value); neither
+    // a values-first nor instances-first phase order is correct. PureScript
+    // modules are written so eager bindings are dependency-ordered in source, so
+    // emitting in source order is correct for the common case (matching the
+    // reference compiler's effective behavior).
+    let empty_cd = std::collections::HashMap::new();
+    let empty_leading: Vec<crate::typecheck_db::types::Constraint> = Vec::new();
+    let mut emitted_value: HashSet<String> = HashSet::new();
     for d in desugared {
         match d {
+            Decl::Data { name, span, .. } => {
+                let decl_key = format!("data__{}", resolve_symbol(name.value.symbol()));
+                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+                    db, module, &decl_key, src_hash, module_context_hash, d,
+                ) {
+                    outputs.push(out);
+                }
+            }
+            Decl::Newtype { name, span, .. } => {
+                let decl_key = format!("newtype__{}", resolve_symbol(name.value.symbol()));
+                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+                    db, module, &decl_key, src_hash, module_context_hash, d,
+                ) {
+                    outputs.push(out);
+                }
+            }
+            Decl::Foreign { name, span, .. } => {
+                let decl_key = format!("foreign__{}", resolve_symbol(name.value.symbol()));
+                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+                    db, module, &decl_key, src_hash, module_context_hash, d,
+                ) {
+                    outputs.push(out);
+                }
+            }
+            Decl::Class { name, span, .. } => {
+                let decl_key = format!("class__{}", resolve_symbol(name.value.symbol()));
+                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                if let Ok((out, _, _)) = codegen_decl::run_class_decl(
+                    db, module, &decl_key, src_hash, module_context_hash, d,
+                ) {
+                    outputs.push(out);
+                }
+            }
             Decl::Instance { .. } => {
                 outputs.push(codegen_decl::run_instance_decl(
                     d, &ctx, &method_dicts_by_name, &method_leading,
@@ -2794,38 +2814,25 @@ fn generate_module_js(
                     .unwrap_or_default();
                 outputs.push(codegen_decl::run_derive_decl(d, &ctx, derived_info.get(&head)));
             }
-            _ => {}
-        }
-    }
-
-    // 2) Value declarations, grouped by name in first-seen (source) order.
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<&Decl>> = HashMap::new();
-    let mut spans: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    for d in desugared {
-        if let Decl::Value { name, span, .. } = d {
-            let n = resolve_symbol(name.value.symbol());
-            if !groups.contains_key(&n) {
-                order.push(n.clone());
+            Decl::Value { name, .. } => {
+                let n = resolve_symbol(name.value.symbol());
+                if emitted_value.insert(n.clone()) {
+                    let eqs = &value_groups[&n];
+                    let sp = &value_spans[&n];
+                    let src_hash = codegen_decl::source_slice_hash(source, sp);
+                    let scheme_dep = local_scheme_hashes.get(&n).copied();
+                    let decl_key = format!("value__{n}");
+                    let cd = cd_by_name.get(&n).unwrap_or(&empty_cd);
+                    let leading = leading_by_name.get(&n).unwrap_or(&empty_leading);
+                    if let Ok((out, _, _)) = codegen_decl::run_value_group(
+                        db, &decl_key, src_hash, module_context_hash, scheme_dep, eqs, &ctx, cd,
+                        leading,
+                    ) {
+                        outputs.push(out);
+                    }
+                }
             }
-            groups.entry(n.clone()).or_default().push(d);
-            spans.entry(n).or_default().push((span.start, span.end));
-        }
-    }
-    let empty_cd = std::collections::HashMap::new();
-    let empty_leading: Vec<crate::typecheck_db::types::Constraint> = Vec::new();
-    for n in &order {
-        let eqs = &groups[n];
-        let sp = &spans[n];
-        let src_hash = codegen_decl::source_slice_hash(source, sp);
-        let scheme_dep = local_scheme_hashes.get(n).copied();
-        let decl_key = format!("value__{n}");
-        let cd = cd_by_name.get(n).unwrap_or(&empty_cd);
-        let leading = leading_by_name.get(n).unwrap_or(&empty_leading);
-        if let Ok((out, _, _)) = codegen_decl::run_value_group(
-            db, &decl_key, src_hash, module_context_hash, scheme_dep, eqs, &ctx, cd, leading,
-        ) {
-            outputs.push(out);
+            _ => {}
         }
     }
 

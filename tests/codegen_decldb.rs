@@ -484,6 +484,52 @@ test = unwrap (map (\x -> x + 1) (Wrap (Just 41)))
 }
 
 #[test]
+fn codegen_prelude_derive_foldable() {
+    let source = r#"
+module Test where
+
+import Prelude
+import Data.Foldable (foldr, foldl)
+
+data Pair a = Pair a a
+derive instance Foldable Pair
+
+test :: Int
+test = foldr (\x acc -> x + acc) 0 (Pair 40 2) + foldl (\acc x -> acc + x) 0 (Pair 30 0)
+-- TEST: 72
+"#;
+    run_prelude(
+        "derive_foldable",
+        &["prelude", "foldable-traversable", "maybe", "control", "invariant", "newtype", "tuples", "either", "const", "identity", "functors", "safe-coerce", "unsafe-coerce"],
+        source,
+        "72",
+    );
+}
+
+#[test]
+fn codegen_prelude_derive_foldable_foldmap() {
+    let source = r#"
+module Test where
+
+import Prelude
+import Data.Foldable (foldMap)
+
+data Pair a = Pair a a
+derive instance Foldable Pair
+
+test :: String
+test = foldMap (\x -> x) (Pair "ab" "cd")
+-- TEST: "abcd"
+"#;
+    run_prelude(
+        "derive_foldmap",
+        &["prelude", "foldable-traversable", "maybe", "control", "invariant", "newtype", "tuples", "either", "const", "identity", "functors", "safe-coerce", "unsafe-coerce"],
+        source,
+        "\"abcd\"",
+    );
+}
+
+#[test]
 fn codegen_prelude_derive_eq1() {
     let source = r#"
 module Test where

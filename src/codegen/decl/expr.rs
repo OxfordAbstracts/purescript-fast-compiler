@@ -25,6 +25,10 @@ pub(super) struct Cg<'a> {
     /// In-scope given dictionaries: (class simple name, JS param name).
     dict_scope: Vec<(String, String)>,
     external_refs: Vec<Vec<String>>,
+    /// Local (same-module) JS names this decl references — used to
+    /// topologically order top-level declarations so eager initializers see
+    /// their dependencies already bound.
+    local_refs: Vec<String>,
     counter: usize,
 }
 
@@ -34,11 +38,28 @@ impl<'a> Cg<'a> {
         constraint_dicts: &'a HashMap<Span, Vec<ResolvedDict>>,
         dict_scope: Vec<(String, String)>,
     ) -> Self {
-        Self { ctx, constraint_dicts, dict_scope, external_refs: Vec::new(), counter: 0 }
+        Self {
+            ctx,
+            constraint_dicts,
+            dict_scope,
+            external_refs: Vec::new(),
+            local_refs: Vec::new(),
+            counter: 0,
+        }
     }
 
-    pub(super) fn take_external_refs(self) -> Vec<Vec<String>> {
-        self.external_refs
+    pub(super) fn take_external_refs(&mut self) -> Vec<Vec<String>> {
+        std::mem::take(&mut self.external_refs)
+    }
+
+    pub(super) fn take_local_refs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.local_refs)
+    }
+
+    fn note_local(&mut self, name: &str) {
+        if !self.local_refs.iter().any(|n| n == name) {
+            self.local_refs.push(name.to_string());
+        }
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -458,6 +479,7 @@ impl<'a> Cg<'a> {
             if self.ctx.foreign_names.contains(&raw) {
                 return JsExpr::ModuleAccessor("$foreign".to_string(), raw);
             }
+            self.note_local(&js_name);
             JsExpr::Var(js_name)
         } else {
             self.record_external(&module_str);
@@ -474,6 +496,7 @@ impl<'a> Cg<'a> {
             module.resolve().unwrap_or_default()
         };
         if module_str.is_empty() || module_str == self.ctx.module {
+            self.note_local(&ctor_js);
             JsExpr::Var(ctor_js)
         } else {
             self.record_external(&module_str);
@@ -592,7 +615,10 @@ impl<'a> Cg<'a> {
                 self.record_external(m);
                 JsExpr::ModuleAccessor(module_name_str_to_js(m), name)
             }
-            _ => JsExpr::Var(name),
+            _ => {
+                self.note_local(&name);
+                JsExpr::Var(name)
+            }
         }
     }
 
@@ -600,6 +626,36 @@ impl<'a> Cg<'a> {
     /// the deriver to obtain each field's instance dictionary.
     pub(super) fn dict_for_type(&mut self, class_simple: &str, ty: &Type) -> JsExpr {
         self.resolve_dict(class_simple, std::slice::from_ref(ty))
+    }
+
+    /// Superclass-accessor dict fields for an instance of `class_simple` whose
+    /// head is `inst_types`. PureScript represents `class S a <= C a`'s dict
+    /// with a thunked field `S0: () => <S dict>` per superclass (numbered by
+    /// position). Required so subclass dicts can reach superclass methods
+    /// (e.g. `dictMonoid.Semigroup0().append`).
+    pub(super) fn superclass_fields(
+        &mut self,
+        class_simple: &str,
+        inst_types: &[Type],
+    ) -> Vec<(String, JsExpr)> {
+        let Some(ci) = self.ctx.instances.class_info(class_simple) else {
+            return Vec::new();
+        };
+        let superclasses = ci.superclasses.clone();
+        let type_vars = ci.type_vars.clone();
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        for (v, t) in type_vars.iter().zip(inst_types.iter()) {
+            subst.insert(v.clone(), t.clone());
+        }
+        let mut fields = Vec::new();
+        for (i, sc) in superclasses.iter().enumerate() {
+            let sc_class = sc.class.name.clone();
+            let sc_args: Vec<Type> = sc.args.iter().map(|a| apply_subst(a, &subst)).collect();
+            let dict = self.resolve_dict(&sc_class, &sc_args);
+            let name = format!("{sc_class}{i}");
+            fields.push((name, JsExpr::Function(None, vec![], vec![JsStmt::Return(dict)])));
+        }
+        fields
     }
 
     /// Push an in-scope given dictionary (class → JS param name). Used by the

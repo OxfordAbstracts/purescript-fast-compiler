@@ -40,6 +40,9 @@ pub struct CodegenOutput {
     pub units: Vec<JsUnit>,
     /// Module parts of every external module referenced by this decl.
     pub external_refs: Vec<Vec<String>>,
+    /// Local (same-module) JS names referenced — for topological ordering.
+    #[serde(default)]
+    pub local_refs: Vec<String>,
     /// (js_name, optional original-PS-name for `as` rename) to export.
     pub exports: Vec<(String, Option<String>)>,
     /// `$foreign` members referenced / re-exported.
@@ -55,6 +58,7 @@ fn gen_to_output(gen: GenDecl) -> CodegenOutput {
     CodegenOutput {
         units,
         external_refs: gen.external_refs,
+        local_refs: gen.local_refs,
         exports: gen.exports,
         foreign_refs: gen.foreign_refs,
     }
@@ -174,7 +178,63 @@ pub fn run_nonvalue_decl(
 /// rendered unit text in the order given, and builds the export block. A
 /// `$foreign` import + re-export block is emitted when `foreign_members` is
 /// non-empty.
+/// Post-order DFS over the local-reference graph: returns output indices with
+/// each declaration's local dependencies before it. Cycles (mutual recursion)
+/// are left in discovery order — safe because such references are inside
+/// function bodies, which `var`-hoist.
+fn topo_order(outputs: &[CodegenOutput]) -> Vec<usize> {
+    let mut defined: HashMap<&str, usize> = HashMap::new();
+    for (i, out) in outputs.iter().enumerate() {
+        for u in &out.units {
+            defined.entry(u.js_name.as_str()).or_insert(i);
+        }
+    }
+    let deps: Vec<Vec<usize>> = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, out)| {
+            let mut ds: Vec<usize> = Vec::new();
+            for r in &out.local_refs {
+                if let Some(&j) = defined.get(r.as_str()) {
+                    if j != i && !ds.contains(&j) {
+                        ds.push(j);
+                    }
+                }
+            }
+            ds
+        })
+        .collect();
+    let n = outputs.len();
+    let mut visited = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    for i in 0..n {
+        topo_visit(i, &deps, &mut visited, &mut order);
+    }
+    order
+}
+
+fn topo_visit(i: usize, deps: &[Vec<usize>], visited: &mut [bool], order: &mut Vec<usize>) {
+    if visited[i] {
+        return;
+    }
+    visited[i] = true;
+    for &j in &deps[i] {
+        topo_visit(j, deps, visited, order);
+    }
+    order.push(i);
+}
+
 pub fn assemble_module(outputs: &[CodegenOutput]) -> String {
+    // Topologically order the declarations so eager initializers (top-level
+    // value bindings, instance dict objects) appear after the local
+    // declarations they reference (e.g. `bindEither = { bind: either(...) }`
+    // must follow `either`). Post-order DFS over the local-ref graph emits
+    // dependencies first; mutual cycles (recursive functions) fall back to
+    // source order and rely on `var` hoisting.
+    let order = topo_order(outputs);
+    let outputs: Vec<&CodegenOutput> = order.iter().map(|&i| &outputs[i]).collect();
+    let outputs = outputs.as_slice();
+
     // Foreign members are re-exported from the FFI companion module.
     let mut foreign_members: Vec<String> = Vec::new();
     for out in outputs {
