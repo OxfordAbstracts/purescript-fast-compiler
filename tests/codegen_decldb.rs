@@ -530,6 +530,34 @@ test = foldMap (\x -> x) (Pair "ab" "cd")
 }
 
 #[test]
+fn codegen_prelude_derive_traversable() {
+    let source = r#"
+module Test where
+
+import Prelude
+import Data.Maybe (Maybe(..))
+import Data.Traversable (traverse)
+
+data Pair a = Pair a a
+derive instance Functor Pair
+derive instance Foldable Pair
+derive instance Traversable Pair
+
+test :: Int
+test = case traverse (\x -> Just x) (Pair 40 2) of
+  Just (Pair a b) -> a + b
+  Nothing -> 0
+-- TEST: 42
+"#;
+    run_prelude(
+        "derive_traversable",
+        &["prelude", "foldable-traversable", "maybe", "control", "invariant", "newtype", "tuples", "either", "const", "identity", "functors", "safe-coerce", "unsafe-coerce"],
+        source,
+        "42",
+    );
+}
+
+#[test]
 fn codegen_prelude_derive_eq1() {
     let source = r#"
 module Test where

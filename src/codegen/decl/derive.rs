@@ -66,6 +66,7 @@ pub fn codegen_derive_decl(
             "Ord1" => derive_ord_like(&mut cg, info, "compare1", true),
             "Functor" => derive_functor(&mut cg, info),
             "Foldable" => derive_foldable(&mut cg, info),
+            "Traversable" => derive_traversable(&mut cg, info),
             // Unknown class: emit an empty dict — valid JS that only errors if a
             // missing method is actually invoked at runtime.
             _ => JsExpr::ObjectLit(vec![]),
@@ -354,6 +355,133 @@ fn derive_foldable(cg: &mut Cg, info: Option<&DerivedTypeInfo>) -> JsExpr {
         ("foldr".to_string(), curry3("f", "z", "m", foldr_stmts)),
         ("foldMap".to_string(), foldmap_fn),
     ])
+}
+
+/// `traverse`/`sequence` — rebuild the structure applicatively over the last
+/// type parameter. Uses the `Applicative` dict (leading `dictApplicative`
+/// param) and its superclass chain for `map`/`apply`/`pure`.
+fn derive_traversable(cg: &mut Cg, info: Option<&DerivedTypeInfo>) -> JsExpr {
+    let Some(info) = info else { return JsExpr::ObjectLit(vec![]) };
+    let Some(a) = info.type_vars.last().cloned() else { return JsExpr::ObjectLit(vec![]) };
+
+    // Build the per-constructor rebuild body, given the element function `f`.
+    let build = |cg: &mut Cg, f_is_identity: bool| -> Vec<JsStmt> {
+        let x = || JsExpr::Var("x".to_string());
+        let mut stmts: Vec<JsStmt> = Vec::new();
+        let multi = info.ctors.len() > 1;
+        for ctor in &info.ctors {
+            let test = JsExpr::InstanceOf(Box::new(x()), Box::new(JsExpr::Var(ctor.js_name.clone())));
+            let body = if ctor.fields.is_empty() {
+                // pure(Ctor.value)
+                app1(pure_accessor(), ctor_value_ref(&ctor.js_name))
+            } else {
+                // Ctor.create <$> trav(v0) <*> trav(v1) <*> ...
+                let mut acc = app2(
+                    map_accessor(),
+                    JsExpr::Indexer(
+                        Box::new(JsExpr::Var(ctor.js_name.clone())),
+                        Box::new(JsExpr::StringLit("create".to_string())),
+                    ),
+                    trav_field(cg, &ctor.fields[0], &a, field(x(), 0), f_is_identity),
+                );
+                for (i, fty) in ctor.fields.iter().enumerate().skip(1) {
+                    acc = app2(apply_accessor(), acc, trav_field(cg, fty, &a, field(x(), i), f_is_identity));
+                }
+                acc
+            };
+            stmts.push(JsStmt::If(test, vec![JsStmt::Return(body)], None));
+        }
+        if multi {
+            stmts.push(JsStmt::Throw(JsExpr::App(
+                Box::new(JsExpr::Var("Error".to_string())),
+                vec![JsExpr::StringLit("Failed pattern match".to_string())],
+            )));
+        }
+        stmts
+    };
+
+    // traverse: dictApplicative => f => x => <build with f>
+    let traverse_body = build(cg, false);
+    let traverse_fn = JsExpr::Function(
+        None,
+        vec!["dictApplicative".to_string()],
+        vec![JsStmt::Return(curry2_named("f", "x", traverse_body))],
+    );
+    // sequence: dictApplicative => x => <build with f = identity>
+    let seq_body = build(cg, true);
+    let sequence_fn = JsExpr::Function(
+        None,
+        vec!["dictApplicative".to_string()],
+        vec![JsStmt::Return(JsExpr::Function(None, vec!["x".to_string()], seq_body))],
+    );
+
+    JsExpr::ObjectLit(vec![
+        ("traverse".to_string(), traverse_fn),
+        ("sequence".to_string(), sequence_fn),
+    ])
+}
+
+/// `m b` for a field in `traverse`: `a` → `f x` (or `x` for sequence); a
+/// field without `a` → `pure x`; `G (..a..)` → recurse via `G`'s Traversable.
+fn trav_field(cg: &mut Cg, fty: &Type, a: &str, value: JsExpr, f_is_identity: bool) -> JsExpr {
+    if is_var(fty, a) {
+        return if f_is_identity {
+            value
+        } else {
+            app1(JsExpr::Var("f".to_string()), value)
+        };
+    }
+    if !contains_var(fty, a) {
+        return app1(pure_accessor(), value);
+    }
+    if let Type::App(g, inner) = fty {
+        let gdict = cg.dict_for_type("Traversable", g);
+        // gdict.traverse(dictApplicative)(innerFn)(value)
+        let inner_fn = JsExpr::Function(
+            None,
+            vec!["$x".to_string()],
+            vec![JsStmt::Return(trav_field(cg, inner, a, JsExpr::Var("$x".to_string()), f_is_identity))],
+        );
+        let trav = JsExpr::App(
+            Box::new(method(gdict, "traverse")),
+            vec![JsExpr::Var("dictApplicative".to_string())],
+        );
+        return JsExpr::App(Box::new(JsExpr::App(Box::new(trav), vec![inner_fn])), vec![value]);
+    }
+    app1(pure_accessor(), value)
+}
+
+// Applicative-dict accessors via the superclass chain.
+fn pure_accessor() -> JsExpr {
+    JsExpr::Indexer(
+        Box::new(JsExpr::Var("dictApplicative".to_string())),
+        Box::new(JsExpr::StringLit("pure".to_string())),
+    )
+}
+fn apply_accessor() -> JsExpr {
+    // dictApplicative.Apply0().apply
+    method(thunk_call(method(JsExpr::Var("dictApplicative".to_string()), "Apply0")), "apply")
+}
+fn map_accessor() -> JsExpr {
+    // dictApplicative.Apply0().Functor0().map
+    let apply_dict = thunk_call(method(JsExpr::Var("dictApplicative".to_string()), "Apply0"));
+    let functor_dict = thunk_call(method(apply_dict, "Functor0"));
+    method(functor_dict, "map")
+}
+fn thunk_call(e: JsExpr) -> JsExpr {
+    JsExpr::App(Box::new(e), vec![])
+}
+fn ctor_value_ref(ctor_js: &str) -> JsExpr {
+    JsExpr::Indexer(
+        Box::new(JsExpr::Var(ctor_js.to_string())),
+        Box::new(JsExpr::StringLit("value".to_string())),
+    )
+}
+fn app1(f: JsExpr, a: JsExpr) -> JsExpr {
+    JsExpr::App(Box::new(f), vec![a])
+}
+fn app2(f: JsExpr, a: JsExpr, b: JsExpr) -> JsExpr {
+    JsExpr::App(Box::new(app1(f, a)), vec![b])
 }
 
 #[derive(Clone, Copy)]
