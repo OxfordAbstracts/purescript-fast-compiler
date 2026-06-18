@@ -276,8 +276,12 @@ pub fn solve_one(
     // `UnifyState::record_pending_constraint`). Match structurally
     // on zonked forms so a skolemised `Semigroupoid !sa` satisfies
     // a pending `Semigroupoid ?ua` once `?ua := !sa` is bound.
-    if given_discharges_pending(state, instances, pending) {
+    if let Some(given_index) = given_discharges_pending(state, instances, pending) {
         phase_mark(&PHASE_GIVENS_NS, &mut phase_t);
+        // For a given-discharge, `instance_idx` carries the discharging given's
+        // index in the decl's constraint context (or `usize::MAX` when there's
+        // no stable index). Codegen maps that to the matching dict parameter,
+        // disambiguating multiple same-class givens (e.g. `Show a` vs `Show b`).
         return SolveOutcome::Resolved(ResolvedDict {
             class: pending.constraint.class.clone(),
             instance_types: pending
@@ -286,7 +290,7 @@ pub fn solve_one(
                 .iter()
                 .map(|a| state.zonk(a))
                 .collect(),
-            instance_idx: usize::MAX,
+            instance_idx: given_index,
             context: Vec::new(),
         });
     }
@@ -723,29 +727,44 @@ fn app_spine_head_arity(
 /// the given's superclass chain. Strict match: same class,
 /// pairwise `ty_eq` on zonked args — givens aren't subject to
 /// further unification.
+/// If some in-scope given discharges `pending`, returns the matched given's
+/// index within `pending.givens` (the enclosing decl's constraint context, in
+/// declaration order — which codegen mirrors as its dict-param order). A match
+/// found only among the live (non-snapshot) givens, or via a superclass chain,
+/// returns `Some(usize::MAX)` (discharged, but no stable param index — codegen
+/// falls back to class-based lookup). `None` means no given discharges it.
 fn given_discharges_pending(
     state: &mut crate::typecheck_db::unify::UnifyState,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     pending: &PendingConstraint,
-) -> bool {
+) -> Option<usize> {
     // No givens to check against → can't discharge. Skips the zonk
     // + snapshot clone; this is the bulk of `solve_one`'s deferred
     // path for view modules (no class constraint in scope).
     if pending.givens.is_empty() && state.givens_is_empty() {
-        return false;
+        return None;
     }
     let zp = Constraint {
         class: pending.constraint.class.clone(),
         args: pending.constraint.args.iter().map(|a| state.zonk(a)).collect(),
     };
     let live = state.givens_snapshot();
-    for g in pending.givens.iter().chain(live.iter()) {
+    let snapshot_len = pending.givens.len();
+    for (i, g) in pending.givens.iter().chain(live.iter()).enumerate() {
+        // Index into `pending.givens` (the declaration's constraint context)
+        // when the match is there; live-only matches have no stable param index.
+        let param_index = if i < snapshot_len { i } else { usize::MAX };
         let zg = Constraint {
             class: g.class.clone(),
             args: g.args.iter().map(|a| state.zonk(a)).collect(),
         };
-        if constraints_eq(&zg, &zp) || superclass_matches(instances, &zg, &zp) {
-            return true;
+        if constraints_eq(&zg, &zp) {
+            return Some(param_index);
+        }
+        if superclass_matches(instances, &zg, &zp) {
+            // Discharged via the given's superclass chain — the dict isn't the
+            // given itself, so no direct param index.
+            return Some(usize::MAX);
         }
         // Functional-dependency-style improvement: if the names match
         // and unifying the args succeeds, the given satisfies the
@@ -765,12 +784,12 @@ fn given_discharges_pending(
                 }
             }
             if all_ok {
-                return true;
+                return Some(param_index);
             }
             state.restore_bindings(snapshot);
         }
     }
-    false
+    None
 }
 
 /// BFS over `given`'s superclass chain. Each superclass's args

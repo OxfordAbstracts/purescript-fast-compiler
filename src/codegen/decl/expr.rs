@@ -538,7 +538,17 @@ impl<'a> Cg<'a> {
                     continue;
                 }
                 seen.push(rd.clone());
-                out.push(self.resolve_dict(&rd.class.name, &rd.instance_types));
+                // A given-discharged constraint has a type-variable head; the
+                // solver recorded the discharging given's context index in
+                // `instance_idx`, which maps to our dict-param scope (built in
+                // the same order). This disambiguates multiple same-class givens
+                // (`Show a` vs `Show b`).
+                let all_given = rd.instance_types.iter().all(|t| type_head_name(t).is_empty());
+                if all_given {
+                    out.push(JsExpr::Var(self.given_param(rd.instance_idx, &rd.class.name)));
+                } else {
+                    out.push(self.resolve_dict(&rd.class.name, &rd.instance_types));
+                }
             }
             return out;
         }
@@ -661,6 +671,16 @@ impl<'a> Cg<'a> {
     /// `Eq1`/`Ord1` derivers, whose method takes the element dict as a param.
     pub(super) fn push_scope(&mut self, class: &str, param: &str) {
         self.dict_scope.push((class.to_string(), param.to_string()));
+    }
+
+    /// The dict parameter for a given-discharged constraint. Prefers the
+    /// discharging given's context index (disambiguates same-class givens);
+    /// falls back to the first in-scope param of the class.
+    fn given_param(&self, given_index: usize, class_simple: &str) -> String {
+        if let Some((_, param)) = self.dict_scope.get(given_index) {
+            return param.clone();
+        }
+        self.scope_param(class_simple).unwrap_or_else(|| format!("dict{class_simple}"))
     }
 
     fn scope_param(&self, class_simple: &str) -> Option<String> {

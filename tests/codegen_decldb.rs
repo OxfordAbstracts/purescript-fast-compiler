@@ -577,11 +577,7 @@ test = from REPVALUE
 "#;
 
 #[test]
-#[ignore = "blocked on multi-given-same-class dict disambiguation (showSum's `Show a` vs `Show b`): given-discharged constraints aren't recorded with their type/index, so codegen can't tell which same-class given to use. Needs solver-side given-discharge tracking."]
 fn codegen_generic_show_rep() {
-    // Rep synthesis + IsSymbol + per-instance method dicts get this running and
-    // dispatching the right Rep Show instances; the remaining wrong output comes
-    // from showSum picking dictShow for both `Show a` and `Show b`.
     let source = r#"
 module Test where
 
@@ -591,11 +587,40 @@ import Data.Generic.Rep (class Generic, from)
 data Shape = Circle Int | Rect Int Int | Dot
 derive instance Generic Shape _
 
+-- `show` on the generic representation: Sum position (Inr/Inl), the constructor
+-- name via IsSymbol, and the right field values — exercising multi-same-class
+-- givens (showSum's `Show a` vs `Show b`).
 test :: String
 test = show (from (Rect 40 2))
--- TEST: (Inr (Inl (Rect 40 2)))
 "#;
-    run_prelude("generic_show_rep", &["prelude"], source, "(Inr (Inl (Rect 40 2)))");
+    run_prelude(
+        "generic_show_rep",
+        &["prelude"],
+        source,
+        "\"(Inr (Inl (Constructor @\\\"Rect\\\" (Product (Argument 40) (Argument 2)))))\"",
+    );
+}
+
+#[test]
+fn codegen_generic_show() {
+    // The idiomatic use: derive Generic, then `show = genericShow`.
+    let source = r#"
+module Test where
+
+import Prelude
+import Data.Generic.Rep (class Generic)
+import Data.Show.Generic (genericShow)
+
+data Shape = Circle Int | Rect Int Int | Dot
+derive instance Generic Shape _
+
+instance Show Shape where
+  show x = genericShow x
+
+test :: String
+test = show (Rect 40 2)
+"#;
+    run_prelude("generic_show", &["prelude"], source, "\"(Rect 40 2)\"");
 }
 
 #[test]

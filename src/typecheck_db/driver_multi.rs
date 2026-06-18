@@ -2765,6 +2765,29 @@ fn generate_module_js(
             }
         }
     }
+    // Imported class methods: a bare reference to an imported method (e.g.
+    // `from`/`to` of `Generic`) under a polymorphic constraint is discharged by
+    // an in-scope given, NOT recorded in `constraint_dicts` (sig constraints
+    // aren't givens during a plain value's body inference). Codegen's fallback
+    // maps the method name to its class, then to the matching `dict<Class>`
+    // param — but only if the method is in `class_methods`. Local methods are
+    // already there; add imported ones by detecting, per registry module, which
+    // exported values are class methods (leading constraint = a class declared
+    // in that module, applied to that class's type vars).
+    for (_, exports) in registry.iter() {
+        for (vname, scheme) in &exports.values {
+            if class_methods.contains_key(vname) {
+                continue;
+            }
+            let lead = crate::codegen::decl::leading_constraints(&scheme.ty);
+            let Some(first) = lead.first() else { continue };
+            if let Some(ci) = exports.classes.get(&first.class.name) {
+                if first.args.len() == ci.type_vars.len() {
+                    class_methods.insert(vname.clone(), first.class.name.clone());
+                }
+            }
+        }
+    }
     // Imported class methods: their own constraints (beyond the class itself)
     // also become leading dict params on instance method bodies. The method's
     // exported scheme is `forall. Class a => MethodCtx => …`, so we strip the

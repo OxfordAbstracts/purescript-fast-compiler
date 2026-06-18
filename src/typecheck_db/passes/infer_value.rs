@@ -31,8 +31,10 @@ use crate::typecheck_db::types::{convert_type_expr, Constraint, QName, Scheme, T
 use crate::typecheck_db::unify::{LocatedUnifyError, UnifyError, UnifyState};
 
 pub const PASS_NAME: &str = "infer_value_scc";
-// v2: constraint_dicts now stores a Vec per span (multi-constraint call sites).
-pub const PASS_VERSION: u32 = 2;
+// v2: constraint_dicts stores a Vec per span (multi-constraint call sites).
+// v3: given-discharged dicts carry the discharging given's context index in
+//     `instance_idx` (was always usize::MAX) for same-class-given disambiguation.
+pub const PASS_VERSION: u32 = 3;
 
 /// When set, `infer_value_scc` zonks each decl's `constraint_dicts` so codegen
 /// sees concrete instance types. Off by default — plain typechecking never
