@@ -958,6 +958,25 @@ fn check_one_module(
                         .map(|t| crate::typecheck_db::types::expand_aliases(t, &alias_map))
                         .collect();
                 }
+                // Synthesize the Generic representation type for
+                // `derive instance Generic Foo _`: the `_` (Rep) is otherwise
+                // left as a wildcard, which lets the solver match `Show`/etc.
+                // against it arbitrarily (unsound). Replace it with the concrete
+                // `Sum`/`Product`/`Constructor`/`Argument`/`NoArguments` type
+                // built from `Foo`'s constructors so downstream dispatch is sound.
+                if shape.class.name == "Generic" && inst.types.len() == 2 {
+                    if matches!(inst.types[1], crate::typecheck_db::types::Type::Wildcard) {
+                        if let Some(rep) =
+                            synthesize_generic_rep(&inst.types[0], &data_constructors, &ctor_details)
+                        {
+                            inst.types[1] = rep;
+                            inst.vars = crate::typecheck_db::passes::instance_index::collect_instance_vars(
+                                &inst.types,
+                                &inst.context,
+                            );
+                        }
+                    }
+                }
                 local_instances.push(inst);
                 registry.set_nonvalue_hash(&name, "i", &decl_key, oh);
                 registry.push_module_instance(&name, &shape.class.name, decl_key.clone());
@@ -1530,6 +1549,15 @@ fn check_one_module(
     // surfacing, hole reporting, validation) treats them the same as
     // ordinary value decls.
     let mut instance_method_schemes: Vec<InferredScheme> = Vec::new();
+    // Per-(instance, method) resolved dicts for codegen. Keyed by the instance's
+    // decl key so method-name collisions across instances (every `Show` instance
+    // has a `show` method) don't clobber each other.
+    type MethodDicts = std::collections::HashMap<
+        crate::span::Span,
+        Vec<crate::typecheck_db::passes::constraints::ResolvedDict>,
+    >;
+    let mut method_dicts_by_instance: HashMap<String, HashMap<String, MethodDicts>> =
+        HashMap::new();
     let inst_method_started = std::time::Instant::now();
     // Per-class cache so a module that declares N instances for the
     // same class (e.g. Deku.DOM.Attr.Tabindex with 170 `Attr X_
@@ -1900,6 +1928,12 @@ fn check_one_module(
                     }
                 }
                 if let Ok(schemes) = inference {
+                    let inst_key =
+                        crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
+                    let slot = method_dicts_by_instance.entry(inst_key).or_default();
+                    for s in &schemes {
+                        slot.insert(s.name.clone(), s.constraint_dicts.clone());
+                    }
                     instance_method_schemes.extend(schemes);
                 }
             }
@@ -2528,7 +2562,7 @@ fn check_one_module(
             &local_scheme_hashes,
             module_context_hash,
             &all_schemes,
-            &instance_method_schemes,
+            &method_dicts_by_instance,
             &instance_index,
             registry,
             &ctor_details,
@@ -2556,6 +2590,61 @@ fn check_one_module(
     }
 }
 
+/// Build the `Data.Generic.Rep` representation type for a data type from its
+/// constructors: a right-nested `Sum` of `Constructor name args`, where `args`
+/// is `NoArguments`, a single `Argument t`, or a right-nested `Product` of
+/// `Argument`s. Mirrors the reference compiler's Generic deriving.
+fn synthesize_generic_rep(
+    head: &crate::typecheck_db::types::Type,
+    data_constructors: &DataConstructors,
+    ctor_details: &CtorRegistry,
+) -> Option<crate::typecheck_db::types::Type> {
+    use crate::typecheck_db::types::{QName, Type};
+    use std::sync::Arc;
+
+    fn head_name(t: &Type) -> Option<&str> {
+        match t {
+            Type::Con(q) => Some(&q.name),
+            Type::App(f, _) => head_name(f),
+            _ => None,
+        }
+    }
+    let con = |n: &str| Type::Con(QName { module: Some("Data.Generic.Rep".to_string()), name: n.to_string() });
+    let app1 = |f: Type, a: Type| Type::App(Arc::new(f), Arc::new(a));
+    let app2 = |f: Type, a: Type, b: Type| Type::App(Arc::new(Type::App(Arc::new(f), Arc::new(a))), Arc::new(b));
+
+    let type_name = head_name(head)?;
+    let ctors = data_constructors.get(type_name)?;
+    if ctors.is_empty() {
+        return Some(con("NoConstructors"));
+    }
+
+    let ctor_rep = |ctor: &str| -> Type {
+        let fields = ctor_details.get(ctor).map(|ci| ci.fields.clone()).unwrap_or_default();
+        let args = match fields.len() {
+            0 => con("NoArguments"),
+            1 => app1(con("Argument"), fields[0].clone()),
+            _ => {
+                let mut acc = app1(con("Argument"), fields[fields.len() - 1].clone());
+                for f in fields[..fields.len() - 1].iter().rev() {
+                    acc = app2(con("Product"), app1(con("Argument"), f.clone()), acc);
+                }
+                acc
+            }
+        };
+        // Constructor "Name" args (the name is a type-level Symbol literal).
+        app2(con("Constructor"), Type::TypeString(ctor.to_string()), args)
+    };
+
+    let reps: Vec<Type> = ctors.iter().map(|c| ctor_rep(c)).collect();
+    let mut it = reps.into_iter().rev();
+    let mut acc = it.next().unwrap();
+    for r in it {
+        acc = app2(con("Sum"), r, acc);
+    }
+    Some(acc)
+}
+
 /// Generate the full ES-module JS for a checked module via the per-decl
 /// `codegen_decl` pass + trivial assembler. Phase 1: value declarations only.
 #[allow(clippy::too_many_arguments)]
@@ -2567,7 +2656,10 @@ fn generate_module_js(
     local_scheme_hashes: &HashMap<String, OutputHash>,
     module_context_hash: [u8; 32],
     all_schemes: &[InferredScheme],
-    instance_method_schemes: &[InferredScheme],
+    method_dicts_by_instance: &HashMap<
+        String,
+        HashMap<String, std::collections::HashMap<crate::span::Span, Vec<crate::typecheck_db::passes::constraints::ResolvedDict>>>,
+    >,
     instance_index: &crate::typecheck_db::passes::instance_index::InstanceIndex,
     registry: &ModuleRegistry,
     ctor_details: &CtorRegistry,
@@ -2626,14 +2718,6 @@ fn generate_module_js(
             crate::codegen::decl::leading_constraints(&s.scheme.ty),
         );
     }
-    let mut method_dicts_by_name: HashMap<
-        String,
-        std::collections::HashMap<crate::span::Span, _>,
-    > = HashMap::new();
-    for s in instance_method_schemes {
-        method_dicts_by_name.insert(s.name.clone(), s.constraint_dicts.clone());
-    }
-
     // Module-global info needed for expression translation.
     let mut ctor_arity: HashMap<String, usize> = HashMap::new();
     let mut newtype_ctors: HashSet<String> = HashSet::new();
@@ -2806,8 +2890,12 @@ fn generate_module_js(
                 }
             }
             Decl::Instance { .. } => {
+                let inst_key =
+                    crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
+                let empty = HashMap::new();
+                let method_dicts = method_dicts_by_instance.get(&inst_key).unwrap_or(&empty);
                 outputs.push(codegen_decl::run_instance_decl(
-                    d, &ctx, &method_dicts_by_name, &method_leading,
+                    d, &ctx, method_dicts, &method_leading,
                 ));
             }
             Decl::Derive { types, .. } => {

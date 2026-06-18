@@ -556,6 +556,18 @@ impl<'a> Cg<'a> {
     /// `types`, recursing into the matched instance's context. A type-variable
     /// head means the dict is supplied by an in-scope given parameter.
     fn resolve_dict(&mut self, class_simple: &str, types: &[Type]) -> JsExpr {
+        // Compiler-magic `IsSymbol sym`: its dictionary reflects the type-level
+        // Symbol literal to a runtime string. No instance exists to look up.
+        if class_simple == "IsSymbol" && types.len() == 1 {
+            if let Type::TypeString(s) = &types[0] {
+                let reflect = JsExpr::Function(
+                    None,
+                    vec!["$_".to_string()],
+                    vec![JsStmt::Return(JsExpr::StringLit(s.clone()))],
+                );
+                return JsExpr::ObjectLit(vec![("reflectSymbol".to_string(), reflect)]);
+            }
+        }
         let heads: Vec<String> = types.iter().map(type_head_name).collect();
         if heads.iter().all(|h| h.is_empty()) {
             // No concrete head: a given parameter.

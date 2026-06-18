@@ -577,6 +577,28 @@ test = from REPVALUE
 "#;
 
 #[test]
+#[ignore = "blocked on multi-given-same-class dict disambiguation (showSum's `Show a` vs `Show b`): given-discharged constraints aren't recorded with their type/index, so codegen can't tell which same-class given to use. Needs solver-side given-discharge tracking."]
+fn codegen_generic_show_rep() {
+    // Rep synthesis + IsSymbol + per-instance method dicts get this running and
+    // dispatching the right Rep Show instances; the remaining wrong output comes
+    // from showSum picking dictShow for both `Show a` and `Show b`.
+    let source = r#"
+module Test where
+
+import Prelude
+import Data.Generic.Rep (class Generic, from)
+
+data Shape = Circle Int | Rect Int Int | Dot
+derive instance Generic Shape _
+
+test :: String
+test = show (from (Rect 40 2))
+-- TEST: (Inr (Inl (Rect 40 2)))
+"#;
+    run_prelude("generic_show_rep", &["prelude"], source, "(Inr (Inl (Rect 40 2)))");
+}
+
+#[test]
 fn codegen_generic_rep_first_single_arg() {
     // Circle: sum position 0 (Inl), single Argument (erased) → the value.
     let src = GENERIC_SHAPE.replace("REPVALUE", "(Circle 5)");
