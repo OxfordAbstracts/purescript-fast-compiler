@@ -562,13 +562,27 @@ impl<'a> Cg<'a> {
             let param = self.scope_param(class_simple).unwrap_or_else(|| format!("dict{class_simple}"));
             return JsExpr::Var(param);
         }
-        let base = self.instance_var(class_simple, &heads);
 
-        // Apply context sub-dicts using the matched instance's structure.
-        let Some(subst) = self.match_instance(class_simple, types) else {
+        // Find the matching instance once: its class QName gives the class's
+        // defining module (for name disambiguation) and its context/subst drive
+        // sub-dict resolution. Collect owned data to drop the borrow before
+        // calling `&mut self` methods.
+        let matched: Option<(Option<String>, Vec<crate::typecheck_db::types::Constraint>, HashMap<String, Type>)> =
+            self.ctx.instances.candidates(class_simple).iter().find_map(|inst| {
+                let vars: std::collections::HashSet<String> = inst.vars.iter().cloned().collect();
+                let mut subst = HashMap::new();
+                if match_types(&inst.types, types, &vars, &mut subst) {
+                    Some((inst.class.module.clone(), inst.context.clone(), subst))
+                } else {
+                    None
+                }
+            });
+        let class_module = matched.as_ref().and_then(|(m, _, _)| m.clone());
+        let base = self.instance_var(class_module.as_deref(), class_simple, &heads);
+
+        let Some((_, context, subst)) = matched else {
             return base;
         };
-        let context = self.instance_context(class_simple, types);
         let mut e = base;
         for c in &context {
             let sub_types: Vec<Type> = c.args.iter().map(|t| apply_subst(t, &subst)).collect();
@@ -578,38 +592,11 @@ impl<'a> Cg<'a> {
         e
     }
 
-    /// The (unsubstituted) context of the instance of `class` matching `types`.
-    fn instance_context(
-        &self,
-        class_simple: &str,
-        types: &[Type],
-    ) -> Vec<crate::typecheck_db::types::Constraint> {
-        for inst in self.ctx.instances.candidates(class_simple) {
-            let mut subst = HashMap::new();
-            let vars: std::collections::HashSet<String> = inst.vars.iter().cloned().collect();
-            if match_types(&inst.types, types, &vars, &mut subst) {
-                return inst.context.clone();
-            }
-        }
-        Vec::new()
-    }
-
-    /// The substitution binding the matched instance's vars to `types`.
-    fn match_instance(&self, class_simple: &str, types: &[Type]) -> Option<HashMap<String, Type>> {
-        for inst in self.ctx.instances.candidates(class_simple) {
-            let mut subst = HashMap::new();
-            let vars: std::collections::HashSet<String> = inst.vars.iter().cloned().collect();
-            if match_types(&inst.types, types, &vars, &mut subst) {
-                return Some(subst);
-            }
-        }
-        None
-    }
 
     /// A reference to an instance dictionary by JS name, qualified with its
     /// defining module when that is an imported module.
-    fn instance_var(&mut self, class_simple: &str, heads: &[String]) -> JsExpr {
-        let name = instance_js_name(class_simple, heads);
+    fn instance_var(&mut self, class_module: Option<&str>, class_simple: &str, heads: &[String]) -> JsExpr {
+        let name = instance_js_name(class_module, class_simple, heads);
         match self.ctx.instance_modules.get(&name) {
             Some(m) if m != self.ctx.module => {
                 self.record_external(m);

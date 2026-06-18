@@ -29,7 +29,19 @@ fn no_dicts() -> HashMap<Span, Vec<ResolvedDict>> {
 /// instance declaration and call sites: `lowerFirst(Class)` followed by each
 /// head type's name (e.g. `ToInt Color` → `toIntColor`, `Eq (Maybe a)` →
 /// `eqMaybe`). Must agree on both sides so references resolve.
-pub fn instance_js_name(class_simple: &str, type_heads: &[String]) -> String {
+pub fn instance_js_name(
+    class_module: Option<&str>,
+    class_simple: &str,
+    type_heads: &[String],
+) -> String {
+    // NOTE: the class's defining module is threaded here to disambiguate
+    // same-named classes from different modules, but isn't yet folded into the
+    // name: the reference side derives the class module from the InstanceIndex
+    // QName while the declaration side uses the resolved defining module, and
+    // those two sources currently disagree (e.g. `Data.Eq` vs none), so
+    // prefixing would break cross-module instance references. Reconciling those
+    // module sources is a prerequisite for true disambiguation.
+    let _ = class_module;
     let mut s = String::new();
     for (i, c) in class_simple.chars().enumerate() {
         if i == 0 {
@@ -38,7 +50,15 @@ pub fn instance_js_name(class_simple: &str, type_heads: &[String]) -> String {
             s.push(c);
         }
     }
-    for h in type_heads {
+    // `Generic`'s second parameter is the (fundep-determined) representation
+    // type, written `_` at the declaration. Name by the data type only so the
+    // declaration and call sites (which see the concrete Rep) agree.
+    let heads: &[String] = if class_simple == "Generic" && !type_heads.is_empty() {
+        &type_heads[..1]
+    } else {
+        type_heads
+    };
+    for h in heads {
         s.push_str(h);
     }
     ident_to_js(crate::interner::intern(&s))
@@ -238,8 +258,9 @@ pub fn codegen_instance_decl(
     };
 
     let class_simple = class_name.name.resolve().unwrap_or_default();
+    let class_module = class_name.module.resolve();
     let heads: Vec<String> = types.iter().map(type_expr_head_name).collect();
-    let inst_name = instance_js_name(&class_simple, &heads);
+    let inst_name = instance_js_name(class_module.as_deref(), &class_simple, &heads);
 
     // Group instance methods by name (preserving source order).
     let mut order: Vec<crate::interner::Symbol> = Vec::new();

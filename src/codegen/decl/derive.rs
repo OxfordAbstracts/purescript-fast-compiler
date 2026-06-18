@@ -42,8 +42,9 @@ pub fn codegen_derive_decl(
         return out;
     };
     let class_simple = class_name.name.resolve().unwrap_or_default();
+    let class_module = class_name.module.resolve();
     let heads: Vec<String> = types.iter().map(type_expr_head_name).collect();
-    let inst_name = instance_js_name(&class_simple, &heads);
+    let inst_name = instance_js_name(class_module.as_deref(), &class_simple, &heads);
 
     // Context dictionaries (e.g. `Eq a => Eq (Foo a)`) become leading params,
     // available as givens while resolving field dictionaries.
@@ -67,6 +68,7 @@ pub fn codegen_derive_decl(
             "Functor" => derive_functor(&mut cg, info),
             "Foldable" => derive_foldable(&mut cg, info),
             "Traversable" => derive_traversable(&mut cg, info),
+            "Generic" => derive_generic(&mut cg, info),
             // Unknown class: emit an empty dict — valid JS that only errors if a
             // missing method is actually invoked at runtime.
             _ => JsExpr::ObjectLit(vec![]),
@@ -449,6 +451,144 @@ fn trav_field(cg: &mut Cg, fty: &Type, a: &str, value: JsExpr, f_is_identity: bo
         return JsExpr::App(Box::new(JsExpr::App(Box::new(trav), vec![inner_fn])), vec![value]);
     }
     app1(pure_accessor(), value)
+}
+
+/// `to`/`from` between a type and its `Data.Generic.Rep` representation:
+/// a right-nested `Sum` (Inl/Inr) of `Constructor`s, each a right-nested
+/// `Product` of `Argument`s (or `NoArguments`). `Constructor`/`Argument` are
+/// newtypes (erased at runtime), so only Sum/Product/NoArguments appear.
+fn derive_generic(cg: &mut Cg, info: Option<&DerivedTypeInfo>) -> JsExpr {
+    let Some(info) = info else { return JsExpr::ObjectLit(vec![]) };
+    cg.note_external("Data.Generic.Rep");
+    let n = info.ctors.len();
+
+    // -- from: x => <Sum-wrapped Product of fields> --
+    let x = || JsExpr::Var("x".to_string());
+    let mut from_stmts: Vec<JsStmt> = Vec::new();
+    for (idx, ctor) in info.ctors.iter().enumerate() {
+        let test = JsExpr::InstanceOf(Box::new(x()), Box::new(JsExpr::Var(ctor.js_name.clone())));
+        // Right-nested Product of the field values (Argument erased).
+        let rep = build_product(&ctor.fields, &x());
+        from_stmts.push(JsStmt::If(test, vec![JsStmt::Return(sum_wrap(idx, n, rep))], None));
+    }
+    if n > 1 {
+        from_stmts.push(throw_match());
+    } else if from_stmts.is_empty() {
+        from_stmts.push(JsStmt::Return(gr_value("NoArguments")));
+    }
+    let from_fn = JsExpr::Function(None, vec!["x".to_string()], from_stmts);
+
+    // -- to: rep => <reconstruct the constructor> --
+    let rep = || JsExpr::Var("rep".to_string());
+    let mut to_stmts: Vec<JsStmt> = Vec::new();
+    if n == 1 {
+        to_stmts.push(JsStmt::Return(reconstruct(&info.ctors[0], rep())));
+    } else {
+        // Peel Inr's; at Inl(v) reconstruct ctor[depth] from v; else the last.
+        let mut cur = rep();
+        for (idx, ctor) in info.ctors.iter().enumerate() {
+            if idx == n - 1 {
+                to_stmts.push(JsStmt::Return(reconstruct(ctor, cur.clone())));
+            } else {
+                let is_inl = JsExpr::InstanceOf(
+                    Box::new(cur.clone()),
+                    Box::new(JsExpr::ModuleAccessor("Data_Generic_Rep".to_string(), "Inl".to_string())),
+                );
+                let inner = field(cur.clone(), 0); // (Inl v).value0
+                to_stmts.push(JsStmt::If(is_inl, vec![JsStmt::Return(reconstruct(ctor, inner))], None));
+                cur = field(cur, 0); // unwrap Inr for next
+            }
+        }
+    }
+    let to_fn = JsExpr::Function(None, vec!["rep".to_string()], to_stmts);
+
+    JsExpr::ObjectLit(vec![("from".to_string(), from_fn), ("to".to_string(), to_fn)])
+}
+
+/// Right-nested `Product` of a constructor's fields (Argument erased), reading
+/// them from `scrut.value{i}`; `NoArguments` for nullary.
+fn build_product(fields: &[Type], scrut: &JsExpr) -> JsExpr {
+    match fields.len() {
+        0 => gr_value("NoArguments"),
+        1 => field(scrut.clone(), 0),
+        _ => {
+            // Product.create(v0)(Product.create(v1)(...))
+            let mut acc = field(scrut.clone(), fields.len() - 1);
+            for i in (0..fields.len() - 1).rev() {
+                acc = app2(gr_create("Product"), field(scrut.clone(), i), acc);
+            }
+            acc
+        }
+    }
+}
+
+/// Reconstruct a constructor from its `Product`-chain representation `rep`.
+fn reconstruct(ctor: &DerivedCtor, rep: JsExpr) -> JsExpr {
+    let n = ctor.fields.len();
+    if n == 0 {
+        return ctor_value_ref(&ctor.js_name);
+    }
+    let create = JsExpr::Indexer(
+        Box::new(JsExpr::Var(ctor.js_name.clone())),
+        Box::new(JsExpr::StringLit("create".to_string())),
+    );
+    let mut call = create;
+    for i in 0..n {
+        // field i: rep.value0 (i==0) | rep.value1{i}.value0 | last = rep.value1{n-1}
+        let arg = product_field(&rep, i, n);
+        call = JsExpr::App(Box::new(call), vec![arg]);
+    }
+    call
+}
+
+/// Extract field `i` of `n` from a right-nested `Product` value `rep`.
+fn product_field(rep: &JsExpr, i: usize, n: usize) -> JsExpr {
+    if n == 1 {
+        return rep.clone();
+    }
+    // Navigate i steps into `.value1`, then `.value0` (except the last field,
+    // which is the innermost `.value1` directly).
+    let mut e = rep.clone();
+    let steps = i.min(n - 1);
+    for _ in 0..steps {
+        e = field(e, 1);
+    }
+    if i == n - 1 {
+        e
+    } else {
+        field(e, 0)
+    }
+}
+
+fn gr_create(name: &str) -> JsExpr {
+    JsExpr::Indexer(
+        Box::new(JsExpr::ModuleAccessor("Data_Generic_Rep".to_string(), name.to_string())),
+        Box::new(JsExpr::StringLit("create".to_string())),
+    )
+}
+fn gr_value(name: &str) -> JsExpr {
+    JsExpr::Indexer(
+        Box::new(JsExpr::ModuleAccessor("Data_Generic_Rep".to_string(), name.to_string())),
+        Box::new(JsExpr::StringLit("value".to_string())),
+    )
+}
+/// Sum-wrap a constructor's rep at declaration index `idx` of `n` constructors.
+fn sum_wrap(idx: usize, n: usize, rep: JsExpr) -> JsExpr {
+    if n == 1 {
+        return rep;
+    }
+    let mut e = if idx == n - 1 { rep } else { app1(gr_create("Inl"), rep) };
+    let inr_count = if idx == n - 1 { n - 1 } else { idx };
+    for _ in 0..inr_count {
+        e = app1(gr_create("Inr"), e);
+    }
+    e
+}
+fn throw_match() -> JsStmt {
+    JsStmt::Throw(JsExpr::App(
+        Box::new(JsExpr::Var("Error".to_string())),
+        vec![JsExpr::StringLit("Failed pattern match".to_string())],
+    ))
 }
 
 // Applicative-dict accessors via the superclass chain.

@@ -530,6 +530,79 @@ test = foldMap (\x -> x) (Pair "ab" "cd")
 }
 
 #[test]
+fn codegen_prelude_derive_generic() {
+    // Round-trip through the generic representation: to (from x) == x.
+    let source = r#"
+module Test where
+
+import Prelude
+import Data.Generic.Rep (class Generic, to, from)
+
+data Shape = Circle Int | Rect Int Int | Dot
+derive instance Generic Shape _
+
+area :: Shape -> Int
+area (Circle r) = r
+area (Rect w h) = w + h
+area Dot = 0
+
+test :: Int
+test = area (to (from (Rect 40 2)))
+-- TEST: 42
+"#;
+    run_prelude("derive_generic", &["prelude"], source, "42");
+}
+
+// The generic representation: `from value` builds the `Sum`/`Product`/
+// `NoArguments` structure (`Constructor`/`Argument` newtypes are erased). We
+// verify the structure by JSON-serializing `from value` — covering single-arg,
+// multi-arg (Product), and nullary constructors across all Sum positions.
+//
+// (Showing the rep via `show (from v)` / `genericShow v` additionally needs the
+// solver to resolve a `Show`/`GenericShow` dict for the *fundep-determined* Rep
+// type, which the typecheck_db doesn't yet do — so we inspect the structure
+// directly, which is the same verification of the encoding.)
+
+const GENERIC_SHAPE: &str = r#"
+module Test where
+
+import Prelude
+import Data.Generic.Rep (class Generic, from)
+
+data Shape = Circle Int | Rect Int Int | Dot
+derive instance Generic Shape _
+
+test :: _
+test = from REPVALUE
+"#;
+
+#[test]
+fn codegen_generic_rep_first_single_arg() {
+    // Circle: sum position 0 (Inl), single Argument (erased) → the value.
+    let src = GENERIC_SHAPE.replace("REPVALUE", "(Circle 5)");
+    run_prelude("generic_rep_circle", &["prelude"], &src, r#"{"value0":5}"#);
+}
+
+#[test]
+fn codegen_generic_rep_middle_product() {
+    // Rect: sum position 1 (Inr (Inl ...)), two Arguments → right-nested Product.
+    let src = GENERIC_SHAPE.replace("REPVALUE", "(Rect 40 2)");
+    run_prelude(
+        "generic_rep_rect",
+        &["prelude"],
+        &src,
+        r#"{"value0":{"value0":{"value0":40,"value1":2}}}"#,
+    );
+}
+
+#[test]
+fn codegen_generic_rep_last_nullary() {
+    // Dot: sum position 2 / last (Inr (Inr ...)), NoArguments → empty object.
+    let src = GENERIC_SHAPE.replace("REPVALUE", "Dot");
+    run_prelude("generic_rep_dot", &["prelude"], &src, r#"{"value0":{"value0":{}}}"#);
+}
+
+#[test]
 fn codegen_prelude_derive_traversable() {
     let source = r#"
 module Test where

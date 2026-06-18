@@ -2600,7 +2600,10 @@ fn generate_module_js(
                 None => inst.class.name.clone(),
             };
             let key = instance_key_hex(&class_debug, &inst.types);
-            key_to_name.insert(key, instance_js_name(class_str, &heads));
+            key_to_name.insert(
+                key,
+                instance_js_name(inst.class.module.as_deref(), class_str, &heads),
+            );
         }
         for (mod_name, _) in registry.iter() {
             for key in registry.module_instances(mod_name) {
@@ -2808,8 +2811,11 @@ fn generate_module_js(
                 ));
             }
             Decl::Derive { types, .. } => {
+                // The instance head's FIRST type argument is the data type being
+                // derived for (`Generic Foo _` → Foo); later args (e.g. Generic's
+                // Rep) are not the subject type.
                 let head = types
-                    .last()
+                    .first()
                     .map(crate::codegen::decl::type_expr_head_name)
                     .unwrap_or_default();
                 outputs.push(codegen_decl::run_derive_decl(d, &ctx, derived_info.get(&head)));
