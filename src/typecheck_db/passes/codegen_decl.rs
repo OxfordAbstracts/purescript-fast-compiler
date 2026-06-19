@@ -165,21 +165,115 @@ fn nonvalue_codegen_input_hash(
     hasher.finish()
 }
 
+/// Append an ID-stable structural "shape" of a type: concrete constructor
+/// applications are preserved, but every type variable / skolem / unification
+/// var / wildcard collapses to `_`. This is what makes the dict hash stable
+/// across edits that merely renumber skolems (e.g. adding an unrelated decl
+/// shifts skolem ids in a given-discharge's recorded `instance_types`).
+fn type_shape(t: &crate::typecheck_db::types::Type, out: &mut String) {
+    use crate::typecheck_db::types::Type;
+    match t {
+        Type::Con(q) => {
+            if let Some(m) = &q.module {
+                out.push_str(m);
+                out.push('.');
+            }
+            out.push_str(&q.name);
+        }
+        Type::App(f, a) => {
+            out.push('(');
+            type_shape(f, out);
+            out.push(' ');
+            type_shape(a, out);
+            out.push(')');
+        }
+        Type::Fun(a, b) => {
+            out.push('(');
+            type_shape(a, out);
+            out.push_str("->");
+            type_shape(b, out);
+            out.push(')');
+        }
+        Type::TypeString(s) => {
+            out.push('"');
+            out.push_str(s);
+            out.push('"');
+        }
+        Type::TypeInt(i) => out.push_str(&i.to_string()),
+        Type::Record(fs, _) | Type::Row(fs, _) => {
+            out.push('{');
+            for (l, ft) in fs {
+                out.push_str(l);
+                out.push(':');
+                type_shape(ft, out);
+                out.push(',');
+            }
+            out.push('}');
+        }
+        Type::Forall(_, inner)
+        | Type::Constrained(_, inner)
+        | Type::Kinded(inner, _) => type_shape(inner, out),
+        // Var / Skolem / Unif / Wildcard / Hole — all id/name-dependent, so
+        // normalize to a single token.
+        _ => out.push('_'),
+    }
+}
+
+/// Stable, codegen-relevant projection of one resolved dictionary: the class,
+/// the structural shape of its instance types, and — only when every instance
+/// type is a bare variable (a given discharge) — the discharging given's index
+/// (which codegen maps to a dict parameter). For a concrete resolution the
+/// emitted reference is derived from the class + type heads (NOT the candidate
+/// `instance_idx`, which shifts as instances are added), so `instance_idx` is
+/// deliberately omitted there.
+fn dict_projection(d: &ResolvedDict) -> String {
+    let shapes: Vec<String> = d
+        .instance_types
+        .iter()
+        .map(|t| {
+            let mut s = String::new();
+            type_shape(t, &mut s);
+            s
+        })
+        .collect();
+    let all_given = shapes.iter().all(|s| s == "_");
+    let mut parts = vec![d.class.name.clone(), shapes.join(",")];
+    if all_given {
+        parts.push(format!("g{}", d.instance_idx));
+    }
+    for c in &d.context {
+        let cs: Vec<String> = c
+            .args
+            .iter()
+            .map(|t| {
+                let mut s = String::new();
+                type_shape(t, &mut s);
+                s
+            })
+            .collect();
+        parts.push(format!("{}<{}>", c.class.name, cs.join(",")));
+    }
+    parts.join("|")
+}
+
 /// Stable content hash of an instance's resolved method dictionaries. Folded
 /// into the instance's codegen input hash so a re-resolved dict (e.g. a new
 /// overlapping instance changed which dictionary a method body uses)
-/// re-codegens the instance. Sorted by (method, span) so the hash is
-/// independent of `HashMap` iteration order.
+/// re-codegens the instance — while edits that merely renumber skolems or
+/// reindex unrelated instances leave it unchanged. Sorted by (method, span) so
+/// the hash is independent of `HashMap` iteration order.
 fn method_dicts_content_hash(
     method_dicts: &HashMap<String, HashMap<Span, Vec<ResolvedDict>>>,
 ) -> OutputHash {
-    let mut by_method: Vec<(&String, Vec<(Span, &Vec<ResolvedDict>)>)> = method_dicts
+    let mut by_method: Vec<(&str, Vec<(Span, Vec<String>)>)> = method_dicts
         .iter()
         .map(|(m, spans)| {
-            let mut v: Vec<(Span, &Vec<ResolvedDict>)> =
-                spans.iter().map(|(s, d)| (*s, d)).collect();
+            let mut v: Vec<(Span, Vec<String>)> = spans
+                .iter()
+                .map(|(s, dicts)| (*s, dicts.iter().map(dict_projection).collect()))
+                .collect();
             v.sort_by_key(|(s, _)| (s.start, s.end));
-            (m, v)
+            (m.as_str(), v)
         })
         .collect();
     by_method.sort_by(|a, b| a.0.cmp(b.0));

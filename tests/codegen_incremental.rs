@@ -100,6 +100,241 @@ fn count_miss(outcomes: &[CacheOutcome]) -> usize {
     outcomes.iter().filter(|o| matches!(o, CacheOutcome::Miss)).count()
 }
 
+fn count_hit(outcomes: &[CacheOutcome]) -> usize {
+    outcomes.iter().filter(|o| matches!(o, CacheOutcome::Hit)).count()
+}
+
+// ===========================================================================
+// Chapter 6 scenarios — book.purescript.org/chapter6
+//   - instance dependencies   (constrained instances: Show a => Show (Box a))
+//   - multi-parameter classes  (class Convert a b)
+//   - superclasses             (class Eq a <= Ord a)
+// All use locally-declared classes (the incremental harness has no Prelude).
+// Each test reasons about exactly which declarations SHOULD rebuild.
+// ===========================================================================
+
+// --- instance dependencies -------------------------------------------------
+
+// `Show (Box a)` depends on `Show a`, but takes that dictionary as a PARAMETER
+// (a given) — it does not bake in any concrete element instance. So editing a
+// concrete element instance must not re-codegen `Show (Box a)`, and vice-versa.
+const INSTDEP_V1: &str = "\
+module M where
+
+class Show a where
+  show :: a -> String
+
+data Color = Red | Green
+
+instance Show Color where
+  show Red = \"Red\"
+  show Green = \"Green\"
+
+data Box a = Box a
+
+instance Show a => Show (Box a) where
+  show (Box x) = show x
+";
+
+#[test]
+fn instdep_noop_rebuild_all_hit() {
+    let mut db = new_db();
+    run(&mut db, &[("M", INSTDEP_V1)]);
+    let second = run(&mut db, &[("M", INSTDEP_V1)]);
+    let outs = instance_outcomes(&second, "M");
+    assert_eq!(outs.len(), 2);
+    assert_eq!(count_miss(&outs), 0, "unchanged instances all hit");
+}
+
+#[test]
+fn instdep_edit_element_instance_leaves_container_cached() {
+    // Edit the concrete `Show Color` body. `Show (Box a)` resolves its element
+    // dict from a parameter, so its codegen is independent → only Show Color
+    // re-codegens.
+    let v2 = INSTDEP_V1.replace("show Green = \"Green\"", "show Green = \"GREEN\"");
+    let mut db = new_db();
+    run(&mut db, &[("M", INSTDEP_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    assert_eq!(
+        count_miss(&instance_outcomes(&second, "M")),
+        1,
+        "only the edited element instance (Show Color) rebuilds; Show (Box a) is independent"
+    );
+}
+
+#[test]
+fn instdep_edit_container_instance_leaves_element_cached() {
+    let v2 = INSTDEP_V1.replace("show (Box x) = show x", "show (Box y) = show y");
+    let mut db = new_db();
+    run(&mut db, &[("M", INSTDEP_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    assert_eq!(
+        count_miss(&instance_outcomes(&second, "M")),
+        1,
+        "only Show (Box a) rebuilds; Show Color is untouched"
+    );
+}
+
+#[test]
+fn instdep_adding_unrelated_instance_leaves_existing_cached() {
+    // A brand-new instance for a brand-new type cannot change how the existing
+    // instances' method bodies resolve, so they must stay cached.
+    let v2 = format!(
+        "{INSTDEP_V1}\ndata Other = Other\n\ninstance Show Other where\n  show Other = \"Other\"\n"
+    );
+    let mut db = new_db();
+    run(&mut db, &[("M", INSTDEP_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    let outs = instance_outcomes(&second, "M");
+    assert_eq!(outs.len(), 3, "three instances now");
+    assert_eq!(
+        count_miss(&outs),
+        1,
+        "only the newly-added instance is fresh; the two existing instances stay cached"
+    );
+}
+
+// --- multi-parameter type classes ------------------------------------------
+
+const MULTIPARAM_V1: &str = "\
+module M where
+
+class Convert a b where
+  convert :: a -> b
+
+data A = A
+data B = B
+
+instance Convert A B where
+  convert _ = B
+
+instance Convert B A where
+  convert _ = A
+";
+
+#[test]
+fn multiparam_noop_rebuild_all_hit() {
+    let mut db = new_db();
+    run(&mut db, &[("M", MULTIPARAM_V1)]);
+    let second = run(&mut db, &[("M", MULTIPARAM_V1)]);
+    let outs = instance_outcomes(&second, "M");
+    assert_eq!(outs.len(), 2);
+    assert_eq!(count_miss(&outs), 0);
+}
+
+#[test]
+fn multiparam_edit_one_instance_leaves_sibling_cached() {
+    // Real body edit (rename the binder) to the `Convert A B` instance.
+    let v2 = MULTIPARAM_V1.replace("instance Convert A B where\n  convert _ = B", "instance Convert A B where\n  convert _x = B");
+    let mut db = new_db();
+    run(&mut db, &[("M", MULTIPARAM_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    assert_eq!(
+        count_miss(&instance_outcomes(&second, "M")),
+        1,
+        "editing Convert A B must not rebuild Convert B A"
+    );
+}
+
+#[test]
+fn multiparam_edit_class_rebuilds_all_its_instances() {
+    // Changing the class (here: add a second method) changes the dict shape, so
+    // every instance of it must re-codegen.
+    let v2 = MULTIPARAM_V1
+        .replace("  convert :: a -> b\n", "  convert :: a -> b\n  back :: b -> a\n")
+        .replace("  convert _ = B\n", "  convert _ = B\n  back _ = A\n")
+        .replace("  convert _ = A\n", "  convert _ = A\n  back _ = B\n");
+    let mut db = new_db();
+    run(&mut db, &[("M", MULTIPARAM_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    assert_eq!(
+        count_miss(&instance_outcomes(&second, "M")),
+        2,
+        "a class-shape change rebuilds all its instances"
+    );
+    assert_eq!(
+        outcome(&second, "M", "class__Convert"),
+        CacheOutcome::Miss,
+        "the class accessor decl rebuilds too"
+    );
+}
+
+// --- superclasses ----------------------------------------------------------
+
+const SUPERCLASS_V1: &str = "\
+module M where
+
+class Eq a where
+  eq :: a -> a -> Boolean
+
+class Eq a <= Ord a where
+  cmp :: a -> a -> Int
+
+data D = D
+
+instance Eq D where
+  eq _ _ = true
+
+instance Ord D where
+  cmp _ _ = 0
+";
+
+#[test]
+fn superclass_noop_rebuild_all_hit() {
+    let mut db = new_db();
+    run(&mut db, &[("M", SUPERCLASS_V1)]);
+    let second = run(&mut db, &[("M", SUPERCLASS_V1)]);
+    let outs = instance_outcomes(&second, "M");
+    assert_eq!(outs.len(), 2);
+    assert_eq!(count_miss(&outs), 0);
+}
+
+#[test]
+fn superclass_edit_superclass_instance_leaves_subclass_cached() {
+    // The `Ord D` dict carries a superclass accessor `Eq0: () => eqD` that
+    // references the Eq instance BY NAME. Editing `Eq D`'s body changes eqD's
+    // definition but not its name, so `Ord D` stays byte-identical → cached.
+    let v2 = SUPERCLASS_V1.replace("eq _ _ = true", "eq _ _ = false");
+    let mut db = new_db();
+    run(&mut db, &[("M", SUPERCLASS_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    assert_eq!(
+        count_miss(&instance_outcomes(&second, "M")),
+        1,
+        "editing the Eq (superclass) instance must not rebuild the Ord (subclass) instance"
+    );
+}
+
+#[test]
+fn superclass_edit_subclass_instance_leaves_superclass_cached() {
+    let v2 = SUPERCLASS_V1.replace("cmp _ _ = 0", "cmp _ _ = 1");
+    let mut db = new_db();
+    run(&mut db, &[("M", SUPERCLASS_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    assert_eq!(
+        count_miss(&instance_outcomes(&second, "M")),
+        1,
+        "editing the Ord (subclass) instance must not rebuild the Eq (superclass) instance"
+    );
+}
+
+#[test]
+fn superclass_removing_superclass_relation_rebuilds_subclass_instance() {
+    // Dropping `Eq a <=` removes the `Eq0` superclass accessor from every Ord
+    // dict, so `Ord D`'s codegen changes and must rebuild. `Eq D` is unaffected.
+    let v2 = SUPERCLASS_V1.replace("class Eq a <= Ord a where", "class Ord a where");
+    let mut db = new_db();
+    run(&mut db, &[("M", SUPERCLASS_V1)]);
+    let second = run(&mut db, &[("M", &v2)]);
+    let outs = instance_outcomes(&second, "M");
+    assert_eq!(outs.len(), 2);
+    assert_eq!(
+        count_miss(&outs),
+        1,
+        "only the Ord instance (whose superclass accessor disappeared) rebuilds"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Baseline per-decl caching
 // ---------------------------------------------------------------------------
@@ -195,6 +430,41 @@ user = helper 1
         CacheOutcome::Hit,
         "user only references helper by name; its JS is unchanged"
     );
+}
+
+#[test]
+fn editing_a_later_equation_of_a_multi_equation_value_invalidates_it() {
+    // Multi-equation decls are merged into a single IR decl whose span covers
+    // only the FIRST equation; the source hash must still cover later equations.
+    let v1 = "\
+module M where
+
+f :: Int -> String
+f 0 = \"zero\"
+f _ = \"other\"
+
+g :: Int
+g = 1
+";
+    let v2 = "\
+module M where
+
+f :: Int -> String
+f 0 = \"zero\"
+f _ = \"OTHER\"
+
+g :: Int
+g = 1
+";
+    let mut db = new_db();
+    run(&mut db, &[("M", v1)]);
+    let second = run(&mut db, &[("M", v2)]);
+    assert_eq!(
+        outcome(&second, "M", "value__f"),
+        CacheOutcome::Miss,
+        "editing f's second equation must re-codegen f"
+    );
+    assert_eq!(outcome(&second, "M", "value__g"), CacheOutcome::Hit);
 }
 
 #[test]

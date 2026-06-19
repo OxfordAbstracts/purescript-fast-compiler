@@ -847,6 +847,7 @@ fn check_one_module(
             &local_ctor_parent_hash,
             &local_fixity_hashes,
             &local_foreign_value_hashes,
+            false,
         );
         match d {
             crate::typecheck_db::ir::Decl::Data { .. } | crate::typecheck_db::ir::Decl::Newtype { .. } => {
@@ -1400,6 +1401,7 @@ fn check_one_module(
                             &local_instance_hashes_by_class,
                             &mut dep_output_hashes,
                             &mut dep_seen,
+                            false,
                         );
                     }
                     NameKind::Op | NameKind::TypeOp => resolve_fixity_dep(
@@ -1603,6 +1605,10 @@ fn check_one_module(
             ) {
                 let key =
                     crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
+                // Codegen of an instance/derive depends on its class SHAPE (and
+                // ctor/type ABI), not on sibling instances — fold class shapes
+                // only. Body-level dispatch is captured by the per-instance
+                // `method_dicts_content_hash` instead.
                 let deps = collect_nonvalue_dep_hashes(
                     d,
                     &name,
@@ -1613,6 +1619,7 @@ fn check_one_module(
                     &local_ctor_parent_hash,
                     &local_fixity_hashes,
                     &local_foreign_value_hashes,
+                    true,
                 );
                 codegen_nonvalue_deps.insert(key, deps);
             }
@@ -2953,12 +2960,10 @@ fn generate_module_js(
     // Group value-decl equations by name; emit the whole group at the first
     // equation's source position.
     let mut value_groups: HashMap<String, Vec<&Decl>> = HashMap::new();
-    let mut value_spans: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     for d in desugared {
-        if let Decl::Value { name, span, .. } = d {
+        if let Decl::Value { name, .. } = d {
             let n = resolve_symbol(name.value.symbol());
             value_groups.entry(n.clone()).or_default().push(d);
-            value_spans.entry(n).or_default().push((span.start, span.end));
         }
     }
 
@@ -2972,11 +2977,33 @@ fn generate_module_js(
     let empty_cd = std::collections::HashMap::new();
     let empty_leading: Vec<crate::typecheck_db::types::Constraint> = Vec::new();
     let mut emitted_value: HashSet<String> = HashSet::new();
+
+    // A decl's source extent for hashing: from its start to the next top-level
+    // decl's start, with trailing whitespace trimmed. This is more robust than
+    // the parser's `span.end` for two reasons: (1) multi-equation decls are
+    // merged into a single IR decl whose span covers only the FIRST equation, so
+    // hashing that span would miss edits to later equations; (2) the last decl's
+    // head span is left open-ended by the parser, so appending text after it
+    // would spuriously shift it. The start→next-start window covers every
+    // equation, and trimming trailing whitespace makes it append-stable.
+    let mut decl_starts: Vec<usize> = desugared.iter().map(|d| d.span().start).collect();
+    decl_starts.sort_unstable();
+    decl_starts.dedup();
+    let decl_extent = |start: usize| -> (usize, usize) {
+        let end = decl_starts
+            .iter()
+            .copied()
+            .find(|&x| x > start)
+            .unwrap_or(source.len());
+        let slice = source.get(start..end).unwrap_or("");
+        (start, start + slice.trim_end().len())
+    };
+
     for d in desugared {
         match d {
             Decl::Data { name, span, .. } => {
                 let decl_key = format!("data__{}", resolve_symbol(name.value.symbol()));
-                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                let src_hash = codegen_decl::source_slice_hash(source, &[decl_extent(span.start)]);
                 if let Ok((out, oh, oc)) = codegen_decl::run_nonvalue_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
@@ -2987,7 +3014,7 @@ fn generate_module_js(
             }
             Decl::Newtype { name, span, .. } => {
                 let decl_key = format!("newtype__{}", resolve_symbol(name.value.symbol()));
-                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                let src_hash = codegen_decl::source_slice_hash(source, &[decl_extent(span.start)]);
                 if let Ok((out, oh, oc)) = codegen_decl::run_nonvalue_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
@@ -2998,7 +3025,7 @@ fn generate_module_js(
             }
             Decl::Foreign { name, span, .. } => {
                 let decl_key = format!("foreign__{}", resolve_symbol(name.value.symbol()));
-                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                let src_hash = codegen_decl::source_slice_hash(source, &[decl_extent(span.start)]);
                 if let Ok((out, oh, oc)) = codegen_decl::run_nonvalue_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
@@ -3009,7 +3036,7 @@ fn generate_module_js(
             }
             Decl::Class { name, span, .. } => {
                 let decl_key = format!("class__{}", resolve_symbol(name.value.symbol()));
-                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                let src_hash = codegen_decl::source_slice_hash(source, &[decl_extent(span.start)]);
                 if let Ok((out, oh, oc)) = codegen_decl::run_class_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
@@ -3018,20 +3045,17 @@ fn generate_module_js(
                     unit_hashes.push(oh);
                 }
             }
-            Decl::Instance { span, members, .. } => {
+            Decl::Instance { span, .. } => {
                 let inst_key =
                     crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
                 let empty = HashMap::new();
                 let method_dicts = method_dicts_by_instance.get(&inst_key).unwrap_or(&empty);
-                // Hash the instance head AND every member body span — the
-                // instance `span` covers only the head, so a method-body edit
-                // would otherwise look unchanged.
-                let mut spans = vec![(span.start, span.end)];
-                for mem in members {
-                    let s = mem.span();
-                    spans.push((s.start, s.end));
-                }
-                let src_hash = codegen_decl::source_slice_hash(source, &spans);
+                // `decl_extent` covers the whole instance block (head + every
+                // member equation), so both head edits and method-body edits are
+                // caught; method-level dict resolution is additionally folded via
+                // `method_dicts` inside `run_instance_decl`.
+                let src_hash =
+                    codegen_decl::source_slice_hash(source, &[decl_extent(span.start)]);
                 let empty_deps: Vec<OutputHash> = Vec::new();
                 let deps = codegen_nonvalue_deps.get(&inst_key).unwrap_or(&empty_deps);
                 if let Ok((out, oh, oc)) = codegen_decl::run_instance_decl(
@@ -3053,7 +3077,8 @@ fn generate_module_js(
                     .unwrap_or_default();
                 let derive_key =
                     crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
-                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                let src_hash =
+                    codegen_decl::source_slice_hash(source, &[decl_extent(span.start)]);
                 let empty_deps: Vec<OutputHash> = Vec::new();
                 let deps = codegen_nonvalue_deps.get(&derive_key).unwrap_or(&empty_deps);
                 if let Ok((out, oh, oc)) = codegen_decl::run_derive_decl(
@@ -3069,8 +3094,12 @@ fn generate_module_js(
                 let n = resolve_symbol(name.value.symbol());
                 if emitted_value.insert(n.clone()) {
                     let eqs = &value_groups[&n];
-                    let sp = &value_spans[&n];
-                    let src_hash = codegen_decl::source_slice_hash(source, sp);
+                    // `decl_extent` from the (merged) value decl's start covers
+                    // all of the group's equations up to the next top-level decl,
+                    // unlike the merged decl's own span (which covers only the
+                    // first equation).
+                    let src_hash =
+                        codegen_decl::source_slice_hash(source, &[decl_extent(d.span().start)]);
                     // Full infer-output hash (incl. constraint_dicts) so a
                     // re-resolved dictionary re-codegens this value.
                     let scheme_dep = local_full_output_hashes.get(&n).copied();
@@ -4918,6 +4947,7 @@ fn collect_nonvalue_dep_hashes(
     local_ctor_parent_hash: &HashMap<String, OutputHash>,
     local_fixity_hashes: &HashMap<String, OutputHash>,
     local_foreign_value_hashes: &HashMap<String, OutputHash>,
+    class_shape_only: bool,
 ) -> Vec<OutputHash> {
     let free = free_names::compute(decl);
     let mut out: Vec<(String, String, OutputHash)> = Vec::new();
@@ -4967,6 +4997,7 @@ fn collect_nonvalue_dep_hashes(
                 &empty_instance_by_class,
                 &mut out,
                 &mut seen,
+                class_shape_only,
             ),
             NameKind::Op | NameKind::TypeOp => resolve_fixity_dep(
                 r,
@@ -5100,6 +5131,7 @@ fn cross_module_ctor_hash(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_class_dep(
     r: &crate::typecheck_db::passes::names::Reference,
     self_module: &str,
@@ -5109,6 +5141,13 @@ fn resolve_class_dep(
     local_instance_hashes_by_class: &HashMap<String, Vec<(String, OutputHash)>>,
     out: &mut Vec<(String, String, OutputHash)>,
     seen: &mut HashSet<(String, String)>,
+    // When true, fold only the class's SHAPE hash (Edge 1) and skip the
+    // in-scope-instance edges (Edge 2). Codegen of an instance/derive depends on
+    // its class's shape (method set/order, superclass list) but NOT on sibling
+    // instances of that class — those are captured precisely by the decl's own
+    // `method_dicts_content_hash`. Folding the instance set here would
+    // re-codegen every sibling instance whenever an unrelated one is added.
+    class_shape_only: bool,
 ) {
     let (class_mod, class_name) = match (&r.module, &r.name) {
         (None, nm) => {
@@ -5143,6 +5182,10 @@ fn resolve_class_dep(
     };
     if let Some(oh) = class_hash {
         push_dep(out, seen, &class_mod, &format!("class:{class_name}"), oh);
+    }
+
+    if class_shape_only {
+        return;
     }
 
     // Edge 2: every in-scope Instance of this class. Collect from
