@@ -979,6 +979,17 @@ fn select_newtype_wrap_chain_typechecks() {
 }
 
 #[test]
+fn unsafe_partial_discharges_exhaustiveness() {
+    // A non-exhaustive case/binder wrapped in `unsafePartial`
+    // (`(Partial => a) -> a`) discharges the Partial obligation, so
+    // no NonExhaustive diagnostic should fire. Covers both the direct
+    // `unsafePartial (case ...)` form and a lambda-bodied argument.
+    assert_typechecks(include_str!(
+        "fixtures/single_succeeds/unsafe_partial_discharges_exhaustiveness.purs"
+    ));
+}
+
+#[test]
 fn capability_marker_carried_into_scheme() {
     // A nullary class with zero instances appearing as a sig
     // constraint on a check_equation-path decl (sig has inner forall)

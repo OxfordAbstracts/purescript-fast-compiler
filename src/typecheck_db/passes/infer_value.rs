@@ -201,6 +201,13 @@ pub struct PendingExhaust {
     pub span: crate::span::Span,
     pub scrutinee_tys: Vec<Type>,
     pub alts: Vec<PendingAlt>,
+    /// True when a `Partial` constraint was in scope as a *given* at
+    /// the point this case/binder group was recorded — i.e. the match
+    /// sits inside `unsafePartial (…)` (or any `(Partial => a) -> …`
+    /// argument position). Such records skip the exhaustiveness check:
+    /// the user has asserted the missing cases never arise. Stamped by
+    /// [`UnifyState::record_pending_exhaust`].
+    pub discharged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1506,6 +1513,11 @@ pub fn infer_value_scc_with_all(
         // exhaustiveness — the user is asserting the missing
         // cases never arise at runtime.
         if partial_decls.contains(&owner) {
+            continue;
+        }
+        // Matches recorded with a `Partial` given in scope (inside
+        // `unsafePartial (…)`) are likewise discharged.
+        if p.discharged {
             continue;
         }
         // For each scrutinee column: gather the column's binders from
@@ -3511,6 +3523,7 @@ fn infer_case(
                 guarded: a.result.clone(),
             })
             .collect(),
+        discharged: false, // stamped by `record_pending_exhaust`
     });
 
     Ok(result_ty)
@@ -3624,6 +3637,7 @@ fn infer_equation_with_hints(
                 binders: binders.to_vec(),
                 guarded: guarded.clone(),
             }],
+            discharged: false, // stamped by `record_pending_exhaust`
         });
     }
 

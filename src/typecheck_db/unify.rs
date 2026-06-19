@@ -765,7 +765,21 @@ impl UnifyState {
         mut entry: crate::typecheck_db::passes::infer_value::PendingExhaust,
     ) {
         entry.decl_name = self.current_decl.clone();
+        // A `Partial` given in scope means the match sits inside a
+        // `(Partial => a) -> …` argument (canonically `unsafePartial`):
+        // the obligation is discharged, so skip exhaustiveness for it.
+        entry.discharged = self.has_partial_given();
         self.pending_exhaust.push(entry);
+    }
+
+    /// True when a `Partial` class constraint is currently in scope as
+    /// a given (pushed by `push_givens`, e.g. while inferring the
+    /// argument of `unsafePartial :: forall a. (Partial => a) -> a`).
+    pub fn has_partial_given(&self) -> bool {
+        self.givens.iter().any(|g| {
+            let n = &g.class.name;
+            n == "Partial" || n.ends_with(".Partial")
+        })
     }
 
     /// Drain and return every pending exhaustiveness record.
