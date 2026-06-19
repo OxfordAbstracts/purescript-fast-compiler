@@ -1975,23 +1975,28 @@ pub fn try_get_cached(
     dep_output_hashes: &[(String, String, OutputHash)],
     module_context_hash: [u8; 32],
     env: &mut Env,
-) -> Result<Option<(Vec<InferredScheme>, OutputHash)>, DriverError> {
+) -> Result<Option<(Vec<InferredScheme>, OutputHash, OutputHash)>, DriverError> {
     let key = PassKey::new(module, scc_key, PASS_NAME);
     let input_hash =
         scc_input_hash(scc_source_hash, dep_output_hashes, module_context_hash);
-    if let Some((schemes, _blob_oh)) = db.get_cached::<Vec<InferredScheme>>(&key, input_hash)? {
+    if let Some((schemes, blob_oh)) = db.get_cached::<Vec<InferredScheme>>(&key, input_hash)? {
         for s in &schemes {
             env.bind_scheme(QName::unqualified(&s.name), s.scheme.clone());
             env.bind_scheme(QName::qualified(module, &s.name), s.scheme.clone());
         }
         let scheme_oh = scheme_only_output_hash(&schemes);
-        return Ok(Some((schemes, scheme_oh)));
+        // `blob_oh` hashes the FULL serialized output (schemes + body-derived
+        // `constraint_dicts`), so codegen — which reads `constraint_dicts` —
+        // keys off it. `scheme_oh` (the deps-facing hash) deliberately drops
+        // body-derived data so dependents aren't invalidated by body edits.
+        return Ok(Some((schemes, scheme_oh, blob_oh)));
     }
     Ok(None)
 }
 
-/// Persist a fresh SCC inference result and record its direct deps.
-/// Returns the scheme-only output hash (what downstream SCCs key on).
+/// Persist a fresh SCC inference result and record its direct deps. Returns
+/// `(scheme_only_hash, full_blob_hash)`: downstream SCCs key on the first
+/// (body-insensitive), codegen keys on the second (includes `constraint_dicts`).
 pub fn put_cached(
     db: &mut TypecheckDb,
     module: &str,
@@ -2000,13 +2005,13 @@ pub fn put_cached(
     dep_output_hashes: &[(String, String, OutputHash)],
     module_context_hash: [u8; 32],
     schemes: &[InferredScheme],
-) -> Result<OutputHash, DriverError> {
+) -> Result<(OutputHash, OutputHash), DriverError> {
     let key = PassKey::new(module, scc_key, PASS_NAME);
     let input_hash =
         scc_input_hash(scc_source_hash, dep_output_hashes, module_context_hash);
 
     let schemes_vec: Vec<InferredScheme> = schemes.to_vec();
-    db.put(&key, input_hash, &schemes_vec)?;
+    let blob_oh = db.put(&key, input_hash, &schemes_vec)?;
     let dep_edges: Vec<DepEdge> = dep_output_hashes
         .iter()
         .map(|(m, d, _)| DepEdge {
@@ -2016,7 +2021,7 @@ pub fn put_cached(
         })
         .collect();
     db.put_deps(&key, &dep_edges)?;
-    Ok(scheme_only_output_hash(schemes))
+    Ok((scheme_only_output_hash(schemes), blob_oh))
 }
 
 /// Hash the SCC's schemes only, ignoring body-derived diagnostics

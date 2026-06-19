@@ -157,6 +157,36 @@ pub fn run_with_shared_db(
     check_many_modules_with_db(db, parsed)
 }
 
+/// Convenience: pluck a specific `(module, codegen-decl-key)` codegen cache
+/// outcome out of a report. Mirrors [`outcome_of`] but reads
+/// `codegen_outcomes` (populated only when codegen is enabled on the db). The
+/// module-assembly outcome lives under the key `"$module"`.
+pub fn codegen_outcome_of(
+    report: &ModuleCheckReport,
+    module: &str,
+    decl_key: &str,
+) -> CacheOutcome {
+    let result = report
+        .results
+        .iter()
+        .find(|r| r.name == module)
+        .unwrap_or_else(|| {
+            panic!(
+                "module {module:?} not in report; modules present: {:?}",
+                report.results.iter().map(|r| &r.name).collect::<Vec<_>>()
+            )
+        });
+    *result
+        .codegen_outcomes
+        .get(decl_key)
+        .unwrap_or_else(|| {
+            panic!(
+                "codegen decl-key {decl_key:?} not in {module:?} codegen_outcomes; present: {:?}",
+                result.codegen_outcomes.keys().collect::<Vec<_>>()
+            )
+        })
+}
+
 /// Convenience: pluck a specific `(module, decl)` cache outcome out
 /// of a report. Panics if the module or decl isn't present, so
 /// tests fail fast on a typo instead of silently returning `None`.

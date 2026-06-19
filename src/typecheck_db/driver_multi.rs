@@ -88,6 +88,12 @@ pub struct ModuleCheckResult {
     /// per-declaration codegen (`DeclDb` engine). `None` unless codegen
     /// was enabled on the `TypecheckDb` via `set_codegen(true)`.
     pub js_module_text: Option<String>,
+    /// Per-declaration cache outcome from the `codegen_decl` pass plus the
+    /// module-assembly outcome (under the key `"$module"`). Populated only when
+    /// codegen is enabled. Keyed by codegen decl-key (`value__N`, `data__N`,
+    /// `class__N`, instance/derive content keys, …). Used by incremental tests
+    /// to assert a decl's JS was only regenerated when its inputs changed.
+    pub codegen_outcomes: HashMap<String, CacheOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1249,6 +1255,10 @@ fn check_one_module(
     // In-module scheme output hashes so later SCCs can resolve
     // intra-module deps.
     let mut local_scheme_hashes: HashMap<String, OutputHash> = HashMap::new();
+    // Full infer-output (blob) hashes — include body-derived `constraint_dicts`.
+    // Codegen keys off these so a cross-module instance change that re-resolves
+    // a decl's dicts (without changing its scheme) re-codegens that decl.
+    let mut local_full_output_hashes: HashMap<String, OutputHash> = HashMap::new();
 
     // Per-value-decl free_names, augmented with the references from
     // any associated `TypeSignature` decl (e.g. `fn :: Alias ->
@@ -1426,8 +1436,10 @@ fn check_one_module(
         .expect("typecheck_db get_cached");
         scc_post_total += cache_t.elapsed();
 
-        let (schemes, outcome, scheme_oh) = match cached {
-            Some((schemes, scheme_oh)) => (schemes, CacheOutcome::Hit, Some(scheme_oh)),
+        let (schemes, outcome, scheme_oh, full_oh) = match cached {
+            Some((schemes, scheme_oh, full_oh)) => {
+                (schemes, CacheOutcome::Hit, Some(scheme_oh), Some(full_oh))
+            }
             None => {
                 // Run fresh inference for this SCC.
                 let scc_started = std::time::Instant::now();
@@ -1454,7 +1466,7 @@ fn check_one_module(
                         // (SQLITE_TOOBIG). Treat any store failure
                         // as a cache skip — the schemes are still
                         // valid for THIS run; only re-use is lost.
-                        let scheme_oh = match put_cached(
+                        let (scheme_oh, full_oh) = match put_cached(
                             db,
                             &name,
                             &scc_key,
@@ -1463,19 +1475,19 @@ fn check_one_module(
                             module_context_hash,
                             &schemes,
                         ) {
-                            Ok(oh) => Some(oh),
+                            Ok((soh, foh)) => (Some(soh), Some(foh)),
                             Err(e) => {
                                 eprintln!(
                                     "[typecheck_db] cache write skipped for {name}::{scc_label}: {e:?}",
                                 );
-                                None
+                                (None, None)
                             }
                         };
-                        (schemes, CacheOutcome::Miss, scheme_oh)
+                        (schemes, CacheOutcome::Miss, scheme_oh, full_oh)
                     }
                     Err(e) => {
                         inference_error.get_or_insert(e);
-                        (Vec::new(), CacheOutcome::Miss, None)
+                        (Vec::new(), CacheOutcome::Miss, None, None)
                     }
                 };
                 let scc_elapsed = scc_started.elapsed();
@@ -1525,8 +1537,86 @@ fn check_one_module(
                 registry.set_scheme_hash(&name, &s.name, oh);
             }
         }
+        if let Some(foh) = full_oh {
+            for s in &schemes {
+                local_full_output_hashes.insert(s.name.clone(), foh);
+            }
+        }
         all_schemes.extend(schemes);
         scc_full_iter_total += scc_iter_started.elapsed();
+    }
+
+    // Per-value constructor-ABI dependencies for codegen. A value's generated
+    // JS depends on the *shape* (data vs newtype, ctor arity) of every
+    // constructor it references — e.g. `data T = T Int` emits `T.create`, while
+    // `newtype T = T Int` erases to identity. Those two have the SAME inferred
+    // scheme/dicts, so the full-infer-output dep alone wouldn't re-codegen a
+    // user when the data type toggles. Fold each referenced ctor's parent
+    // data/newtype shape hash in too. Keyed by value name; unioned across the
+    // name's equations. (Class/instance + value-ref deps are already covered
+    // transitively by the full infer-output hash.)
+    let mut codegen_ctor_deps: HashMap<String, Vec<OutputHash>> = HashMap::new();
+    if db.codegen_enabled() {
+        for (slot, free) in full_free.iter().enumerate() {
+            let vn = &value_names[slot];
+            let mut out: Vec<(String, String, OutputHash)> = Vec::new();
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+            for r in &free.refs {
+                if r.kind == NameKind::Constructor {
+                    resolve_ctor_dep(
+                        r,
+                        &name,
+                        &imports_lookup,
+                        registry,
+                        &local_ctor_parent_hash,
+                        &mut out,
+                        &mut seen,
+                    );
+                }
+            }
+            if !out.is_empty() {
+                let entry = codegen_ctor_deps.entry(vn.clone()).or_default();
+                for (_, _, oh) in out {
+                    if !entry.contains(&oh) {
+                        entry.push(oh);
+                    }
+                }
+            }
+        }
+    }
+
+    // Per-instance / per-derive codegen dependencies. An instance dict's JS
+    // depends on: its class shape (method set/order, superclasses), every
+    // in-scope instance of the classes its method bodies dispatch on (a new
+    // overlapping instance can re-resolve a method dict), and the ctor ABI of
+    // any constructors it builds. `collect_nonvalue_dep_hashes` already folds
+    // exactly that set (and is body-insensitive on dependency instances, whose
+    // `i` shape hash excludes method bodies). Keyed by the instance/derive
+    // content key (`decl_key_for_nonvalue`).
+    let mut codegen_nonvalue_deps: HashMap<String, Vec<OutputHash>> = HashMap::new();
+    if db.codegen_enabled() {
+        for d in &desugared {
+            if matches!(
+                d,
+                crate::typecheck_db::ir::Decl::Instance { .. }
+                    | crate::typecheck_db::ir::Decl::Derive { .. }
+            ) {
+                let key =
+                    crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
+                let deps = collect_nonvalue_dep_hashes(
+                    d,
+                    &name,
+                    &imports_lookup,
+                    registry,
+                    &local_type_hashes,
+                    &local_class_hashes,
+                    &local_ctor_parent_hash,
+                    &local_fixity_hashes,
+                    &local_foreign_value_hashes,
+                );
+                codegen_nonvalue_deps.insert(key, deps);
+            }
+        }
     }
 
     // Type-check instance method bodies. The class method's full
@@ -2553,13 +2643,15 @@ fn check_one_module(
     }
     // Per-declaration JS codegen (DeclDb engine). Only when explicitly
     // enabled, so plain typechecking pays no codegen cost.
-    let js_module_text = if db.codegen_enabled() {
-        Some(generate_module_js(
+    let (js_module_text, codegen_outcomes) = if db.codegen_enabled() {
+        let (text, outcomes) = generate_module_js(
             db,
             &name,
             &desugared,
             &input.source,
-            &local_scheme_hashes,
+            &local_full_output_hashes,
+            &codegen_ctor_deps,
+            &codegen_nonvalue_deps,
             module_context_hash,
             &all_schemes,
             &method_dicts_by_instance,
@@ -2567,9 +2659,10 @@ fn check_one_module(
             registry,
             &ctor_details,
             &data_constructors,
-        ))
+        );
+        (Some(text), outcomes)
     } else {
-        None
+        (None, HashMap::new())
     };
 
     ModuleCheckResult {
@@ -2587,6 +2680,7 @@ fn check_one_module(
         kind_errors,
         coercible_errors,
         js_module_text,
+        codegen_outcomes,
     }
 }
 
@@ -2653,7 +2747,9 @@ fn generate_module_js(
     module: &str,
     desugared: &[crate::typecheck_db::ir::Decl],
     source: &str,
-    local_scheme_hashes: &HashMap<String, OutputHash>,
+    local_full_output_hashes: &HashMap<String, OutputHash>,
+    codegen_ctor_deps: &HashMap<String, Vec<OutputHash>>,
+    codegen_nonvalue_deps: &HashMap<String, Vec<OutputHash>>,
     module_context_hash: [u8; 32],
     all_schemes: &[InferredScheme],
     method_dicts_by_instance: &HashMap<
@@ -2664,7 +2760,7 @@ fn generate_module_js(
     registry: &ModuleRegistry,
     ctor_details: &CtorRegistry,
     data_constructors: &DataConstructors,
-) -> String {
+) -> (String, HashMap<String, CacheOutcome>) {
     use crate::codegen::common::ident_to_js;
     use crate::codegen::decl::{instance_js_name, type_head_name, DeclCgCtx};
     use crate::typecheck_db::ir::Decl;
@@ -2830,6 +2926,8 @@ fn generate_module_js(
     };
 
     let mut outputs: Vec<codegen_decl::CodegenOutput> = Vec::new();
+    let mut unit_hashes: Vec<OutputHash> = Vec::new();
+    let mut outcomes: HashMap<String, CacheOutcome> = HashMap::new();
 
     // Constructor layout per local type, for the deriver.
     let mut derived_info: HashMap<String, crate::codegen::decl::DerivedTypeInfo> = HashMap::new();
@@ -2879,49 +2977,73 @@ fn generate_module_js(
             Decl::Data { name, span, .. } => {
                 let decl_key = format!("data__{}", resolve_symbol(name.value.symbol()));
                 let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
-                if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+                if let Ok((out, oh, oc)) = codegen_decl::run_nonvalue_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
+                    outcomes.insert(decl_key, oc);
                     outputs.push(out);
+                    unit_hashes.push(oh);
                 }
             }
             Decl::Newtype { name, span, .. } => {
                 let decl_key = format!("newtype__{}", resolve_symbol(name.value.symbol()));
                 let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
-                if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+                if let Ok((out, oh, oc)) = codegen_decl::run_nonvalue_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
+                    outcomes.insert(decl_key, oc);
                     outputs.push(out);
+                    unit_hashes.push(oh);
                 }
             }
             Decl::Foreign { name, span, .. } => {
                 let decl_key = format!("foreign__{}", resolve_symbol(name.value.symbol()));
                 let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
-                if let Ok((out, _, _)) = codegen_decl::run_nonvalue_decl(
+                if let Ok((out, oh, oc)) = codegen_decl::run_nonvalue_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
+                    outcomes.insert(decl_key, oc);
                     outputs.push(out);
+                    unit_hashes.push(oh);
                 }
             }
             Decl::Class { name, span, .. } => {
                 let decl_key = format!("class__{}", resolve_symbol(name.value.symbol()));
                 let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
-                if let Ok((out, _, _)) = codegen_decl::run_class_decl(
+                if let Ok((out, oh, oc)) = codegen_decl::run_class_decl(
                     db, module, &decl_key, src_hash, module_context_hash, d,
                 ) {
+                    outcomes.insert(decl_key, oc);
                     outputs.push(out);
+                    unit_hashes.push(oh);
                 }
             }
-            Decl::Instance { .. } => {
+            Decl::Instance { span, members, .. } => {
                 let inst_key =
                     crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
                 let empty = HashMap::new();
                 let method_dicts = method_dicts_by_instance.get(&inst_key).unwrap_or(&empty);
-                outputs.push(codegen_decl::run_instance_decl(
-                    d, &ctx, method_dicts, &method_leading,
-                ));
+                // Hash the instance head AND every member body span — the
+                // instance `span` covers only the head, so a method-body edit
+                // would otherwise look unchanged.
+                let mut spans = vec![(span.start, span.end)];
+                for mem in members {
+                    let s = mem.span();
+                    spans.push((s.start, s.end));
+                }
+                let src_hash = codegen_decl::source_slice_hash(source, &spans);
+                let empty_deps: Vec<OutputHash> = Vec::new();
+                let deps = codegen_nonvalue_deps.get(&inst_key).unwrap_or(&empty_deps);
+                if let Ok((out, oh, oc)) = codegen_decl::run_instance_decl(
+                    db, &inst_key, src_hash, module_context_hash, deps, d, &ctx, method_dicts,
+                    &method_leading,
+                ) {
+                    outcomes.insert(inst_key, oc);
+                    outputs.push(out);
+                    unit_hashes.push(oh);
+                }
             }
-            Decl::Derive { types, .. } => {
+            Decl::Derive { types, span, .. } => {
                 // The instance head's FIRST type argument is the data type being
                 // derived for (`Generic Foo _` → Foo); later args (e.g. Generic's
                 // Rep) are not the subject type.
@@ -2929,7 +3051,19 @@ fn generate_module_js(
                     .first()
                     .map(crate::codegen::decl::type_expr_head_name)
                     .unwrap_or_default();
-                outputs.push(codegen_decl::run_derive_decl(d, &ctx, derived_info.get(&head)));
+                let derive_key =
+                    crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
+                let src_hash = codegen_decl::source_slice_hash(source, &[(span.start, span.end)]);
+                let empty_deps: Vec<OutputHash> = Vec::new();
+                let deps = codegen_nonvalue_deps.get(&derive_key).unwrap_or(&empty_deps);
+                if let Ok((out, oh, oc)) = codegen_decl::run_derive_decl(
+                    db, &derive_key, src_hash, module_context_hash, deps, d, &ctx,
+                    derived_info.get(&head),
+                ) {
+                    outcomes.insert(derive_key, oc);
+                    outputs.push(out);
+                    unit_hashes.push(oh);
+                }
             }
             Decl::Value { name, .. } => {
                 let n = resolve_symbol(name.value.symbol());
@@ -2937,15 +3071,21 @@ fn generate_module_js(
                     let eqs = &value_groups[&n];
                     let sp = &value_spans[&n];
                     let src_hash = codegen_decl::source_slice_hash(source, sp);
-                    let scheme_dep = local_scheme_hashes.get(&n).copied();
+                    // Full infer-output hash (incl. constraint_dicts) so a
+                    // re-resolved dictionary re-codegens this value.
+                    let scheme_dep = local_full_output_hashes.get(&n).copied();
                     let decl_key = format!("value__{n}");
                     let cd = cd_by_name.get(&n).unwrap_or(&empty_cd);
                     let leading = leading_by_name.get(&n).unwrap_or(&empty_leading);
-                    if let Ok((out, _, _)) = codegen_decl::run_value_group(
-                        db, &decl_key, src_hash, module_context_hash, scheme_dep, eqs, &ctx, cd,
-                        leading,
+                    let empty_ctor_deps: Vec<OutputHash> = Vec::new();
+                    let ctor_deps = codegen_ctor_deps.get(&n).unwrap_or(&empty_ctor_deps);
+                    if let Ok((out, oh, oc)) = codegen_decl::run_value_group(
+                        db, &decl_key, src_hash, module_context_hash, scheme_dep, ctor_deps, eqs,
+                        &ctx, cd, leading,
                     ) {
+                        outcomes.insert(decl_key, oc);
                         outputs.push(out);
+                        unit_hashes.push(oh);
                     }
                 }
             }
@@ -2953,7 +3093,18 @@ fn generate_module_js(
         }
     }
 
-    codegen_decl::assemble_module(&outputs)
+    // Assemble (cached): an unchanged set of per-decl outputs ⇒ no reassembly.
+    let text = match codegen_decl::run_module(db, module, &unit_hashes, &outputs) {
+        Ok((text, oc)) => {
+            outcomes.insert("$module".to_string(), oc);
+            text
+        }
+        Err(_) => {
+            outcomes.insert("$module".to_string(), CacheOutcome::Miss);
+            codegen_decl::assemble_module(&outputs)
+        }
+    };
+    (text, outcomes)
 }
 
 // ---------------------------------------------------------------------------

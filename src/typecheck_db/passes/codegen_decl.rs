@@ -25,7 +25,12 @@ use crate::typecheck_db::key::{hash_bytes, InputHasher, OutputHash, PassKey};
 use crate::typecheck_db::passes::constraints::ResolvedDict;
 
 pub const PASS_NAME: &str = "codegen_decl";
-pub const PASS_VERSION: u32 = 1;
+pub const PASS_VERSION: u32 = 2;
+
+/// Module-assembly pass: stitches the per-decl `CodegenOutput`s into the final
+/// ES-module text. Cached so an unchanged module skips reassembly entirely.
+pub const MODULE_PASS_NAME: &str = "codegen_module";
+pub const MODULE_PASS_VERSION: u32 = 1;
 
 /// One emitted top-level JS binding, as rendered text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,12 +73,24 @@ fn input_hash(
     decl_source_hash: [u8; 32],
     module_context_hash: [u8; 32],
     scheme_dep: Option<OutputHash>,
+    ctor_abi_deps: &[OutputHash],
 ) -> [u8; 32] {
     let mut hasher = InputHasher::new(PASS_NAME, PASS_VERSION)
         .with_source_hash(decl_source_hash)
         .with_module_context(module_context_hash);
     if let Some(oh) = scheme_dep {
+        // The FULL infer-value output (schemes + constraint_dicts) for this
+        // decl: a re-resolved dictionary re-codegens it.
         hasher.add_dep("_self", "_scheme", "infer_value_scc", oh);
+    }
+    // Referenced constructors' parent data/newtype shape hashes — so a
+    // data↔newtype toggle or ctor-arity change (which can leave the scheme
+    // unchanged) still re-codegens this decl. Sort first so the result is
+    // independent of the order the refs were collected in.
+    let mut sorted: Vec<OutputHash> = ctor_abi_deps.to_vec();
+    sorted.sort();
+    for (i, oh) in sorted.iter().enumerate() {
+        hasher.add_dep("_ctor_abi", format!("{i}"), "codegen_decl", *oh);
     }
     hasher.finish()
 }
@@ -86,13 +103,14 @@ pub fn run_value_group(
     decl_source_hash: [u8; 32],
     module_context_hash: [u8; 32],
     scheme_dep: Option<OutputHash>,
+    ctor_abi_deps: &[OutputHash],
     equations: &[&ir::Decl],
     ctx: &DeclCgCtx,
     constraint_dicts: &HashMap<Span, Vec<ResolvedDict>>,
     leading_constraints: &[crate::typecheck_db::types::Constraint],
 ) -> Result<(CodegenOutput, OutputHash, CacheOutcome), DriverError> {
     let key = PassKey::new(ctx.module, decl_key, PASS_NAME);
-    let ih = input_hash(decl_source_hash, module_context_hash, scheme_dep);
+    let ih = input_hash(decl_source_hash, module_context_hash, scheme_dep, ctor_abi_deps);
 
     if let Some((value, oh)) = db.get_cached::<CodegenOutput>(&key, ih)? {
         return Ok((value, oh, CacheOutcome::Hit));
@@ -114,7 +132,7 @@ pub fn run_class_decl(
     decl: &ir::Decl,
 ) -> Result<(CodegenOutput, OutputHash, CacheOutcome), DriverError> {
     let key = PassKey::new(module, decl_key, PASS_NAME);
-    let ih = input_hash(decl_source_hash, module_context_hash, None);
+    let ih = input_hash(decl_source_hash, module_context_hash, None, &[]);
     if let Some((value, oh)) = db.get_cached::<CodegenOutput>(&key, ih)? {
         return Ok((value, oh, CacheOutcome::Hit));
     }
@@ -123,25 +141,103 @@ pub fn run_class_decl(
     Ok((value, oh, CacheOutcome::Miss))
 }
 
-/// Cache-aware codegen for an `instance` declaration (dictionary object).
-/// Not cached through the DB yet because the instance method dicts come from
-/// in-memory schemes; computed fresh each run.
+/// Input hash for an instance/derive codegen unit: source slice + module
+/// context + the decl's dependency shape hashes (class shape, in-scope
+/// instances, ctor ABI — from `collect_nonvalue_dep_hashes`) + an optional
+/// extra content hash (the instance's resolved method dicts).
+fn nonvalue_codegen_input_hash(
+    decl_source_hash: [u8; 32],
+    module_context_hash: [u8; 32],
+    dep_hashes: &[OutputHash],
+    extra: Option<OutputHash>,
+) -> [u8; 32] {
+    let mut hasher = InputHasher::new(PASS_NAME, PASS_VERSION)
+        .with_source_hash(decl_source_hash)
+        .with_module_context(module_context_hash);
+    let mut sorted: Vec<OutputHash> = dep_hashes.to_vec();
+    sorted.sort();
+    for (i, oh) in sorted.iter().enumerate() {
+        hasher.add_dep("_dep", format!("{i}"), "codegen_decl", *oh);
+    }
+    if let Some(oh) = extra {
+        hasher.add_dep("_self", "_method_dicts", "codegen_decl", oh);
+    }
+    hasher.finish()
+}
+
+/// Stable content hash of an instance's resolved method dictionaries. Folded
+/// into the instance's codegen input hash so a re-resolved dict (e.g. a new
+/// overlapping instance changed which dictionary a method body uses)
+/// re-codegens the instance. Sorted by (method, span) so the hash is
+/// independent of `HashMap` iteration order.
+fn method_dicts_content_hash(
+    method_dicts: &HashMap<String, HashMap<Span, Vec<ResolvedDict>>>,
+) -> OutputHash {
+    let mut by_method: Vec<(&String, Vec<(Span, &Vec<ResolvedDict>)>)> = method_dicts
+        .iter()
+        .map(|(m, spans)| {
+            let mut v: Vec<(Span, &Vec<ResolvedDict>)> =
+                spans.iter().map(|(s, d)| (*s, d)).collect();
+            v.sort_by_key(|(s, _)| (s.start, s.end));
+            (m, v)
+        })
+        .collect();
+    by_method.sort_by(|a, b| a.0.cmp(b.0));
+    let bytes = bincode::serialize(&by_method).unwrap_or_default();
+    hash_bytes(&bytes)
+}
+
+/// Cache-aware codegen for an `instance` declaration (dictionary object). The
+/// method dicts come from in-memory schemes, so they're folded into the input
+/// hash via `method_dicts_content_hash` rather than re-derived on a cache hit.
+#[allow(clippy::too_many_arguments)]
 pub fn run_instance_decl(
+    db: &mut TypecheckDb,
+    decl_key: &str,
+    decl_source_hash: [u8; 32],
+    module_context_hash: [u8; 32],
+    dep_hashes: &[OutputHash],
     decl: &ir::Decl,
     ctx: &DeclCgCtx,
     method_dicts: &HashMap<String, HashMap<Span, Vec<ResolvedDict>>>,
     method_leading: &HashMap<String, Vec<String>>,
-) -> CodegenOutput {
-    gen_to_output(codegen_instance_decl(decl, ctx, method_dicts, method_leading))
+) -> Result<(CodegenOutput, OutputHash, CacheOutcome), DriverError> {
+    let key = PassKey::new(ctx.module, decl_key, PASS_NAME);
+    let dicts_hash = method_dicts_content_hash(method_dicts);
+    let ih = nonvalue_codegen_input_hash(
+        decl_source_hash,
+        module_context_hash,
+        dep_hashes,
+        Some(dicts_hash),
+    );
+    if let Some((value, oh)) = db.get_cached::<CodegenOutput>(&key, ih)? {
+        return Ok((value, oh, CacheOutcome::Hit));
+    }
+    let value = gen_to_output(codegen_instance_decl(decl, ctx, method_dicts, method_leading));
+    let oh = db.put(&key, ih, &value)?;
+    Ok((value, oh, CacheOutcome::Miss))
 }
 
-/// Codegen for a `derive instance` / `derive newtype instance` declaration.
+/// Cache-aware codegen for a `derive instance` / `derive newtype instance`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_derive_decl(
+    db: &mut TypecheckDb,
+    decl_key: &str,
+    decl_source_hash: [u8; 32],
+    module_context_hash: [u8; 32],
+    dep_hashes: &[OutputHash],
     decl: &ir::Decl,
     ctx: &DeclCgCtx,
     info: Option<&DerivedTypeInfo>,
-) -> CodegenOutput {
-    gen_to_output(codegen_derive_decl(decl, ctx, info))
+) -> Result<(CodegenOutput, OutputHash, CacheOutcome), DriverError> {
+    let key = PassKey::new(ctx.module, decl_key, PASS_NAME);
+    let ih = nonvalue_codegen_input_hash(decl_source_hash, module_context_hash, dep_hashes, None);
+    if let Some((value, oh)) = db.get_cached::<CodegenOutput>(&key, ih)? {
+        return Ok((value, oh, CacheOutcome::Hit));
+    }
+    let value = gen_to_output(codegen_derive_decl(decl, ctx, info));
+    let oh = db.put(&key, ih, &value)?;
+    Ok((value, oh, CacheOutcome::Miss))
 }
 
 /// Cache-aware codegen for a non-value declaration (data / newtype / foreign).
@@ -155,7 +251,7 @@ pub fn run_nonvalue_decl(
     decl: &ir::Decl,
 ) -> Result<(CodegenOutput, OutputHash, CacheOutcome), DriverError> {
     let key = PassKey::new(module, decl_key, PASS_NAME);
-    let ih = input_hash(decl_source_hash, module_context_hash, None);
+    let ih = input_hash(decl_source_hash, module_context_hash, None, &[]);
 
     if let Some((value, oh)) = db.get_cached::<CodegenOutput>(&key, ih)? {
         return Ok((value, oh, CacheOutcome::Hit));
@@ -222,6 +318,37 @@ fn topo_visit(i: usize, deps: &[Vec<usize>], visited: &mut [bool], order: &mut V
         topo_visit(j, deps, visited, order);
     }
     order.push(i);
+}
+
+/// Input hash for the module-assembly pass: the ordered sequence of per-decl
+/// codegen output hashes. Order is significant (assembly concatenates), so each
+/// hash is keyed by its zero-padded emit position. If every decl's codegen
+/// output is unchanged AND in the same order, the module text is a cache hit.
+fn module_input_hash(unit_hashes: &[OutputHash]) -> [u8; 32] {
+    let mut hasher = InputHasher::new(MODULE_PASS_NAME, MODULE_PASS_VERSION);
+    for (i, oh) in unit_hashes.iter().enumerate() {
+        hasher.add_dep("_unit", format!("{i:06}"), PASS_NAME, *oh);
+    }
+    hasher.finish()
+}
+
+/// Cache-aware module assembly. `unit_hashes` are the per-decl codegen output
+/// hashes (emit order); `outputs` are the matching `CodegenOutput`s used only
+/// on a cache miss.
+pub fn run_module(
+    db: &mut TypecheckDb,
+    module: &str,
+    unit_hashes: &[OutputHash],
+    outputs: &[CodegenOutput],
+) -> Result<(String, CacheOutcome), DriverError> {
+    let key = PassKey::new(module, "$module", MODULE_PASS_NAME);
+    let ih = module_input_hash(unit_hashes);
+    if let Some((text, _oh)) = db.get_cached::<String>(&key, ih)? {
+        return Ok((text, CacheOutcome::Hit));
+    }
+    let text = assemble_module(outputs);
+    db.put(&key, ih, &text)?;
+    Ok((text, CacheOutcome::Miss))
 }
 
 pub fn assemble_module(outputs: &[CodegenOutput]) -> String {
