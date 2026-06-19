@@ -32,9 +32,13 @@ pub use error::BuildError;
 pub struct DeclDbModule {
     pub name: String,
     /// Number of type/constraint/inference errors found in this module.
+    /// Equal to `errors.len()`.
     pub error_count: usize,
     /// True if generated JS was written to `output_dir`.
     pub wrote_js: bool,
+    /// Formatted, location-prefixed error messages
+    /// (`path:line:col - line:col: message`), one per diagnostic.
+    pub errors: Vec<String>,
 }
 
 /// Result of a DeclDb build.
@@ -67,11 +71,15 @@ pub fn build_from_sources_decldb(
     let mut inputs: Vec<ModuleInput> = Vec::new();
     let mut parse_errors: Vec<(String, String)> = Vec::new();
     let mut name_by_path: HashMap<String, String> = HashMap::new();
+    // Per module name: the source path and text, for resolving error spans.
+    let mut info_by_name: HashMap<String, (String, String)> = HashMap::new();
     for (path, src) in sources {
         match crate::parse(src) {
             Ok(cst) => {
                 let name = interner::resolve_module_name(&cst.name.value.parts);
                 name_by_path.insert((*path).to_string(), name.clone());
+                info_by_name
+                    .insert(name.clone(), ((*path).to_string(), (*src).to_string()));
                 inputs.push(ModuleInput::new(name, (*src).to_string(), cst));
             }
             Err(e) => parse_errors.push(((*path).to_string(), format!("{e:?}"))),
@@ -97,10 +105,12 @@ pub fn build_from_sources_decldb(
 
     let mut modules = Vec::new();
     for r in &report.results {
-        let error_count = r.constraint_errors.len()
-            + r.kind_errors.len()
-            + r.validation_errors.len()
-            + usize::from(r.inference_error.is_some());
+        let (path, source) = info_by_name
+            .get(&r.name)
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .unwrap_or((r.name.as_str(), ""));
+        let errors = format_decldb_errors(path, r, source);
+        let error_count = errors.len();
         let mut wrote_js = false;
         if let (Some(dir), Some(js)) = (output_dir, &r.js_module_text) {
             let mod_dir = dir.join(&r.name);
@@ -113,7 +123,7 @@ pub fn build_from_sources_decldb(
                 }
             }
         }
-        modules.push(DeclDbModule { name: r.name.clone(), error_count, wrote_js });
+        modules.push(DeclDbModule { name: r.name.clone(), error_count, wrote_js, errors });
     }
 
     DeclDbBuildResult {
@@ -121,6 +131,113 @@ pub fn build_from_sources_decldb(
         graph_errors: report.errors.iter().map(|e| format!("{e:?}")).collect(),
         parse_errors,
     }
+}
+
+/// Render `span` as `path:line:col - line:col`, falling back to just
+/// `path` when the span can't be resolved against `source`.
+fn span_location(path: &str, span: &Span, source: &str) -> String {
+    match span.to_pos(source) {
+        Some((start, end)) => format!(
+            "{}:{}:{} - {}:{}",
+            path, start.line, start.column, end.line, end.column
+        ),
+        None => path.to_string(),
+    }
+}
+
+/// Format every diagnostic in a typecheck_db [`ModuleCheckResult`] into
+/// location-prefixed message strings. Spans are resolved against the
+/// module's own `source`. Mirrors the per-error rendering used in the
+/// `all_packages` fixture harness.
+fn format_decldb_errors(
+    path: &str,
+    r: &crate::typecheck_db::driver_multi::ModuleCheckResult,
+    source: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in &r.import_errors {
+        out.push(format!("{}: import error: {:?}", span_location(path, &e.span, source), e.kind));
+    }
+    for e in &r.validation_errors {
+        out.push(format!("{}: {:?}", span_location(path, &e.span, source), e.kind));
+    }
+    for e in &r.kind_errors {
+        out.push(format!("{}: {:?}", span_location(path, &e.span, source), e.kind));
+    }
+    for e in &r.coercible_errors {
+        out.push(format!("{}: {:?}", span_location(path, &e.span, source), e.kind));
+    }
+    for e in &r.exhaustiveness_errors {
+        out.push(format!(
+            "{}: non-exhaustive patterns for {}: missing {:?}",
+            span_location(path, &e.span, source),
+            e.type_name,
+            e.missing
+        ));
+    }
+    for e in &r.constraint_errors {
+        out.push(format!(
+            "{}: {:?}: {} (args={:?})",
+            span_location(path, &e.span, source),
+            e.kind,
+            e.constraint.class.name,
+            e.constraint.args
+        ));
+    }
+    // `inference_error` is a fatal early-bailout enum with no single span.
+    if let Some(ie) = &r.inference_error {
+        out.push(format!("{path}: inference error: {ie:?}"));
+    }
+    out
+}
+
+/// Glob-driven entry point for the DeclDb build, parallel to
+/// [`build_cached`] for the legacy pipeline. Resolves `globs` to
+/// `.purs` files, reads each source plus its companion `.js` FFI file,
+/// and runs [`build_from_sources_decldb`]. Glob and file-read failures
+/// are folded into the result's `parse_errors`.
+pub fn build_decldb_from_globs(
+    globs: &[&str],
+    output_dir: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> DeclDbBuildResult {
+    let mut file_errors: Vec<BuildError> = Vec::new();
+    let paths = resolve_globs(globs, &mut file_errors);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(source) => sources.push((path.to_string_lossy().into_owned(), source)),
+            Err(e) => file_errors.push(BuildError::FileReadError {
+                path: path.clone(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    // Scan for FFI companion `.js` files (same name, `.js` extension).
+    let mut js_sources: HashMap<String, String> = HashMap::new();
+    for (path_str, _) in &sources {
+        let js_path = PathBuf::from(path_str).with_extension("js");
+        if js_path.exists() {
+            if let Ok(js_source) = std::fs::read_to_string(&js_path) {
+                js_sources.insert(path_str.clone(), js_source);
+            }
+        }
+    }
+
+    let source_refs: Vec<(&str, &str)> =
+        sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let js_refs: HashMap<&str, &str> =
+        js_sources.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let mut result =
+        build_from_sources_decldb(&source_refs, &Some(js_refs), output_dir, db_path);
+    // Surface glob/read failures alongside parse failures.
+    for err in file_errors {
+        result.parse_errors.push((String::new(), format!("{err}")));
+    }
+    result
 }
 
 // ===== Build options =====

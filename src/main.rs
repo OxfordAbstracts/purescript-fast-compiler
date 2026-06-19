@@ -28,6 +28,24 @@ enum Commands {
         #[arg(short, long, default_value = "output")]
         output: String,
     },
+    /// Compile PureScript source files via the typecheck_db per-declaration engine
+    CompileDb {
+        /// Glob patterns for PureScript source files (e.g. "src/**/*.purs")
+        #[arg(required = true)]
+        globs: Vec<String>,
+
+        /// Output directory for generated JavaScript (default: "output")
+        #[arg(short, long, default_value = "output")]
+        output: String,
+
+        /// Override the SQLite cache path (default: <output>/.pfc-decldb.sqlite)
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Disable the persistent cache (use a fresh in-memory db)
+        #[arg(long)]
+        no_cache: bool,
+    },
     /// Compile and run tests
     Test {
         /// Glob patterns for PureScript source files (e.g. "src/**/*.purs")
@@ -129,6 +147,62 @@ fn run_compile(globs: &[String], output: &str) -> bool {
     }
 }
 
+/// Run compilation through the typecheck_db engine. Returns true on success.
+fn run_compile_db(globs: &[String], output: &str, db: Option<PathBuf>, no_cache: bool) -> bool {
+    log::debug!("Starting compile-db with globs: {:?}", globs);
+
+    let output_path = PathBuf::from(output);
+    // Ensure the output dir exists so the SQLite cache file's parent is present.
+    if let Err(e) = std::fs::create_dir_all(&output_path) {
+        eprintln!("Failed to create output directory {}: {e}", output_path.display());
+        return false;
+    }
+
+    let db_path = if no_cache {
+        None
+    } else {
+        Some(db.unwrap_or_else(|| output_path.join(".pfc-decldb.sqlite")))
+    };
+
+    let glob_refs: Vec<&str> = globs.iter().map(|s| s.as_str()).collect();
+    let result = build::build_decldb_from_globs(&glob_refs, Some(&output_path), db_path.as_deref());
+
+    let mut error_messages: Vec<String> = Vec::new();
+    for (path, msg) in &result.parse_errors {
+        if path.is_empty() {
+            error_messages.push(msg.clone());
+        } else {
+            error_messages.push(format!("{path}: parse error: {msg}"));
+        }
+    }
+    for err in &result.graph_errors {
+        error_messages.push(err.clone());
+    }
+    for module in &result.modules {
+        error_messages.extend(module.errors.iter().cloned());
+    }
+
+    if !error_messages.is_empty() {
+        let error_count = error_messages.len();
+        eprintln!(
+            "\nCompilation failed with {error_count} error{}:\n",
+            if error_count == 1 { "" } else { "s" }
+        );
+        for msg in &error_messages {
+            eprintln!("  {msg}");
+        }
+        false
+    } else {
+        let wrote = result.modules.iter().filter(|m| m.wrote_js).count();
+        println!(
+            "\nCompiled {} module{} successfully.",
+            wrote,
+            if wrote == 1 { "" } else { "s" }
+        );
+        true
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -153,6 +227,11 @@ fn main() {
         }
         Commands::Compile { globs, output } => {
             if !run_compile(&globs, &output) {
+                std::process::exit(1);
+            }
+        }
+        Commands::CompileDb { globs, output, db, no_cache } => {
+            if !run_compile_db(&globs, &output, db, no_cache) {
                 std::process::exit(1);
             }
         }
