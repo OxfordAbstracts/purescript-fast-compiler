@@ -59,6 +59,14 @@ enum Commands {
         /// Test module containing the main entry point (default: "Test.Main")
         #[arg(short, long, default_value = "Test.Main")]
         test_module: String,
+
+        /// Override the SQLite cache path (default: <output>/.pfc-decldb.sqlite)
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Disable the persistent cache (use a fresh in-memory db)
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Start the PureScript language server (LSP over stdio)
     Lsp {
@@ -235,8 +243,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Test { globs, output, test_module } => {
-            if !run_compile(&globs, &output) {
+        Commands::Test { globs, output, test_module, db, no_cache } => {
+            if !run_compile_db(&globs, &output, db, no_cache) {
                 std::process::exit(1);
             }
 
