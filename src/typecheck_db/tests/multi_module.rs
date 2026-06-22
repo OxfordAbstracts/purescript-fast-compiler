@@ -1173,3 +1173,103 @@ handle = case _ of
 ",
     ]);
 }
+
+#[test]
+fn qualified_scrutinee_does_not_collide_with_local_type() {
+    // A case on an imported, module-qualified type (`TS.Output`, ctors
+    // `{GoBack}`) must check exhaustiveness against THAT type — not a
+    // locally-defined type that happens to share the bare name
+    // `Output` (ctors `{GoBack, Continue}`). The two even share a
+    // `GoBack` ctor, which defeats the cheap collision-tolerance
+    // guard, so without module-aware lookup the local-only `Continue`
+    // is falsely reported missing. Reduced from
+    // DelegateRegistrationAttendee/Pages/Tickets/Page.purs.
+    assert_typechecks_multi(&[
+        "\
+module TicketsSelection where
+
+data Output = GoBack
+",
+        "\
+module Main where
+
+import TicketsSelection as TS
+
+data Output = GoBack | Continue
+
+handle :: TS.Output -> Int
+handle = case _ of
+  TS.GoBack -> 1
+",
+    ]);
+}
+
+#[test]
+fn qualified_scrutinee_inferred_via_indirection_no_collision() {
+    // Faithful reduction of the Halogen `slot` shape: the case
+    // scrutinee's type is NOT pinned by an explicit signature but
+    // inferred through a polymorphic argument (`slotLike`) that ties
+    // the handler's input to the component's output parameter. In this
+    // path the inferred scrutinee `Con` loses its module qualifier
+    // (becomes `None`), so a fix can't rely on the scrutinee's module —
+    // it must consult the qualified binder's defining module. Without
+    // that, the local `Output` (`{GoBack, Continue}`) is matched and
+    // `Continue` is falsely reported missing.
+    assert_typechecks_multi(&[
+        "\
+module TicketsSelection where
+
+data Output = GoBack
+
+data Component o = Component
+
+component :: Component Output
+component = Component
+",
+        "\
+module Main where
+
+import TicketsSelection as TS
+
+data Output = GoBack | Continue
+
+data Action = OnGoBack | DoNext
+
+foreign import slotLike :: forall o a. TS.Component o -> (o -> a) -> a
+
+useIt :: Action
+useIt = slotLike TS.component (case _ of TS.GoBack -> OnGoBack)
+",
+    ]);
+}
+
+#[test]
+fn qualified_scrutinee_type_from_binder_only_no_collision() {
+    // The scrutinee's type is determined ONLY by the qualified binder
+    // `TS.GoBack` (the handler is passed to a fully polymorphic
+    // function, so nothing else pins it). The inferred scrutinee `Con`
+    // can carry `module: None` here, so the exhaustiveness check must
+    // disambiguate using the binder's defining module — otherwise it
+    // matches the local `Output` and falsely reports `Continue`.
+    assert_typechecks_multi(&[
+        "\
+module TicketsSelection where
+
+data Output = GoBack
+",
+        "\
+module Main where
+
+import TicketsSelection as TS
+
+data Output = GoBack | Continue
+
+data Action = OnGoBack
+
+foreign import run1 :: forall a. (a -> Action) -> Action
+
+useIt :: Action
+useIt = run1 (case _ of TS.GoBack -> OnGoBack)
+",
+    ]);
+}

@@ -990,6 +990,18 @@ fn unsafe_partial_discharges_exhaustiveness() {
 }
 
 #[test]
+fn unsafe_partial_compose_discharges() {
+    // Point-free `unsafePartial <<< case _ of …` must discharge the
+    // Partial obligation of the non-exhaustive case, just like the
+    // direct application form. Here the case is the argument of `<<<`,
+    // so the discharge must recognise `unsafePartial` in the function
+    // position of the application chain.
+    assert_typechecks(include_str!(
+        "fixtures/single_succeeds/unsafe_partial_compose_discharges.purs"
+    ));
+}
+
+#[test]
 fn capability_marker_carried_into_scheme() {
     // A nullary class with zero instances appearing as a sig
     // constraint on a check_equation-path decl (sig has inner forall)

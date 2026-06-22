@@ -99,8 +99,30 @@ pub fn check_exhaustiveness(
     data_constructors: &DataConstructors,
     ctor_details: &CtorRegistry,
 ) -> Option<Vec<String>> {
-    let (type_name, type_args) = extract_type_con_and_args(scrutinee_ty)?;
+    let (type_name, scrut_module, type_args) = extract_type_con_and_args(scrutinee_ty)?;
     let all_ctors = data_constructors.get(&type_name)?;
+
+    // Module disambiguation: `data_constructors` / `ctor_details` are
+    // keyed by *bare* name and hold only the current module's types.
+    // If the scrutinee names a module other than the one that defined
+    // the locally-registered same-named type, we've matched a colliding
+    // local type by accident — the imported type's real constructor set
+    // isn't in our registry, so we can't decide coverage. Bail rather
+    // than report the wrong type's constructors as missing. (Imported
+    // types with no local name-collision aren't in `data_constructors`
+    // at all, so they already fall out at the `.get(..)?` above; this
+    // only guards the collision case.)
+    if let Some(scrut_mod) = &scrut_module {
+        let def_mod = all_ctors
+            .first()
+            .and_then(|c| ctor_details.get(c))
+            .and_then(|info| info.parent_module.as_ref());
+        if let Some(def_mod) = def_mod {
+            if def_mod != scrut_mod {
+                return None;
+            }
+        }
+    }
 
     // Classify every binder.
     let mut has_catchall = false;
@@ -276,7 +298,7 @@ fn classify(
 /// arguments. Returns `None` for anything that isn't a saturated (or
 /// partial) type-constructor application — `Unif`, bare `Var`,
 /// function arrows, records, etc.
-fn extract_type_con_and_args(ty: &Type) -> Option<(String, Vec<Type>)> {
+fn extract_type_con_and_args(ty: &Type) -> Option<(String, Option<String>, Vec<Type>)> {
     let mut args: Vec<Type> = Vec::new();
     let mut cur = ty;
     loop {
@@ -287,7 +309,7 @@ fn extract_type_con_and_args(ty: &Type) -> Option<(String, Vec<Type>)> {
             }
             Type::Con(q) => {
                 args.reverse();
-                return Some((q.name.clone(), args));
+                return Some((q.name.clone(), q.module.clone(), args));
             }
             _ => return None,
         }

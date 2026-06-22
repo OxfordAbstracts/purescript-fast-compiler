@@ -34,7 +34,11 @@ pub const PASS_NAME: &str = "infer_value_scc";
 // v2: constraint_dicts stores a Vec per span (multi-constraint call sites).
 // v3: given-discharged dicts carry the discharging given's context index in
 //     `instance_idx` (was always usize::MAX) for same-class-given disambiguation.
-pub const PASS_VERSION: u32 = 3;
+// v4: `unsafePartial`-composition Partial discharge (infer_app) + module-aware
+//     exhaustiveness (qualified scrutinee no longer collides with a same-named
+//     local type). Both change cached exhaustiveness_errors, so bump to
+//     invalidate stale value-SCC cache entries.
+pub const PASS_VERSION: u32 = 4;
 
 /// When set, `infer_value_scc` zonks each decl's `constraint_dicts` so codegen
 /// sees concrete instance types. Off by default — plain typechecking never
@@ -2163,6 +2167,57 @@ fn infer_constructor(
     Ok(instantiate(state, scheme))
 }
 
+/// True when a constraint is the `Partial` class (bare or
+/// module-qualified). Shared shape with `UnifyState::has_partial_given`.
+fn constraint_is_partial(c: &Constraint) -> bool {
+    let n = &c.class.name;
+    n == "Partial" || n.ends_with(".Partial")
+}
+
+/// True when `ty` carries a `Partial` constraint in a function
+/// *parameter* position — i.e. applying a value of this type
+/// discharges a `Partial` obligation in the argument. Canonically
+/// `unsafePartial :: forall a. (Partial => a) -> a`, whose `Partial`
+/// sits inside `Fun.arg`. Mirrors the old engine's
+/// `has_partial_in_function_param`.
+fn type_has_partial_in_param(ty: &Type) -> bool {
+    fn arg_carries_partial(ty: &Type) -> bool {
+        match ty {
+            Type::Constrained(cs, b) => {
+                cs.iter().any(constraint_is_partial) || arg_carries_partial(b)
+            }
+            Type::Forall(_, b) => arg_carries_partial(b),
+            _ => false,
+        }
+    }
+    match ty {
+        Type::Forall(_, b) => type_has_partial_in_param(b),
+        Type::Fun(arg, ret) => {
+            arg_carries_partial(arg) || type_has_partial_in_param(ret)
+        }
+        _ => false,
+    }
+}
+
+/// True when `e` is a `Var` whose scheme discharges `Partial` (i.e.
+/// has `Partial` in a parameter position — `unsafePartial`). Looks the
+/// scheme up the same way `infer_var` does.
+fn expr_is_partial_discharger(env: &Env, e: &Expr) -> bool {
+    let Expr::Var { name, .. } = e else { return false };
+    let name_str = crate::typecheck_db::util::resolve_symbol(name.name.symbol());
+    if !name.module.is_unresolved() {
+        let module = crate::typecheck_db::util::resolve_symbol(name.module.symbol());
+        let q = QName { module: Some(module), name: name_str.clone() };
+        if let Some(scheme) = env.lookup_qualified(&q) {
+            return type_has_partial_in_param(&scheme.ty);
+        }
+    }
+    match env.lookup_unqualified(&name_str) {
+        Lookup::Scheme(s) => type_has_partial_in_param(&s.ty),
+        _ => false,
+    }
+}
+
 fn infer_app(
     state: &mut UnifyState,
     env: &mut Env,
@@ -2265,7 +2320,34 @@ fn infer_app(
             return Ok(Arc::unwrap_or_clone(ret));
         }
     }
-    let arg_ty = infer_expr(state, env, type_ops, arg)?;
+    // Partial-discharge through application / composition chains
+    // (the old engine's `discharges_partial`): when `func` is a
+    // `Partial`-discharging value (`unsafePartial :: (Partial => a) ->
+    // a`), or an application whose *argument* is one — so
+    // `unsafePartial <<< f`, `unsafePartial >>> f` and `unsafePartial $
+    // x` all match, since `func` is then `App(op, unsafePartial)` —
+    // push a `Partial` given while inferring the argument. A
+    // non-exhaustive `case`/binder in the argument then records itself
+    // as discharged via `has_partial_given`. The direct `unsafePartial
+    // (case …)` form is already handled by the `Constrained`-arg branch
+    // above (which returns early), so this only fills the
+    // function-position gap that branch can't see.
+    let discharges_partial = expr_is_partial_discharger(env, func)
+        || matches!(func, Expr::App { arg: inner, .. }
+            if expr_is_partial_discharger(env, inner));
+    let partial_snapshot = if discharges_partial {
+        Some(state.push_givens(vec![Constraint {
+            class: QName::unqualified("Partial"),
+            args: Vec::new(),
+        }]))
+    } else {
+        None
+    };
+    let arg_ty = infer_expr(state, env, type_ops, arg);
+    if let Some(snap) = partial_snapshot {
+        state.pop_givens_to(snap);
+    }
+    let arg_ty = arg_ty?;
     // Subsumption on the actual arg type: if `infer_expr` returned
     // a `Forall` / `Constrained` (e.g. a `Var` lookup whose scheme
     // had an inner forall — `Getter s t a b = forall r. Fold r s
