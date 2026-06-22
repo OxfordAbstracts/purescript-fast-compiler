@@ -202,8 +202,16 @@ pub fn build_decldb_from_globs(
     db_path: Option<&std::path::Path>,
 ) -> DeclDbBuildResult {
     let mut file_errors: Vec<BuildError> = Vec::new();
+    let discover_started = Instant::now();
     let paths = resolve_globs(globs, &mut file_errors);
+    eprintln!(
+        "Discovered {} source file{} ({:.2?})",
+        paths.len(),
+        if paths.len() == 1 { "" } else { "s" },
+        discover_started.elapsed(),
+    );
 
+    let read_started = Instant::now();
     let mut sources: Vec<(String, String)> = Vec::new();
     for path in &paths {
         match std::fs::read_to_string(path) {
@@ -225,14 +233,28 @@ pub fn build_decldb_from_globs(
             }
         }
     }
+    eprintln!(
+        "Read {} source file{} and {} FFI companion{} ({:.2?})",
+        sources.len(),
+        if sources.len() == 1 { "" } else { "s" },
+        js_sources.len(),
+        if js_sources.len() == 1 { "" } else { "s" },
+        read_started.elapsed(),
+    );
 
     let source_refs: Vec<(&str, &str)> =
         sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
     let js_refs: HashMap<&str, &str> =
         js_sources.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
+    eprintln!("Typechecking and generating JS…");
+    let build_started = Instant::now();
     let mut result =
         build_from_sources_decldb(&source_refs, &Some(js_refs), output_dir, db_path);
+    eprintln!(
+        "Typecheck + codegen finished in {:.2?}",
+        build_started.elapsed(),
+    );
     // Surface glob/read failures alongside parse failures.
     for err in file_errors {
         result.parse_errors.push((String::new(), format!("{err}")));
