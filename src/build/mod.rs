@@ -101,6 +101,9 @@ pub fn build_from_sources_decldb(
         None => TypecheckDb::open_in_memory().expect("open in-memory TypecheckDb"),
     };
     db.set_codegen(true);
+    // Let the build plan know where JS lives, so it re-checks (regenerates)
+    // any unchanged module whose index.js was deleted instead of skipping it.
+    db.set_output_dir(output_dir.map(|p| p.to_path_buf()));
     let report = check_many_modules_with_db(&mut db, inputs);
 
     let mut modules = Vec::new();
@@ -112,14 +115,29 @@ pub fn build_from_sources_decldb(
         let errors = format_decldb_errors(path, r, source);
         let error_count = errors.len();
         let mut wrote_js = false;
-        if let (Some(dir), Some(js)) = (output_dir, &r.js_module_text) {
+        if let Some(dir) = output_dir {
             let mod_dir = dir.join(&r.name);
-            if std::fs::create_dir_all(&mod_dir).is_ok()
-                && std::fs::write(mod_dir.join("index.js"), js).is_ok()
-            {
+            if r.cached {
+                // Restored/skipped by the build plan: its index.js is already
+                // on disk (the plan re-checks any unchanged module whose
+                // index.js is missing), so don't rewrite it — just ensure the
+                // FFI companion is present and count it as built.
                 wrote_js = true;
                 if let Some(ffi) = ffi_by_module.get(&r.name) {
-                    let _ = std::fs::write(mod_dir.join("foreign.js"), ffi);
+                    let foreign_path = mod_dir.join("foreign.js");
+                    if !foreign_path.exists() {
+                        let _ = std::fs::create_dir_all(&mod_dir);
+                        let _ = std::fs::write(foreign_path, ffi);
+                    }
+                }
+            } else if let Some(js) = &r.js_module_text {
+                if std::fs::create_dir_all(&mod_dir).is_ok()
+                    && std::fs::write(mod_dir.join("index.js"), js).is_ok()
+                {
+                    wrote_js = true;
+                    if let Some(ffi) = ffi_by_module.get(&r.name) {
+                        let _ = std::fs::write(mod_dir.join("foreign.js"), ffi);
+                    }
                 }
             }
         }

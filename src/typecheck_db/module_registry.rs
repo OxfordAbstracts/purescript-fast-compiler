@@ -298,6 +298,65 @@ impl ModuleRegistry {
             .unwrap_or(&[])
     }
 
+    // ===== Bulk per-module accessors for the build-plan module memo =====
+
+    /// All recorded scheme-only output hashes for `module`, as owned pairs.
+    pub fn scheme_hashes_for(&self, module: &str) -> Vec<(String, [u8; 32])> {
+        self.scheme_hashes
+            .get(module)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// All recorded non-value output hashes for `module`, as owned
+    /// `((kind_prefix, name), hash)` pairs.
+    pub fn nonvalue_hashes_for(&self, module: &str) -> Vec<((String, String), [u8; 32])> {
+        self.nonvalue_hashes
+            .get(module)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every `(class_name, instance_decl_key)` recorded for `module`,
+    /// recovered from the per-class index so a memo restore can rebuild
+    /// both `module_instances` and `instances_by_class` via
+    /// `push_module_instance`.
+    pub fn instances_with_class_for(&self, module: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for ((m, class), keys) in &self.instances_by_class {
+            if m == module {
+                for k in keys {
+                    out.push((class.clone(), k.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Repopulate every per-module structure for a clean module restored
+    /// from its memo: exports, per-decl scheme / non-value hashes, and
+    /// instances. Used by the build plan to skip `check_one_module` while
+    /// keeping the registry identical to what a fresh check would produce.
+    pub fn restore_module(
+        &mut self,
+        module: &str,
+        exports: ModuleExports,
+        scheme_hashes: Vec<(String, [u8; 32])>,
+        nonvalue_hashes: Vec<((String, String), [u8; 32])>,
+        instances: Vec<(String, String)>,
+    ) {
+        self.insert(module.to_string(), exports);
+        for (decl, h) in scheme_hashes {
+            self.set_scheme_hash(module.to_string(), decl, h);
+        }
+        for ((kind, name), h) in nonvalue_hashes {
+            self.set_nonvalue_hash(module.to_string(), kind, name, h);
+        }
+        for (class, key) in instances {
+            self.push_module_instance(module.to_string(), class, key);
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<&ModuleExports> {
         self.modules.get(name)
     }

@@ -546,3 +546,212 @@ useIt = fromJs
         "type change of a foreign import must invalidate users",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Build-plan module memo (Tier 1)
+//
+// The build plan only activates on a *persistent* (on-disk) db, so these
+// tests open a tempfile-backed `TypecheckDb`, build it cold, then **reopen
+// it from the same path** (simulating a fresh process / warm rebuild) and
+// assert which modules are restored from their memo vs re-checked.
+// ---------------------------------------------------------------------------
+
+/// Find a module's result by name and return whether it was restored from
+/// memo (`cached`).
+fn was_cached(report: &super::super::driver_multi::ModuleCheckReport, name: &str) -> bool {
+    report
+        .results
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap_or_else(|| panic!("no result for module {name}"))
+        .cached
+}
+
+fn js_of(report: &super::super::driver_multi::ModuleCheckReport, name: &str) -> Option<String> {
+    report
+        .results
+        .iter()
+        .find(|r| r.name == name)
+        .and_then(|r| r.js_module_text.clone())
+}
+
+#[test]
+fn build_plan_no_op_rebuild_marks_all_modules_cached() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let a = "module A where\nfn1 = 1\n";
+    let b = "module B where\nimport A\nfn2 = fn1\n";
+
+    // Cold build (fresh db): everything is checked, memos are written.
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("A", a), ("B", b)]);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(!was_cached(&first, "A") && !was_cached(&first, "B"), "cold build checks everything");
+        assert!(js_of(&first, "A").is_some() && js_of(&first, "B").is_some(), "codegen produced JS");
+    }
+
+    // Warm rebuild (reopened db, same sources): nothing changed, so nothing
+    // is dirty and nothing is "needed" — every module is skipped (cached).
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("A", a), ("B", b)]);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(was_cached(&second, "A"), "A unchanged → skipped");
+        assert!(was_cached(&second, "B"), "B unchanged → skipped");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_dirty_module_uses_restored_clean_dependency() {
+    // Y is unchanged (clean); X is edited (dirty) and imports Y. The plan
+    // must restore Y into the registry (it's in X's import-closure) so X's
+    // re-check resolves `yval`. An empty registry would surface as an import
+    // error on X — so "no errors" proves Y was restored.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let y = "module Y where\nyval :: Int\nyval = 1\n";
+    let x_v1 = "module X where\nimport Y\nxval = yval\n";
+    let x_v2 = "module X where\nimport Y\nxval = yval + 0\n"; // body edit to X only
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("Y", y), ("X", x_v1)]);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("Y", y), ("X", x_v2)]);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(was_cached(&second, "Y"), "Y unchanged but imported by dirty X → restored from memo");
+        assert!(!was_cached(&second, "X"), "X's source changed → re-checked");
+        // X must have type-checked against the restored Y (no import errors).
+        let x = second.results.iter().find(|r| r.name == "X").unwrap();
+        assert!(x.import_errors.is_empty(), "X resolved Y from the restored memo: {:?}", x.import_errors);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_type_edit_reprocesses_only_dirty_cone() {
+    // A's exported type changes; B imports A (so it's in the dirty cone and
+    // must re-check); C imports nothing changed (skipped). Uses a type edit
+    // so the change actually propagates under fine-grained invalidation.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let a_v1 = "module A where\nfn1 = 1\n"; // Int
+    let a_v2 = "module A where\nfn1 = \"x\"\n"; // String — exported type changes
+    let b = "module B where\nimport A\nfn2 = fn1\n"; // imports A
+    let c = "module C where\nunrelated = 7\n"; // imports nothing user-defined
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("A", a_v1), ("B", b), ("C", c)]);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("A", a_v2), ("B", b), ("C", c)]);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(!was_cached(&second, "A"), "A's source changed → re-checked");
+        assert!(!was_cached(&second, "B"), "B imports A whose exported type changed → re-checked");
+        assert!(was_cached(&second, "C"), "C imports nothing changed → skipped");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_body_edit_does_not_invalidate_importer() {
+    // Fine-grained (Stage 4): A's fn1 keeps type Int across a body edit; B
+    // imports A. A is re-checked (its source changed) but its *exported
+    // interface* is unchanged, so B must NOT be invalidated — it stays cached.
+    // (Coarse invalidation would have re-checked B as part of A's cone.)
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let a_v1 = "module A where\nfn1 = 1\n";
+    let a_v2 = "module A where\nfn1 = 2\n"; // body edit; inferred type still Int
+    let b = "module B where\nimport A (fn1)\nfn2 = fn1\n";
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("A", a_v1), ("B", b)]);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("A", a_v2), ("B", b)]);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(!was_cached(&second, "A"), "A's source changed → re-checked");
+        assert!(
+            was_cached(&second, "B"),
+            "A's exported type is unchanged, so B must stay cached (fine-grained)",
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_type_edit_does_invalidate_importer() {
+    // The dual of the above: when A's exported *type* changes, B must be
+    // re-checked (its ExportDiff is non-empty and touches what B imports).
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let a_v1 = "module A where\nfn1 = 1\n"; // Int
+    let a_v2 = "module A where\nfn1 = \"x\"\n"; // String — exported type changes
+    let b = "module B where\nimport A (fn1)\nfn2 = fn1\n";
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let _ = run_with_shared_db(&mut db, &[("A", a_v1), ("B", b)]);
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("A", a_v2), ("B", b)]);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(!was_cached(&second, "A"), "A changed → re-checked");
+        assert!(!was_cached(&second, "B"), "A's exported type changed → B re-checked");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_errored_module_is_never_memoized() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    // `bad` is annotated Int but defined as a String → a type error.
+    let m = "module M where\nbad :: Int\nbad = \"x\"\n";
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("M", m)]);
+        assert!(!first.errors.is_empty() || first.results[0].constraint_errors.len() + first.results[0].import_errors.len() > 0 || first.results[0].inference_error.is_some(),
+            "M should produce a diagnostic");
+    }
+    {
+        // Same (still-erroring) source: M must be re-checked, not restored,
+        // so its diagnostic is re-reported.
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("M", m)]);
+        assert!(!was_cached(&second, "M"), "errored module is never memoized → always re-checked");
+    }
+    let _ = std::fs::remove_file(&path);
+}

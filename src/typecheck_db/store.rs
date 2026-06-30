@@ -1,5 +1,6 @@
 //! SQLite persistence layer for pass outputs and their dep edges.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -35,6 +36,17 @@ CREATE TABLE IF NOT EXISTS module_source (
     module          TEXT PRIMARY KEY,
     source_hash     BLOB NOT NULL,
     decl_index_blob BLOB NOT NULL
+);
+
+-- Module-level memo for the build-plan fast path. `source_hash` is stored as
+-- its own column so the build plan can read every module's hash without
+-- deserializing the (large) memo blob. `memo_blob` is a bincode-serialized
+-- `ModuleMemo` (exports + per-decl registry hashes + instances + generated JS)
+-- restored into the `ModuleRegistry` when a module is proven clean.
+CREATE TABLE IF NOT EXISTS module_memo (
+    module      TEXT PRIMARY KEY,
+    source_hash BLOB NOT NULL,
+    memo_blob   BLOB NOT NULL
 );
 "#;
 
@@ -239,6 +251,60 @@ impl Store {
         }
         Ok(out)
     }
+
+    // ===== Module-level memo (build-plan fast path) =====
+
+    /// Every cached `(module, source_hash)` pair. Cheap — reads only the
+    /// `source_hash` column, never the memo blob, so the build plan can
+    /// diff all modules' source hashes up front in one query.
+    pub fn module_source_hashes(&self) -> Result<HashMap<String, [u8; 32]>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT module, source_hash FROM module_memo")?;
+        let rows = stmt.query_map([], |r| {
+            let m: String = r.get(0)?;
+            let h: Vec<u8> = r.get(1)?;
+            Ok((m, h))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (m, h) = r?;
+            out.insert(m, to_hash(&h)?);
+        }
+        Ok(out)
+    }
+
+    /// The serialized `ModuleMemo` blob for one module, if present.
+    pub fn get_module_memo_blob(&self, module: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT memo_blob FROM module_memo WHERE module = ?1")?;
+        let row = stmt
+            .query_row(params![module], |r| {
+                let b: Vec<u8> = r.get(0)?;
+                Ok(b)
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Persist (or overwrite) a module's memo blob and its source hash.
+    pub fn put_module_memo(
+        &self,
+        module: &str,
+        source_hash: [u8; 32],
+        memo_blob: &[u8],
+    ) -> Result<(), StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO module_memo (module, source_hash, memo_blob)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (module) DO UPDATE SET
+                source_hash = excluded.source_hash,
+                memo_blob   = excluded.memo_blob",
+        )?;
+        stmt.execute(params![module, &source_hash[..], memo_blob])?;
+        Ok(())
+    }
 }
 
 fn to_hash(bytes: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -318,5 +384,42 @@ mod tests {
         let got = store.get_deps(&k).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].dep_module, "Y");
+    }
+
+    #[test]
+    fn module_memo_round_trip_and_source_hashes() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.get_module_memo_blob("M").unwrap().is_none());
+        assert!(store.module_source_hashes().unwrap().is_empty());
+
+        store.put_module_memo("M", [7u8; 32], b"memo-blob").unwrap();
+        store.put_module_memo("N", [9u8; 32], b"other").unwrap();
+
+        assert_eq!(store.get_module_memo_blob("M").unwrap().unwrap(), b"memo-blob");
+        let hashes = store.module_source_hashes().unwrap();
+        assert_eq!(hashes.get("M"), Some(&[7u8; 32]));
+        assert_eq!(hashes.get("N"), Some(&[9u8; 32]));
+
+        // Overwrite updates both blob and source hash.
+        store.put_module_memo("M", [8u8; 32], b"memo-v2").unwrap();
+        assert_eq!(store.get_module_memo_blob("M").unwrap().unwrap(), b"memo-v2");
+        assert_eq!(store.module_source_hashes().unwrap().get("M"), Some(&[8u8; 32]));
+    }
+
+    #[test]
+    fn module_memo_persists_across_reopen() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        {
+            let store = Store::open(&path).unwrap();
+            store.put_module_memo("M", [3u8; 32], b"persisted").unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.get_module_memo_blob("M").unwrap().unwrap(), b"persisted");
+            assert_eq!(store.module_source_hashes().unwrap().get("M"), Some(&[3u8; 32]));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

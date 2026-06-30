@@ -6,7 +6,7 @@
 //! on top.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
@@ -46,6 +46,14 @@ pub struct TypecheckDb {
     /// (the `DeclDb` engine) and populates `ModuleCheckResult::js_module_text`.
     /// Off by default so plain typechecking pays no codegen cost.
     codegen_enabled: bool,
+    /// True for an on-disk store. The build-plan module memo (which lets a
+    /// warm rebuild skip unchanged modules entirely) only makes sense when
+    /// the cache persists across process runs, so it is gated on this.
+    persistent: bool,
+    /// Codegen output directory, if any. The build plan restores a clean
+    /// module's JS from disk rather than the memo, so it must re-check a
+    /// clean module whose `<dir>/<Module>/index.js` is missing.
+    output_dir: Option<PathBuf>,
 }
 
 impl TypecheckDb {
@@ -54,6 +62,8 @@ impl TypecheckDb {
             store: Store::open(path)?,
             memo: HashMap::new(),
             codegen_enabled: false,
+            persistent: true,
+            output_dir: None,
         })
     }
 
@@ -62,7 +72,25 @@ impl TypecheckDb {
             store: Store::open_in_memory()?,
             memo: HashMap::new(),
             codegen_enabled: false,
+            persistent: false,
+            output_dir: None,
         })
+    }
+
+    /// Whether this db persists to disk — gates the build-plan module memo.
+    pub fn persistent(&self) -> bool {
+        self.persistent
+    }
+
+    /// Tell the build plan where generated JS lives, so it can re-check a
+    /// clean module whose `index.js` is missing instead of skipping it.
+    pub fn set_output_dir(&mut self, dir: Option<PathBuf>) {
+        self.output_dir = dir;
+    }
+
+    /// The codegen output directory, if one was set.
+    pub fn output_dir(&self) -> Option<&Path> {
+        self.output_dir.as_deref()
     }
 
     /// Enable/disable per-declaration JS codegen for subsequent module checks.
@@ -146,6 +174,30 @@ impl TypecheckDb {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    // ===== Module-level memo passthroughs (build-plan fast path) =====
+
+    /// Every cached `(module, source_hash)` pair — for the build plan's
+    /// up-front source-change diff.
+    pub fn module_source_hashes(&self) -> Result<HashMap<String, [u8; 32]>, DriverError> {
+        Ok(self.store.module_source_hashes()?)
+    }
+
+    /// The raw serialized `ModuleMemo` blob for one module, if present.
+    pub fn get_module_memo_blob(&self, module: &str) -> Result<Option<Vec<u8>>, DriverError> {
+        Ok(self.store.get_module_memo_blob(module)?)
+    }
+
+    /// Persist a module's memo blob + source hash.
+    pub fn put_module_memo(
+        &self,
+        module: &str,
+        source_hash: [u8; 32],
+        blob: &[u8],
+    ) -> Result<(), DriverError> {
+        self.store.put_module_memo(module, source_hash, blob)?;
+        Ok(())
     }
 
     pub fn clear_memo(&mut self) {
