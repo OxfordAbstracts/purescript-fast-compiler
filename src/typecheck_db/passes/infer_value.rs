@@ -1274,14 +1274,19 @@ pub fn infer_value_scc_with_all(
                 };
                 // Seed constrained-argument positions from the sig so a rank-2
                 // `(C => T)` parameter carries its constraint into the body
-                // (capability pattern). Additionally seed positions whose sig
-                // type is fully ground (no type variables) — e.g. `Int` in
-                // `Int -> Int` — so a signed decl's concrete parameters (and
-                // any `where`/`let` helpers that reference them) infer to the
-                // declared type instead of an un-pinned fresh unif. Polymorphic
-                // positions stay fresh (no hint) to avoid over-constraining.
-                let arg_hints =
-                    signed_arg_hints(env, name, &mut state, binders.len());
+                // (capability pattern); ordinary params stay fresh unifs.
+                // In the IDE path (span recording on) ALSO seed fully-ground
+                // param positions so hover — including `where`/`let` helpers
+                // that reference a signed param — reflects the declared type.
+                // Normal builds keep the well-tested `constrained_arg_hints`
+                // behavior byte-for-byte (pinning ground params on the rank-1
+                // path is what regressed the ratchets; see memory notes), so
+                // this extra seeding is confined to IDE checks.
+                let arg_hints = if state.recording_spans() {
+                    signed_arg_hints(env, name, &mut state, binders.len())
+                } else {
+                    constrained_arg_hints(env, name, &mut state, binders.len())
+                };
                 let lam_ty = infer_equation_with_hints(
                     &mut state,
                     env,
@@ -1296,8 +1301,9 @@ pub fn infer_value_scc_with_all(
                 // the sig), so hover would show `?u`. Re-record each top-level
                 // `Binder::Var`'s span → the matching sig parameter type so
                 // hover reflects the declared signature. Recording only — does
-                // not affect inference.
-                if env.local_signed.contains(name) {
+                // not affect inference. Guarded so normal builds don't clone
+                // the scheme for data nothing consumes.
+                if state.recording_spans() && env.local_signed.contains(name) {
                     if let Some(scheme) = env
                         .top_level
                         .get(&QName { module: None, name: name.clone() })
@@ -4222,11 +4228,17 @@ fn type_is_ground(ty: &Type) -> bool {
 }
 
 /// Like [`constrained_arg_hints`], but ALSO seeds every parameter position
-/// whose signature type is fully ground (no type vars). This pins a signed
-/// decl's concrete parameters (e.g. `Int` in `Int -> Int`) so hover and
+/// whose signature type is fully ground (no type vars) — e.g. `Int` in
+/// `Int -> Int`. This pins a signed decl's concrete parameters so hover and
 /// `where`/`let` helpers that reference them see the declared type instead of
-/// an un-pinned fresh unif. Polymorphic positions keep `None` (no hint), so
-/// this never over-constrains a generic parameter.
+/// an un-pinned fresh unif. Polymorphic positions keep `None` (no hint).
+///
+/// IDE-ONLY: used only when span recording is enabled (`check_module_ide`).
+/// Pinning ground params is sound (the param IS that type per the signature,
+/// and matches the reference compiler checking the body against the sig), but
+/// to keep normal-build inference byte-for-byte identical to the well-tested
+/// `constrained_arg_hints` behavior, the call site branches on
+/// `UnifyState::recording_spans()`.
 fn signed_arg_hints(
     env: &Env,
     name: &str,

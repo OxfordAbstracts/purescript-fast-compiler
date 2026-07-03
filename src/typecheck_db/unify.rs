@@ -407,6 +407,12 @@ impl UnifyState {
         self.record_spans = on;
     }
 
+    /// Whether IDE span→type recording is on. Callers can skip building
+    /// recording-only data (e.g. cloning a scheme) when it's off.
+    pub fn recording_spans(&self) -> bool {
+        self.record_spans
+    }
+
     /// Record `span → ty` for hover, if recording is enabled. Types recorded
     /// here still contain unification variables; the SCC driver zonks the map
     /// via `take_span_types` once inference is complete.
