@@ -118,6 +118,15 @@ pub struct ModuleExports {
     /// Type constructor arities (Int=0, Array=1, Function=2, …).
     pub type_arities: HashMap<String, usize>,
 
+    /// Renderable kind per exported type constructor and class, for LSP
+    /// hover — e.g. `Type`, `Type -> Type`, `Type -> Constraint`,
+    /// `(Type -> Type) -> Constraint`. Types default to all-`Type` params
+    /// from their arity; classes carry their real param kinds (inferred from
+    /// method usage), so higher-kinded params render correctly. Not consumed
+    /// by the type checker — purely IDE metadata.
+    #[serde(default)]
+    pub type_kinds: HashMap<String, Type>,
+
     /// For each exported value, the *defining* module. When a
     /// module only re-exports a name (via `module Other` re-export
     /// clauses), the origin here is the module that actually
@@ -430,6 +439,10 @@ pub fn distill_exports(
         .collect::<Vec<_>>()
         .join(".");
     let mut scheme_by_name: HashMap<String, std::sync::Arc<Scheme>> = HashMap::new();
+    // Renderable class kinds (e.g. `(Type -> Type) -> Constraint`), keyed by
+    // class name, folded from the per-var kinds computed below. Merged into
+    // `out.type_kinds` before return (classes override the arity-based default).
+    let mut class_kinds_by_name: HashMap<String, Type> = HashMap::new();
     for d in &module.decls {
         match d {
             Decl::Class { name, type_vars, type_var_kind_anns, members, .. } => {
@@ -491,6 +504,22 @@ pub fn distill_exports(
                         }
                         class_var_kinds[i] = Some(k);
                     }
+                }
+                // Renderable class kind for hover: fold each param's kind
+                // (defaulting unannotated/un-inferred params to `Type`) into a
+                // right-nested arrow ending in `Constraint`. A no-param class
+                // is just `Constraint`.
+                {
+                    let kind = class_var_kinds.iter().rev().fold(
+                        crate::typecheck_db::types::prim_constraint(),
+                        |acc, k| {
+                            let param = k
+                                .clone()
+                                .unwrap_or_else(crate::typecheck_db::types::prim_kind_type);
+                            Type::Fun(std::sync::Arc::new(param), std::sync::Arc::new(acc))
+                        },
+                    );
+                    class_kinds_by_name.insert(class_name.clone(), kind);
                 }
                 for m in members {
                     let method_name =
@@ -1038,6 +1067,24 @@ pub fn distill_exports(
                     out.value_fixities.insert(op.clone(), fx.clone());
                 }
             }
+        }
+    }
+
+    // Renderable kinds for hover. Types default to all-`Type` params from
+    // their arity; classes then override with their real (possibly
+    // higher-kinded) param kinds. Only emit kinds for names actually exported.
+    for (n, arity) in &out.type_arities {
+        let kind = (0..*arity).fold(crate::typecheck_db::types::prim_kind_type(), |acc, _| {
+            Type::Fun(
+                std::sync::Arc::new(crate::typecheck_db::types::prim_kind_type()),
+                std::sync::Arc::new(acc),
+            )
+        });
+        out.type_kinds.insert(n.clone(), kind);
+    }
+    for (n, kind) in &class_kinds_by_name {
+        if out.classes.contains_key(n) {
+            out.type_kinds.insert(n.clone(), kind.clone());
         }
     }
 

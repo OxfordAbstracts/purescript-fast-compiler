@@ -106,3 +106,33 @@ fn underscore_prefixed_import_is_exempt() {
     let unused = unused_imports_of("Main", &[("Lib", lib), ("Main", main)]);
     assert!(!unused.iter().any(|n| n == "_helper"), "_-prefixed exempt: {unused:?}");
 }
+
+// --- A4: exported kinds for hover -------------------------------------------
+
+fn kind_of(name: &str, module: &str, src: &str) -> Option<String> {
+    let m = parse(src).expect("parse");
+    let report = check_many_modules(vec![ModuleInput::new(module, src, m)]);
+    report
+        .registry
+        .get(module)
+        .and_then(|e| e.type_kinds.get(name))
+        .map(|k| k.to_string())
+}
+
+#[test]
+fn exports_carry_class_and_type_kinds() {
+    let src = "module Test where\n\nclass MyShow a where\n  myShow :: a -> String\n\ndata Box a = MkBox a\n\ndata Color = Red\n";
+    assert_eq!(kind_of("MyShow", "Test", src).as_deref(), Some("Type -> Constraint"));
+    assert_eq!(kind_of("Box", "Test", src).as_deref(), Some("Type -> Type"));
+    assert_eq!(kind_of("Color", "Test", src).as_deref(), Some("Type"));
+}
+
+#[test]
+fn exports_carry_higher_kinded_class_kind() {
+    // `f` is applied to type args in the method, so it's `Type -> Type`.
+    let src = "module Test where\n\nclass MyFunctor f where\n  mmap :: forall a b. (a -> b) -> f a -> f b\n";
+    assert_eq!(
+        kind_of("MyFunctor", "Test", src).as_deref(),
+        Some("(Type -> Type) -> Constraint"),
+    );
+}
