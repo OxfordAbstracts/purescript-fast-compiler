@@ -136,3 +136,43 @@ fn exports_carry_higher_kinded_class_kind() {
         Some("(Type -> Type) -> Constraint"),
     );
 }
+
+// --- B1: check_module_ide entry point ---------------------------------------
+
+#[test]
+fn check_module_ide_gives_complete_span_types_against_warm_registry() {
+    use crate::typecheck_db::driver::TypecheckDb;
+    use crate::typecheck_db::driver_multi::{check_many_modules_with_db, check_module_ide};
+
+    // Warm the registry with Lib + Main, then IDE-check Main: span_types must
+    // cover Main's locals across BOTH decls, and its `base` import resolves
+    // against the warm registry.
+    let lib = "module Lib where\n\nbase :: Int\nbase = 1\n";
+    let main = "module Main where\nimport Lib (base)\n\nfirst :: Int\nfirst = base\n\nsecond :: Int -> Int\nsecond n = base\n";
+    let mut db = TypecheckDb::open_in_memory().unwrap();
+    let libm = parse(lib).unwrap();
+    let mainm = parse(main).unwrap();
+    let report = check_many_modules_with_db(
+        &mut db,
+        vec![
+            ModuleInput::new("Lib", lib, libm),
+            ModuleInput::new("Main", main, mainm.clone()),
+        ],
+    );
+    let mut registry = report.registry;
+
+    let input = ModuleInput::new("Main", main, mainm);
+    let r = check_module_ide(&mut db, &input, &mut registry);
+    assert!(
+        r.import_errors.is_empty(),
+        "warm registry resolves `base`: {:?}",
+        r.import_errors
+    );
+    // A use of `base` in the SECOND decl must be recorded (full re-inference).
+    let off = offset_of(main, "second n = base") + "second n = ".len();
+    assert_eq!(
+        ty_at(&r, off).as_deref(),
+        Some("Int"),
+        "IDE check records span types for the second decl too"
+    );
+}

@@ -206,6 +206,27 @@ pub fn check_many_modules(modules: Vec<ModuleInput>) -> ModuleCheckReport {
     check_many_modules_with_db(&mut db, modules)
 }
 
+/// Re-check ONE module against an already-populated (warm) `registry` for the
+/// IDE. Forces full re-inference of the focused module so its `span_types`
+/// (hover) and `warnings` (unused imports) are complete across every decl —
+/// not just the ones that would miss the per-decl cache. The module's own
+/// entry in `registry` is refreshed in place with the freshly-inferred
+/// exports, so subsequent hovers/completions see the edited surface.
+///
+/// This is the LSP's single-module entry point, the analog of the old
+/// `check_module_for_ide` / `check_module_with_registry`. Dependencies must
+/// already be present in `registry` (populated by an earlier full
+/// [`check_many_modules_with_db`] over the project). `imports_iface_hash` is
+/// zero here — IDE checks don't participate in the cross-build drift key and
+/// force full inference regardless.
+pub fn check_module_ide(
+    db: &mut TypecheckDb,
+    input: &ModuleInput,
+    registry: &mut ModuleRegistry,
+) -> ModuleCheckResult {
+    check_one_module(db, input, registry, [0u8; 32], true)
+}
+
 /// Check every module against a caller-owned [`TypecheckDb`]. Call
 /// this twice with the same `db` to observe incremental behavior:
 /// unchanged decls return [`CacheOutcome::Hit`] on the second run.
@@ -893,7 +914,7 @@ fn check_many_modules_inner(
 
         let started = std::time::Instant::now();
         crate::memstats::checkpoint(&format!("module:{}:start", input.name));
-        let result = check_one_module(db, input, registry, imports_iface_hash);
+        let result = check_one_module(db, input, registry, imports_iface_hash, false);
         crate::memstats::checkpoint(&format!("module:{}:end", input.name));
         let elapsed_ms = started.elapsed().as_millis();
         if timing_trace || elapsed_ms >= slow_threshold_ms {
@@ -1025,6 +1046,12 @@ fn check_one_module(
     // non-persistent runs (no build plan → every module is checked fresh
     // anyway, and the per-decl cache keeps its fine-grained cross-module keys).
     imports_iface_hash: [u8; 32],
+    // Force full re-inference of every value SCC (bypass the per-decl cache
+    // read). Used by the IDE entry point [`check_module_ide`] so `span_types`
+    // and `warnings` are complete across the whole module — a cache-hit decl
+    // never runs inference and would otherwise contribute neither. The normal
+    // build path passes `false`.
+    force_reinfer: bool,
 ) -> ModuleCheckResult {
     let name = input.name.clone();
     let module = &input.module;
@@ -2105,17 +2132,24 @@ fn check_one_module(
 
         scc_dep_resolve_total += scc_iter_started.elapsed();
         let cache_t = std::time::Instant::now();
-        // Try the cache first.
-        let cached = try_get_cached(
-            db,
-            &name,
-            &scc_key,
-            scc_source_hash,
-            &dep_output_hashes,
-            module_context_hash,
-            &mut env,
-        )
-        .expect("typecheck_db get_cached");
+        // Try the cache first — unless the caller forced full re-inference
+        // (IDE mode), where every SCC must run so span_types/warnings are
+        // complete. `try_get_cached` also binds cached schemes into `env`; the
+        // fresh-inference path below does the equivalent bind on the miss path.
+        let cached = if force_reinfer {
+            None
+        } else {
+            try_get_cached(
+                db,
+                &name,
+                &scc_key,
+                scc_source_hash,
+                &dep_output_hashes,
+                module_context_hash,
+                &mut env,
+            )
+            .expect("typecheck_db get_cached")
+        };
         scc_post_total += cache_t.elapsed();
 
         let (schemes, outcome, scheme_oh, full_oh) = match cached {
