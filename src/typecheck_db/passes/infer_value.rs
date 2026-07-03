@@ -807,6 +807,7 @@ fn check_equation(
         match b {
             Binder::Var { name, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                state.record_span_type(name.span, arg.clone());
                 env.bind_local(n, arg);
             }
             _ => {
@@ -915,6 +916,7 @@ fn check_lambda(
         match b {
             Binder::Var { name, .. } => {
                 let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
+                state.record_span_type(name.span, arg.clone());
                 env.bind_local(n, arg);
             }
             _ => {
@@ -1270,12 +1272,16 @@ pub fn infer_value_scc_with_all(
                 } else {
                     None
                 };
-                // Seed ONLY constrained-argument positions from the
-                // sig so a rank-2 `(C => T)` parameter carries its
-                // constraint into the body (capability pattern).
-                // Ordinary params stay fresh unifs.
+                // Seed constrained-argument positions from the sig so a rank-2
+                // `(C => T)` parameter carries its constraint into the body
+                // (capability pattern). Additionally seed positions whose sig
+                // type is fully ground (no type variables) — e.g. `Int` in
+                // `Int -> Int` — so a signed decl's concrete parameters (and
+                // any `where`/`let` helpers that reference them) infer to the
+                // declared type instead of an un-pinned fresh unif. Polymorphic
+                // positions stay fresh (no hint) to avoid over-constraining.
                 let arg_hints =
-                    constrained_arg_hints(env, name, &mut state, binders.len());
+                    signed_arg_hints(env, name, &mut state, binders.len());
                 let lam_ty = infer_equation_with_hints(
                     &mut state,
                     env,
@@ -1285,6 +1291,21 @@ pub fn infer_value_scc_with_all(
                     arg_hints.as_deref(),
                 )?;
                 state.unify_here(&expected, &lam_ty)?;
+                // IDE: on the rank-1 infer path a signed decl's parameters keep
+                // fresh unif slots (they're only generalized, never pinned to
+                // the sig), so hover would show `?u`. Re-record each top-level
+                // `Binder::Var`'s span → the matching sig parameter type so
+                // hover reflects the declared signature. Recording only — does
+                // not affect inference.
+                if env.local_signed.contains(name) {
+                    if let Some(scheme) = env
+                        .top_level
+                        .get(&QName { module: None, name: name.clone() })
+                        .map(|arc| arc.as_ref().clone())
+                    {
+                        record_sig_param_spans(&mut state, binders, &scheme.ty);
+                    }
+                }
                 if let Some(scheme) = sig_scheme_for_pin {
                     let original_should_pin =
                         hole_sites.is_some() || scheme_has_constraint(&scheme);
@@ -2614,6 +2635,9 @@ fn bind_pattern(
             let v = state.fresh();
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             env.bind_local(n, v.clone());
+            // IDE: record the binder's name span → its (fresh, later zonked)
+            // type so hover resolves local variables at their definition site.
+            state.record_span_type(name.span, v.clone());
             Ok(v)
         }
         Binder::Typed { binder, ty, .. } => {
@@ -2651,6 +2675,7 @@ fn bind_pattern(
             let inner = bind_pattern(state, env, type_ops, binder)?;
             let n = crate::typecheck_db::util::resolve_symbol(name.value.symbol());
             env.bind_local(n, inner.clone());
+            state.record_span_type(name.span, inner.clone());
             Ok(inner)
         }
         Binder::Record { fields, .. } => bind_record_pattern(state, env, type_ops, fields),
@@ -3188,6 +3213,9 @@ fn infer_let(
                     env.bind_local_scheme(n.clone(), scheme);
                 } else {
                     let slot = state.fresh();
+                    // IDE: record the let/where binding's name span → its slot
+                    // (zonked at drain) so hover resolves it at its def site.
+                    state.record_span_type(name.span, slot.clone());
                     env.bind_local(n.clone(), slot);
                 }
                 value_bindings.push(LetValueBinding { name: n, sig, expr });
@@ -3550,6 +3578,7 @@ fn process_do_let_bindings(
                     check_expr(state, env, type_ops, expr, &monotype)?;
                 } else {
                     let slot = state.fresh();
+                    state.record_span_type(name.span, slot.clone());
                     env.bind_local(n.clone(), slot.clone());
                     let actual = infer_expr(state, env, type_ops, expr)?;
                     state.unify_here(&slot, &actual)?;
@@ -4171,6 +4200,92 @@ fn constrained_arg_hints(
         }
     }
     if any { Some(hints) } else { None }
+}
+
+/// Whether `ty` mentions no type variable (fully ground). Used to decide
+/// whether a signed decl's parameter can be safely pinned to its sig type.
+fn type_is_ground(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Con(_) => true,
+        Type::Fun(a, b) => type_is_ground(a) && type_is_ground(b),
+        Type::App(f, x) => type_is_ground(f) && type_is_ground(x),
+        Type::Forall(_, _) => false,
+        Type::Constrained(_, _) => false,
+        Type::Record(fields, tail) => {
+            fields.iter().all(|(_, t)| type_is_ground(t))
+                && tail.as_ref().map_or(true, |t| type_is_ground(t))
+        }
+        Type::Unif(_) => false,
+        _ => false,
+    }
+}
+
+/// Like [`constrained_arg_hints`], but ALSO seeds every parameter position
+/// whose signature type is fully ground (no type vars). This pins a signed
+/// decl's concrete parameters (e.g. `Int` in `Int -> Int`) so hover and
+/// `where`/`let` helpers that reference them see the declared type instead of
+/// an un-pinned fresh unif. Polymorphic positions keep `None` (no hint), so
+/// this never over-constrains a generic parameter.
+fn signed_arg_hints(
+    env: &Env,
+    name: &str,
+    state: &mut UnifyState,
+    arity: usize,
+) -> Option<Vec<Option<Type>>> {
+    if arity == 0 || !env.local_signed.contains(name) {
+        return None;
+    }
+    let scheme = env
+        .top_level
+        .get(&QName { module: None, name: name.to_string() })
+        .map(|arc| arc.as_ref().clone())?;
+    let mono = instantiate_scheme_no_constraints(state, &scheme);
+    let mut hints: Vec<Option<Type>> = Vec::with_capacity(arity);
+    let mut cur = mono;
+    let mut any = false;
+    for _ in 0..arity {
+        match cur {
+            Type::Fun(a, b) => {
+                let za = state.zonk(&a);
+                if matches!(za, Type::Constrained(_, _)) || type_is_ground(&za) {
+                    hints.push(Some(za));
+                    any = true;
+                } else {
+                    hints.push(None);
+                }
+                cur = Arc::unwrap_or_clone(b);
+            }
+            _ => return None,
+        }
+    }
+    if any { Some(hints) } else { None }
+}
+
+/// IDE hover support: record each top-level `Binder::Var`'s name span → the
+/// corresponding parameter type from the declared signature `sig`. Walks the
+/// binder list against `sig`'s arrow chain (after stripping outer `Forall` /
+/// `Constrained` layers). Pure recording; no unification.
+fn record_sig_param_spans(state: &mut UnifyState, binders: &[Binder], sig: &Type) {
+    let mut cur = sig;
+    // Peel outer quantifiers / constraints to reach the arrow chain.
+    loop {
+        match cur {
+            Type::Forall(_, body) => cur = body,
+            Type::Constrained(_, body) => cur = body,
+            _ => break,
+        }
+    }
+    for b in binders {
+        let (arg, rest) = match cur {
+            Type::Fun(a, r) => (a.as_ref(), r.as_ref()),
+            _ => break,
+        };
+        if let Binder::Var { name, .. } = b {
+            state.record_span_type(name.span, arg.clone());
+        }
+        cur = rest;
+    }
 }
 
 /// Does the env's scheme for `name` carry a `Partial` constraint?

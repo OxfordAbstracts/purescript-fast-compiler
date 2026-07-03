@@ -11,7 +11,38 @@ use crate::cst::{
     ImportList, LetBinding, Literal, Module, TypeExpr,
 };
 use crate::interner::{self, Symbol};
-use crate::typechecker::error::TypeError;
+
+/// Name-resolution errors produced by this module's own resolver walk.
+/// These are internal to `resolve.rs` (only its `#[cfg(test)]` helpers read
+/// them); the LSP does not consume them. Mirrors the three variants the old
+/// resolver reported here, keeping the `crate::names::*` payload types.
+#[derive(Debug, Clone)]
+pub enum ResolveError {
+    UndefinedVariable {
+        span: Span,
+        name: crate::names::ValueName,
+    },
+    UnknownType {
+        span: Span,
+        name: crate::names::TypeName,
+    },
+    UnknownClass {
+        span: Span,
+        name: crate::names::Qualified<crate::names::ClassName>,
+    },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::UndefinedVariable { name, .. } => {
+                write!(f, "undefined variable: {name:?}")
+            }
+            ResolveError::UnknownType { name, .. } => write!(f, "unknown type: {name:?}"),
+            ResolveError::UnknownClass { name, .. } => write!(f, "unknown class: {name:?}"),
+        }
+    }
+}
 
 // ===== Public types =====
 
@@ -64,15 +95,15 @@ impl ResolutionExports {
         }
 
         // Add Prim submodule names so `module Prim.Row` re-exports work
+        let prim_all = crate::typecheck_db::prim::prim_exports();
         for sub in &[
             "Boolean", "Coerce", "Int", "Ordering", "Row", "RowList", "Symbol", "TypeError",
         ] {
-            let prim_mod_name = crate::cst::ModuleName {
-                parts: vec![interner::intern("Prim"), interner::intern(sub)],
-            };
-            let prim_sym = interner::intern(&format!("Prim.{}", sub));
-            let prim_exports = crate::typechecker::check::prim_submodule_exports(&prim_mod_name);
-            all_names_map.insert(prim_sym, module_exports_to_resolved_names(&prim_exports));
+            let prim_mod_str = format!("Prim.{}", sub);
+            let prim_sym = interner::intern(&prim_mod_str);
+            if let Some(prim_exports) = prim_all.get(&prim_mod_str) {
+                all_names_map.insert(prim_sym, module_exports_to_resolved_names(prim_exports));
+            }
         }
 
         // Pass 2: filter by export lists. Run multiple iterations so transitive
@@ -197,7 +228,7 @@ impl PModuleResolvedNames {
 /// Result of name resolution for a module.
 pub struct ResolvedResult {
     /// Name resolution errors (unresolved names, scope conflicts, etc.)
-    pub errors: Vec<TypeError>,
+    pub errors: Vec<ResolveError>,
     /// All resolutions, sorted by `src_span.start` for binary search.
     resolutions: Vec<ResolvedName>,
     /// Resolutions keyed by source span for direct lookup (index into `resolutions`).
@@ -325,7 +356,7 @@ type LocalScope = HashMap<Symbol, Span>;
 struct Resolver<'a> {
     scope: &'a NameScope,
     resolutions: Vec<ResolvedName>,
-    errors: Vec<TypeError>,
+    errors: Vec<ResolveError>,
 }
 
 // ===== Helpers =====
@@ -355,30 +386,39 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 
 // ===== Module export collection =====
 
-/// Convert a `ModuleExports` (from the typechecker, used for Prim) into a `ModuleResolvedNames`.
-fn module_exports_to_resolved_names(exports: &crate::typechecker::registry::ModuleExports) -> ModuleResolvedNames {
+/// Convert a typecheck_db `ModuleExports` (used for Prim) into a
+/// `ModuleResolvedNames`. All keys in the new exports are plain `String`s, so
+/// we intern each into a `Symbol` for the resolver's interned-key scope.
+fn module_exports_to_resolved_names(
+    exports: &crate::typecheck_db::module_registry::ModuleExports,
+) -> ModuleResolvedNames {
     let mut names = ModuleResolvedNames::new();
     for name in exports.values.keys() {
-        names.values.insert(name.name_symbol());
+        names.values.insert(interner::intern(name));
     }
     for (ty_name, ctors) in &exports.data_constructors {
-        names.types.insert(ty_name.name_symbol());
-        for ctor in ctors {
-            names.values.insert(ctor.name_symbol());
+        let ty_sym = interner::intern(ty_name);
+        names.types.insert(ty_sym);
+        let ctor_syms: Vec<Symbol> = ctors.iter().map(|c| interner::intern(c)).collect();
+        for &ctor in &ctor_syms {
+            names.values.insert(ctor);
         }
-        names.data_constructors.insert(ty_name.name_symbol(), ctors.iter().map(|c| c.name_symbol()).collect());
+        names.data_constructors.insert(ty_sym, ctor_syms);
     }
-    for name in exports.instances.keys() {
-        names.classes.insert(name.name_symbol());
+    for name in exports.type_arities.keys() {
+        names.types.insert(interner::intern(name));
     }
-    for (op, _) in &exports.type_operators {
-        names.type_operators.insert(op.name_symbol());
+    for name in exports.type_aliases.keys() {
+        names.types.insert(interner::intern(name));
+    }
+    for name in exports.classes.keys() {
+        names.classes.insert(interner::intern(name));
     }
     for op in exports.value_fixities.keys() {
-        names.values.insert(op.name_symbol());
+        names.values.insert(interner::intern(op));
     }
-    for name in exports.class_methods.keys() {
-        names.values.insert(name.name_symbol());
+    for op in exports.type_fixities.keys() {
+        names.type_operators.insert(interner::intern(op));
     }
     names
 }
@@ -536,9 +576,10 @@ fn filter_by_exports(
 
 // ===== Scope building =====
 
-/// Import all exports from a known module into scope with an optional qualifier.
+/// Import all exports from a known (typecheck_db) module into scope with an
+/// optional qualifier. Keys are plain `String`s in the new exports shape.
 fn import_known_exports_to_scope(
-    exports: &crate::typechecker::registry::ModuleExports,
+    exports: &crate::typecheck_db::module_registry::ModuleExports,
     scope: &mut NameScope,
     qualifier: Option<Symbol>,
     origin: NameOrigin,
@@ -546,54 +587,51 @@ fn import_known_exports_to_scope(
     for name in exports.values.keys() {
         scope
             .values
-            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
+            .insert(maybe_qualify(interner::intern(name), qualifier), origin.clone());
     }
-    for name in exports.data_constructors.keys() {
-        scope
-            .types
-            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
-    }
-    for (op, _) in &exports.type_operators {
-        scope.type_operators.insert(op.name_symbol(), origin.clone());
-    }
-    for op in exports.value_fixities.keys() {
+    for name in exports.value_fixities.keys() {
         scope
             .values
-            .insert(maybe_qualify(op.name_symbol(), qualifier), origin.clone());
+            .insert(maybe_qualify(interner::intern(name), qualifier), origin.clone());
     }
-    for name in exports.class_methods.keys() {
+    for name in exports.classes.keys() {
         scope
             .classes
-            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
-    }
-    for name in exports.class_param_counts.keys() {
-        scope
-            .classes
-            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
+            .insert(maybe_qualify(interner::intern(name), qualifier), origin.clone());
     }
     for name in exports.type_aliases.keys() {
         scope
             .types
-            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
+            .insert(maybe_qualify(interner::intern(name), qualifier), origin.clone());
     }
-    for ctors in exports.data_constructors.values() {
+    for name in exports.type_arities.keys() {
+        scope
+            .types
+            .insert(maybe_qualify(interner::intern(name), qualifier), origin.clone());
+    }
+    for (ty_name, ctors) in &exports.data_constructors {
+        scope
+            .types
+            .insert(maybe_qualify(interner::intern(ty_name), qualifier), origin.clone());
         for ctor in ctors {
             scope
                 .values
-                .insert(maybe_qualify(ctor.name_symbol(), qualifier), origin.clone());
+                .insert(maybe_qualify(interner::intern(ctor), qualifier), origin.clone());
         }
     }
-    for name in exports.type_con_arities.keys() {
+    for name in exports.type_fixities.keys() {
         scope
-            .types
-            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
+            .type_operators
+            .insert(interner::intern(name), origin.clone());
     }
 }
 
 /// Import Prim exports into scope (unqualified). Prim types are built-in.
 fn import_prim_to_scope(scope: &mut NameScope) {
-    let prim = crate::typechecker::check::prim_exports();
-    import_known_exports_to_scope(prim, scope, None, NameOrigin::Prim);
+    let prim = crate::typecheck_db::prim::prim_exports();
+    if let Some(prim_main) = prim.get("Prim") {
+        import_known_exports_to_scope(prim_main, scope, None, NameOrigin::Prim);
+    }
 }
 
 /// Import a Prim module or submodule's exports into scope.
@@ -603,12 +641,11 @@ fn import_prim_module_to_scope(
     qualifier: Option<Symbol>,
     imports: &Option<ImportList>,
 ) {
-    let owned_exports;
-    let exports: &crate::typechecker::registry::ModuleExports = if is_prim_module(module) {
-        crate::typechecker::check::prim_exports()
-    } else {
-        owned_exports = crate::typechecker::check::prim_submodule_exports(module);
-        &owned_exports
+    let module_str = interner::resolve_module_name(&module.parts);
+    let prim_all = crate::typecheck_db::prim::prim_exports();
+    let exports = match prim_all.get(&module_str) {
+        Some(e) => e,
+        None => return,
     };
 
     let origin = NameOrigin::Prim;
@@ -617,8 +654,8 @@ fn import_prim_module_to_scope(
             import_known_exports_to_scope(exports, scope, qualifier, origin);
         }
         Some(ImportList::Explicit(items)) => {
-            // For explicit Prim imports, we can enumerate constructors/methods
-            // from the known exports
+            // For explicit Prim imports, we can enumerate constructors from the
+            // known exports.
             for item in items {
                 match item {
                     crate::cst::Import::Value(name) => {
@@ -630,13 +667,14 @@ fn import_prim_module_to_scope(
                         scope
                             .types
                             .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
-                        let name_typed = crate::names::Qualified::unqualified(crate::names::TypeName::new(name.value.symbol()));
-                        if let Some(ctors) = exports.data_constructors.get(&name_typed) {
+                        let type_name_str =
+                            interner::resolve(name.value.symbol()).unwrap_or_default();
+                        if let Some(ctors) = exports.data_constructors.get(&type_name_str) {
                             match members {
                                 Some(crate::cst::DataMembers::All) => {
                                     for ctor in ctors {
                                         scope.values.insert(
-                                            maybe_qualify(ctor.name_symbol(), qualifier),
+                                            maybe_qualify(interner::intern(ctor), qualifier),
                                             origin.clone(),
                                         );
                                     }
@@ -659,14 +697,6 @@ fn import_prim_module_to_scope(
                         scope
                             .classes
                             .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
-                        // Also import class methods
-                        for (method, (class, _)) in &exports.class_methods {
-                            if class.name_symbol() == name.value.symbol() {
-                                scope
-                                    .values
-                                    .insert(maybe_qualify(method.name_symbol(), qualifier), origin.clone());
-                            }
-                        }
                     }
                 }
             }
@@ -878,9 +908,11 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
         import_prim_to_scope(&mut scope);
     }
     // Prim is always available as a qualifier (for Prim.Int, Prim.Boolean, etc.)
-    let prim = crate::typechecker::check::prim_exports();
-    let prim_sym = interner::intern("Prim");
-    import_known_exports_to_scope(prim, &mut scope, Some(prim_sym), NameOrigin::Prim);
+    let prim_all = crate::typecheck_db::prim::prim_exports();
+    if let Some(prim_main) = prim_all.get("Prim") {
+        let prim_sym = interner::intern("Prim");
+        import_known_exports_to_scope(prim_main, &mut scope, Some(prim_sym), NameOrigin::Prim);
+    }
 
     // Process imports
     for import_decl in &module.imports {
@@ -1111,7 +1143,7 @@ impl<'a> Resolver<'a> {
                 definition: origin.to_definition_site(),
             });
         } else {
-            self.errors.push(TypeError::UndefinedVariable {
+            self.errors.push(ResolveError::UndefinedVariable {
                 span,
                 name: crate::names::ValueName::new(resolved),
             });
@@ -1141,7 +1173,7 @@ impl<'a> Resolver<'a> {
                 definition: origin.to_definition_site(),
             });
         } else {
-            self.errors.push(TypeError::UnknownType {
+            self.errors.push(ResolveError::UnknownType {
                 span,
                 name: crate::names::TypeName::new(resolved),
             });
@@ -1162,7 +1194,7 @@ impl<'a> Resolver<'a> {
                 definition: origin.to_definition_site(),
             });
         } else {
-            self.errors.push(TypeError::UnknownClass {
+            self.errors.push(ResolveError::UnknownClass {
                 span,
                 name: crate::names::Qualified {
                     module: module.map(crate::names::ModuleQualifier::new),
@@ -1182,7 +1214,7 @@ impl<'a> Resolver<'a> {
                 definition: origin.to_definition_site(),
             });
         } else {
-            self.errors.push(TypeError::UnknownType {
+            self.errors.push(ResolveError::UnknownType {
                 span,
                 name: crate::names::TypeName::new(name),
             });
@@ -1792,7 +1824,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             if !r.scope.values.contains_key(&resolved)
                 && !r.scope.types.contains_key(&resolved)
             {
-                r.errors.push(TypeError::UndefinedVariable {
+                r.errors.push(ResolveError::UndefinedVariable {
                     span: *span,
                     name: crate::names::ValueName::new(resolved),
                 });
@@ -1877,7 +1909,7 @@ mod tests {
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UndefinedVariable { name: n, .. } if n.eq_str(name)))
+            .any(|e| matches!(e, ResolveError::UndefinedVariable { name: n, .. } if n.eq_str(name)))
     }
 
     /// Check if any error is an UnknownType for the given name.
@@ -1885,7 +1917,7 @@ mod tests {
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UnknownType { name: n, .. } if n.eq_str(name)))
+            .any(|e| matches!(e, ResolveError::UnknownType { name: n, .. } if n.eq_str(name)))
     }
 
     /// Check if any error is an UnknownClass for the given name.
@@ -1893,7 +1925,7 @@ mod tests {
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UnknownClass { name: n, .. } if n.name.eq_str(name)))
+            .any(|e| matches!(e, ResolveError::UnknownClass { name: n, .. } if n.name.eq_str(name)))
     }
 
     // ===== Error cases =====

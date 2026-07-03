@@ -54,7 +54,7 @@ impl Backend {
         // not just the ones the client included in `context.diagnostics` (clients often
         // only send diagnostics within the requested range).
         if let Some(module) = &module {
-            let unused_spans = self.collect_unused_import_spans(module).await;
+            let unused_spans = self.collect_unused_import_spans(module, &source).await;
             if !unused_spans.is_empty() {
                 if let Some(action) =
                     remove_all_imports_action(&uri, &source, module, &unused_spans)
@@ -71,14 +71,22 @@ impl Backend {
         }
     }
 
-    async fn collect_unused_import_spans(&self, module: &Module) -> Vec<Span> {
-        let registry = self.registry.read().await;
-        let result = crate::typechecker::check_module_with_registry(module, &registry);
+    async fn collect_unused_import_spans(&self, module: &Module, source: &str) -> Vec<Span> {
+        use crate::typecheck_db::driver_multi::{check_module_ide, ModuleInput};
+        use crate::typecheck_db::passes::warnings::WarningKind;
+
+        let module_name = crate::interner::resolve_module_name(&module.name.value.parts);
+        let input = ModuleInput::new(module_name, source.to_string(), module.clone());
+        let result = {
+            let mut reg = self.registry.write().await;
+            let mut db = self.db.lock().await;
+            check_module_ide(&mut db, &input, &mut reg)
+        };
         result
             .warnings
             .iter()
-            .filter_map(|w| match w {
-                crate::typechecker::error::TypeWarning::UnusedImport { span, .. } => Some(*span),
+            .filter_map(|w| match &w.kind {
+                WarningKind::UnusedImport { .. } => Some(w.span),
                 _ => None,
             })
             .collect()

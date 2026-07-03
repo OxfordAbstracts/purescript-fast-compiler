@@ -2,10 +2,10 @@ use std::fmt::Display;
 
 use tower_lsp::lsp_types::*;
 
-use crate::cst::Module;
 use crate::interner;
-use crate::build::cache::{ModuleCache, extract_import_items};
-use crate::typechecker::registry::ModuleRegistry;
+use crate::span::Span;
+use crate::typecheck_db::driver_multi::{check_module_ide, ModuleCheckResult, ModuleInput};
+use crate::typecheck_db::passes::warnings::WarningKind;
 
 use super::super::{Backend, FileState};
 
@@ -14,32 +14,6 @@ impl Backend {
         self.client
             .log_message(MessageType::INFO, message)
             .await;
-    }
-
-    /// Ensure all modules imported by `module` have their exports loaded into the registry.
-    /// Loads missing exports lazily from the ModuleCache (which reads from disk on demand).
-    async fn ensure_imports_loaded(&self, module: &Module, registry: &mut ModuleRegistry) {
-        for import_decl in &module.imports {
-            let import_parts = &import_decl.module.parts;
-
-            // Skip if already in registry
-            if registry.lookup(import_parts).is_some() {
-                continue;
-            }
-
-            let import_name = interner::resolve_module_name(import_parts);
-
-            // Try to load from module cache (lazy disk load)
-            let exports = {
-                let mut cache = self.module_cache.write().await;
-                cache.get_exports(&import_name).cloned()
-            };
-
-            if let Some(exports) = exports {
-                registry.register(import_parts, exports);
-                log::debug!("Lazy-loaded exports for {import_name}");
-            }
-        }
     }
 
     pub(crate) async fn on_change(&self, uri: Url, source: String) {
@@ -91,192 +65,197 @@ impl Backend {
         self.info(format!("[on_change] parse: {:.2?}", t.elapsed())).await;
 
         let module_name = interner::resolve_module_name(&module.name.value.parts);
-        let module_parts: Vec<interner::Symbol> = module.name.value.parts.clone();
 
-        // Ensure imported modules' exports are in the registry (lazy load from cache)
+        // Type-check the focused module against the warm registry. Its
+        // dependencies are already present in the registry from the project
+        // load (C3); `check_module_ide` forces full re-inference of this module
+        // so span-types + warnings are complete, and refreshes the module's own
+        // entry in the registry.
         let t = std::time::Instant::now();
-        let mut registry = self.registry.write().await;
-        self.ensure_imports_loaded(&module, &mut registry).await;
-        self.info(format!("[on_change] ensure_imports_loaded: {:.2?}", t.elapsed())).await;
-
-        // Type-check against the registry
-        let t = std::time::Instant::now();
-        let check_result = crate::typechecker::check_module_with_registry(&module, &registry);
+        let input = ModuleInput::new(module_name.clone(), source.clone(), module);
+        let check_result = {
+            let mut reg = self.registry.write().await;
+            let mut db = self.db.lock().await;
+            check_module_ide(&mut db, &input, &mut reg)
+        };
         self.info(format!("[on_change] typecheck {module_name}: {:.2?}", t.elapsed())).await;
 
-        // Update registry with new exports
-        registry.register(&module_parts, check_result.exports.clone());
-
-        // Update cache
-        let source_hash = ModuleCache::content_hash(&source);
-        let import_names: Vec<String> = module.imports.iter()
-            .map(|imp| interner::resolve_module_name(&imp.module.parts))
-            .collect();
-        let import_items = extract_import_items(&module.imports);
-        let mut cache = self.module_cache.write().await;
-        cache.update(module_name.clone(), source_hash, check_result.exports.clone(), import_names, import_items, !check_result.errors.is_empty());
-        drop(cache);
-
         // Publish diagnostics for the changed module: errors and warnings together.
-        let mut diagnostics = type_errors_to_diagnostics(&check_result.errors, &source);
-        diagnostics.extend(type_warnings_to_diagnostics(&check_result.warnings, &source));
+        let diagnostics = to_diagnostics(&check_result, &source);
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
 
-        // Code generation (only when output_dir is set and no type errors)
-        if check_result.errors.is_empty() {
-            if let Some(ref output_dir) = self.output_dir {
-                let t = std::time::Instant::now();
+        // Code generation: `check_module_ide` produces `js_module_text` when
+        // codegen is enabled (output_dir set), but does NOT write it — the LSP
+        // does. Write `<output_dir>/<ModuleName>/index.js` and copy a companion
+        // `foreign.js` when the source `.purs` has a sibling `.js`.
+        if let (Some(js_text), Some(output_dir)) =
+            (check_result.js_module_text.as_ref(), self.output_dir.as_ref())
+        {
+            let t = std::time::Instant::now();
+            let module_dir = output_dir.join(&module_name);
+            if let Err(e) = std::fs::create_dir_all(&module_dir) {
+                self.info(format!("[codegen] failed to create dir {}: {e}", module_dir.display())).await;
+            } else {
+                let index_path = module_dir.join("index.js");
+                if let Err(e) = std::fs::write(&index_path, js_text) {
+                    self.info(format!("[codegen] failed to write {}: {e}", index_path.display())).await;
+                }
 
-                // Check for companion FFI file (.js next to .purs)
-                let has_ffi = uri.to_file_path().ok().map_or(false, |purs_path| {
-                    let js_path = purs_path.with_extension("js");
-                    js_path.exists()
-                });
-
-                let module_exports = registry.lookup(&module_parts).expect("just registered");
-                let global = crate::codegen::js::GlobalCodegenData::from_registry(&registry);
-                let js_module = crate::codegen::js::module_to_js(
-                    &module,
-                    &module_name,
-                    &module_parts,
-                    module_exports,
-                    &registry,
-                    has_ffi,
-                    &global,
-                    &check_result.all_ctor_details,
-                    &check_result.all_data_constructors,
-                    &check_result.types,
-                    &check_result.span_types,
-                );
-                let js_text = crate::codegen::printer::print_module(&js_module);
-
-                let module_dir = output_dir.join(&module_name);
-                if let Err(e) = std::fs::create_dir_all(&module_dir) {
-                    self.info(format!("[codegen] failed to create dir {}: {e}", module_dir.display())).await;
-                } else {
-                    let index_path = module_dir.join("index.js");
-                    if let Err(e) = std::fs::write(&index_path, &js_text) {
-                        self.info(format!("[codegen] failed to write {}: {e}", index_path.display())).await;
-                    }
-
-                    // Copy FFI companion file
-                    if has_ffi {
-                        if let Ok(purs_path) = uri.to_file_path() {
-                            let js_src_path = purs_path.with_extension("js");
-                            let foreign_path = module_dir.join("foreign.js");
-                            if let Err(e) = std::fs::copy(&js_src_path, &foreign_path) {
-                                self.info(format!("[codegen] failed to copy foreign.js: {e}")).await;
-                            }
+                // Copy the FFI companion file (.js next to .purs) if present.
+                if let Ok(purs_path) = uri.to_file_path() {
+                    let js_src_path = purs_path.with_extension("js");
+                    if js_src_path.exists() {
+                        let foreign_path = module_dir.join("foreign.js");
+                        if let Err(e) = std::fs::copy(&js_src_path, &foreign_path) {
+                            self.info(format!("[codegen] failed to copy foreign.js: {e}")).await;
                         }
                     }
                 }
-
-                self.info(format!("[on_change] codegen {module_name}: {:.2?}", t.elapsed())).await;
             }
+            self.info(format!("[on_change] codegen {module_name}: {:.2?}", t.elapsed())).await;
         }
 
         self.info(format!("[on_change] total: {:.2?}", on_change_start.elapsed())).await;
     }
+}
 
-    /// Re-typecheck all files that are currently open in the editor.
-    /// Called after initialization completes to process files opened during loading.
-    pub(crate) async fn typecheck_open_files(&self) {
-        let open_files: Vec<(String, String)> = {
-            let files = self.files.read().await;
-            files.iter().map(|(uri, fs)| (uri.clone(), fs.source.clone())).collect()
-        };
-        if open_files.is_empty() {
-            return;
-        }
-        self.info(format!("[lsp] typechecking {} open file(s) after init", open_files.len())).await;
-        for (uri_str, source) in open_files {
-            if let Ok(uri) = Url::parse(&uri_str) {
-                self.on_change(uri, source).await;
-            }
-        }
+/// Convert a `Span` into an LSP `Range` against `source`.
+fn span_to_range(span: &Span, source: &str) -> Range {
+    match span.to_pos(source) {
+        Some((start, end)) => Range {
+            start: Position {
+                line: start.line.saturating_sub(1) as u32,
+                character: start.column.saturating_sub(1) as u32,
+            },
+            end: Position {
+                line: end.line.saturating_sub(1) as u32,
+                character: end.column.saturating_sub(1) as u32,
+            },
+        },
+        None => Range::default(),
     }
 }
 
-pub(crate) fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], source: &str) -> Vec<Diagnostic> {
-    errors
-        .iter()
-        .map(|err| {
-            let span = err.span();
-            let range = match span.to_pos(source) {
-                Some((start, end)) => Range {
-                    start: Position {
-                        line: start.line.saturating_sub(1) as u32,
-                        character: start.column.saturating_sub(1) as u32,
-                    },
-                    end: Position {
-                        line: end.line.saturating_sub(1) as u32,
-                        character: end.column.saturating_sub(1) as u32,
-                    },
-                },
-                None => Range::default(),
-            };
-            Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(format!("TypeError.{}", err.code()))),
-                source: Some("pfc".to_string()),
-                message: format!("{}\n", err.format_pretty()),
-                ..Default::default()
-            }
-        })
-        .collect()
+fn error_diag(span: &Span, source: &str, code: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        range: span_to_range(span, source),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(code.to_string())),
+        source: Some("pfc".to_string()),
+        message,
+        ..Default::default()
+    }
 }
 
-pub(crate) fn type_warnings_to_diagnostics(
-    warnings: &[crate::typechecker::error::TypeWarning],
-    source: &str,
-) -> Vec<Diagnostic> {
-    warnings
-        .iter()
-        .map(|w| {
-            let span = w.span();
-            let range = match span.to_pos(source) {
-                Some((start, end)) => Range {
-                    start: Position {
-                        line: start.line.saturating_sub(1) as u32,
-                        character: start.column.saturating_sub(1) as u32,
-                    },
-                    end: Position {
-                        line: end.line.saturating_sub(1) as u32,
-                        character: end.column.saturating_sub(1) as u32,
-                    },
-                },
-                None => Range::default(),
-            };
-            Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::WARNING),
-                code: Some(NumberOrString::String(format!("TypeWarning.{}", w.code()))),
-                source: Some("pfc".to_string()),
-                message: format!("{w}\n"),
-                ..Default::default()
-            }
-        })
-        .collect()
+/// Map every diagnostic channel of a typecheck_db [`ModuleCheckResult`] — all
+/// eight error channels plus the warning channel — to LSP `Diagnostic`s.
+pub(crate) fn to_diagnostics(result: &ModuleCheckResult, source: &str) -> Vec<Diagnostic> {
+    let mut diags: Vec<Diagnostic> = Vec::new();
+
+    for e in &result.import_errors {
+        diags.push(error_diag(
+            &e.span,
+            source,
+            "TypeError.ImportError",
+            format!("Import error: {:?}", e.kind),
+        ));
+    }
+    for e in &result.validation_errors {
+        diags.push(error_diag(
+            &e.span,
+            source,
+            "TypeError.ValidationError",
+            format!("{:?}", e.kind),
+        ));
+    }
+    for e in &result.kind_errors {
+        diags.push(error_diag(
+            &e.span,
+            source,
+            "TypeError.KindError",
+            format!("{:?}", e.kind),
+        ));
+    }
+    for e in &result.coercible_errors {
+        diags.push(error_diag(
+            &e.span,
+            source,
+            "TypeError.CoercibleError",
+            format!("{:?}", e.kind),
+        ));
+    }
+    for e in &result.exhaustiveness_errors {
+        diags.push(error_diag(
+            &e.span,
+            source,
+            "TypeError.NonExhaustivePattern",
+            format!(
+                "Non-exhaustive patterns for {}: missing {:?}",
+                e.type_name, e.missing
+            ),
+        ));
+    }
+    for e in &result.constraint_errors {
+        diags.push(error_diag(
+            &e.span,
+            source,
+            "TypeError.ConstraintError",
+            format!(
+                "{:?}: {} (args={:?})",
+                e.kind, e.constraint.class.name, e.constraint.args
+            ),
+        ));
+    }
+    for h in &result.hole_diagnostics {
+        diags.push(error_diag(
+            &h.span,
+            source,
+            "TypeError.TypedHole",
+            format!("{h:?}"),
+        ));
+    }
+    // `inference_error` is a fatal early-bailout enum with no single reliable
+    // span; use a best-effort range.
+    if let Some(ie) = &result.inference_error {
+        diags.push(Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("TypeError.InferenceError".to_string())),
+            source: Some("pfc".to_string()),
+            message: format!("Inference error: {ie:?}"),
+            ..Default::default()
+        });
+    }
+
+    for w in &result.warnings {
+        let (code, message) = match &w.kind {
+            WarningKind::UnusedImport { name } => (
+                "TypeWarning.UnusedImport".to_string(),
+                format!("Unused import: {name}"),
+            ),
+            WarningKind::UnusedName { name } => (
+                "TypeWarning.UnusedName".to_string(),
+                format!("Unused name: {name}"),
+            ),
+        };
+        diags.push(Diagnostic {
+            range: span_to_range(&w.span, source),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(code)),
+            source: Some("pfc".to_string()),
+            message,
+            ..Default::default()
+        });
+    }
+
+    diags
 }
 
 pub(crate) fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Range {
     match err.get_span() {
-        Some(span) => match span.to_pos(source) {
-            Some((start, end)) => Range {
-                start: Position {
-                    line: start.line.saturating_sub(1) as u32,
-                    character: start.column.saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: end.line.saturating_sub(1) as u32,
-                    character: end.column.saturating_sub(1) as u32,
-                },
-            },
-            None => Range::default(),
-        },
+        Some(span) => span_to_range(&span, source),
         None => Range::default(),
     }
 }

@@ -1,18 +1,30 @@
-use std::collections::HashMap;
-
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
 use crate::cst::{self, Comment, Decl};
 use crate::interner;
-use crate::names;
 use crate::lsp::utils::find_definition::position_to_offset;
 use crate::lsp::utils::resolve::{self, DefinitionSite, Namespace};
-use crate::typechecker::error::pretty_type;
-use crate::typechecker::types::Type;
+use crate::typecheck_db::driver_multi::{check_module_ide, ModuleInput};
+use crate::typecheck_db::types::Type;
 
 fn fmt_ty(ty: &Type) -> String {
-    pretty_type(ty, &HashMap::new())
+    ty.to_string()
+}
+
+/// Render a constructor's type from its `CtorInfo`: the fields as an arrow
+/// chain ending in the parent type applied to its type vars. Constructors are
+/// not stored in `ModuleExports.values`, so hover synthesizes their type here.
+fn ctor_type_string(info: &crate::typecheck_db::passes::exhaustiveness::CtorInfo) -> String {
+    let mut result = info.parent_type.clone();
+    for v in &info.type_vars {
+        result.push(' ');
+        result.push_str(v);
+    }
+    for field in info.fields.iter().rev() {
+        result = format!("{} -> {result}", field);
+    }
+    result
 }
 
 /// Format a `name :: type` line, wrapping long types onto a new indented line
@@ -117,7 +129,7 @@ impl Backend {
                         }
                     }
                     DefinitionSite::LocalVar(local_span) => {
-                        self.get_local_var_type(&module, *local_span).await
+                        self.get_local_var_type(&module, &source, *local_span).await
                     }
                     DefinitionSite::Imported(module_sym) => {
                         let ty = self.get_imported_type(*module_sym, &name_str).await;
@@ -216,52 +228,80 @@ impl Backend {
         }))
     }
 
+    /// Run an IDE check of `module` against the warm registry and return its
+    /// span→type map. `module_name` is the dotted name; `source` is the module
+    /// text for per-decl hashing.
+    async fn ide_span_types(
+        &self,
+        module: &cst::Module,
+        source: &str,
+    ) -> std::collections::HashMap<crate::span::Span, Type> {
+        let module_name = interner::resolve_module_name(&module.name.value.parts);
+        let input = ModuleInput::new(module_name, source.to_string(), module.clone());
+        let mut reg = self.registry.write().await;
+        let mut db = self.db.lock().await;
+        check_module_ide(&mut db, &input, &mut reg).span_types
+    }
+
     async fn hover_span_type(&self, module: &cst::Module, source: &str, offset: usize) -> Result<Option<Hover>> {
-        let registry = self.registry.read().await;
-        let check_result = crate::typechecker::check_module_for_ide(module, &registry);
-        for (span, ty) in &check_result.span_types {
-            if offset >= span.start && offset < span.end {
-                let label = &source[span.start..span.end];
-                let type_str = fmt_ty(ty);
-                let sig = format_sig(label, &type_str);
-                let markdown = format!("```purescript\n{sig}\n```");
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: markdown,
-                    }),
-                    range: None,
-                }));
-            }
+        let span_types = self.ide_span_types(module, source).await;
+        // On ties, prefer the narrowest span containing the offset.
+        let best = span_types
+            .iter()
+            .filter(|(span, _)| offset >= span.start && offset < span.end)
+            .min_by_key(|(span, _)| span.end - span.start);
+        if let Some((span, ty)) = best {
+            let label = &source[span.start..span.end];
+            let type_str = fmt_ty(ty);
+            let sig = format_sig(label, &type_str);
+            let markdown = format!("```purescript\n{sig}\n```");
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: markdown,
+                }),
+                range: None,
+            }));
         }
         Ok(None)
     }
 
-    async fn get_local_var_type(&self, module: &cst::Module, span: crate::span::Span) -> Option<String> {
-        let registry = self.registry.read().await;
-        let check_result = crate::typechecker::check_module_for_ide(module, &registry);
-        check_result.span_types.get(&span).map(fmt_ty)
+    async fn get_local_var_type(
+        &self,
+        module: &cst::Module,
+        source: &str,
+        span: crate::span::Span,
+    ) -> Option<String> {
+        let span_types = self.ide_span_types(module, source).await;
+        span_types.get(&span).map(fmt_ty)
     }
 
     async fn get_local_type(&self, module: &cst::Module, symbol: interner::Symbol, source: &str) -> Option<String> {
-        let registry = self.registry.read().await;
-        let check_result = crate::typechecker::check_module_with_registry(module, &registry);
-        if let Some(ty) = check_result.types.get(&crate::names::ValueName::new(symbol)) {
-            return Some(fmt_ty(ty));
+        // The registry exports the GENERALIZED inferred type for signed decls
+        // (e.g. `foo :: Int -> Int` → `a -> a`). Prefer the explicit CST
+        // signature when present so hover matches what the user wrote.
+        if let Some(sig) = find_cst_type_signature(&module.decls, symbol, source) {
+            return Some(sig);
         }
-        // Data constructors are stored in exports.values (keyed by unqualified ValueName),
-        // not in `types` (which is limited to Value/Foreign decls).
+
+        // No CST signature — read the inferred scheme from the registry (this
+        // covers unsigned decls). Constructors live in `ctors`, not `values`,
+        // so fall back to synthesizing their type from `CtorInfo`.
+        let module_name = interner::resolve_module_name(&module.name.value.parts);
         let name_str = interner::resolve(symbol).unwrap_or_default();
-        if let Some(scheme) = check_result
-            .exports
-            .values
-            .get(&names::unqualified_value(&name_str))
         {
-            return Some(fmt_ty(&scheme.ty));
+            let registry = self.registry.read().await;
+            if let Some(exports) = registry.get(&module_name) {
+                if let Some(scheme) = exports.values.get(&name_str) {
+                    return Some(fmt_ty(&scheme.ty));
+                }
+                if let Some(info) = exports.ctors.get(&name_str) {
+                    return Some(ctor_type_string(info));
+                }
+            }
         }
-        // Fall back to CST type signatures for declarations not in CheckResult.types
-        // (foreign imports, class methods, etc.)
-        find_cst_type_signature(&module.decls, symbol, source)
+
+        None
     }
 
     async fn hover_import_item(
@@ -343,16 +383,11 @@ impl Backend {
     }
 
     async fn get_imported_type_by_name(&self, module_name: &str, name_str: &str) -> Option<String> {
-        let module_parts: Vec<interner::Symbol> = module_name
-            .split('.')
-            .map(|s| interner::intern(s))
-            .collect();
         let registry = self.registry.read().await;
-        let mod_exports = registry.lookup(&module_parts)?;
-        let qv = names::unqualified_value(name_str);
+        let mod_exports = registry.get(module_name)?;
         mod_exports
             .values
-            .get(&qv)
+            .get(name_str)
             .map(|scheme| fmt_ty(&scheme.ty))
     }
 
@@ -387,21 +422,8 @@ impl Backend {
     }
 
     async fn get_imported_module_doc(&self, module_name: &str) -> Vec<String> {
-        // Try registry first (has module_doc from typechecking)
-        {
-            let module_parts: Vec<interner::Symbol> = module_name
-                .split('.')
-                .map(|s| interner::intern(s))
-                .collect();
-            let registry = self.registry.read().await;
-            if let Some(mod_exports) = registry.lookup(&module_parts) {
-                if !mod_exports.module_doc.is_empty() {
-                    return mod_exports.module_doc.clone();
-                }
-            }
-        }
-
-        // Fall back to parsing the source file
+        // typecheck_db exports don't carry module-level docs, so source them
+        // from the target module's parsed CST.
         let target_uri = {
             let mf = self.module_file_map.read().await;
             mf.get(module_name).cloned()
@@ -424,15 +446,13 @@ impl Backend {
     }
 
     async fn get_local_kind(&self, module: &cst::Module, symbol: interner::Symbol) -> Option<String> {
+        let module_name = interner::resolve_module_name(&module.name.value.parts);
+        let name_str = interner::resolve(symbol).unwrap_or_default();
         let registry = self.registry.read().await;
-        let check_result = crate::typechecker::check_module_with_registry(module, &registry);
-        if let Some(kind) = check_result.exports.class_type_kinds.get(&names::ClassName::new(symbol)) {
-            return Some(format!("{kind}"));
-        }
-        if let Some(kind) = check_result.exports.type_kinds.get(&names::TypeName::new(symbol)) {
-            return Some(format!("{kind}"));
-        }
-        None
+        let exports = registry.get(&module_name)?;
+        // `type_kinds` is a single String-keyed map covering both types and
+        // classes.
+        exports.type_kinds.get(&name_str).map(|kind| kind.to_string())
     }
 
     async fn get_type_definition_text(
@@ -490,18 +510,13 @@ impl Backend {
 
     async fn get_imported_type(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {
         let module_name = interner::resolve(module_sym).unwrap_or_default();
-        let module_parts: Vec<interner::Symbol> = module_name
-            .split('.')
-            .map(|s| interner::intern(s))
-            .collect();
-
         let registry = self.registry.read().await;
-        let mod_exports = registry.lookup(&module_parts)?;
-        let qv = names::unqualified_value(name_str);
-        mod_exports
-            .values
-            .get(&qv)
-            .map(|scheme| fmt_ty(&scheme.ty))
+        let mod_exports = registry.get(&module_name)?;
+        if let Some(scheme) = mod_exports.values.get(name_str) {
+            return Some(fmt_ty(&scheme.ty));
+        }
+        // Constructors live in `ctors`, not `values`.
+        mod_exports.ctors.get(name_str).map(ctor_type_string)
     }
 
     async fn get_imported_kind(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {
@@ -510,21 +525,13 @@ impl Backend {
     }
 
     async fn get_imported_kind_by_name(&self, module_name: &str, name_str: &str) -> Option<String> {
-        let module_parts: Vec<interner::Symbol> = module_name
-            .split('.')
-            .map(|s| interner::intern(s))
-            .collect();
-        let name_sym = interner::intern(name_str);
-
-        // Try registry first (has inferred kinds from kind checker)
+        // Try registry first (has inferred kinds from kind checker). `type_kinds`
+        // is String-keyed and covers both types and classes.
         {
             let registry = self.registry.read().await;
-            if let Some(mod_exports) = registry.lookup(&module_parts) {
-                if let Some(kind) = mod_exports.class_type_kinds.get(&names::ClassName::new(name_sym)) {
-                    return Some(format!("{kind}"));
-                }
-                if let Some(kind) = mod_exports.type_kinds.get(&names::TypeName::new(name_sym)) {
-                    return Some(format!("{kind}"));
+            if let Some(mod_exports) = registry.get(module_name) {
+                if let Some(kind) = mod_exports.type_kinds.get(name_str) {
+                    return Some(kind.to_string());
                 }
             }
         }

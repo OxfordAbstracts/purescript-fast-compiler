@@ -13,9 +13,9 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::build::cache::ModuleCache;
 use crate::lsp::utils::resolve::ResolutionExports;
-use crate::typechecker::registry::ModuleRegistry;
+use crate::typecheck_db::driver::TypecheckDb;
+use crate::typecheck_db::module_registry::ModuleRegistry;
 
 use utils::find_definition::DefinitionIndex;
 
@@ -88,7 +88,11 @@ pub struct Backend {
     pub(crate) module_file_map: Arc<RwLock<HashMap<String, String>>>,
     /// Maps file URI → source content for loaded project files
     pub(crate) source_map: Arc<RwLock<HashMap<String, String>>>,
-    pub(crate) module_cache: Arc<RwLock<ModuleCache>>,
+    /// The typecheck_db engine backing all checks. A `Mutex` (not `RwLock`)
+    /// because a check needs `&mut TypecheckDb` and rusqlite's `Connection` is
+    /// `Send` but `!Sync`. Serializes checks — fine for the LSP (one edit at a
+    /// time).
+    pub(crate) db: Arc<tokio::sync::Mutex<TypecheckDb>>,
     pub(crate) completion_index: Arc<RwLock<CompletionIndex>>,
     pub(crate) sources_cmd: Option<String>,
     pub(crate) cache_dir: Option<PathBuf>,
@@ -326,6 +330,21 @@ impl Backend {
         output_dir: Option<PathBuf>,
         formatter_command: Option<String>,
     ) -> Self {
+        // Open the typecheck_db: persistent SQLite alongside the output dir when
+        // one is configured (so warm restarts reuse the cache), else in-memory.
+        // Codegen is enabled iff we have somewhere to write it.
+        let db = {
+            let mut db = match &output_dir {
+                Some(dir) => TypecheckDb::open(&dir.join(".pfc-decldb.sqlite"))
+                    .unwrap_or_else(|_| {
+                        TypecheckDb::open_in_memory().expect("in-memory TypecheckDb")
+                    }),
+                None => TypecheckDb::open_in_memory().expect("in-memory TypecheckDb"),
+            };
+            db.set_codegen(output_dir.is_some());
+            db.set_output_dir(output_dir.clone());
+            db
+        };
         Backend {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
@@ -334,7 +353,7 @@ impl Backend {
             resolution_exports: Arc::new(RwLock::new(ResolutionExports::empty())),
             module_file_map: Arc::new(RwLock::new(HashMap::new())),
             source_map: Arc::new(RwLock::new(HashMap::new())),
-            module_cache: Arc::new(RwLock::new(ModuleCache::default())),
+            db: Arc::new(tokio::sync::Mutex::new(db)),
             completion_index: Arc::new(RwLock::new(CompletionIndex::default())),
             sources_cmd,
             cache_dir,
