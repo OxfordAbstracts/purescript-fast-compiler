@@ -22,3 +22,4 @@ pub mod kind_check;
 pub mod coercible_check;
 pub mod check_ffi;
 pub mod codegen_decl;
+pub mod warnings;

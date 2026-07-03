@@ -101,6 +101,14 @@ pub struct ModuleCheckResult {
     /// was skipped entirely). Diagnostics are empty and `js_module_text`
     /// carries the previously generated JS.
     pub cached: bool,
+    /// IDE span→type map for hover. Populated only when inference runs with
+    /// recording enabled (the LSP path via [`check_module_ide`]). Transient;
+    /// never written to the cache or folded into any cache key.
+    pub span_types:
+        std::collections::HashMap<crate::span::Span, crate::typecheck_db::types::Type>,
+    /// Non-fatal warnings (unused imports / bindings). Transient; NOT an error
+    /// channel — see [`ModuleCheckResult::has_errors`].
+    pub warnings: Vec<crate::typecheck_db::passes::warnings::Warning>,
 }
 
 impl ModuleCheckResult {
@@ -124,6 +132,8 @@ impl ModuleCheckResult {
             js_module_text,
             codegen_outcomes: HashMap::new(),
             cached: true,
+            span_types: HashMap::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -3368,6 +3378,8 @@ fn check_one_module(
         js_module_text,
         codegen_outcomes,
         cached: false,
+        span_types: std::collections::HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 
