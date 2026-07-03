@@ -2878,7 +2878,9 @@ g c = eq c c
         let ops = TypeOpMap::default();
         let data = DataConstructors::new();
         let ctors = CtorRegistry::new();
-        infer_value_scc_with_all(&ops, env, &decls, &data, &ctors, instances).unwrap()
+        infer_value_scc_with_all(&ops, env, &decls, &data, &ctors, instances)
+            .unwrap()
+            .0
     }
 
     #[test]

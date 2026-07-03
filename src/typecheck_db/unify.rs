@@ -350,6 +350,13 @@ pub struct UnifyState {
     /// improvement once-per-pending. Improvement is an
     /// optimisation; skipping repeats can't lose solutions.
     improved_pendings: std::collections::HashSet<(u32, String)>,
+    // IDE span→type recording. When `record_spans` is true, `infer_expr`
+    // inserts `expr.span() → inferred_type` here; the SCC driver drains and
+    // zonks it via `take_span_types` at the end of inference. Mirrors the
+    // `pending_exhaust` sidecar — lives on `UnifyState` so the infer_* call
+    // chain doesn't grow a parameter. Transient: never cached.
+    span_types: std::collections::HashMap<Span, Type>,
+    record_spans: bool,
 }
 
 /// Captures the union-find state at a point so a later
@@ -384,7 +391,31 @@ impl UnifyState {
             deadline_budget_ms: 0,
             binding_trail: Vec::new(),
             improved_pendings: std::collections::HashSet::new(),
+            span_types: std::collections::HashMap::new(),
+            record_spans: true,
         }
+    }
+
+    /// Toggle IDE span→type recording. Enabled by default (always-on); the
+    /// lever exists so non-IDE build paths can disable the (otherwise unused)
+    /// recording if its cost proves measurable on large sweeps.
+    pub fn set_record_spans(&mut self, on: bool) {
+        self.record_spans = on;
+    }
+
+    /// Record `span → ty` for hover, if recording is enabled. Types recorded
+    /// here still contain unification variables; the SCC driver zonks the map
+    /// via `take_span_types` once inference is complete.
+    pub fn record_span_type(&mut self, span: Span, ty: Type) {
+        if self.record_spans {
+            self.span_types.insert(span, ty);
+        }
+    }
+
+    /// Drain the recorded span→type map (leaving it empty). Caller is expected
+    /// to zonk each value against the final substitution before use.
+    pub fn take_span_types(&mut self) -> std::collections::HashMap<Span, Type> {
+        std::mem::take(&mut self.span_types)
     }
 
     /// Record that `pending` (identified by its span start + class

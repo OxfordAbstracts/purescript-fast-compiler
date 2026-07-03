@@ -374,6 +374,11 @@ pub fn infer_expr(
     let prev_unify_span = state.current_unify_span();
     state.set_current_unify_span(Some(expr.span()));
     let result = infer_expr_inner(state, env, type_ops, expr);
+    // Record this expression's inferred type for IDE hover. Recorded raw
+    // (may contain unif vars); the SCC driver zonks the whole map at the end.
+    if let Ok(ty) = &result {
+        state.record_span_type(expr.span(), ty.clone());
+    }
     state.set_current_unify_span(prev_unify_span);
     result
 }
@@ -561,6 +566,12 @@ pub fn check_expr(
     let prev_unify_span = state.current_unify_span();
     state.set_current_unify_span(Some(expr.span()));
     let result = check_expr_inner(state, env, type_ops, expr, expected);
+    // Record this expression's checked (expected) type for IDE hover — in
+    // check mode the expr's type IS the type it was checked against. Recorded
+    // raw; the SCC driver zonks the whole map at the end.
+    if result.is_ok() {
+        state.record_span_type(expr.span(), expected.clone());
+    }
     state.set_current_unify_span(prev_unify_span);
     result
 }
@@ -956,7 +967,9 @@ pub fn infer_value_scc_with_registries(
     ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
 ) -> Result<Vec<InferredScheme>, InferError> {
     let instances = crate::typecheck_db::passes::instance_index::InstanceIndex::new();
+    // Discard the IDE span→type map; this wrapper predates hover support.
     infer_value_scc_with_all(type_ops, env, decls, data_constructors, ctor_details, &instances)
+        .map(|(schemes, _span_types)| schemes)
 }
 
 /// The real entry point: runs inference, exhaustiveness, *and*
@@ -972,7 +985,13 @@ pub fn infer_value_scc_with_all(
     data_constructors: &crate::typecheck_db::passes::exhaustiveness::DataConstructors,
     ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
-) -> Result<Vec<InferredScheme>, InferError> {
+) -> Result<
+    (
+        Vec<InferredScheme>,
+        std::collections::HashMap<crate::span::Span, Type>,
+    ),
+    InferError,
+> {
     // Sub-phase profiling for slow SCCs. Gated on TYPECHECK_DB_PROFILE_SLOW
     // so production runs see no overhead. Logged as a single line at function
     // return when the SCC total exceeds 200ms. Splits SCC time across body
@@ -1956,7 +1975,13 @@ pub fn infer_value_scc_with_all(
             tm = try_match_delta,
         );
     }
-    Ok(out)
+    // Drain the IDE span→type recording and zonk each entry against the final
+    // substitution so hover sees concrete types (no residual unif vars).
+    let mut span_types = state.take_span_types();
+    for ty in span_types.values_mut() {
+        *ty = state.zonk(ty);
+    }
+    Ok((out, span_types))
 }
 
 /// Compute the `input_hash` for one SCC-inference cache entry.

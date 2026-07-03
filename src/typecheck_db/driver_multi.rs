@@ -1924,6 +1924,14 @@ fn check_one_module(
     // hash, so the SCC's input_hash captures exactly the shape of
     // what it consumes.
     let mut all_schemes: Vec<InferredScheme> = Vec::new();
+    // IDE span→type recording aggregated across every SCC + instance-method
+    // body inferred this module. Transient; surfaced on `ModuleCheckResult`
+    // for hover. Empty for decls restored from cache (their inference is
+    // skipped) — the LSP path (`check_module_ide`) forces full re-inference.
+    let mut module_span_types: std::collections::HashMap<
+        crate::span::Span,
+        crate::typecheck_db::types::Type,
+    > = std::collections::HashMap::new();
     let mut inference_error: Option<InferError> = None;
     // In-module scheme output hashes so later SCCs can resolve
     // intra-module deps.
@@ -2132,7 +2140,8 @@ fn check_one_module(
                     &ctor_details,
                     &instance_index,
                 ) {
-                    Ok(schemes) => {
+                    Ok((schemes, scc_span_types)) => {
+                        module_span_types.extend(scc_span_types);
                         // Cache write is best-effort: a pathological
                         // scheme (constraint-leak blowup in a decl
                         // that ran long under a generous deadline)
@@ -2708,7 +2717,8 @@ fn check_one_module(
                         scope.insert(method_name.clone(), slot);
                     }
                 }
-                if let Ok(schemes) = inference {
+                if let Ok((schemes, scc_span_types)) = inference {
+                    module_span_types.extend(scc_span_types);
                     let inst_key =
                         crate::typecheck_db::passes::check_nonvalue::decl_key_for_nonvalue(d).0;
                     let slot = method_dicts_by_instance.entry(inst_key).or_default();
@@ -3378,7 +3388,7 @@ fn check_one_module(
         js_module_text,
         codegen_outcomes,
         cached: false,
-        span_types: std::collections::HashMap::new(),
+        span_types: module_span_types,
         warnings: Vec::new(),
     }
 }
