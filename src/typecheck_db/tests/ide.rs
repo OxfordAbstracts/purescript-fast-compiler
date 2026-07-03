@@ -53,3 +53,56 @@ fn span_types_record_top_level_body_type() {
     let off = offset_of(src, "42");
     assert_eq!(ty_at(&r, off).as_deref(), Some("Int"));
 }
+
+// --- A3: unused-import warnings ---------------------------------------------
+
+use crate::typecheck_db::passes::warnings::WarningKind;
+
+/// Names flagged `UnusedImport` in the module named `name`.
+fn unused_imports_of(name: &str, sources: &[(&str, &str)]) -> Vec<String> {
+    let inputs: Vec<ModuleInput> = sources
+        .iter()
+        .map(|(n, src)| ModuleInput::new(*n, *src, parse(src).expect("parse")))
+        .collect();
+    let report = check_many_modules(inputs);
+    let r = report
+        .results
+        .iter()
+        .find(|r| r.name == name)
+        .expect("result");
+    r.warnings
+        .iter()
+        .filter_map(|w| match &w.kind {
+            WarningKind::UnusedImport { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn unused_import_is_warned() {
+    let lib = "module Lib where\n\nused :: Int\nused = 1\n\nunused :: Int\nunused = 2\n";
+    let main = "module Main where\nimport Lib (used, unused)\nmain :: Int\nmain = used\n";
+    let unused = unused_imports_of("Main", &[("Lib", lib), ("Main", main)]);
+    assert!(unused.contains(&"unused".to_string()), "should warn `unused`: {unused:?}");
+    assert!(!unused.contains(&"used".to_string()), "must NOT warn `used`: {unused:?}");
+}
+
+#[test]
+fn type_only_used_in_signature_is_not_unused() {
+    // `Lib.T` is referenced only in a signature — must not be flagged unused.
+    let lib = "module Lib where\n\ndata T = T\n";
+    let main = "module Main where\nimport Lib (T(..))\nmk :: T\nmk = T\n";
+    let unused = unused_imports_of("Main", &[("Lib", lib), ("Main", main)]);
+    assert!(unused.is_empty(), "type used in signature is not unused: {unused:?}");
+}
+
+#[test]
+fn underscore_prefixed_import_is_exempt() {
+    // (Constructed) — an explicitly imported but unreferenced name that starts
+    // with `_` must not be warned. Uses a value name `_helper`.
+    let lib = "module Lib where\n\n_helper :: Int\n_helper = 1\n\nreal :: Int\nreal = 2\n";
+    let main = "module Main where\nimport Lib (_helper, real)\nmain :: Int\nmain = real\n";
+    let unused = unused_imports_of("Main", &[("Lib", lib), ("Main", main)]);
+    assert!(!unused.iter().any(|n| n == "_helper"), "_-prefixed exempt: {unused:?}");
+}

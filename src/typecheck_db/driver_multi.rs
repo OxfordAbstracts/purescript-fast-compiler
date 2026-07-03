@@ -3371,6 +3371,41 @@ fn check_one_module(
         phase_timing::record("0.module_total", phase_total.elapsed());
     }
 
+    // Unused-import warnings: diff every explicitly-imported name against the
+    // set of names referenced anywhere in the module (all decl kinds, all
+    // namespaces). Name-level match (namespace-agnostic) — cheap and matches
+    // the reference compiler on the common cases. `Type(T(..))` /
+    // `Type(T(ctor))` imports are skipped: they're "used" if either the type
+    // OR any brought-in constructor is referenced, which a name-only match on
+    // the type name would miss (→ false positives when only a constructor is
+    // used, e.g. `import Data.Maybe (Maybe(..))` with only `Just`). Skipping
+    // yields at worst a missed lint, never a wrong squiggle. Open imports
+    // (`import M`) have no per-item span to remove and are likewise skipped.
+    let module_warnings = {
+        let mut referenced: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for d in &desugared {
+            for r in free_names::compute(d).refs {
+                referenced.insert(r.name);
+            }
+        }
+        let mut imported: Vec<(String, crate::span::Span)> = Vec::new();
+        for imp in &module.imports {
+            if let Some(crate::cst::ImportList::Explicit(items)) = &imp.imports {
+                for it in items {
+                    if matches!(it, crate::cst::Import::Type(_, Some(_))) {
+                        continue;
+                    }
+                    imported.push((
+                        crate::typecheck_db::util::resolve_symbol(it.name()),
+                        it.span(),
+                    ));
+                }
+            }
+        }
+        crate::typecheck_db::passes::warnings::compute_unused_imports(&imported, &referenced)
+    };
+
     ModuleCheckResult {
         name,
         schemes: all_schemes,
@@ -3389,7 +3424,7 @@ fn check_one_module(
         codegen_outcomes,
         cached: false,
         span_types: module_span_types,
-        warnings: Vec::new(),
+        warnings: module_warnings,
     }
 }
 
