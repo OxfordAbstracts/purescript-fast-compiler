@@ -43,17 +43,31 @@ CREATE TABLE IF NOT EXISTS module_source (
 -- deserializing the (large) memo blob. `memo_blob` is a bincode-serialized
 -- `ModuleMemo` (exports + per-decl registry hashes + instances + generated JS)
 -- restored into the `ModuleRegistry` when a module is proven clean.
+--
+-- `interface_hash` / `deps_combined_hash` are ALSO stored as their own columns
+-- (like `source_hash`) so the build plan can detect cross-build interface
+-- drift without deserializing any blob: `interface_hash` fingerprints this
+-- module's own exported interface, and `deps_combined_hash` folds in the
+-- interface fingerprints of its in-build dependencies AS SEEN when the memo
+-- was written. A restored module is stale iff recomputing its
+-- `deps_combined_hash` from its dependencies' CURRENT `interface_hash`es no
+-- longer matches — which happens when a dependency's interface changed in a
+-- build that did not include this module. Nullable so pre-existing rows
+-- (written before these columns existed) read back as `None` and are treated
+-- as "cannot verify → re-check", healing the cache on the first run.
 CREATE TABLE IF NOT EXISTS module_memo (
-    module      TEXT PRIMARY KEY,
-    source_hash BLOB NOT NULL,
-    memo_blob   BLOB NOT NULL
+    module             TEXT PRIMARY KEY,
+    source_hash        BLOB NOT NULL,
+    memo_blob          BLOB NOT NULL,
+    interface_hash     BLOB,
+    deps_combined_hash BLOB
 );
 "#;
 
-/// Best-effort migration for pre-`decl_debug` databases. We detect the
-/// missing column by trying to select it and, if it errors, apply the
-/// ALTER. Idempotent on fresh DBs because `CREATE TABLE IF NOT EXISTS`
-/// above already declares the column.
+/// Best-effort migration for older databases. We detect a missing column by
+/// trying to select it and, if it errors, apply the ALTER. Idempotent on
+/// fresh DBs because `CREATE TABLE IF NOT EXISTS` above already declares the
+/// columns.
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
     let has_col: bool = conn
         .prepare("SELECT decl_debug FROM pass_output LIMIT 0")
@@ -61,6 +75,22 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if !has_col {
         conn.execute(
             "ALTER TABLE pass_output ADD COLUMN decl_debug TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    // Build-plan drift columns (added after the initial module_memo shape).
+    if conn
+        .prepare("SELECT interface_hash FROM module_memo LIMIT 0")
+        .is_err()
+    {
+        conn.execute("ALTER TABLE module_memo ADD COLUMN interface_hash BLOB", [])?;
+    }
+    if conn
+        .prepare("SELECT deps_combined_hash FROM module_memo LIMIT 0")
+        .is_err()
+    {
+        conn.execute(
+            "ALTER TABLE module_memo ADD COLUMN deps_combined_hash BLOB",
             [],
         )?;
     }
@@ -274,6 +304,39 @@ impl Store {
         Ok(out)
     }
 
+    /// Every cached `(module, interface_hash)` pair, skipping rows whose
+    /// `interface_hash` is NULL (pre-drift-columns memos). Cheap — reads only
+    /// the small hash column so the build plan can detect cross-build
+    /// interface drift up front without deserializing any memo blob.
+    pub fn module_interface_hashes(&self) -> Result<HashMap<String, [u8; 32]>, StoreError> {
+        self.read_hash_column("interface_hash")
+    }
+
+    /// Every cached `(module, deps_combined_hash)` pair, skipping NULLs.
+    /// `deps_combined_hash` folds in this module's dependencies' interface
+    /// fingerprints as of the last successful check.
+    pub fn module_deps_combined_hashes(&self) -> Result<HashMap<String, [u8; 32]>, StoreError> {
+        self.read_hash_column("deps_combined_hash")
+    }
+
+    fn read_hash_column(&self, col: &str) -> Result<HashMap<String, [u8; 32]>, StoreError> {
+        // `col` is a fixed internal identifier (never user input), so
+        // interpolating it into the query text is safe here.
+        let sql = format!("SELECT module, {col} FROM module_memo WHERE {col} IS NOT NULL");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            let m: String = r.get(0)?;
+            let h: Vec<u8> = r.get(1)?;
+            Ok((m, h))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (m, h) = r?;
+            out.insert(m, to_hash(&h)?);
+        }
+        Ok(out)
+    }
+
     /// The serialized `ModuleMemo` blob for one module, if present.
     pub fn get_module_memo_blob(&self, module: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let mut stmt = self
@@ -288,21 +351,34 @@ impl Store {
         Ok(row)
     }
 
-    /// Persist (or overwrite) a module's memo blob and its source hash.
+    /// Persist (or overwrite) a module's memo blob plus its source-hash and
+    /// drift-detection hashes (all stored as their own columns for cheap
+    /// blob-free reads by the build plan).
     pub fn put_module_memo(
         &self,
         module: &str,
         source_hash: [u8; 32],
         memo_blob: &[u8],
+        interface_hash: [u8; 32],
+        deps_combined_hash: [u8; 32],
     ) -> Result<(), StoreError> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO module_memo (module, source_hash, memo_blob)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO module_memo
+                (module, source_hash, memo_blob, interface_hash, deps_combined_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (module) DO UPDATE SET
-                source_hash = excluded.source_hash,
-                memo_blob   = excluded.memo_blob",
+                source_hash        = excluded.source_hash,
+                memo_blob          = excluded.memo_blob,
+                interface_hash     = excluded.interface_hash,
+                deps_combined_hash = excluded.deps_combined_hash",
         )?;
-        stmt.execute(params![module, &source_hash[..], memo_blob])?;
+        stmt.execute(params![
+            module,
+            &source_hash[..],
+            memo_blob,
+            &interface_hash[..],
+            &deps_combined_hash[..],
+        ])?;
         Ok(())
     }
 }
@@ -392,18 +468,22 @@ mod tests {
         assert!(store.get_module_memo_blob("M").unwrap().is_none());
         assert!(store.module_source_hashes().unwrap().is_empty());
 
-        store.put_module_memo("M", [7u8; 32], b"memo-blob").unwrap();
-        store.put_module_memo("N", [9u8; 32], b"other").unwrap();
+        store.put_module_memo("M", [7u8; 32], b"memo-blob", [1u8; 32], [2u8; 32]).unwrap();
+        store.put_module_memo("N", [9u8; 32], b"other", [3u8; 32], [4u8; 32]).unwrap();
 
         assert_eq!(store.get_module_memo_blob("M").unwrap().unwrap(), b"memo-blob");
         let hashes = store.module_source_hashes().unwrap();
         assert_eq!(hashes.get("M"), Some(&[7u8; 32]));
         assert_eq!(hashes.get("N"), Some(&[9u8; 32]));
+        assert_eq!(store.module_interface_hashes().unwrap().get("M"), Some(&[1u8; 32]));
+        assert_eq!(store.module_deps_combined_hashes().unwrap().get("M"), Some(&[2u8; 32]));
 
-        // Overwrite updates both blob and source hash.
-        store.put_module_memo("M", [8u8; 32], b"memo-v2").unwrap();
+        // Overwrite updates blob, source hash, and drift hashes.
+        store.put_module_memo("M", [8u8; 32], b"memo-v2", [5u8; 32], [6u8; 32]).unwrap();
         assert_eq!(store.get_module_memo_blob("M").unwrap().unwrap(), b"memo-v2");
         assert_eq!(store.module_source_hashes().unwrap().get("M"), Some(&[8u8; 32]));
+        assert_eq!(store.module_interface_hashes().unwrap().get("M"), Some(&[5u8; 32]));
+        assert_eq!(store.module_deps_combined_hashes().unwrap().get("M"), Some(&[6u8; 32]));
     }
 
     #[test]
@@ -413,12 +493,13 @@ mod tests {
         drop(tmp);
         {
             let store = Store::open(&path).unwrap();
-            store.put_module_memo("M", [3u8; 32], b"persisted").unwrap();
+            store.put_module_memo("M", [3u8; 32], b"persisted", [1u8; 32], [2u8; 32]).unwrap();
         }
         {
             let store = Store::open(&path).unwrap();
             assert_eq!(store.get_module_memo_blob("M").unwrap().unwrap(), b"persisted");
             assert_eq!(store.module_source_hashes().unwrap().get("M"), Some(&[3u8; 32]));
+            assert_eq!(store.module_interface_hashes().unwrap().get("M"), Some(&[1u8; 32]));
         }
         let _ = std::fs::remove_file(&path);
     }

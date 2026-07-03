@@ -184,19 +184,38 @@ impl TypecheckDb {
         Ok(self.store.module_source_hashes()?)
     }
 
+    /// Every cached `(module, interface_hash)` pair (NULLs skipped) — for the
+    /// build plan's up-front cross-build interface-drift diff.
+    pub fn module_interface_hashes(&self) -> Result<HashMap<String, [u8; 32]>, DriverError> {
+        Ok(self.store.module_interface_hashes()?)
+    }
+
+    /// Every cached `(module, deps_combined_hash)` pair (NULLs skipped).
+    pub fn module_deps_combined_hashes(&self) -> Result<HashMap<String, [u8; 32]>, DriverError> {
+        Ok(self.store.module_deps_combined_hashes()?)
+    }
+
     /// The raw serialized `ModuleMemo` blob for one module, if present.
     pub fn get_module_memo_blob(&self, module: &str) -> Result<Option<Vec<u8>>, DriverError> {
         Ok(self.store.get_module_memo_blob(module)?)
     }
 
-    /// Persist a module's memo blob + source hash.
+    /// Persist a module's memo blob + source hash + drift-detection hashes.
     pub fn put_module_memo(
         &self,
         module: &str,
         source_hash: [u8; 32],
         blob: &[u8],
+        interface_hash: [u8; 32],
+        deps_combined_hash: [u8; 32],
     ) -> Result<(), DriverError> {
-        self.store.put_module_memo(module, source_hash, blob)?;
+        self.store.put_module_memo(
+            module,
+            source_hash,
+            blob,
+            interface_hash,
+            deps_combined_hash,
+        )?;
         Ok(())
     }
 

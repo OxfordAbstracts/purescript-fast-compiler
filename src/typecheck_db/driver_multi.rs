@@ -26,7 +26,7 @@ use crate::cst;
 use crate::typecheck_db::desugar::{desugar_module, DesugarContext};
 use crate::typecheck_db::driver::{CacheOutcome, TypecheckDb};
 use crate::typecheck_db::env::Env;
-use crate::typecheck_db::key::{hash_bytes, OutputHash};
+use crate::typecheck_db::key::OutputHash;
 use crate::typecheck_db::module_registry::{distill_exports, FixityDecl, ModuleExports, ModuleRegistry};
 use crate::typecheck_db::passes::constraints::{ConstraintError, PendingConstraint, ResolvedDict};
 use crate::typecheck_db::passes::exhaustiveness::{CtorInfo, CtorRegistry, DataConstructors, NonExhaustive};
@@ -296,11 +296,28 @@ fn direct_import_indices(
 /// its source changed since its memo was written (no memo / hash mismatch /
 /// previously errored ⇒ no memo) **or** any module it imports is dirty.
 /// Modules in an import cycle (absent from `order`) are conservatively dirty.
+/// The module-memo's per-module source hash, with the compiler-source
+/// [`CACHE_EPOCH`](crate::typecheck_db::key::CACHE_EPOCH) folded in. Folding
+/// the epoch here means a compiler change flips every module's stored source
+/// hash, so the build plan re-checks everything on the first run after an
+/// upgrade — the memo stores actual schemes, which a changed compiler could
+/// now infer differently, so a plain source-only hash would restore them
+/// stale. Mirrors the epoch folded into the per-decl `input_hash`.
+fn module_memo_source_hash(source: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"module_memo_source_v1");
+    h.update(crate::typecheck_db::key::CACHE_EPOCH.as_bytes());
+    h.update(&[0u8]);
+    h.update(source.as_bytes());
+    *h.finalize().as_bytes()
+}
+
 fn compute_dirty(
     db: &TypecheckDb,
     modules: &[ModuleInput],
     imports_idx: &[Vec<usize>],
     order: &[usize],
+    drift: &[bool],
 ) -> Vec<bool> {
     let n = modules.len();
     let stored = db.module_source_hashes().unwrap_or_default();
@@ -309,9 +326,12 @@ fn compute_dirty(
     let mut in_order = vec![false; n];
     for &i in order {
         in_order[i] = true;
-        let cur = hash_bytes(modules[i].source.as_bytes());
+        let cur = module_memo_source_hash(&modules[i].source);
         let source_changed = stored.get(&modules[i].name).map_or(true, |h| *h != cur);
-        dirty[i] = source_changed || imports_idx[i].iter().any(|&j| dirty[j]);
+        // `drift[i]`: a dependency's interface changed in a build that
+        // excluded `i` (cross-build incoherence) — the coarse cone must
+        // include it so its dependencies are restored for its re-check.
+        dirty[i] = source_changed || drift[i] || imports_idx[i].iter().any(|&j| dirty[j]);
     }
     // Cycle members never appear in `order`; leave them dirty (already true).
     for (i, seen) in in_order.iter().enumerate() {
@@ -346,6 +366,22 @@ fn compute_needed(dirty: &[bool], imports_idx: &[Vec<usize>]) -> Vec<bool> {
     needed
 }
 
+/// Which modules have a missing on-disk `index.js` (e.g. deleted since the
+/// last build). A clean module whose output is gone must be re-checked to
+/// regenerate it — and that re-check needs its dependencies in the registry,
+/// so these modules seed `needed` alongside the dirty cone. Returns all-false
+/// when no output dir is configured (the plan has nothing to regenerate).
+fn compute_output_missing(db: &TypecheckDb, modules: &[ModuleInput]) -> Vec<bool> {
+    let out_dir = match db.output_dir() {
+        Some(d) => d.to_path_buf(),
+        None => return vec![false; modules.len()],
+    };
+    modules
+        .iter()
+        .map(|m| !out_dir.join(&m.name).join("index.js").exists())
+        .collect()
+}
+
 /// Restore a clean module from its memo into the registry and produce a
 /// `cached` result. Returns `None` (caller falls back to re-checking) if the
 /// memo is absent or fails to deserialize.
@@ -370,14 +406,27 @@ fn restore_from_memo(
 /// Persist a freshly-checked module's memo, reading its contribution back
 /// out of the registry (which `check_one_module` just populated). The blob is
 /// zstd-compressed — exports + schemes compress well, keeping the cache small.
-fn write_module_memo(db: &TypecheckDb, registry: &ModuleRegistry, input: &ModuleInput) {
+///
+/// `dep_ifaces` are the `(dep_module, interface_hash)` pairs of this module's
+/// in-build dependencies as they stand right now — folded into the stored
+/// `deps_combined_hash` so a later build can detect that a dependency's
+/// interface drifted (see [`interface_fingerprint`]). Returns this module's
+/// own interface fingerprint so the caller can record it in `current_iface`.
+fn write_module_memo(
+    db: &TypecheckDb,
+    registry: &ModuleRegistry,
+    input: &ModuleInput,
+    mut dep_ifaces: Vec<(String, [u8; 32])>,
+) -> Option<[u8; 32]> {
     let name = &input.name;
     let exports = match registry.get(name) {
         Some(e) => e.clone(),
-        None => return,
+        None => return None,
     };
+    let interface_hash = interface_fingerprint(&exports);
+    let deps_combined_hash = combine_dep_interface_hashes(&mut dep_ifaces);
     let memo = ModuleMemo {
-        source_hash: hash_bytes(input.source.as_bytes()),
+        source_hash: module_memo_source_hash(&input.source),
         exports,
         scheme_hashes: registry.scheme_hashes_for(name),
         nonvalue_hashes: registry.nonvalue_hashes_for(name),
@@ -385,139 +434,186 @@ fn write_module_memo(db: &TypecheckDb, registry: &ModuleRegistry, input: &Module
     };
     if let Ok(raw) = bincode::serialize(&memo) {
         if let Ok(blob) = zstd::encode_all(&raw[..], 1) {
-            let _ = db.put_module_memo(name, memo.source_hash, &blob);
+            let _ = db.put_module_memo(
+                name,
+                memo.source_hash,
+                &blob,
+                interface_hash,
+                deps_combined_hash,
+            );
         }
     }
+    Some(interface_hash)
 }
 
-/// Read a module's previously-memoized exported interface (for diffing
-/// against a fresh re-check). `None` if there's no usable memo.
-fn read_memo_exports(db: &TypecheckDb, name: &str) -> Option<ModuleExports> {
-    let compressed = db.get_module_memo_blob(name).ok().flatten()?;
-    let raw = zstd::decode_all(&compressed[..]).ok()?;
-    let memo: ModuleMemo = bincode::deserialize(&raw).ok()?;
-    Some(memo.exports)
-}
+/// Cross-build interface-drift detection. Returns `drift[i] == true` when
+/// module `i`'s memo was written against a DIFFERENT version of one of its
+/// dependencies' interfaces than is currently cached — i.e. a dependency's
+/// interface changed in a build that did not include module `i`, so `i`'s
+/// restored memo would be silently stale.
+///
+/// Computed entirely from the cheap per-module hash columns (no blob reads),
+/// so it stays free on a no-op rebuild. A module whose memo predates these
+/// columns (no `deps_combined_hash`), or any of whose dependencies lack a
+/// stored `interface_hash`, is conservatively marked dirty so the first run
+/// after upgrading heals the cache.
+fn compute_cross_run_drift(
+    db: &TypecheckDb,
+    modules: &[ModuleInput],
+    imports_idx: &[Vec<usize>],
+) -> Vec<bool> {
+    let n = modules.len();
+    let stored_iface = db.module_interface_hashes().unwrap_or_default();
+    let stored_deps = db.module_deps_combined_hashes().unwrap_or_default();
+    let stored_source = db.module_source_hashes().unwrap_or_default();
 
-/// What changed in a module's *exported interface* between its previous memo
-/// and a fresh re-check. Drives fine-grained invalidation: an importer is
-/// only re-checked if a symbol it actually imports changed. Mirrors the
-/// legacy `cache::ExportDiff`, adapted to the typecheck_db `ModuleExports`.
-#[derive(Debug, Default)]
-struct ExportDiff {
-    changed_values: HashSet<String>,
-    changed_types: HashSet<String>,
-    changed_classes: HashSet<String>,
-    instances_changed: bool,
-    operators_changed: bool,
-    /// No prior exports to diff against (new module / unreadable memo): treat
-    /// as "everything changed" so every importer reconsiders. Conservative.
-    full: bool,
-}
-
-impl ExportDiff {
-    fn is_empty(&self) -> bool {
-        !self.full
-            && self.changed_values.is_empty()
-            && self.changed_types.is_empty()
-            && self.changed_classes.is_empty()
-            && !self.instances_changed
-            && !self.operators_changed
-    }
-
-    fn full_change() -> Self {
-        ExportDiff { full: true, ..Default::default() }
-    }
-
-    fn compute(old: &ModuleExports, new: &ModuleExports) -> Self {
-        fn changed<V: PartialEq>(
-            old: &HashMap<String, V>,
-            new: &HashMap<String, V>,
-            out: &mut HashSet<String>,
-        ) {
-            for (k, v) in new {
-                if old.get(k) != Some(v) {
-                    out.insert(k.clone());
-                }
-            }
-            for k in old.keys() {
-                if !new.contains_key(k) {
-                    out.insert(k.clone());
-                }
-            }
+    let mut drift = vec![false; n];
+    for i in 0..n {
+        let name = &modules[i].name;
+        // No memo at all → not "drift"; it's a fresh module handled by the
+        // source-hash check. Only consider modules that have a memo.
+        if !stored_source.contains_key(name) {
+            continue;
         }
-        let mut d = ExportDiff::default();
-        changed(&old.values, &new.values, &mut d.changed_values);
-        changed(&old.ctors, &new.ctors, &mut d.changed_types);
-        changed(&old.data_constructors, &new.data_constructors, &mut d.changed_types);
-        changed(&old.type_aliases, &new.type_aliases, &mut d.changed_types);
-        changed(&old.type_arities, &new.type_arities, &mut d.changed_types);
-        changed(&old.foreign_data_kinds, &new.foreign_data_kinds, &mut d.changed_types);
-        for n in old.newtypes.symmetric_difference(&new.newtypes) {
-            d.changed_types.insert(n.clone());
-        }
-        changed(&old.classes, &new.classes, &mut d.changed_classes);
-        d.instances_changed = !instances_set_equal(&old.instances, &new.instances);
-        d.operators_changed =
-            old.value_fixities != new.value_fixities || old.type_fixities != new.type_fixities;
-        d
-    }
-
-    /// Does this diff touch anything `imp` brings into scope? Instances are
-    /// globally visible, so any instance change is always relevant.
-    fn affects_import_decl(&self, imp: &cst::ImportDecl) -> bool {
-        if self.full || self.instances_changed {
-            return true;
-        }
-        let resolve = |it: &cst::Import| {
-            crate::typecheck_db::util::resolve_symbol(it.name())
-        };
-        match &imp.imports {
+        let recorded = match stored_deps.get(name) {
+            Some(h) => *h,
+            // Memo predates the drift columns → cannot verify → re-check.
             None => {
-                // Open import (`import M` / `import M as Q`): any change matters.
-                !self.changed_values.is_empty()
-                    || !self.changed_types.is_empty()
-                    || !self.changed_classes.is_empty()
-                    || self.operators_changed
+                drift[i] = true;
+                continue;
             }
-            Some(cst::ImportList::Explicit(items)) => items.iter().any(|it| match it {
-                cst::Import::Value(_) => self.changed_values.contains(&resolve(it)),
-                // A type import also brings its constructors in as values.
-                cst::Import::Type(..) => {
-                    self.changed_types.contains(&resolve(it))
-                        || self.changed_values.contains(&resolve(it))
+        };
+        let mut pairs: Vec<(String, [u8; 32])> = Vec::with_capacity(imports_idx[i].len());
+        let mut missing = false;
+        for &j in &imports_idx[i] {
+            let dep_name = &modules[j].name;
+            match stored_iface.get(dep_name) {
+                Some(h) => pairs.push((dep_name.clone(), *h)),
+                None => {
+                    // Dependency has no stored interface hash (old-format or
+                    // never memoized) → cannot verify → re-check.
+                    missing = true;
+                    break;
                 }
-                cst::Import::Class(_) => self.changed_classes.contains(&resolve(it)),
-                cst::Import::TypeOp(_) => self.operators_changed,
-            }),
-            Some(cst::ImportList::Hiding(items)) => {
-                let hidden: HashSet<String> = items
-                    .iter()
-                    .map(|it| crate::typecheck_db::util::resolve_symbol(it.name()))
-                    .collect();
-                self.operators_changed
-                    || self.changed_values.iter().any(|n| !hidden.contains(n))
-                    || self.changed_types.iter().any(|n| !hidden.contains(n))
-                    || self.changed_classes.iter().any(|n| !hidden.contains(n))
             }
         }
+        if missing {
+            drift[i] = true;
+            continue;
+        }
+        let expected = combine_dep_interface_hashes(&mut pairs);
+        if expected != recorded {
+            drift[i] = true;
+        }
     }
+    drift
 }
 
-/// Compare two instance lists as multisets (order is not significant and may
-/// vary run-to-run), via their debug rendering.
-fn instances_set_equal(
-    a: &[std::sync::Arc<Instance>],
-    b: &[std::sync::Arc<Instance>],
-) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// A deterministic fingerprint of a module's *exported interface* — every
+/// facet an importer can observe. Two structurally-equal export surfaces
+/// hash the same regardless of `HashMap` iteration order (all collections are
+/// sorted first), and any change an importer could see (a value's scheme, a
+/// type alias body, a constructor set, a class, an instance, a fixity) flips
+/// the hash.
+///
+/// This is the build plan's cross-build coherence key: it is stored per module
+/// (as its own SQLite column) and folded into each dependent's
+/// `deps_combined_hash`, so a dependent can tell — without deserializing any
+/// blob — that a dependency's interface has drifted since its own memo was
+/// written (e.g. a field added to a record alias in a build that excluded the
+/// dependent). Mirrors the fields `ExportDiff::compute` compares, so it is at
+/// least as sensitive as the within-run fine-grained diff.
+fn interface_fingerprint(exports: &ModuleExports) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"driver_multi::interface_fingerprint_v1");
+
+    // Helper: hash a map's entries in sorted-key order, each value via Debug.
+    fn hash_map_dbg<V: std::fmt::Debug>(
+        h: &mut blake3::Hasher,
+        tag: &[u8],
+        map: &HashMap<String, V>,
+    ) {
+        h.update(tag);
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        h.update(&(keys.len() as u32).to_le_bytes());
+        for k in keys {
+            h.update(k.as_bytes());
+            h.update(b"\x00");
+            h.update(format!("{:?}", map.get(k).unwrap()).as_bytes());
+            h.update(b"\x01");
+        }
     }
-    let mut av: Vec<String> = a.iter().map(|i| format!("{i:?}")).collect();
-    let mut bv: Vec<String> = b.iter().map(|i| format!("{i:?}")).collect();
-    av.sort();
-    bv.sort();
-    av == bv
+
+    hash_map_dbg(&mut h, b"values", &exports.values);
+    hash_map_dbg(&mut h, b"ctors", &exports.ctors);
+    hash_map_dbg(&mut h, b"data_ctors", &exports.data_constructors);
+    hash_map_dbg(&mut h, b"aliases", &exports.type_aliases);
+    hash_map_dbg(&mut h, b"arities", &exports.type_arities);
+    hash_map_dbg(&mut h, b"foreign_kinds", &exports.foreign_data_kinds);
+    hash_map_dbg(&mut h, b"classes", &exports.classes);
+    hash_map_dbg(&mut h, b"vfix", &exports.value_fixities);
+    hash_map_dbg(&mut h, b"tfix", &exports.type_fixities);
+    // Origin maps: importers bind names under their DEFINING-module key, so a
+    // re-export whose resolved origin changes (without changing the scheme
+    // itself) still alters what importers see and must flip the fingerprint.
+    hash_map_dbg(&mut h, b"value_origins", &exports.value_origins);
+    hash_map_dbg(&mut h, b"class_origins", &exports.class_origins);
+    hash_map_dbg(&mut h, b"type_origins", &exports.type_origins);
+    hash_map_dbg(&mut h, b"ctor_origins", &exports.ctor_origins);
+
+    // Extra origin-qualified value schemes (tuple key `(origin, name)`).
+    h.update(b"qualified_values");
+    let mut qv: Vec<_> = exports.qualified_values.iter().collect();
+    qv.sort_by(|a, b| a.0.cmp(b.0));
+    h.update(&(qv.len() as u32).to_le_bytes());
+    for ((origin, nm), scheme) in qv {
+        h.update(origin.as_bytes());
+        h.update(b"\x00");
+        h.update(nm.as_bytes());
+        h.update(b"\x00");
+        h.update(format!("{scheme:?}").as_bytes());
+        h.update(b"\x01");
+    }
+
+    // Newtypes: sorted set.
+    h.update(b"newtypes");
+    let mut nts: Vec<&String> = exports.newtypes.iter().collect();
+    nts.sort();
+    h.update(&(nts.len() as u32).to_le_bytes());
+    for n in nts {
+        h.update(n.as_bytes());
+        h.update(b"\x00");
+    }
+
+    // Instances: sorted multiset of debug renderings (order not significant).
+    h.update(b"instances");
+    let mut insts: Vec<String> = exports.instances.iter().map(|i| format!("{i:?}")).collect();
+    insts.sort();
+    h.update(&(insts.len() as u32).to_le_bytes());
+    for s in insts {
+        h.update(s.as_bytes());
+        h.update(b"\x01");
+    }
+
+    *h.finalize().as_bytes()
+}
+
+/// Fold a set of `(dep_module, dep_interface_hash)` pairs into one hash. The
+/// input order is normalized (sorted by module name) so the result is stable.
+/// Used both when writing a memo (recording the deps' interfaces as seen) and
+/// when checking drift (recomputing from the deps' CURRENT interfaces).
+fn combine_dep_interface_hashes(pairs: &mut [(String, [u8; 32])]) -> [u8; 32] {
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = blake3::Hasher::new();
+    h.update(b"driver_multi::deps_combined_v1");
+    h.update(&(pairs.len() as u32).to_le_bytes());
+    for (name, hash) in pairs.iter() {
+        h.update(name.as_bytes());
+        h.update(b"\x00");
+        h.update(hash);
+    }
+    *h.finalize().as_bytes()
 }
 
 /// Shared core: drives the topo-sorted check loop, forwarding each
@@ -584,55 +680,130 @@ fn check_many_modules_inner(
     // cold build).
     //
     // Dirtiness is *fine-grained* and decided in the loop below: a module is
-    // re-checked if its own source changed, or if a module it imports
-    // produced an `ExportDiff` that touches a symbol it actually imports.
-    // The coarse dirty-cone is still computed up front, but only to derive
-    // `needed` — the set of clean modules a (coarsely) dirty module might
-    // depend on, which therefore must be restored into the registry rather
-    // than skipped. (Coarse `needed` ⊇ fine `needed`, so it is safe.)
+    // re-checked if its own source changed, or if any dependency's live
+    // interface fingerprint differs from what its memo was checked against
+    // (see the `deps_stale` check). The coarse dirty-cone is still computed up
+    // front, but only to derive `needed` — the set of clean modules a
+    // (coarsely) dirty module might depend on, which therefore must be
+    // restored into the registry rather than skipped. (Coarse `needed` ⊇ fine
+    // `needed`, so it is safe.)
     let plan_enabled = db.persistent();
-    let (needed, stored_hashes) = if plan_enabled {
-        let imports_idx = direct_import_indices(&modules, &name_index);
-        let coarse_dirty = compute_dirty(db, &modules, &imports_idx, &order);
-        let needed = compute_needed(&coarse_dirty, &imports_idx);
-        (needed, db.module_source_hashes().unwrap_or_default())
+    let imports_idx = if plan_enabled {
+        direct_import_indices(&modules, &name_index)
     } else {
-        (Vec::new(), HashMap::new())
+        Vec::new()
+    };
+    // Cross-build interface drift: a dependency's interface changed in a build
+    // that excluded this module, so its restored memo would be stale. Used to
+    // build the coarse cone (for `needed`); the loop makes the precise
+    // re-check decision from live interface fingerprints (`current_iface`).
+    let drift = if plan_enabled {
+        compute_cross_run_drift(db, &modules, &imports_idx)
+    } else {
+        Vec::new()
+    };
+    // Clean modules whose on-disk output was deleted: they fall through to a
+    // re-check (to regenerate `index.js`), which needs their dependencies
+    // restored — so they seed `needed` too. Does NOT propagate to their
+    // importers (regenerating a module's JS doesn't change its interface).
+    let output_missing = if plan_enabled {
+        compute_output_missing(db, &modules)
+    } else {
+        Vec::new()
+    };
+    let (needed, stored_hashes, stored_iface, stored_deps_combined) = if plan_enabled {
+        let mut coarse_dirty = compute_dirty(db, &modules, &imports_idx, &order, &drift);
+        for (i, &missing) in output_missing.iter().enumerate() {
+            if missing {
+                coarse_dirty[i] = true;
+            }
+        }
+        let needed = compute_needed(&coarse_dirty, &imports_idx);
+        (
+            needed,
+            db.module_source_hashes().unwrap_or_default(),
+            db.module_interface_hashes().unwrap_or_default(),
+            db.module_deps_combined_hashes().unwrap_or_default(),
+        )
+    } else {
+        (Vec::new(), HashMap::new(), HashMap::new(), HashMap::new())
     };
 
-    // Per-module export changes, accumulated in topo order and consumed by
-    // importers' fine-grained dirtiness check.
-    let mut export_diffs: HashMap<String, ExportDiff> = HashMap::new();
+    // Each processed module's CURRENT interface fingerprint (restored or
+    // freshly checked). The precise fine-grained re-check decision compares a
+    // module's dependencies' live fingerprints against what its memo recorded
+    // (`deps_combined_hash`), so a change to any dependency's interface — in
+    // THIS build or a prior one — forces a re-check, while a body-only edit
+    // (interface unchanged) leaves dependents cached.
+    let mut current_iface: HashMap<String, [u8; 32]> = HashMap::new();
+    // Modules that errored this run: their importers must re-check (an errored
+    // module is never memoized, and its `stored_iface` is the last-good
+    // interface which can hide a breaking change).
+    let mut errored_this_run: HashSet<String> = HashSet::new();
     let (mut n_checked, mut n_restored, mut n_skipped) = (0usize, 0usize, 0usize);
 
     for (i, idx) in order.iter().enumerate() {
         let input = &modules[*idx];
 
         if plan_enabled {
-            // Fine-grained dirtiness.
-            let cur = hash_bytes(input.source.as_bytes());
+            // Fine-grained dirtiness. A module is clean iff its own source is
+            // unchanged AND every in-build dependency's CURRENT interface
+            // fingerprint matches what this module's memo was checked against
+            // (its recorded `deps_combined_hash`). `current_iface` holds each
+            // already-processed dependency's live fingerprint (fresh if
+            // re-checked, restored/stored otherwise); topo order guarantees
+            // dependencies are processed first. This single check subsumes
+            // both within-build propagation (a dependency re-checked with a
+            // changed interface) and cross-build drift (a dependency restored
+            // from a memo written in a build that excluded this module), while
+            // still leaving dependents cached across body-only edits (which do
+            // not change a dependency's interface fingerprint).
+            let cur = module_memo_source_hash(&input.source);
             let source_changed =
                 stored_hashes.get(&input.name).map_or(true, |h| *h != cur);
-            let affected = input.module.imports.iter().any(|imp| {
-                let dep = imp
-                    .module
-                    .parts
-                    .iter()
-                    .map(|p| crate::typecheck_db::util::resolve_symbol(*p))
-                    .collect::<Vec<_>>()
-                    .join(".");
-                export_diffs
-                    .get(&dep)
-                    .map_or(false, |d| d.affects_import_decl(imp))
-            });
+            // A dependency that ERRORED this run has unreliable exports (and
+            // was not re-memoized), so `stored_iface` for it is the last-good
+            // interface — which can mask a real change. Force any importer of
+            // an errored dependency to re-check (mirrors the old
+            // `ExportDiff::full_change` an errored module used to propagate).
+            let dep_errored = imports_idx[*idx]
+                .iter()
+                .any(|&j| errored_this_run.contains(&modules[j].name));
+            let deps_stale = dep_errored || {
+                let recorded = stored_deps_combined.get(&input.name);
+                match recorded {
+                    // No recorded deps hash (new/old-format memo) → can't
+                    // prove clean → must re-check.
+                    None => true,
+                    Some(recorded) => {
+                        let mut pairs: Vec<(String, [u8; 32])> =
+                            Vec::with_capacity(imports_idx[*idx].len());
+                        let mut unknown = false;
+                        for &j in &imports_idx[*idx] {
+                            let dn = &modules[j].name;
+                            match current_iface
+                                .get(dn)
+                                .or_else(|| stored_iface.get(dn))
+                            {
+                                Some(h) => pairs.push((dn.clone(), *h)),
+                                None => {
+                                    unknown = true;
+                                    break;
+                                }
+                            }
+                        }
+                        unknown || combine_dep_interface_hashes(&mut pairs) != *recorded
+                    }
+                }
+            };
 
-            if !source_changed && !affected {
+            if !source_changed && !deps_stale {
                 // Unchanged. Its index.js is reused from disk, so it must
                 // still be present; if deleted, fall through to regenerate
-                // (this does NOT propagate to importers).
-                let output_present = db.output_dir().map_or(true, |d| {
-                    d.join(&input.name).join("index.js").exists()
-                });
+                // (this does NOT propagate to importers). `output_missing` was
+                // computed up front and its modules were seeded into `needed`,
+                // so a fall-through re-check here finds its deps restored.
+                let output_present = !output_missing[*idx];
                 if output_present {
                     if needed[*idx] {
                         // A dirty module (transitively) imports this one, so
@@ -640,6 +811,16 @@ fn check_many_modules_inner(
                         if let Some(result) =
                             restore_from_memo(db, registry, &input.name)
                         {
+                            // Record its (unchanged) interface for dependents'
+                            // drift bookkeeping. The stored column equals a
+                            // fresh fingerprint of the restored exports.
+                            let iface = stored_iface
+                                .get(&input.name)
+                                .copied()
+                                .or_else(|| registry.get(&input.name).map(interface_fingerprint));
+                            if let Some(h) = iface {
+                                current_iface.insert(input.name.clone(), h);
+                            }
                             n_restored += 1;
                             on_result(result);
                             continue;
@@ -659,14 +840,7 @@ fn check_many_modules_inner(
             }
         }
 
-        // Re-check path. Grab the prior exports first so we can diff them
-        // against the fresh result and propagate a (possibly empty) change set.
-        let old_exports = if plan_enabled {
-            read_memo_exports(db, &input.name)
-        } else {
-            None
-        };
-
+        // Re-check path.
         if trace {
             eprintln!(
                 "[typecheck_db] [{i}/{}] checking {}",
@@ -674,9 +848,42 @@ fn check_many_modules_inner(
                 input.name,
             );
         }
+        // This module's in-build dependencies' CURRENT interface fingerprints.
+        // Computed before the check (folded into the per-decl cache key via
+        // `imports_iface_hash`) and reused afterwards to record the memo's
+        // `deps_combined_hash`. Empty (→ zero hash) in non-persistent runs.
+        let mut dep_ifaces: Vec<(String, [u8; 32])> = if plan_enabled {
+            imports_idx
+                .get(*idx)
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(|&j| {
+                            let dn = &modules[j].name;
+                            // Same lookup order as the `deps_stale` check so a
+                            // module's recorded `deps_combined_hash` and the
+                            // hash recomputed next run agree exactly (no
+                            // spurious re-checks): live fingerprint first, then
+                            // the stored column for deps not processed this run.
+                            current_iface
+                                .get(dn)
+                                .or_else(|| stored_iface.get(dn))
+                                .map(|h| (dn.clone(), *h))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let imports_iface_hash = if plan_enabled {
+            combine_dep_interface_hashes(&mut dep_ifaces)
+        } else {
+            [0u8; 32]
+        };
+
         let started = std::time::Instant::now();
         crate::memstats::checkpoint(&format!("module:{}:start", input.name));
-        let result = check_one_module(db, input, registry);
+        let result = check_one_module(db, input, registry, imports_iface_hash);
         crate::memstats::checkpoint(&format!("module:{}:end", input.name));
         let elapsed_ms = started.elapsed().as_millis();
         if timing_trace || elapsed_ms >= slow_threshold_ms {
@@ -689,22 +896,14 @@ fn check_many_modules_inner(
         }
         if plan_enabled {
             n_checked += 1;
+            // Errored modules are never memoized, so they are always
+            // re-checked (and re-report) next run. A clean module records its
+            // dependencies' CURRENT interface fingerprints so a later build
+            // can tell whether any of them has since drifted.
             if result.has_errors() {
-                // Errored module: never memoized (so it always re-checks and
-                // re-reports), and its exports are unreliable — force every
-                // importer to reconsider.
-                export_diffs.insert(input.name.clone(), ExportDiff::full_change());
-            } else {
-                let diff = match (old_exports.as_ref(), registry.get(&input.name)) {
-                    (Some(old), Some(new)) => ExportDiff::compute(old, new),
-                    // No prior exports (new module / unreadable memo): treat
-                    // as a full change so importers reconsider.
-                    _ => ExportDiff::full_change(),
-                };
-                if !diff.is_empty() {
-                    export_diffs.insert(input.name.clone(), diff);
-                }
-                write_module_memo(db, registry, input);
+                errored_this_run.insert(input.name.clone());
+            } else if let Some(iface) = write_module_memo(db, registry, input, dep_ifaces) {
+                current_iface.insert(input.name.clone(), iface);
             }
         }
         on_result(result);
@@ -807,6 +1006,15 @@ fn check_one_module(
     db: &mut TypecheckDb,
     input: &ModuleInput,
     registry: &mut ModuleRegistry,
+    // Combined interface fingerprint of this module's in-build dependencies
+    // (see [`interface_fingerprint`]). Folded into every per-decl cache key so
+    // that a change to ANY dependency's interface invalidates this module's
+    // cached decls — even the ones whose dependency on the change is structural
+    // (a record built to match an imported alias) rather than a syntactic name
+    // reference that per-decl `dep_output_hashes` would catch. Zero in
+    // non-persistent runs (no build plan → every module is checked fresh
+    // anyway, and the per-decl cache keeps its fine-grained cross-module keys).
+    imports_iface_hash: [u8; 32],
 ) -> ModuleCheckResult {
     let name = input.name.clone();
     let module = &input.module;
@@ -1623,9 +1831,18 @@ fn check_one_module(
     bind_local_ctors(&desugared, &name, &mut env, &alias_map, &type_ops);
 
     // 4) Value decls: split into SCCs + cached per-SCC inference.
-    //    `module_context_hash` is now zero — all context dependencies
-    //    are tracked explicitly via per-decl `dep_output_hashes` below.
-    let module_context_hash: [u8; 32] = [0u8; 32];
+    //    Per-decl `dep_output_hashes` track each decl's *syntactic*
+    //    dependencies (values, types, ctors, classes it names). But a decl can
+    //    depend on an imported type STRUCTURALLY without naming it — e.g.
+    //    building a record literal that unifies with an imported alias, or
+    //    passing it through a polymorphic helper — and that dependency is
+    //    invisible to syntactic tracking. `imports_iface_hash` folds every
+    //    in-build dependency's interface fingerprint into the module context,
+    //    so any change to an imported interface invalidates this module's
+    //    cached decls regardless of how the dependency is expressed. Zero in
+    //    non-persistent runs, preserving the fine-grained per-symbol keys the
+    //    in-memory incremental tests assert on.
+    let module_context_hash: [u8; 32] = imports_iface_hash;
 
     // Partition the desugared decls: value decls go through SCC
     // inference; everything else (data, class, instance, fixity)

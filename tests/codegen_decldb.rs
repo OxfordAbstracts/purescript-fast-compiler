@@ -752,6 +752,54 @@ test = compare 2 1 == GT
 // ---------------------------------------------------------------------------
 
 #[test]
+fn build_api_decldb_deleted_output_regenerates_without_spurious_errors() {
+    // Regression: a clean module whose `index.js` was deleted must be
+    // re-checked to regenerate it — and that re-check needs its dependencies
+    // restored into the registry. Previously, if nothing dirty imported the
+    // module, its deps were skipped, so the fall-through re-check saw an empty
+    // registry and reported spurious import-resolution errors.
+    use purescript_fast_compiler::build::build_from_sources_decldb;
+    let lib = "module Lib where\n\nanswer :: Int\nanswer = 42\n";
+    let main = "module Main where\nimport Lib\ntest :: Int\ntest = answer\n";
+    let sources = [("Lib.purs", lib), ("Main.purs", main)];
+    let out = std::env::temp_dir().join("pfc-decldb-deleted-output");
+    let _ = std::fs::remove_dir_all(&out);
+    let db = std::env::temp_dir().join("pfc-decldb-deleted-output.sqlite");
+    let _ = std::fs::remove_file(&db);
+
+    let errs = |r: &purescript_fast_compiler::build::DeclDbBuildResult| -> String {
+        r.modules
+            .iter()
+            .filter(|m| m.error_count > 0)
+            .map(|m| format!("{}: {}", m.name, m.errors.join("; ")))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+
+    // Cold build: everything checked, index.js written, memos persisted.
+    let r1 = build_from_sources_decldb(&sources, &None, Some(&out), Some(&db));
+    assert!(r1.modules.iter().all(|m| m.error_count == 0), "cold build errors: {}", errs(&r1));
+    let main_js = out.join("Main").join("index.js");
+    assert!(main_js.exists(), "cold build must write Main/index.js");
+
+    // Delete Main's output. Nothing dirty imports Main, and its dep Lib is
+    // otherwise not needed — the plan must still restore Lib so Main's
+    // regeneration re-check resolves `answer`.
+    std::fs::remove_file(&main_js).unwrap();
+
+    let r2 = build_from_sources_decldb(&sources, &None, Some(&out), Some(&db));
+    assert!(
+        r2.modules.iter().all(|m| m.error_count == 0),
+        "warm rebuild after deleting Main/index.js produced spurious errors: {}",
+        errs(&r2),
+    );
+    assert!(main_js.exists(), "warm rebuild must regenerate the deleted Main/index.js");
+
+    let _ = std::fs::remove_dir_all(&out);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
 fn build_api_decldb_cross_module() {
     use purescript_fast_compiler::build::build_from_sources_decldb;
     let lib = "module Lib where\n\nanswer :: Int\nanswer = 42\n";

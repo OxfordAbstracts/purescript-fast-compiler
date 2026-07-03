@@ -10,6 +10,17 @@ use std::fmt;
 pub type InputHash = [u8; 32];
 pub type OutputHash = [u8; 32];
 
+/// A digest of the compiler's own source, injected by `build.rs`. Folded into
+/// every persistent cache key so that any change to the compiler invalidates
+/// stale cached outputs — a build whose inference logic changed must not reuse
+/// results a previous build wrote. Falls back to a fixed marker if the build
+/// script didn't set it (e.g. some tooling paths), which still gives a stable
+/// key within a single binary.
+pub const CACHE_EPOCH: &str = match option_env!("PFC_CACHE_EPOCH") {
+    Some(e) => e,
+    None => "no-epoch",
+};
+
 /// The primary-key portion of a cache row.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PassKey {
@@ -101,6 +112,9 @@ impl InputHasher {
                 .cmp(&(b.dep_module.as_str(), b.dep_decl.as_str(), b.dep_pass))
         });
         let mut h = blake3::Hasher::new();
+        // Compiler-source epoch first: a compiler change invalidates every key.
+        h.update(CACHE_EPOCH.as_bytes());
+        h.update(&[0u8]);
         h.update(self.pass_name.as_bytes());
         h.update(&[0u8]);
         h.update(&self.pass_version.to_le_bytes());

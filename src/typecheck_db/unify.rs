@@ -1899,6 +1899,51 @@ mod tests {
         assert!(s.unify(&int(), &bool_ty()).is_err());
     }
 
+    fn rec(fields: Vec<(&str, Type)>, tail: Option<Type>) -> Type {
+        Type::Record(
+            fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
+            tail.map(std::sync::Arc::new),
+        )
+    }
+
+    #[test]
+    fn unify_nested_record_tail_against_open_record() {
+        // Mirrors the app bug: a closed record whose tail is *another
+        // record* (row-extension) — `{ user :: Int | { has_cat :: Bool,
+        // seen_bulk :: Bool, id :: Int } }` — must unify with an open
+        // record `{ has_cat :: Bool, seen_bulk :: Bool | u }` that only
+        // names fields buried in the nested tail.
+        let mut s = UnifyState::new();
+        let inner = rec(
+            vec![("has_cat", bool_ty()), ("seen_bulk", bool_ty()), ("id", int())],
+            None,
+        );
+        let expected = rec(vec![("user", int())], Some(inner));
+        let u = s.fresh();
+        let actual = rec(vec![("has_cat", bool_ty()), ("seen_bulk", bool_ty())], Some(u));
+        s.unify(&expected, &actual)
+            .expect("nested-tail closed record should unify with open record naming nested fields");
+    }
+
+    #[test]
+    fn unify_flat_record_against_open_record_baseline() {
+        // The flat (canonical) form of the same expected type — this is
+        // what a fresh conversion produces and it already unifies.
+        let mut s = UnifyState::new();
+        let expected = rec(
+            vec![
+                ("user", int()),
+                ("has_cat", bool_ty()),
+                ("seen_bulk", bool_ty()),
+                ("id", int()),
+            ],
+            None,
+        );
+        let u = s.fresh();
+        let actual = rec(vec![("has_cat", bool_ty()), ("seen_bulk", bool_ty())], Some(u));
+        s.unify(&expected, &actual).expect("flat closed record unifies with open record");
+    }
+
     #[test]
     fn expired_deadline_returns_timeout() {
         let mut s = UnifyState::new();

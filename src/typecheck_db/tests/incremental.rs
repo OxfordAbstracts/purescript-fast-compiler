@@ -547,6 +547,144 @@ useIt = fromJs
     );
 }
 
+#[test]
+fn record_alias_field_addition_invalidates_cross_module_user() {
+    // D exports `type R = { a :: Int }`. Q imports R and uses it in a
+    // signature. Adding a field to R must invalidate Q's `consume` — its
+    // cached scheme baked in the old (closed) record, so a caller supplying
+    // the new field would otherwise fail to unify (`Mismatch({}, { x | r })`).
+    let mut db = TypecheckDb::open_in_memory().unwrap();
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+consume :: R -> Int
+consume r = r.a
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r }
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r, v: r.x }
+";
+    let first = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+    assert!(first.errors.is_empty(), "v1 should typecheck: {:?}", first.errors);
+    let second = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+    assert!(
+        second.errors.is_empty(),
+        "after adding field `x` to record alias R, the cross-module user \
+         `consume` must be re-checked so `use` type-checks; stale alias caused: {:?}",
+        second.errors,
+    );
+}
+
+#[test]
+fn record_alias_field_addition_invalidates_through_alias_chain() {
+    // Like the above but the field is added to an alias reached through a
+    // chain: `type Outer = Maybe Inner`, and the field goes on `Inner`.
+    // Q's `consume :: Outer -> Int` pattern-matches into the record, so the
+    // added field must still invalidate it.
+    let mut db = TypecheckDb::open_in_memory().unwrap();
+    let d_v1 = "\
+module D where
+data Maybe a = Nothing | Just a
+type Inner = { a :: Int }
+type Outer = Maybe Inner
+";
+    let d_v2 = "\
+module D where
+data Maybe a = Nothing | Just a
+type Inner = { a :: Int, x :: Int }
+type Outer = Maybe Inner
+";
+    let q = "\
+module Q where
+import D (Outer, Inner, Maybe(..))
+consume :: Outer -> Int
+consume m = case m of
+  Just r -> r.a
+  Nothing -> 0
+";
+    let a_v1 = "\
+module A where
+import D (Outer, Inner, Maybe(..))
+import Q (consume)
+use m = consume m
+";
+    let a_v2 = "\
+module A where
+import D (Outer, Inner, Maybe(..))
+import Q (consume)
+use m = case m of
+  Just r -> { c: consume m, v: r.x }
+  Nothing -> { c: consume m, v: 0 }
+";
+    let first = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+    assert!(first.errors.is_empty(), "v1 should typecheck: {:?}", first.errors);
+    let second = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+    assert!(
+        second.errors.is_empty(),
+        "adding field `x` to Inner (= Outer's target) must invalidate \
+         `consume`; stale alias chain caused: {:?}",
+        second.errors,
+    );
+}
+
+#[test]
+fn perdecl_constrained_sig_alias_field_addition_invalidates() {
+    // Q's `consume` has a *constrained* signature that mentions R. The
+    // per-decl cache pins R's expanded+closed record form; adding a field to
+    // R must invalidate `consume`'s per-decl entry too.
+    let mut db = TypecheckDb::open_in_memory().unwrap();
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+class C a where
+  cm :: a -> Int
+consume :: forall a. C a => a -> R -> Int
+consume _ r = r.a
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume, class C)
+data T = T
+instance C T where
+  cm _ = 0
+mkR :: R
+mkR = { a: 1 }
+use = consume T mkR
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume, class C)
+data T = T
+instance C T where
+  cm _ = 0
+mkR :: R
+mkR = { a: 1, x: 2 }
+use = consume T mkR
+";
+    let first = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+    assert!(first.errors.is_empty(), "v1 should typecheck: {:?}", first.errors);
+    let second = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+    assert!(
+        second.errors.is_empty(),
+        "after adding field `x` to R, `consume`'s per-decl cache (constrained \
+         sig pins R expanded+closed) must be invalidated; stale entry caused: {:?}",
+        second.errors,
+    );
+}
 // ---------------------------------------------------------------------------
 // Build-plan module memo (Tier 1)
 //
@@ -726,6 +864,370 @@ fn build_plan_type_edit_does_invalidate_importer() {
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert!(!was_cached(&second, "A"), "A changed → re-checked");
         assert!(!was_cached(&second, "B"), "A's exported type changed → B re-checked");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Whether a report has no diagnostics of any kind.
+fn report_clean(report: &super::super::driver_multi::ModuleCheckReport) -> bool {
+    report.errors.is_empty()
+        && report.results.iter().all(|r| {
+            r.constraint_errors.is_empty()
+                && r.import_errors.is_empty()
+                && r.inference_error.is_none()
+        })
+}
+
+/// A human-readable dump of a report's diagnostics (for assertion messages).
+fn report_problems(report: &super::super::driver_multi::ModuleCheckReport) -> String {
+    let mut s = format!("errors={:?}", report.errors);
+    for r in &report.results {
+        if !r.constraint_errors.is_empty()
+            || !r.import_errors.is_empty()
+            || r.inference_error.is_some()
+        {
+            s.push_str(&format!(
+                "\n  {}: constraint={:?} import={:?} infer={:?}",
+                r.name, r.constraint_errors, r.import_errors, r.inference_error
+            ));
+        }
+    }
+    s
+}
+
+#[test]
+fn build_plan_record_alias_field_addition_invalidates_persistent() {
+    // Persistent (build-plan) analogue of
+    // `record_alias_field_addition_invalidates_cross_module_user`. The
+    // in-memory version tests only the per-decl cache; this one reopens a
+    // tempfile db between runs so the *module memo* build plan is active —
+    // which is what `pfc compile-db` actually uses. Reproduces the oa-app
+    // bug: adding a field to a record alias in D fails to invalidate the
+    // cross-module user Q, so a caller A that supplies the new field errors.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+consume :: R -> Int
+consume r = r.a
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r }
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r, v: r.x }
+";
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+        assert!(report_clean(&first), "v1 should typecheck: {}", report_problems(&first));
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+        assert!(
+            report_clean(&second),
+            "after adding field `x` to record alias R (persistent build plan), the \
+             cross-module user `consume` must be re-checked so `use` type-checks; \
+             stale memo caused: {}",
+            report_problems(&second),
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_local_alias_wrapping_imported_alias_invalidates_persistent() {
+    // Q defines a *local* alias `Input` that wraps `Array R` where R is an
+    // imported record alias. Adding a field to R must invalidate Q's
+    // `consume` even though Q's signature names only the local alias Input.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+type Input = { items :: Array R }
+consume :: Input -> Int
+consume i = 0
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume, Input)
+mkR :: R
+mkR = { a: 1 }
+use = consume { items: [ mkR ] }
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume, Input)
+mkR :: R
+mkR = { a: 1, x: 2 }
+use = consume { items: [ mkR ] }
+";
+
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let first = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+        assert!(report_clean(&first), "v1 should typecheck: {}", report_problems(&first));
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let second = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+        assert!(
+            report_clean(&second),
+            "adding field `x` to R must invalidate Q's `consume` (local alias \
+             Input wraps Array R); stale memo caused: {}",
+            report_problems(&second),
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_cross_build_interface_drift_invalidates_dependent() {
+    // Cross-build drift: R gains a field in run2, a build that EXCLUDES Q.
+    // In run3 the full set is rebuilt; Q's memo was written against R's old
+    // interface, so the plan must detect Q is stale w.r.t. D and re-check it.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+consume :: R -> Int
+consume r = r.a
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r }
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r, v: r.x }
+";
+
+    // run1: cold build of all three, clean.
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let r1 = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+        assert!(report_clean(&r1), "run1: {}", report_problems(&r1));
+    }
+    // run2: rebuild only D (with the new field). Q is excluded from this build,
+    // so its memo is not touched and still records R's old interface.
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let _ = run_with_shared_db(&mut db, &[("D", d_v2)]);
+    }
+    // run3: full rebuild. Q's memo is stale w.r.t. D's changed interface, so
+    // the plan must re-check Q; otherwise A errors against the stale closed R.
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let r3 = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+        assert!(
+            report_clean(&r3),
+            "run3: Q's `consume` scheme baked in the stale closed record `{{ a }}`; \
+             the rebuild must detect Q is stale w.r.t. D's changed interface and \
+             re-check it. stale cross-build memo caused: {}",
+            report_problems(&r3),
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_cross_build_drift_stale_expanded_record_scheme() {
+    // Cross-build drift through an alias chain: R gains a field in a build
+    // that excludes Q, then the full rebuild must detect Q's memo is stale.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+consume :: R -> Int
+consume r = r.a
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r }
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume)
+use r = { c: consume r, v: r.x }
+";
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let r1 = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+        assert!(report_clean(&r1), "run1: {}", report_problems(&r1));
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let _ = run_with_shared_db(&mut db, &[("D", d_v2)]);
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let r3 = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+        assert!(
+            report_clean(&r3),
+            "run3: after R gained field `x` in a build that excluded Q, the full \
+             rebuild must detect Q's memo is stale w.r.t. D and re-check it; \
+             stale cross-build memo caused: {}",
+            report_problems(&r3),
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_cross_build_drift_through_local_alias_wrapper() {
+    // Cross-build drift where Q's signature names only a local alias that
+    // wraps the imported R. R gains a field in a build excluding Q; the full
+    // rebuild must still detect Q is stale.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let d_v1 = "module D where\ntype R = { a :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+type Input = { items :: Array R }
+consume :: Input -> Int
+consume i = 0
+";
+    let a_v1 = "\
+module A where
+import D (R)
+import Q (consume, Input)
+mkR :: R
+mkR = { a: 1 }
+use = consume { items: [ mkR ] }
+";
+    let a_v2 = "\
+module A where
+import D (R)
+import Q (consume, Input)
+mkR :: R
+mkR = { a: 1, x: 2 }
+use = consume { items: [ mkR ] }
+";
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let r1 = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a_v1)]);
+        assert!(report_clean(&r1), "run1: {}", report_problems(&r1));
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let _ = run_with_shared_db(&mut db, &[("D", d_v2)]);
+    }
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let r3 = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a_v2)]);
+        assert!(
+            report_clean(&r3),
+            "run3: Q's `consume` memo (Input wraps Array R) is stale w.r.t. R's \
+             new field; the rebuild must re-check Q; stale cross-build memo \
+             caused: {}",
+            report_problems(&r3),
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn build_plan_within_build_structural_dep_reports_construction_error() {
+    // Within a single build, D's alias R drops a field between builds; a
+    // caller A builds a record literal that must match R. The incremental
+    // build must not restore a stale field-less R and miss A's error that a
+    // cold build catches.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    let d_v1 = "module D where\ntype R = { a :: Int, x :: Int }\n";
+    let d_v2 = "module D where\ntype R = { a :: Int }\n";
+    let q = "\
+module Q where
+import D (R)
+class C a where
+  cm :: a -> Int
+consume :: forall a. C a => a -> R -> Int
+consume _ r = r.a
+";
+    let a = "\
+module A where
+import Q (consume, class C)
+data T = T
+instance C T where
+  cm _ = 0
+mk = consume T { a: 1 }
+";
+
+    // Cold build with d_v2 (field-less R): A supplies only `{ a: 1 }`, which
+    // is fine, but if A had supplied `x` it must be rejected. First establish
+    // the clean baseline with d_v1.
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let _ = run_with_shared_db(&mut db, &[("D", d_v1), ("Q", q), ("A", a)]);
+    }
+    // Cold build of d_v2 as a sanity reference.
+    {
+        let mut db = TypecheckDb::open_in_memory().unwrap();
+        db.set_codegen(true);
+        let cold = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a)]);
+        assert!(report_clean(&cold), "sanity: cold build of d_v2 must reject A's field-less literal");
+    }
+    // Incremental build with d_v2: must match the cold build's verdict.
+    {
+        let mut db = TypecheckDb::open(&path).unwrap();
+        db.set_codegen(true);
+        let inc = run_with_shared_db(&mut db, &[("D", d_v2), ("Q", q), ("A", a)]);
+        assert!(
+            report_clean(&inc),
+            "incremental build restored a stale field-less R and missed A's error \
+             that the cold build catches",
+        );
     }
     let _ = std::fs::remove_file(&path);
 }
