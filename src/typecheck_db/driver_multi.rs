@@ -2173,6 +2173,7 @@ fn check_one_module(
                     &data_constructors,
                     &ctor_details,
                     &instance_index,
+                    force_reinfer,
                 ) {
                     Ok((schemes, scc_span_types)) => {
                         module_span_types.extend(scc_span_types);
@@ -2714,6 +2715,7 @@ fn check_one_module(
                     &data_constructors,
                     &ctor_details,
                     &instance_index,
+                    force_reinfer,
                 );
                 let inst_elapsed = inst_t.elapsed();
                 if profile_slow && inst_elapsed >= std::time::Duration::from_millis(50) {

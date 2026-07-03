@@ -392,13 +392,17 @@ impl UnifyState {
             binding_trail: Vec::new(),
             improved_pendings: std::collections::HashSet::new(),
             span_types: std::collections::HashMap::new(),
-            record_spans: true,
+            // Off by default: recording clones a `Type` at every expression
+            // node, which measurably slows full builds (e.g. the PMock perf
+            // budget). Only the IDE path (`check_module_ide`) enables it, where
+            // the hover data is actually consumed.
+            record_spans: false,
         }
     }
 
-    /// Toggle IDE span→type recording. Enabled by default (always-on); the
-    /// lever exists so non-IDE build paths can disable the (otherwise unused)
-    /// recording if its cost proves measurable on large sweeps.
+    /// Toggle IDE span→type recording. Enabled by the IDE entry point
+    /// (`check_module_ide`); left off on the normal build path so full builds
+    /// don't pay the per-expression clone cost for data nothing consumes.
     pub fn set_record_spans(&mut self, on: bool) {
         self.record_spans = on;
     }

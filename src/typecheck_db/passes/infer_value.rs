@@ -968,7 +968,7 @@ pub fn infer_value_scc_with_registries(
 ) -> Result<Vec<InferredScheme>, InferError> {
     let instances = crate::typecheck_db::passes::instance_index::InstanceIndex::new();
     // Discard the IDE span→type map; this wrapper predates hover support.
-    infer_value_scc_with_all(type_ops, env, decls, data_constructors, ctor_details, &instances)
+    infer_value_scc_with_all(type_ops, env, decls, data_constructors, ctor_details, &instances, false)
         .map(|(schemes, _span_types)| schemes)
 }
 
@@ -985,6 +985,9 @@ pub fn infer_value_scc_with_all(
     data_constructors: &crate::typecheck_db::passes::exhaustiveness::DataConstructors,
     ctor_details: &crate::typecheck_db::passes::exhaustiveness::CtorRegistry,
     instances: &crate::typecheck_db::passes::instance_index::InstanceIndex,
+    // Record a span→type map for IDE hover. Off on the normal build path (the
+    // returned map is empty); enabled only by `check_module_ide`.
+    record_spans: bool,
 ) -> Result<
     (
         Vec<InferredScheme>,
@@ -1013,6 +1016,7 @@ pub fn infer_value_scc_with_all(
     // Pre-register each SCC member with a fresh unif var so mutual
     // references within the SCC type-check. After inference, we generalize.
     let mut state = UnifyState::new();
+    state.set_record_spans(record_spans);
 
     // Per-decl typecheck deadline. Read the env var once per SCC
     // (cheap — single getenv) so a pathological declaration can't
